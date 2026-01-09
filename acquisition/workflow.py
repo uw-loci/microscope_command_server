@@ -105,7 +105,7 @@ def autofocus_with_manual_fallback(
                     if abs(current_pos.x - original_x) > 1.0 or abs(current_pos.y - original_y) > 1.0:
                         logger.info(f"Restoring XY position after manual focus: "
                                    f"({current_pos.x:.1f}, {current_pos.y:.1f}) -> ({original_x:.1f}, {original_y:.1f})")
-                        from .hardware import Position
+                        # Position already imported at top of file (line 18)
                         restore_pos = Position(original_x, original_y, current_pos.z)
                         hardware.move_to_position(restore_pos)
                     logger.info("User chose to use current focus position")
@@ -128,7 +128,7 @@ def autofocus_with_manual_fallback(
                             if abs(current_pos.x - original_x) > 1.0 or abs(current_pos.y - original_y) > 1.0:
                                 logger.info(f"Restoring XY position: "
                                            f"({current_pos.x:.1f}, {current_pos.y:.1f}) -> ({original_x:.1f}, {original_y:.1f})")
-                                from .hardware import Position
+                                # Position already imported at top of file (line 18)
                                 restore_pos = Position(original_x, original_y, retry_result)
                                 hardware.move_to_position(restore_pos)
                             return retry_result
