@@ -129,30 +129,54 @@ def init_pycromanager_with_logger():
 
 
 # Initialize hardware connections
-logger.info("Loading configuration...")
+logger.info("Loading generic startup configuration...")
 config_manager = ConfigManager()
 
-## DEFAULT CONFIG loaded for exploratory XYZ movements
-# Note: configurations folder is at smart_wsi_scanner/configurations/, not server/configurations/
-package_dir = pathlib.Path(__file__).parent.parent  # smart_wsi_scanner/
+## GENERIC CONFIG loaded for exploratory XYZ movements
+# Actual microscope-specific config loaded during ACQUIRE command via --yaml parameter
+package_dir = pathlib.Path(__file__).parent.parent
 
-config_path = package_dir / "configurations" / "config_PPM.yml"
-loci_rsc_file = (
-    package_dir / "configurations" / "resources" / "resources_LOCI.yml"
-)
-# Try to load default PPM configuration
-ppm_settings = config_manager.get_config("config_PPM")
-loci_resources = config_manager.load_config_file(str(loci_rsc_file))
-if not ppm_settings:
-    logger.error(f"Failed to load configuration from {config_path}")
-    sys.exit(1)
-ppm_settings.update(loci_resources)
+# Try to load generic config
+generic_config_path = package_dir / "configurations" / "config_generic.yml"
+if generic_config_path.exists():
+    logger.info(f"Loading generic startup config from {generic_config_path}")
+    startup_settings = config_manager.load_config_file(str(generic_config_path))
+else:
+    # Fallback to hardcoded minimal config if file doesn't exist
+    logger.warning("Generic config file not found, using hardcoded minimal defaults")
+    startup_settings = {
+        "microscope": {"name": "Generic", "type": "Unconfigured"},
+        "stage": {
+            "stage_id": "GENERIC_STAGE",
+            "limits": {
+                "x_um": {"low": -100000, "high": 100000},
+                "y_um": {"low": -100000, "high": 100000},
+                "z_um": {"low": -20000, "high": 20000}
+            }
+        },
+        "ppm_optics": "NA",
+        "modalities": {},
+        "hardware": {},
+        "id_stage": {},
+        "id_detector": {},
+        "id_camera": {}
+    }
 
+# Load LOCI resources if available (for device lookup during ACQUIRE)
+loci_rsc_file = package_dir / "configurations" / "resources" / "resources_LOCI.yml"
+if loci_rsc_file.exists():
+    loci_resources = config_manager.load_config_file(str(loci_rsc_file))
+    startup_settings.update(loci_resources)
+    logger.info("Loaded LOCI resources for hardware device lookup")
+else:
+    logger.warning("LOCI resources file not found - device lookups may fail during ACQUIRE")
 
-# Initialize hardware
+# Initialize hardware with generic config (will be replaced during ACQUIRE)
+logger.info("Initializing Micro-Manager connection...")
 core, studio = init_pycromanager_with_logger()
-hardware = PycromanagerHardware(core, studio, ppm_settings)
-logger.info("Hardware initialization complete")
+hardware = PycromanagerHardware(core, studio, startup_settings)
+logger.info("Hardware initialized with generic config")
+logger.info("Server ready - microscope-specific config will be loaded from ACQUIRE --yaml parameter")
 
 
 def acquisitionWorkflow(message, client_addr):

@@ -91,6 +91,28 @@ QuPath Extension → Socket Client → Microscope Server
                               Micro-Manager Hardware
 ```
 
+## Server Configuration
+
+The microscope command server uses a **dynamic configuration** approach:
+
+### Startup
+- Server loads a minimal generic configuration (`config_generic.yml`)
+- Connects to Micro-Manager (hardware must be available)
+- Waits for client connections
+
+### During Acquisition
+- Client sends ACQUIRE command with `--yaml /path/to/config.yml` parameter
+- Server loads microscope-specific config from the provided path
+- Hardware settings are updated dynamically
+- Microscope-specific methods (e.g., PPM rotation) are initialized
+
+### Exploratory Commands
+Commands like GETXY, MOVE, GETZ use the most recently loaded config:
+- Before first ACQUIRE: Uses generic startup config with permissive stage limits
+- After ACQUIRE: Uses the microscope-specific config from that acquisition
+
+**Note**: Always provide the `--yaml` parameter in ACQUIRE commands to ensure correct microscope configuration.
+
 ## License
 
 MIT License

@@ -1,0 +1,32 @@
+# Minimal generic configuration for microscope command server startup
+# This allows server to start without microscope-specific hardware config.
+# Actual microscope config provided via --yaml parameter in ACQUIRE command.
+
+microscope:
+  name: "Generic"
+  type: "Unconfigured"
+  description: "Generic startup config - will be replaced by ACQUIRE command"
+
+# Permissive stage limits (overridden by ACQUIRE config)
+stage:
+  stage_id: "GENERIC_STAGE"
+  limits:
+    x_um:
+      low: -100000
+      high: 100000
+    y_um:
+      low: -100000
+      high: 100000
+    z_um:
+      low: -20000
+      high: 20000
+
+# Disable PPM-specific features at startup
+ppm_optics: "NA"
+
+# Empty sections to prevent KeyError exceptions
+modalities: {}
+hardware: {}
+id_stage: {}
+id_detector: {}
+id_camera: {}
