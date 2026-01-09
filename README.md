@@ -15,14 +15,34 @@ Socket-based command server for remote microscope control and QuPath integration
 
 ## Installation
 
-**Recommended:** Use the [QPSC installation instructions](https://github.com/uw-loci/QPSC#quick-start) which includes all required components.
+**Part of [QPSC (QuPath Scope Control)](https://github.com/uw-loci/QPSC)**
 
-**Standalone installation:**
+⚠️ **Important**: This package depends on `microscope-control` and `ppm-library`.
+See the [QPSC Installation Guide](https://github.com/uw-loci/QPSC#automated-installation-windows) for complete setup instructions.
+
+### Quick Install (from GitHub)
+
+**Install dependencies first:**
 ```bash
-pip install microscope-server
+# 1. Install ppm-library
+pip install git+https://github.com/uw-loci/ppm_library.git
+
+# 2. Install microscope-control
+pip install git+https://github.com/uw-loci/microscope_control.git
+
+# 3. Then install microscope_command_server
+pip install git+https://github.com/uw-loci/microscope_command_server.git
 ```
 
-Requires both `microscope-control` and `ppm-library` packages (automatically installed as dependencies).
+### Development Install (editable mode)
+
+```bash
+git clone https://github.com/uw-loci/microscope_command_server.git
+cd microscope_command_server
+pip install -e .
+```
+
+**For automated setup**, use the [QPSC setup script](https://github.com/uw-loci/QPSC/blob/main/PPM-QuPath.ps1).
 
 ## Quick Start
 
