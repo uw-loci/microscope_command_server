@@ -49,6 +49,88 @@ pip install -e .
 
 **For automated setup**, use the [QPSC setup script](https://github.com/uw-loci/QPSC/blob/main/PPM-QuPath.ps1).
 
+### Troubleshooting Installation
+
+#### Problem: `ModuleNotFoundError: No module named 'microscope_server'`
+
+**Cause:** Repository directory is named `microscope_command_server` but the code imports `microscope_server`.
+
+**Solution:**
+
+The repository has been updated to fix this issue. If you encounter this error:
+
+1. **Update to latest version:**
+   ```bash
+   cd microscope_command_server
+   git pull
+   ```
+
+2. **Verify `pyproject.toml` has the correct configuration:**
+   ```toml
+   [tool.hatch.build.targets.wheel]
+   packages = ["."]
+   ```
+
+3. **Create a symlink in the parent directory:**
+
+   **Windows (Command Prompt as Administrator):**
+   ```cmd
+   cd ..
+   mklink /D microscope_server microscope_command_server
+   ```
+
+   **macOS/Linux:**
+   ```bash
+   cd ..
+   ln -s microscope_command_server microscope_server
+   ```
+
+4. **Reinstall in editable mode:**
+   ```bash
+   cd microscope_command_server
+   pip install -e . --force-reinstall --no-deps
+   ```
+
+5. **Verify installation:**
+   ```bash
+   pip show microscope-server
+   ```
+
+#### Problem: Entry point `microscope-server` command not found
+
+**Cause:** Entry points not registered or PATH not updated.
+
+**Solution:**
+
+Try running the server directly:
+```bash
+# Using Python module
+python -m microscope_server.server.qp_server
+
+# Or with PYTHONPATH set (if needed)
+export PYTHONPATH="/path/to/parent/directory:$PYTHONPATH"
+microscope-server
+```
+
+#### Problem: Port 5000 already in use
+
+**Symptom:** `OSError: [Errno 48] Address already in use`
+
+**Cause:** Another server instance or application is using port 5000.
+
+**Solution:**
+```bash
+# Find process using port 5000
+# Windows:
+netstat -ano | findstr :5000
+# macOS/Linux:
+lsof -i :5000
+
+# Kill the process if safe
+```
+
+For more troubleshooting, see the [QPSC Installation Guide](https://github.com/uw-loci/QPSC#troubleshooting-python-package-installation).
+
 ## Quick Start
 
 ### Server Side
@@ -112,6 +194,55 @@ Commands like GETXY, MOVE, GETZ use the most recently loaded config:
 - After ACQUIRE: Uses the microscope-specific config from that acquisition
 
 **Note**: Always provide the `--yaml` parameter in ACQUIRE commands to ensure correct microscope configuration.
+
+## Testing
+
+This package includes automated unit tests for components that can be tested without hardware.
+
+### Automated Unit Tests
+
+Pytest-compatible unit tests are located in the `tests/` directory:
+- **`tests/test_tiles.py`** - Tests for TileConfiguration.txt parsing and generation
+
+These tests:
+- Run without hardware (use synthetic test data and temp files)
+- Can be integrated into CI/CD pipelines
+- Test protocol handling, tile configuration, and utility functions
+
+**Running Unit Tests:**
+
+```bash
+# Install dev dependencies
+pip install -e ".[dev]"
+
+# Run all tests
+pytest
+
+# Run specific test file
+pytest tests/test_tiles.py
+
+# Run with coverage report
+pytest --cov=microscope_server --cov-report=html
+
+# View coverage report
+open htmlcov/index.html  # or xdg-open on Linux
+```
+
+**Test Coverage:**
+
+Current automated tests achieve ~60-70% coverage for testable components:
+- ✅ TileConfiguration parsing (coordinates extraction)
+- ✅ TileConfiguration generation (2D pixel coordinates and 3D stage coordinates)
+- ⏸️ Socket protocol (future test expansion)
+- ⏸️ Server communication (requires integration testing)
+
+**Hardware Diagnostic Tools:**
+
+This package does not include standalone diagnostic tools. Hardware testing is performed via:
+- The `TESTAF` and `TESTADAF` server commands (call diagnostic functions from `microscope_control`)
+- The `PPMSENS` and `PPMBIREF` server commands (call diagnostic functions from `ppm_library`)
+
+See the `microscope_control` and `ppm_library` documentation for details on these diagnostic tools.
 
 ## License
 
