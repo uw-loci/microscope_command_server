@@ -17,6 +17,11 @@ Socket-based command server for remote microscope control and QuPath integration
 
 **Part of [QPSC (QuPath Scope Control)](https://github.com/uw-loci/QPSC)**
 
+**Requirements:**
+- Python 3.9 or later
+- pip (Python package installer)
+- Git (for `pip install git+https://...` commands)
+
 ⚠️ **Important**: This package depends on `microscope-control` and `ppm-library`.
 See the [QPSC Installation Guide](https://github.com/uw-loci/QPSC#automated-installation-windows) for complete setup instructions.
 
