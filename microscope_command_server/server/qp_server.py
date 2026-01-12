@@ -135,6 +135,36 @@ def init_pycromanager_with_logger():
     return core, studio
 
 
+# OPTION 3 HELPER (COMMENTED OUT): Auto-reconnect to MM on first command
+# Uncomment this function and use it in handle_client() if using Option 3 lazy connection mode
+# def ensure_micromanager_connected():
+#     """
+#     Attempt to connect to Micro-Manager if not already connected.
+#     Used with Option 3 (lazy connection mode).
+#
+#     Returns:
+#         bool: True if connected, False if connection failed
+#     """
+#     global core, studio, hardware
+#
+#     if core is not None and hardware is not None:
+#         return True  # Already connected
+#
+#     logger.info("Attempting to connect to Micro-Manager...")
+#     try:
+#         core, studio = init_pycromanager()
+#         if core:
+#             hardware = PycromanagerHardware(core, studio, startup_settings)
+#             logger.info("Successfully connected to Micro-Manager")
+#             return True
+#         else:
+#             logger.error("Failed to connect to Micro-Manager - core is None")
+#             return False
+#     except Exception as e:
+#         logger.error(f"Exception while connecting to Micro-Manager: {e}")
+#         return False
+
+
 # Initialize hardware connections
 logger.info("Loading generic startup configuration...")
 config_manager = ConfigManager()
@@ -179,11 +209,20 @@ else:
     logger.warning("LOCI resources file not found - device lookups may fail during ACQUIRE")
 
 # Initialize hardware with generic config (will be replaced during ACQUIRE)
+# OPTION 1 (ACTIVE): Fail-fast - require Micro-Manager at startup
 logger.info("Initializing Micro-Manager connection...")
 core, studio = init_pycromanager_with_logger()
 hardware = PycromanagerHardware(core, studio, startup_settings)
 logger.info("Hardware initialized with generic config")
 logger.info("Server ready - microscope-specific config will be loaded from ACQUIRE --yaml parameter")
+
+# OPTION 3 (COMMENTED OUT): Allow server to start without MM, auto-reconnect on first command
+# Uncomment this section and comment out Option 1 above to enable lazy connection mode
+# logger.info("Micro-Manager connection will be attempted on first command")
+# core = None
+# studio = None
+# hardware = None
+# logger.warning("Server starting without Micro-Manager - commands will fail until MM connected")
 
 
 def acquisitionWorkflow(message, client_addr):
@@ -373,6 +412,13 @@ def handle_client(conn, addr):
 
             # Position query commands
             if data == ExtendedCommand.GETXY:
+                # OPTION 3 USAGE (COMMENTED OUT): Check MM connection before hardware access
+                # if not ensure_micromanager_connected():
+                #     logger.error("Micro-Manager not connected - cannot get XY position")
+                #     error_msg = f"MM_NOCON".ljust(8)[:8]
+                #     conn.sendall(error_msg.encode("utf-8"))
+                #     continue
+
                 logger.debug(f"Client {addr} requested XY position")
                 try:
                     current_position_xyz = hardware.get_current_position()
@@ -416,7 +462,7 @@ def handle_client(conn, addr):
                     current_fov_x, current_fov_y = hardware.get_fov()
                     response = struct.pack("!ff", current_fov_x, current_fov_y)
                     conn.sendall(response)
-                    logger.debug(f"Sent FOV to {addr}: ({current_fov_x}, current_fov_y})")
+                    logger.debug(f"Sent FOV to {addr}: ({current_fov_x}, {current_fov_y})")
                 except Exception as e:
                     logger.error(f"Failed to get FOV: {e}")
                     # Send error response
@@ -1870,7 +1916,8 @@ def handle_client(conn, addr):
             del acquisition_final_z[addr]
 
         # Clear active connection if this was the active client
-        global server_configured, active_connection_addr, active_connection_config_path
+        # NOTE: global statement removed - these are module-level variables accessed via 'connection_state_lock'
+        # global server_configured, active_connection_addr, active_connection_config_path
         with connection_state_lock:
             if active_connection_addr == addr:
                 logger.info(f"Active connection {addr} disconnected - server now UNCONFIGURED")
