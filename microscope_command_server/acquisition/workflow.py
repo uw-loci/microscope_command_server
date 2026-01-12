@@ -373,6 +373,7 @@ def _acquisition_workflow(
     set_state: Callable[[str], None],
     is_cancelled: Callable[[], bool],
     request_manual_focus: Optional[Callable[[], None]] = None,
+    connection_config_path: Optional[str] = None,
 ):
     """Execute the main image acquisition workflow with progress and cancellation.
 
@@ -388,6 +389,8 @@ def _acquisition_workflow(
         request_manual_focus: Optional callback to request manual focus from user
                              when autofocus fails. If None, autofocus failures will
                              raise exceptions as before.
+        connection_config_path: Optional path to config from initial CONFIG command,
+                               used to warn if ACQUIRE uses different config.
     """
 
     logger.info(f"=== ACQUISITION WORKFLOW STARTED for client {client_addr} ===")
@@ -421,6 +424,19 @@ def _acquisition_workflow(
         loci_resources = config_manager.load_config_file(loci_rsc_file)
         ppm_settings.update(loci_resources)
         hardware.settings = ppm_settings
+
+        # SAFETY WARNING: Check if ACQUIRE yaml differs from CONFIG
+        if connection_config_path:
+            acquire_yaml = Path(params["yaml_file_path"]).resolve()
+            connection_yaml = Path(connection_config_path).resolve()
+            if acquire_yaml != connection_yaml:
+                logger.warning("=" * 80)
+                logger.warning("CONFIG MISMATCH WARNING")
+                logger.warning(f"Connection CONFIG:  {connection_yaml}")
+                logger.warning(f"ACQUIRE --yaml:     {acquire_yaml}")
+                logger.warning("ACQUIRE yaml has overridden connection config for this acquisition")
+                logger.warning("This may cause unexpected behavior or hardware misconfiguration!")
+                logger.warning("=" * 80)
 
         # Re-initialize microscope-specific methods with updated settings
         # This is critical for PPM rotation to work correctly and to ensure

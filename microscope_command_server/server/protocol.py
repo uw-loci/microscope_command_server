@@ -48,6 +48,7 @@ class ExtendedCommand:
     SET = Command.SET.value
 
     # New commands (8 bytes each)
+    CONFIG = b"config__"  # Set microscope configuration file (CRITICAL - must be first command)
     STATUS = b"status__"  # Get acquisition status
     PROGRESS = b"progress"  # Get acquisition progress
     CANCEL = b"cancel__"  # Cancel acquisition

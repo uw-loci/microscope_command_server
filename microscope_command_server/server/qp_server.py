@@ -116,6 +116,13 @@ manual_focus_complete_events = {}  # addr -> Event (set when user acknowledges)
 manual_focus_user_choice = {}  # addr -> str ("retry", "skip", "cancel")
 manual_focus_retries_remaining = {}  # addr -> int (number of retries remaining)
 
+# Server configuration state - CRITICAL FOR SAFETY
+# NEVER allow hardware operations with generic config - could damage microscope!
+server_configured = False  # True only after CONFIG command received with valid microscope config
+active_connection_addr = None  # Track single active QuPath connection (blocks other connections)
+active_connection_config_path = None  # Path to config file provided by active connection
+connection_state_lock = Lock()  # Protect connection state from race conditions
+
 
 def init_pycromanager_with_logger():
     """Initialize Pycro-Manager connection to Micro-Manager."""
@@ -244,6 +251,7 @@ def acquisitionWorkflow(message, client_addr):
         set_state=_set_state,
         is_cancelled=_is_cancelled,
         request_manual_focus=_request_manual_focus,
+        connection_config_path=active_connection_config_path,
     )
 
 
@@ -286,6 +294,83 @@ def handle_client(conn, addr):
                 shutdown_event.set()
                 break
 
+            # CONFIG command - MUST be first command sent by client (safety critical)
+            if data == ExtendedCommand.CONFIG:
+                global server_configured, active_connection_addr, active_connection_config_path
+
+                logger.info(f"Client {addr} sent CONFIG command")
+
+                try:
+                    # Read config file path: 4 bytes length + path string
+                    path_length_bytes = conn.recv(4)
+                    if not path_length_bytes:
+                        logger.error("CONFIG: No path length received")
+                        conn.sendall(b"CFG_FAIL")
+                        continue
+
+                    path_length = struct.unpack("!I", path_length_bytes)[0]
+                    logger.debug(f"CONFIG: Expecting config path of {path_length} bytes")
+
+                    config_path_bytes = conn.recv(path_length)
+                    config_path = config_path_bytes.decode("utf-8")
+                    logger.info(f"CONFIG: Received config path: {config_path}")
+
+                    # Check connection locking
+                    with connection_state_lock:
+                        if active_connection_addr is not None and active_connection_addr != addr:
+                            # Another connection is active - reject this CONFIG
+                            logger.warning(f"CONFIG: Rejected - connection {active_connection_addr} already active")
+                            error_msg = f"BLOCKED: Active connection from {active_connection_addr}".encode("utf-8")
+                            error_length = struct.pack("!I", len(error_msg))
+                            conn.sendall(b"CFG_BLCK" + error_length + error_msg)
+                            continue
+
+                    # Load the config file
+                    new_settings = config_manager.load_config_file(config_path)
+
+                    # Validate essential config sections exist
+                    required_sections = ["microscope", "stage", "id_detector"]
+                    missing = [s for s in required_sections if s not in new_settings or not new_settings[s]]
+                    if missing:
+                        error_msg = f"Config missing required sections: {', '.join(missing)}"
+                        logger.error(f"CONFIG: {error_msg}")
+                        error_bytes = error_msg.encode("utf-8")
+                        error_length = struct.pack("!I", len(error_bytes))
+                        conn.sendall(b"CFG_FAIL" + error_length + error_bytes)
+                        continue
+
+                    # Update hardware with new configuration
+                    hardware.settings = new_settings
+                    hardware._initialize_microscope_methods()
+
+                    # Mark server as configured and track active connection
+                    with connection_state_lock:
+                        server_configured = True
+                        active_connection_addr = addr
+                        active_connection_config_path = config_path
+
+                    microscope_name = new_settings.get("microscope", {}).get("name", "Unknown")
+                    logger.info(f"CONFIG: Successfully loaded config for microscope: {microscope_name}")
+                    logger.info(f"CONFIG: Server now configured and ready for operations")
+
+                    # Send success response
+                    conn.sendall(b"CFG___OK")
+
+                except FileNotFoundError as e:
+                    error_msg = f"Config file not found: {config_path}"
+                    logger.error(f"CONFIG: {error_msg}")
+                    error_bytes = error_msg.encode("utf-8")
+                    error_length = struct.pack("!I", len(error_bytes))
+                    conn.sendall(b"CFG_FAIL" + error_length + error_bytes)
+                except Exception as e:
+                    error_msg = f"Failed to load config: {str(e)}"
+                    logger.error(f"CONFIG: {error_msg}", exc_info=True)
+                    error_bytes = error_msg.encode("utf-8")
+                    error_length = struct.pack("!I", len(error_bytes))
+                    conn.sendall(b"CFG_FAIL" + error_length + error_bytes)
+
+                continue
+
             # Position query commands
             if data == ExtendedCommand.GETXY:
                 logger.debug(f"Client {addr} requested XY position")
@@ -319,15 +404,23 @@ def handle_client(conn, addr):
 
             if data == ExtendedCommand.GETFOV:
                 logger.debug(f"Client {addr} requested Field of View")
+
+                # SAFETY CHECK: Require CONFIG before GETFOV
+                if not server_configured:
+                    logger.warning(f"GETFOV: Blocked - server not configured (CONFIG command required first)")
+                    error_response = struct.pack("!ff", -1.0, -1.0)  # Negative values indicate error
+                    conn.sendall(error_response)
+                    continue
+
                 try:
                     current_fov_x, current_fov_y = hardware.get_fov()
                     response = struct.pack("!ff", current_fov_x, current_fov_y)
                     conn.sendall(response)
-                    logger.debug(f"Sent FOV to {addr}: ({current_fov_x}, {current_fov_y})")
+                    logger.debug(f"Sent FOV to {addr}: ({current_fov_x}, current_fov_y})")
                 except Exception as e:
                     logger.error(f"Failed to get FOV: {e}")
-                    # Send error response or default values
-                    response = struct.pack("!ff", 0.0, 0.0)  # or some error indicator
+                    # Send error response
+                    response = struct.pack("!ff", 0.0, 0.0)
                     conn.sendall(response)
                 continue
 
@@ -644,6 +737,19 @@ def handle_client(conn, addr):
                                 logger.error(error_msg)
                                 conn.sendall(f"FAILED:{error_msg}".encode())
                                 break
+
+                            # SAFETY WARNING: Check if ACQUIRE yaml differs from CONFIG
+                            if active_connection_config_path:
+                                acquire_yaml = pathlib.Path(params["yaml_file_path"]).resolve()
+                                connection_yaml = pathlib.Path(active_connection_config_path).resolve()
+                                if acquire_yaml != connection_yaml:
+                                    logger.warning("=" * 80)
+                                    logger.warning("CONFIG MISMATCH WARNING")
+                                    logger.warning(f"Connection CONFIG:  {connection_yaml}")
+                                    logger.warning(f"ACQUIRE --yaml:     {acquire_yaml}")
+                                    logger.warning("ACQUIRE yaml will override connection config for this acquisition")
+                                    logger.warning("This may cause unexpected behavior or hardware misconfiguration!")
+                                    logger.warning("=" * 80)
 
                             # Send immediate acknowledgment to prevent client timeout
                             try:
@@ -1763,6 +1869,16 @@ def handle_client(conn, addr):
         if addr in acquisition_final_z:
             del acquisition_final_z[addr]
 
+        # Clear active connection if this was the active client
+        global server_configured, active_connection_addr, active_connection_config_path
+        with connection_state_lock:
+            if active_connection_addr == addr:
+                logger.info(f"Active connection {addr} disconnected - server now UNCONFIGURED")
+                logger.info("Next connection will need to provide CONFIG command")
+                server_configured = False
+                active_connection_addr = None
+                active_connection_config_path = None
+
         conn.close()
         logger.info(f"<<< Client {addr} disconnected and cleaned up")
 
@@ -1801,7 +1917,7 @@ def main():
     logger.info(f"  Hardware: {'Initialized' if hardware else 'Not initialized'}")
 
     # Log loaded configuration
-    microscope_info = ppm_settings.get("microscope", {})
+    microscope_info = startup_settings.get("microscope", {})
     logger.info(f"  Microscope: {microscope_info.get('name', 'Unknown')}")
     logger.info(f"  Type: {microscope_info.get('type', 'Unknown')}")
 
