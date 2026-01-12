@@ -10,6 +10,6 @@ Modules:
     client: Test client utilities
 """
 
-from microscope_server.server.protocol import Command, ExtendedCommand, TCP_PORT, END_MARKER
+from microscope_command_server.server.protocol import Command, ExtendedCommand, TCP_PORT, END_MARKER
 
 __all__ = ["Command", "ExtendedCommand", "TCP_PORT", "END_MARKER"]

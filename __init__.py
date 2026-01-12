@@ -19,11 +19,11 @@ annotations in QuPath.
 Example Usage:
 -------------
 # Server side:
-from microscope_server.server.qp_server import run_server
+from microscope_command_server.server.qp_server import run_server
 run_server(host='0.0.0.0', port=5000)
 
 # Client side:
-from microscope_server.client.client import get_stageXY, move_stageXY
+from microscope_command_server.client.client import get_stageXY, move_stageXY
 x, y = get_stageXY()
 move_stageXY(x + 1000, y + 1000)
 """

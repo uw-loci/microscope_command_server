@@ -1,5 +1,5 @@
 [project]
-name = "microscope-server"
+name = "microscope-command-server"
 version = "1.0.0"
 description = "Socket-based command server for remote microscope control and QuPath integration"
 readme = "README.md"
@@ -28,13 +28,13 @@ dev = [
 "Bug Tracker" = "https://github.com/your-org/microscope-server/issues"
 
 [project.scripts]
-microscope-server = "microscope_server.server.qp_server:main"
-get_stageXY = "microscope_server.client.client:get_stageXY"
-get_stageZ = "microscope_server.client.client:get_stageZ"
-move_stageXY = "microscope_server.client.client:move_stageXY"
-move_stageZ = "microscope_server.client.client:move_stageZ"
-get_stageR = "microscope_server.client.client:get_stageR"
-move_stageR = "microscope_server.client.client:move_stageR"
+microscope-command-server = "microscope_command_server.server.qp_server:main"
+get_stageXY = "microscope_command_server.client.client:get_stageXY"
+get_stageZ = "microscope_command_server.client.client:get_stageZ"
+move_stageXY = "microscope_command_server.client.client:move_stageXY"
+move_stageZ = "microscope_command_server.client.client:move_stageZ"
+get_stageR = "microscope_command_server.client.client:get_stageR"
+move_stageR = "microscope_command_server.client.client:move_stageR"
 
 [build-system]
 requires = ["hatchling"]
@@ -42,8 +42,6 @@ build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
 # Package files are at repository root (microscope_command_server/ contains __init__.py directly)
-# The code uses "microscope_server" for imports but directory is "microscope_command_server"
-# A symlink microscope_server -> microscope_command_server resolves this naming mismatch
 # Use "." to indicate the repository root itself is the package
 packages = ["."]
 
@@ -63,7 +61,7 @@ python_classes = ["Test*"]
 python_functions = ["test_*"]
 addopts = [
     "--verbose",
-    "--cov=microscope_server",
+    "--cov=microscope_command_server",
     "--cov-report=term-missing",
     "--cov-report=html",
 ]

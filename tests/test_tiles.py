@@ -8,7 +8,7 @@ Fiji/ImageJ for image stitching.
 import numpy as np
 import pytest
 from pathlib import Path
-from microscope_server.acquisition.tiles import TileConfigUtils
+from microscope_command_server.acquisition.tiles import TileConfigUtils
 
 
 class TestReadTileConfigurationCoordinates:
@@ -338,9 +338,9 @@ class TestTileConfigurationEdgeCases:
             pixel_size_um=1.0
         )
 
-        # Should handle 10,000 tiles
+        # Should handle 10,000 tiles (indices 0-9999 need 4 digits)
         content = output_path.read_text()
-        assert "tile_09999.tif" in content
+        assert "tile_9999.tif" in content
 
     def test_very_large_coordinates(self, temp_output_directory):
         """Test TileConfiguration with very large coordinate values."""

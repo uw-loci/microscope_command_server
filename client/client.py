@@ -2,7 +2,7 @@ import socket
 import struct
 import argparse
 import sys
-from microscope_server.server.protocol import Command, TCP_PORT, END_MARKER
+from microscope_command_server.server.protocol import Command, TCP_PORT, END_MARKER
 
 HOST = "127.0.0.1"  # Server address (localhost by default)
 PORT = TCP_PORT  # Must match server

@@ -11,7 +11,7 @@ Modules:
     pipeline: Text-based image processing pipeline
 """
 
-from microscope_server.acquisition.tiles import TileConfigUtils
-from microscope_server.acquisition.project import QuPathProject
+from microscope_command_server.acquisition.tiles import TileConfigUtils
+from microscope_command_server.acquisition.project import QuPathProject
 
 __all__ = ["TileConfigUtils", "QuPathProject"]

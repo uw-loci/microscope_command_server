@@ -68,8 +68,8 @@ def check_for_existing_server(host: str, port: int, timeout: float = 2.0) -> boo
             pass
 from microscope_control.hardware import Position
 from microscope_control.hardware.pycromanager import PycromanagerHardware, init_pycromanager
-from microscope_server.server.protocol import ExtendedCommand, TCP_PORT, END_MARKER
-from microscope_server.acquisition.workflow import _acquisition_workflow
+from microscope_command_server.server.protocol import ExtendedCommand, TCP_PORT, END_MARKER
+from microscope_command_server.acquisition.workflow import _acquisition_workflow
 
 
 # Configure logging
@@ -654,7 +654,7 @@ def handle_client(conn, addr):
                                 )
 
                                 # Execute background acquisition using simplified collection
-                                from microscope_server.acquisition.workflow import (
+                                from microscope_command_server.acquisition.workflow import (
                                     simple_background_collection,
                                 )
 
@@ -1383,7 +1383,7 @@ def handle_client(conn, addr):
                                 logger.info("Sent STARTED acknowledgment for polarizer calibration")
 
                                 # Execute polarizer calibration workflow
-                                from microscope_server.acquisition.workflow import (
+                                from microscope_command_server.acquisition.workflow import (
                                     polarizer_calibration_workflow,
                                 )
 

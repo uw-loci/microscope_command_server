@@ -18,7 +18,7 @@ import numpy as np
 from microscope_control.hardware import Position
 from microscope_control.hardware.pycromanager import PycromanagerHardware
 from microscope_control.autofocus.core import AutofocusUtils
-from microscope_server.acquisition.tiles import TileConfigUtils
+from microscope_command_server.acquisition.tiles import TileConfigUtils
 from ppm_library.imaging.writer import TifWriterUtils
 from ppm_library.imaging.background import BackgroundCorrectionUtils
 import shlex

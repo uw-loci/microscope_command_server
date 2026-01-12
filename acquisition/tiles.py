@@ -54,7 +54,7 @@ class TileConfigUtils:
         return positions
 
     @staticmethod
-    def read_TileConfiguration_coordinates(tile_config_path) -> np.ndarray:
+    def read_TileConfiguration_coordinates(tile_config_path):
         """
         Read tile XY coordinates from a TileConfiguration.txt file.
 
@@ -62,57 +62,70 @@ class TileConfigUtils:
             tile_config_path: Path to TileConfiguration.txt file
 
         Returns:
-            numpy array of XY coordinates
+            dict: Dictionary mapping tile names to (x, y) coordinate tuples
         """
-        coordinates = []
+        coordinates = {}
         with open(tile_config_path, "r") as file:
             for line in file:
-                # Extract coordinates using regular expression
-                match = re.search(r"\((-?\d+\.\d+), (-?\d+\.\d+)\)", line)
+                # Extract tile name and coordinates using regular expression
+                # Format: "tile_name.tif; ; (x, y)"
+                match = re.search(r"([\w\-\.]+\.tif)[^(]*\((-?\d+\.?\d*),\s*(-?\d+\.?\d*)\)", line)
                 if match:
-                    x, y = map(float, match.groups())
-                    coordinates.append([x, y])
-        return np.array(coordinates)
+                    tile_name = match.group(1)
+                    x = float(match.group(2))
+                    y = float(match.group(3))
+                    coordinates[tile_name] = (x, y)
+        return coordinates
 
     @staticmethod
     def write_tileconfig(
-        tileconfig_path: Optional[str] = None,
         target_foldername: Optional[str] = None,
         positions: Optional[list] = None,
-        id1: str = "Tile",
-        suffix_length: str = "06",
-        pixel_size: float = 1.0,
+        filename: str = "TileConfiguration.txt",
+        pixel_size_um: float = 1.0,
+        id1: int = 0,
+        suffix_length: int = 3,
+        tileconfig_path: Optional[str] = None,
     ):
         """
         Write a TileConfiguration.txt file.
 
         Args:
-            tileconfig_path: Direct path to output file
             target_foldername: Folder to create file in
-            positions: List of (x, y) positions
-            id1: Prefix for tile names
+            positions: List of (x, y) positions in micrometers
+            filename: Name of output file (default: TileConfiguration.txt)
+            pixel_size_um: Pixel size in micrometers for scaling coordinates
+            id1: Starting index for tile numbering
             suffix_length: Number of digits for tile index
-            pixel_size: Pixel size for scaling coordinates
+            tileconfig_path: Direct path to output file (overrides target_foldername/filename)
         """
-        if not tileconfig_path and target_foldername is not None:
+        # If direct path provided, use it; otherwise construct from folder + filename
+        if tileconfig_path is None and target_foldername is not None:
             target_folder_path = pathlib.Path(target_foldername)
-            tileconfig_path = str(target_folder_path / "TileConfiguration.txt")
+            tileconfig_path = str(target_folder_path / filename)
 
         if tileconfig_path is not None and positions is not None:
+            # Auto-calculate suffix length if not enough for all tiles
+            num_tiles = len(positions)
+            last_tile_index = id1 + num_tiles - 1
+            min_suffix_length = len(str(last_tile_index))
+            actual_suffix_length = max(suffix_length, min_suffix_length)
+
             with open(tileconfig_path, "w") as text_file:
                 print("dim = {}".format(2), file=text_file)
                 for ix, pos in enumerate(positions):
-                    file_id = f"{id1}_{ix:{suffix_length}}"
+                    tile_index = id1 + ix
+                    file_id = f"tile_{tile_index:0{actual_suffix_length}d}"
                     x, y = pos
                     print(
-                        f"{file_id}.tif; ; ({x / pixel_size:.3f}, {y / pixel_size:.3f})",
+                        f"{file_id}.tif; ; ({x / pixel_size_um:.1f}, {y / pixel_size_um:.1f})",
                         file=text_file,
                     )
 
     @staticmethod
     def write_tileconfig_stage(
-        output_path: pathlib.Path,
-        tile_positions: List[Tuple[str, float, float, float]],
+        output_path,
+        tile_positions,
         filename: str = "TileConfiguration_Stage.txt",
     ):
         """
@@ -123,10 +136,12 @@ class TileConfigUtils:
         for understanding focus variation across the sample.
 
         Args:
-            output_path: Directory to write the file
-            tile_positions: List of (filename, x, y, z) tuples with stage positions in micrometers
+            output_path: Directory to write the file (Path or str)
+            tile_positions: List of (x, y, z) or (filename, x, y, z) tuples with stage positions
             filename: Name of output file (default: TileConfiguration_Stage.txt)
         """
+        # Convert to Path if string
+        output_path = pathlib.Path(output_path) if isinstance(output_path, str) else output_path
         tileconfig_path = output_path / filename
 
         with open(tileconfig_path, "w") as f:
@@ -134,7 +149,18 @@ class TileConfigUtils:
             f.write("dim = 3\n")
             f.write("# Stage coordinates in micrometers (X, Y, Z)\n")
 
-            for tile_filename, x, y, z in tile_positions:
+            for idx, pos in enumerate(tile_positions):
+                # Check if position includes filename or just coordinates
+                if len(pos) == 4:
+                    # Format: (filename, x, y, z)
+                    tile_filename, x, y, z = pos
+                elif len(pos) == 3:
+                    # Format: (x, y, z) - auto-generate filename
+                    x, y, z = pos
+                    tile_filename = f"tile_{idx:03d}.tif"
+                else:
+                    raise ValueError(f"Invalid position format: {pos}. Expected (x,y,z) or (filename,x,y,z)")
+
                 # Format: filename; ; (x, y, z)
                 f.write(f"{tile_filename}; ; ({x:.3f}, {y:.3f}, {z:.3f})\n")
 

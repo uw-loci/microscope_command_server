@@ -6,7 +6,7 @@ Client library for communicating with the microscope command server.
 Provides Python functions for remote stage control and acquisition.
 """
 
-from microscope_server.client.client import (
+from microscope_command_server.client.client import (
     get_stageXY,
     get_stageZ,
     move_stageXY,
