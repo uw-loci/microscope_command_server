@@ -875,6 +875,553 @@ def handle_client(conn, addr):
 
                 continue
 
+            if data == ExtendedCommand.WBCALIBR:
+                logger.info(f"Client {addr} requested white balance calibration")
+
+                # Read the message using the same pattern as BGACQUIRE
+                message_parts = []
+                total_bytes = 0
+                start_time = time.time()
+
+                conn.settimeout(5.0)
+
+                try:
+                    while True:
+                        chunk = conn.recv(1024)
+                        if not chunk:
+                            logger.error(
+                                "Connection closed while reading white balance message"
+                            )
+                            conn.sendall(b"FAILED:Connection closed")
+                            break
+
+                        message_parts.append(chunk.decode("utf-8"))
+                        total_bytes += len(chunk)
+                        logger.debug(f"WBCALIBR: received {total_bytes} bytes so far")
+
+                        full_message = "".join(message_parts)
+
+                        if END_MARKER in full_message:
+                            message = full_message.replace(END_MARKER, "").strip()
+                            logger.info(f"WBCALIBR message: {message}")
+
+                            # Parse the message
+                            params = {}
+
+                            # Parse flags: --yaml, --output, --modality, --objective,
+                            #              --target, --tolerance, --defocus
+                            flags = [
+                                "--yaml",
+                                "--output",
+                                "--modality",
+                                "--objective",
+                                "--target",
+                                "--tolerance",
+                                "--defocus",
+                            ]
+
+                            for i, flag in enumerate(flags):
+                                if flag in message:
+                                    start_idx = message.index(flag) + len(flag)
+                                    end_idx = len(message)
+                                    for next_flag in flags[i + 1 :]:
+                                        if next_flag in message[start_idx:]:
+                                            next_pos = message.index(next_flag, start_idx)
+                                            if next_pos < end_idx:
+                                                end_idx = next_pos
+                                                break
+
+                                    value = message[start_idx:end_idx].strip()
+
+                                    if flag == "--yaml":
+                                        params["yaml_file_path"] = value
+                                    elif flag == "--output":
+                                        params["output_folder_path"] = value
+                                    elif flag == "--modality":
+                                        params["modality"] = value
+                                    elif flag == "--objective":
+                                        params["objective"] = value
+                                    elif flag == "--target":
+                                        params["target_intensity"] = float(value)
+                                    elif flag == "--tolerance":
+                                        params["tolerance"] = float(value)
+                                    elif flag == "--defocus":
+                                        params["defocus_um"] = float(value)
+
+                            # Validate required parameters
+                            required = ["yaml_file_path", "output_folder_path", "modality"]
+                            missing = [key for key in required if key not in params]
+                            if missing:
+                                error_msg = f"Missing required parameters: {missing}"
+                                logger.error(error_msg)
+                                conn.sendall(f"FAILED:{error_msg}".encode())
+                                break
+
+                            # Send immediate acknowledgment to prevent client timeout
+                            try:
+                                ack_response = f"STARTED:{params['output_folder_path']}".encode()
+                                conn.sendall(ack_response)
+                                logger.info(
+                                    "Sent STARTED acknowledgment for white balance calibration"
+                                )
+
+                                # Import the calibration module
+                                from microscope_control.jai import (
+                                    JAIWhiteBalanceCalibrator,
+                                    CalibrationConfig,
+                                    JAICameraProperties,
+                                )
+                                from pathlib import Path
+
+                                # Build calibration config
+                                wb_config = CalibrationConfig(
+                                    target_value=params.get("target_intensity", 180.0),
+                                    tolerance=params.get("tolerance", 5.0),
+                                    defocus_offset_um=params.get("defocus_um"),
+                                )
+
+                                # Create calibrator with hardware
+                                jai_props = JAICameraProperties(hardware.core)
+                                calibrator = JAIWhiteBalanceCalibrator(hardware, jai_props)
+
+                                # Set up PPM rotation callback if modality is PPM
+                                ppm_callback = None
+                                if params["modality"].lower() == "ppm":
+                                    if hasattr(hardware, "set_psg_ticks"):
+                                        ppm_callback = hardware.set_psg_ticks
+
+                                # Set up defocus callback if configured
+                                defocus_callback = None
+                                if wb_config.defocus_offset_um is not None:
+                                    def create_defocus_callback():
+                                        def defocus_fn(offset_um):
+                                            current_pos = hardware.get_current_position()
+                                            original_z = current_pos.z
+                                            new_z = original_z + offset_um
+                                            hardware.move_to_position(
+                                                hardware.get_current_position()._replace(z=new_z)
+                                            )
+                                            def restore():
+                                                hardware.move_to_position(
+                                                    hardware.get_current_position()._replace(z=original_z)
+                                                )
+                                            return original_z, restore
+                                        return defocus_fn
+                                    defocus_callback = create_defocus_callback()
+
+                                # Run calibration
+                                output_path = Path(params["output_folder_path"])
+                                result = calibrator.calibrate(
+                                    config=wb_config,
+                                    output_path=output_path,
+                                    ppm_rotation_callback=ppm_callback,
+                                    defocus_callback=defocus_callback,
+                                )
+
+                                # Format response
+                                exp_str = (
+                                    f"exp_r:{result.exposures_ms['red']:.2f},"
+                                    f"exp_g:{result.exposures_ms['green']:.2f},"
+                                    f"exp_b:{result.exposures_ms['blue']:.2f}"
+                                )
+                                gain_str = (
+                                    f"gain_r:{result.gains['red']:.2f},"
+                                    f"gain_g:{result.gains['green']:.2f},"
+                                    f"gain_b:{result.gains['blue']:.2f}"
+                                )
+                                status = "CONVERGED" if result.converged else "NOT_CONVERGED"
+
+                                response = f"SUCCESS:{status}|{output_path}|{exp_str}|{gain_str}"
+                                conn.sendall(response.encode())
+                                logger.info(f"White balance calibration completed: {status}")
+
+                            except ImportError as e:
+                                error_msg = f"JAI calibration module not available: {e}"
+                                logger.error(error_msg)
+                                conn.sendall(f"FAILED:{error_msg}".encode())
+                            except Exception as e:
+                                error_msg = f"White balance calibration failed: {str(e)}"
+                                logger.error(error_msg, exc_info=True)
+                                conn.sendall(f"FAILED:{error_msg}".encode())
+                            break
+
+                        if total_bytes > 100000:
+                            logger.error(
+                                "White balance message exceeds maximum size"
+                            )
+                            conn.sendall(b"FAILED:Message too large")
+                            break
+
+                        if time.time() - start_time > 10:
+                            logger.error("Timeout reading white balance message")
+                            conn.sendall(b"FAILED:Timeout waiting for complete message")
+                            break
+
+                except socket.timeout:
+                    logger.error(f"Timeout reading white balance message from {addr}")
+                    conn.sendall(b"FAILED:Timeout reading message")
+                except Exception as e:
+                    logger.error(f"Error in white balance calibration: {str(e)}", exc_info=True)
+                    conn.sendall(f"FAILED:{str(e)}".encode())
+                finally:
+                    conn.settimeout(None)  # Reset to blocking mode
+
+                continue
+
+            # ==================== WBSIMPLE: Simple White Balance ====================
+            if data == ExtendedCommand.WBSIMPLE:
+                logger.info(f"Client {addr} requested simple white balance calibration")
+
+                # Read the message using the same pattern as WBCALIBR
+                message_parts = []
+                total_bytes = 0
+                start_time = time.time()
+
+                conn.settimeout(5.0)
+
+                try:
+                    while True:
+                        chunk = conn.recv(1024)
+                        if not chunk:
+                            logger.error(
+                                "Connection closed while reading WBSIMPLE message"
+                            )
+                            conn.sendall(b"FAILED:Connection closed")
+                            break
+
+                        message_parts.append(chunk.decode("utf-8"))
+                        total_bytes += len(chunk)
+                        logger.debug(f"WBSIMPLE: received {total_bytes} bytes so far")
+
+                        full_message = "".join(message_parts)
+
+                        if END_MARKER in full_message:
+                            message = full_message.replace(END_MARKER, "").strip()
+                            logger.info(f"WBSIMPLE message: {message}")
+
+                            # Parse the message
+                            params = {}
+
+                            # Parse flags: --yaml, --output, --camera, --exposure,
+                            #              --target, --tolerance
+                            flags = [
+                                "--yaml",
+                                "--output",
+                                "--camera",
+                                "--exposure",
+                                "--target",
+                                "--tolerance",
+                            ]
+
+                            for i, flag in enumerate(flags):
+                                if flag in message:
+                                    start_idx = message.index(flag) + len(flag)
+                                    end_idx = len(message)
+                                    for next_flag in flags[i + 1 :]:
+                                        if next_flag in message[start_idx:]:
+                                            next_pos = message.index(next_flag, start_idx)
+                                            if next_pos < end_idx:
+                                                end_idx = next_pos
+                                                break
+
+                                    value = message[start_idx:end_idx].strip()
+
+                                    if flag == "--yaml":
+                                        params["yaml_file_path"] = value
+                                    elif flag == "--output":
+                                        params["output_folder_path"] = value
+                                    elif flag == "--camera":
+                                        params["camera"] = value
+                                    elif flag == "--exposure":
+                                        params["initial_exposure_ms"] = float(value)
+                                    elif flag == "--target":
+                                        params["target_intensity"] = float(value)
+                                    elif flag == "--tolerance":
+                                        params["tolerance"] = float(value)
+
+                            # Validate required parameters
+                            required = ["output_folder_path", "initial_exposure_ms"]
+                            missing = [key for key in required if key not in params]
+                            if missing:
+                                error_msg = f"Missing required parameters: {missing}"
+                                logger.error(error_msg)
+                                conn.sendall(f"FAILED:{error_msg}".encode())
+                                break
+
+                            # Send immediate acknowledgment
+                            try:
+                                ack_response = f"STARTED:{params['output_folder_path']}".encode()
+                                conn.sendall(ack_response)
+                                logger.info(
+                                    "Sent STARTED acknowledgment for WBSIMPLE"
+                                )
+
+                                # Import the calibration module
+                                from microscope_control.jai import (
+                                    JAIWhiteBalanceCalibrator,
+                                    JAICameraProperties,
+                                )
+                                from pathlib import Path
+
+                                # Create calibrator with hardware
+                                jai_props = JAICameraProperties(hardware.core)
+                                calibrator = JAIWhiteBalanceCalibrator(hardware, jai_props)
+
+                                # Run simple calibration using the new method
+                                output_path = Path(params["output_folder_path"])
+                                result = calibrator.calibrate_simple(
+                                    initial_exposure_ms=params["initial_exposure_ms"],
+                                    target=params.get("target_intensity", 180.0),
+                                    tolerance=params.get("tolerance", 5.0),
+                                    output_path=output_path,
+                                )
+
+                                # Format response
+                                exp_str = (
+                                    f"exp_r:{result.exposures_ms['red']:.2f},"
+                                    f"exp_g:{result.exposures_ms['green']:.2f},"
+                                    f"exp_b:{result.exposures_ms['blue']:.2f}"
+                                )
+                                status = "CONVERGED" if result.converged else "NOT_CONVERGED"
+
+                                response = f"SUCCESS:{output_path}|{status}|{exp_str}"
+                                conn.sendall(response.encode())
+                                logger.info(f"WBSIMPLE completed: {status}")
+
+                            except ImportError as e:
+                                error_msg = f"JAI calibration module not available: {e}"
+                                logger.error(error_msg)
+                                conn.sendall(f"FAILED:{error_msg}".encode())
+                            except Exception as e:
+                                error_msg = f"WBSIMPLE failed: {str(e)}"
+                                logger.error(error_msg, exc_info=True)
+                                conn.sendall(f"FAILED:{error_msg}".encode())
+                            break
+
+                        if total_bytes > 100000:
+                            logger.error("WBSIMPLE message exceeds maximum size")
+                            conn.sendall(b"FAILED:Message too large")
+                            break
+
+                        if time.time() - start_time > 10:
+                            logger.error("Timeout reading WBSIMPLE message")
+                            conn.sendall(b"FAILED:Timeout waiting for complete message")
+                            break
+
+                except socket.timeout:
+                    logger.error(f"Timeout reading WBSIMPLE message from {addr}")
+                    conn.sendall(b"FAILED:Timeout reading message")
+                except Exception as e:
+                    logger.error(f"Error in WBSIMPLE: {str(e)}", exc_info=True)
+                    conn.sendall(f"FAILED:{str(e)}".encode())
+                finally:
+                    conn.settimeout(None)  # Reset to blocking mode
+
+                continue
+
+            # ==================== WBPPM: PPM White Balance (4 angles) ====================
+            if data == ExtendedCommand.WBPPM:
+                logger.info(f"Client {addr} requested PPM white balance calibration (4 angles)")
+
+                # Read the message
+                message_parts = []
+                total_bytes = 0
+                start_time = time.time()
+
+                conn.settimeout(5.0)
+
+                try:
+                    while True:
+                        chunk = conn.recv(1024)
+                        if not chunk:
+                            logger.error(
+                                "Connection closed while reading WBPPM message"
+                            )
+                            conn.sendall(b"FAILED:Connection closed")
+                            break
+
+                        message_parts.append(chunk.decode("utf-8"))
+                        total_bytes += len(chunk)
+                        logger.debug(f"WBPPM: received {total_bytes} bytes so far")
+
+                        full_message = "".join(message_parts)
+
+                        if END_MARKER in full_message:
+                            message = full_message.replace(END_MARKER, "").strip()
+                            logger.info(f"WBPPM message: {message}")
+
+                            # Parse the message
+                            params = {}
+
+                            # Parse flags for PPM white balance:
+                            # --yaml, --output, --camera,
+                            # --positive_exp, --positive_angle,
+                            # --negative_exp, --negative_angle,
+                            # --crossed_exp, --crossed_angle,
+                            # --uncrossed_exp, --uncrossed_angle,
+                            # --target, --tolerance
+                            flags = [
+                                "--yaml",
+                                "--output",
+                                "--camera",
+                                "--positive_exp",
+                                "--positive_angle",
+                                "--negative_exp",
+                                "--negative_angle",
+                                "--crossed_exp",
+                                "--crossed_angle",
+                                "--uncrossed_exp",
+                                "--uncrossed_angle",
+                                "--target",
+                                "--tolerance",
+                            ]
+
+                            for i, flag in enumerate(flags):
+                                if flag in message:
+                                    start_idx = message.index(flag) + len(flag)
+                                    end_idx = len(message)
+                                    for next_flag in flags[i + 1 :]:
+                                        if next_flag in message[start_idx:]:
+                                            next_pos = message.index(next_flag, start_idx)
+                                            if next_pos < end_idx:
+                                                end_idx = next_pos
+                                                break
+
+                                    value = message[start_idx:end_idx].strip()
+
+                                    if flag == "--yaml":
+                                        params["yaml_file_path"] = value
+                                    elif flag == "--output":
+                                        params["output_folder_path"] = value
+                                    elif flag == "--camera":
+                                        params["camera"] = value
+                                    elif flag == "--positive_exp":
+                                        params["positive_exp"] = float(value)
+                                    elif flag == "--positive_angle":
+                                        params["positive_angle"] = float(value)
+                                    elif flag == "--negative_exp":
+                                        params["negative_exp"] = float(value)
+                                    elif flag == "--negative_angle":
+                                        params["negative_angle"] = float(value)
+                                    elif flag == "--crossed_exp":
+                                        params["crossed_exp"] = float(value)
+                                    elif flag == "--crossed_angle":
+                                        params["crossed_angle"] = float(value)
+                                    elif flag == "--uncrossed_exp":
+                                        params["uncrossed_exp"] = float(value)
+                                    elif flag == "--uncrossed_angle":
+                                        params["uncrossed_angle"] = float(value)
+                                    elif flag == "--target":
+                                        params["target_intensity"] = float(value)
+                                    elif flag == "--tolerance":
+                                        params["tolerance"] = float(value)
+
+                            # Validate required parameters
+                            required = [
+                                "output_folder_path",
+                                "positive_exp", "positive_angle",
+                                "negative_exp", "negative_angle",
+                                "crossed_exp", "crossed_angle",
+                                "uncrossed_exp", "uncrossed_angle",
+                            ]
+                            missing = [key for key in required if key not in params]
+                            if missing:
+                                error_msg = f"Missing required parameters: {missing}"
+                                logger.error(error_msg)
+                                conn.sendall(f"FAILED:{error_msg}".encode())
+                                break
+
+                            # Send immediate acknowledgment
+                            try:
+                                ack_response = f"STARTED:{params['output_folder_path']}".encode()
+                                conn.sendall(ack_response)
+                                logger.info(
+                                    "Sent STARTED acknowledgment for WBPPM"
+                                )
+
+                                # Import the calibration module
+                                from microscope_control.jai import (
+                                    JAIWhiteBalanceCalibrator,
+                                    JAICameraProperties,
+                                )
+                                from pathlib import Path
+
+                                # Build angle/exposure pairs
+                                angle_exposures = {
+                                    "positive": (params["positive_angle"], params["positive_exp"]),
+                                    "negative": (params["negative_angle"], params["negative_exp"]),
+                                    "crossed": (params["crossed_angle"], params["crossed_exp"]),
+                                    "uncrossed": (params["uncrossed_angle"], params["uncrossed_exp"]),
+                                }
+
+                                # Create calibrator with hardware
+                                jai_props = JAICameraProperties(hardware.core)
+                                calibrator = JAIWhiteBalanceCalibrator(hardware, jai_props)
+
+                                # Set up PPM rotation callback
+                                ppm_callback = None
+                                if hasattr(hardware, "set_psg_ticks"):
+                                    ppm_callback = hardware.set_psg_ticks
+
+                                # Run PPM calibration using the new method
+                                output_path = Path(params["output_folder_path"])
+                                results = calibrator.calibrate_ppm(
+                                    angle_exposures=angle_exposures,
+                                    target=params.get("target_intensity", 180.0),
+                                    tolerance=params.get("tolerance", 5.0),
+                                    output_path=output_path,
+                                    ppm_rotation_callback=ppm_callback,
+                                )
+
+                                # Format response with results for all angles
+                                response_parts = [f"SUCCESS:{output_path}"]
+                                all_converged = True
+                                for name, result in results.items():
+                                    exp_str = (
+                                        f"{result.exposures_ms['red']:.2f},"
+                                        f"{result.exposures_ms['green']:.2f},"
+                                        f"{result.exposures_ms['blue']:.2f}"
+                                    )
+                                    converged = "Y" if result.converged else "N"
+                                    response_parts.append(f"{name}:{exp_str}:{converged}")
+                                    if not result.converged:
+                                        all_converged = False
+
+                                response = "|".join(response_parts)
+                                conn.sendall(response.encode())
+                                logger.info(f"WBPPM completed: all_converged={all_converged}")
+
+                            except ImportError as e:
+                                error_msg = f"JAI calibration module not available: {e}"
+                                logger.error(error_msg)
+                                conn.sendall(f"FAILED:{error_msg}".encode())
+                            except Exception as e:
+                                error_msg = f"WBPPM failed: {str(e)}"
+                                logger.error(error_msg, exc_info=True)
+                                conn.sendall(f"FAILED:{error_msg}".encode())
+                            break
+
+                        if total_bytes > 100000:
+                            logger.error("WBPPM message exceeds maximum size")
+                            conn.sendall(b"FAILED:Message too large")
+                            break
+
+                        if time.time() - start_time > 10:
+                            logger.error("Timeout reading WBPPM message")
+                            conn.sendall(b"FAILED:Timeout waiting for complete message")
+                            break
+
+                except socket.timeout:
+                    logger.error(f"Timeout reading WBPPM message from {addr}")
+                    conn.sendall(b"FAILED:Timeout reading message")
+                except Exception as e:
+                    logger.error(f"Error in WBPPM: {str(e)}", exc_info=True)
+                    conn.sendall(f"FAILED:{str(e)}".encode())
+                finally:
+                    conn.settimeout(None)  # Reset to blocking mode
+
+                continue
+
             if data == ExtendedCommand.SNAP:
                 logger.info(f"Client {addr} requested simple snap (fixed exposure)")
                 snap_start_time = time.time()

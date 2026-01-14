@@ -27,6 +27,74 @@ import skimage.filters
 logger = logging.getLogger(__name__)
 
 
+def load_and_apply_white_balance_settings(
+    hardware: PycromanagerHardware,
+    calibration_folder: str,
+    detector: str,
+    modality: str,
+    objective: str,
+    logger=None,
+) -> bool:
+    """
+    Load and apply white balance calibration settings for JAI camera.
+
+    Looks for white_balance_settings.yml in the calibration folder structure:
+    {calibration_folder}/{detector}/{modality}/{objective}/white_balance_settings.yml
+
+    Args:
+        hardware: PycromanagerHardware instance
+        calibration_folder: Base path for calibration data
+        detector: Detector ID (e.g., "JAI")
+        modality: Modality name (e.g., "ppm", "brightfield")
+        objective: Objective ID (e.g., "20x")
+        logger: Optional logger instance
+
+    Returns:
+        True if settings were loaded and applied, False otherwise
+    """
+    # Only applies to JAI camera
+    camera_name = hardware.core.get_property("Core", "Camera")
+    if camera_name != "JAICamera":
+        if logger:
+            logger.debug(f"White balance loading skipped - camera is {camera_name}, not JAI")
+        return False
+
+    try:
+        from microscope_control.jai import JAICameraProperties
+
+        # Build path to settings file
+        wb_settings_path = (
+            Path(calibration_folder)
+            / detector
+            / modality
+            / objective
+            / "white_balance_settings.yml"
+        )
+
+        if not wb_settings_path.exists():
+            if logger:
+                logger.info(f"No white balance settings found at {wb_settings_path}")
+            return False
+
+        # Load and apply settings
+        jai_props = JAICameraProperties(hardware.core)
+        success = jai_props.apply_white_balance_settings(str(wb_settings_path))
+
+        if success and logger:
+            logger.info(f"Applied white balance settings from {wb_settings_path}")
+
+        return success
+
+    except ImportError:
+        if logger:
+            logger.warning("JAI calibration module not available - skipping white balance loading")
+        return False
+    except Exception as e:
+        if logger:
+            logger.warning(f"Failed to load white balance settings: {e}")
+        return False
+
+
 def log_timing(logger, operation_name, start_time):
     """Log elapsed time for an operation in milliseconds.
 
@@ -262,6 +330,9 @@ def parse_acquisition_message(message: str) -> dict:
             elif parts[i] == "--white-balance" and i + 1 < len(parts):
                 params["white_balance_enabled"] = parts[i + 1].lower() == "true"
                 i += 2
+            elif parts[i] == "--wb-per-angle" and i + 1 < len(parts):
+                params["white_balance_per_angle"] = parts[i + 1].lower() == "true"
+                i += 2
             elif parts[i] == "--objective" and i + 1 < len(parts):
                 params["objective"] = parts[i + 1]
                 i += 2
@@ -445,6 +516,27 @@ def _acquisition_workflow(
             hardware._initialize_microscope_methods()
             logger.info("Re-initialized hardware methods with updated settings")
 
+        # Try to load and apply JAI white balance settings if available
+        # Settings are stored in calibration folder after running WBCALIBRATE command
+        wb_calibration_folder = params.get("white_balance_calibration_folder")
+        if wb_calibration_folder:
+            # Extract modality and objective from params for path construction
+            wb_modality = BackgroundCorrectionUtils.get_modality_from_scan_type(
+                params["scan_type"]
+            )
+            # Try to get objective from scan type (e.g., "ppm_20x" -> "20x")
+            scan_parts = params["scan_type"].split("_")
+            wb_objective = scan_parts[-1] if len(scan_parts) > 1 else "default"
+
+            load_and_apply_white_balance_settings(
+                hardware=hardware,
+                calibration_folder=wb_calibration_folder,
+                detector="JAI",
+                modality=wb_modality,
+                objective=wb_objective,
+                logger=logger,
+            )
+
         # Home rot-stage
         # hardware.home_psg()
 
@@ -533,11 +625,23 @@ def _acquisition_workflow(
 
         # ======= WHITE BALANCE SETUP =======
         angles_wb = {}
+        white_balance_per_angle = params.get("white_balance_per_angle", False)
 
         if white_balance_enabled:
             # Load white balance settings from configuration
             angles_wb = get_angles_wb_from_settings(ppm_settings)
-            logger.info(f"Loaded white balance settings for {len(angles_wb)} angles")
+
+            if white_balance_per_angle:
+                # Use per-angle white balance profiles (PPM mode)
+                logger.info(f"Using per-angle white balance for {len(angles_wb)} angles")
+            else:
+                # Use single white balance profile (uncrossed/90deg) for all angles
+                # This is the default for non-PPM or when per-angle is disabled
+                uncrossed_profile = angles_wb.get(90.0, [1.0, 1.0, 1.0])
+                logger.info(f"Using single white balance profile for all angles: {uncrossed_profile}")
+                # Apply uncrossed profile to all angles that will be acquired
+                for angle in params.get("angles", []):
+                    angles_wb[angle] = uncrossed_profile
 
         # Set up output paths
         project_path = Path(params["projects_folder_path"]) / params["sample_label"]
