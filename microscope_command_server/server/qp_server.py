@@ -1179,6 +1179,14 @@ def handle_client(conn, addr):
                                     output_path=output_path,
                                 )
 
+                                # Update imageprocessing config if yaml path provided
+                                if "yaml_file_path" in params:
+                                    calibrator.update_imageprocessing_config(
+                                        config_path=Path(params["yaml_file_path"]),
+                                        result=result,
+                                        calibration_type="simple",
+                                    )
+
                                 # Format response
                                 exp_str = (
                                     f"exp_r:{result.exposures_ms['red']:.2f},"
@@ -1375,6 +1383,16 @@ def handle_client(conn, addr):
                                     output_path=output_path,
                                     ppm_rotation_callback=ppm_callback,
                                 )
+
+                                # Update imageprocessing config for each angle
+                                if "yaml_file_path" in params:
+                                    for angle_name, result in results.items():
+                                        calibrator.update_imageprocessing_config(
+                                            config_path=Path(params["yaml_file_path"]),
+                                            result=result,
+                                            calibration_type="ppm",
+                                            angle_name=angle_name,
+                                        )
 
                                 # Format response with results for all angles
                                 response_parts = [f"SUCCESS:{output_path}"]
