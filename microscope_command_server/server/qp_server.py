@@ -927,12 +927,12 @@ def handle_client(conn, addr):
                                 if flag in message:
                                     start_idx = message.index(flag) + len(flag)
                                     end_idx = len(message)
-                                    for next_flag in flags[i + 1 :]:
-                                        if next_flag in message[start_idx:]:
+                                    # Find the CLOSEST next flag (check all flags, not just remaining ones)
+                                    for next_flag in flags:
+                                        if next_flag != flag and next_flag in message[start_idx:]:
                                             next_pos = message.index(next_flag, start_idx)
                                             if next_pos < end_idx:
                                                 end_idx = next_pos
-                                                break
 
                                     value = message[start_idx:end_idx].strip()
 
@@ -1120,12 +1120,12 @@ def handle_client(conn, addr):
                                 if flag in message:
                                     start_idx = message.index(flag) + len(flag)
                                     end_idx = len(message)
-                                    for next_flag in flags[i + 1 :]:
-                                        if next_flag in message[start_idx:]:
+                                    # Find the CLOSEST next flag (check all flags, not just remaining ones)
+                                    for next_flag in flags:
+                                        if next_flag != flag and next_flag in message[start_idx:]:
                                             next_pos = message.index(next_flag, start_idx)
                                             if next_pos < end_idx:
                                                 end_idx = next_pos
-                                                break
 
                                     value = message[start_idx:end_idx].strip()
 
@@ -1291,12 +1291,12 @@ def handle_client(conn, addr):
                                 if flag in message:
                                     start_idx = message.index(flag) + len(flag)
                                     end_idx = len(message)
-                                    for next_flag in flags[i + 1 :]:
-                                        if next_flag in message[start_idx:]:
+                                    # Find the CLOSEST next flag (check all flags, not just remaining ones)
+                                    for next_flag in flags:
+                                        if next_flag != flag and next_flag in message[start_idx:]:
                                             next_pos = message.index(next_flag, start_idx)
                                             if next_pos < end_idx:
                                                 end_idx = next_pos
-                                                break
 
                                     value = message[start_idx:end_idx].strip()
 
