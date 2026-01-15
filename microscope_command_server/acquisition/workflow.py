@@ -1678,9 +1678,171 @@ def write_position_metadata(metadata_txt_for_positions, raw_image_path, hardware
         f.write(line)
 
 
+def angle_to_name(angle: float) -> str:
+    """
+    Convert numeric angle to canonical name.
+
+    Args:
+        angle: Rotation angle in degrees
+
+    Returns:
+        Angle name (e.g., 'uncrossed', 'crossed', 'positive', 'negative')
+    """
+    abs_angle = abs(angle)
+
+    if 88 <= abs_angle <= 92:
+        return "uncrossed"
+    elif abs_angle <= 3:
+        return "crossed"
+    elif 4 <= abs_angle <= 10:
+        return "positive" if angle > 0 else "negative"
+    else:
+        return f"angle_{angle}"
+
+
+def get_default_target_intensity(modality: str, angle: float) -> float:
+    """
+    Get hardcoded default target intensity for background acquisition.
+
+    These defaults are used when no YAML configuration is available.
+    The values are based on the optical properties of polarized light:
+    - Crossed polarizers (0 deg): Very dim -> 125
+    - Birefringence angles (5-7 deg): Moderate -> 160
+    - Uncrossed (90 deg): Very bright -> 245
+    - Intermediate: Standard -> 180
+
+    Args:
+        modality: Modality identifier (e.g., "ppm", "brightfield")
+        angle: Rotation angle in degrees (for PPM)
+
+    Returns:
+        Target grayscale intensity (0-255)
+    """
+    modality_lower = modality.lower()
+
+    # Brightfield modality
+    if "brightfield" in modality_lower or "bf" in modality_lower:
+        return 250.0
+
+    # PPM modality - angle-specific targets
+    if "ppm" in modality_lower:
+        abs_angle = abs(angle)
+
+        if 88 <= abs_angle <= 92:
+            # Near-uncrossed region (around 90 deg) - brightest
+            return 245.0
+        elif 4 <= abs_angle <= 10:
+            # Birefringence angles (5-7 deg and their neighbors)
+            return 160.0
+        elif abs_angle <= 3:
+            # Near-crossed region (around 0 deg) - dimmest
+            return 125.0
+        else:
+            # Intermediate angles (10-88 deg)
+            return 180.0
+
+    # Default fallback
+    return 180.0
+
+
+def load_calibration_targets_from_yaml(config_path: Path) -> Optional[Dict[str, Any]]:
+    """
+    Load calibration targets from imageprocessing YAML file.
+
+    Looks for the calibration_targets section which contains:
+    - target_intensities: Per-angle default targets
+    - background_exposures: Achieved intensities from prior background collection
+
+    Args:
+        config_path: Path to the main config file (config_PPM.yml)
+
+    Returns:
+        Dictionary with calibration_targets data or None if not found
+    """
+    config_path = Path(config_path)
+
+    # Derive imageprocessing file path
+    config_name = config_path.stem
+    if config_name.startswith("config_"):
+        microscope_name = config_name[7:]
+        imageprocessing_name = f"imageprocessing_{microscope_name}.yml"
+    else:
+        imageprocessing_name = f"imageprocessing_{config_name}.yml"
+
+    imageprocessing_path = config_path.parent / imageprocessing_name
+
+    if not imageprocessing_path.exists():
+        return None
+
+    try:
+        with open(imageprocessing_path, "r") as f:
+            ip_data = yaml.safe_load(f) or {}
+        return ip_data.get("calibration_targets")
+    except Exception as e:
+        logger.warning(f"Failed to load calibration targets from {imageprocessing_path}: {e}")
+        return None
+
+
+def get_target_intensity_for_angle(
+    angle: float,
+    modality: str = "ppm",
+    config_path: Optional[Path] = None,
+) -> Tuple[float, str]:
+    """
+    Get target intensity for a specific angle with YAML priority logic.
+
+    Priority order:
+    1. background_exposures.angles.{name}.achieved_intensity (from prior BG collection)
+    2. calibration_targets.target_intensities.{name} (YAML configured)
+    3. Hardcoded defaults (based on optical properties)
+
+    This ensures white balance calibration uses the same target intensity
+    as background collection, so white-balanced images match backgrounds.
+
+    Args:
+        angle: Rotation angle in degrees
+        modality: Modality identifier (default: "ppm")
+        config_path: Path to config file (optional, enables YAML lookup)
+
+    Returns:
+        Tuple of (target_intensity, source) where source describes where
+        the value came from (e.g., "background_exposures", "yaml_config", "default")
+    """
+    angle_name = angle_to_name(angle)
+
+    # Try YAML lookup if config_path provided
+    if config_path is not None:
+        cal_targets = load_calibration_targets_from_yaml(config_path)
+        if cal_targets is not None:
+            # Priority 1: Check background_exposures (achieved intensity from BG collection)
+            bg_exposures = cal_targets.get("background_exposures", {})
+            if bg_exposures and "angles" in bg_exposures:
+                angle_data = bg_exposures["angles"].get(angle_name)
+                if angle_data and "achieved_intensity" in angle_data:
+                    return float(angle_data["achieved_intensity"]), "background_exposures"
+
+            # Priority 2: Check configured target_intensities
+            target_intensities = cal_targets.get("target_intensities", {})
+            if angle_name in target_intensities:
+                return float(target_intensities[angle_name]), "yaml_config"
+            # Also check for 'default' key
+            if "default" in target_intensities:
+                return float(target_intensities["default"]), "yaml_config_default"
+
+    # Priority 3: Hardcoded defaults
+    return get_default_target_intensity(modality, angle), "default"
+
+
 def get_target_intensity_for_background(modality: str, angle: float) -> float:
     """
     Get target intensity for background acquisition based on modality and angle.
+
+    This is a convenience wrapper around get_target_intensity_for_angle() that
+    only returns the intensity value (not the source). Use this for backward
+    compatibility with existing code.
+
+    For new code that needs to know where the value came from (e.g., to log
+    whether YAML or defaults are being used), use get_target_intensity_for_angle().
 
     Args:
         modality: Modality identifier (e.g., "ppm", "brightfield")
@@ -1695,42 +1857,107 @@ def get_target_intensity_for_background(modality: str, angle: float) -> float:
         >>> get_target_intensity_for_background("ppm", 90)
         245.0
         >>> get_target_intensity_for_background("ppm", 5)
-        150.0
+        160.0
         >>> get_target_intensity_for_background("ppm", -5)
-        150.0
+        160.0
         >>> get_target_intensity_for_background("ppm", 0)
         125.0
     """
-    # Normalize modality to lowercase for comparison
-    modality_lower = modality.lower()
+    # For backward compatibility, use defaults only (no YAML lookup)
+    # Callers that want YAML lookup should use get_target_intensity_for_angle()
+    return get_default_target_intensity(modality, angle)
 
-    # Brightfield modality
-    if "brightfield" in modality_lower or "bf" in modality_lower:
-        return 250.0
 
-    # PPM modality - angle-specific targets
-    # Use RANGES instead of exact matches to ensure consistent exposure
-    # for fine deviation testing (e.g., 89.95 and 90.05 should match 90)
-    if "ppm" in modality_lower:
-        # Normalize angle to absolute value for symmetric angles
-        abs_angle = abs(angle)
+def save_background_exposures_to_yaml(
+    config_path: Path,
+    final_exposures: Dict[float, float],
+    achieved_intensities: Dict[float, float],
+    modality: str = "ppm",
+    objective: Optional[str] = None,
+    detector: Optional[str] = None,
+) -> bool:
+    """
+    Save background collection exposures and achieved intensities to YAML.
 
-        if 88 <= abs_angle <= 92:
-            # Near-uncrossed region (around 90 deg)
-            return 245.0
-        elif 4 <= abs_angle <= 10:
-            # Birefringence angles (5-7 deg and their neighbors)
-            return 160.0
-        elif abs_angle <= 3:
-            # Near-crossed region (around 0 deg)
-            return 125.0
+    Updates the calibration_targets.background_exposures section in the
+    imageprocessing YAML file. This data becomes the source of truth for
+    target intensities in white balance calibration.
+
+    Args:
+        config_path: Path to the main config file (config_PPM.yml)
+        final_exposures: Dictionary mapping angles to final exposure times (ms)
+        achieved_intensities: Dictionary mapping angles to achieved median intensity
+        modality: Modality name (e.g., "ppm")
+        objective: Objective LOCI ID (optional)
+        detector: Detector LOCI ID (optional)
+
+    Returns:
+        True if successfully saved, False otherwise
+    """
+    from datetime import datetime
+
+    config_path = Path(config_path)
+
+    # Derive imageprocessing file path
+    config_name = config_path.stem
+    if config_name.startswith("config_"):
+        microscope_name = config_name[7:]
+        imageprocessing_name = f"imageprocessing_{microscope_name}.yml"
+    else:
+        imageprocessing_name = f"imageprocessing_{config_name}.yml"
+
+    imageprocessing_path = config_path.parent / imageprocessing_name
+
+    try:
+        # Load existing file or create empty dict
+        if imageprocessing_path.exists():
+            with open(imageprocessing_path, "r") as f:
+                ip_data = yaml.safe_load(f) or {}
         else:
-            # Intermediate angles (10-88 deg)
-            return 180.0
+            ip_data = {}
 
-    # Default fallback
-    logger.warning(f"Unknown modality {modality}, using default target 200")
-    return 200.0
+        # Ensure calibration_targets section exists
+        if "calibration_targets" not in ip_data:
+            ip_data["calibration_targets"] = {}
+
+        # Build background_exposures data
+        angles_data = {}
+        for angle, exposure_ms in final_exposures.items():
+            angle_name = angle_to_name(angle)
+            angles_data[angle_name] = {
+                "angle_degrees": angle,
+                "exposure_ms": round(exposure_ms, 2),
+                "achieved_intensity": round(achieved_intensities.get(angle, 0.0), 1),
+            }
+
+        ip_data["calibration_targets"]["background_exposures"] = {
+            "last_calibrated": datetime.now().isoformat(),
+            "modality": modality,
+            "objective": objective,
+            "detector": detector,
+            "angles": angles_data,
+        }
+
+        # Also ensure target_intensities has defaults if not present
+        if "target_intensities" not in ip_data["calibration_targets"]:
+            ip_data["calibration_targets"]["target_intensities"] = {
+                "uncrossed": 245.0,
+                "positive": 160.0,
+                "negative": 160.0,
+                "crossed": 125.0,
+                "default": 180.0,
+            }
+
+        # Save updated file
+        with open(imageprocessing_path, "w") as f:
+            yaml.dump(ip_data, f, default_flow_style=False, sort_keys=False)
+
+        logger.info(f"Saved background exposures to {imageprocessing_path}")
+        return True
+
+    except Exception as e:
+        logger.error(f"Failed to save background exposures to YAML: {e}")
+        return False
 
 
 def acquire_background_with_target_intensity(
@@ -2094,8 +2321,9 @@ def simple_background_collection(
         total_images = len(angles)
         update_progress(0, total_images)
 
-        # Track final exposures for each angle
+        # Track final exposures and achieved intensities for each angle
         final_exposures = {}
+        achieved_intensities = {}
 
         # Track reference images for birefringence pair matching
         # When acquiring paired polarization angles (+7/-7 or +5/-5), the negative
@@ -2137,12 +2365,14 @@ def simple_background_collection(
                             max_iterations=10,
                             logger=logger,
                         )
+                        actual_intensity = float(np.median(image))
                         logger.info(
                             f"Acquired background: shape={image.shape}, "
-                            f"achieved_biref={achieved_biref:.1f}, "
+                            f"achieved_biref={achieved_biref:.1f}, median={actual_intensity:.1f}, "
                             f"final_exposure={final_exposure:.1f}ms"
                         )
                         final_exposures[angle] = final_exposure
+                        achieved_intensities[angle] = actual_intensity
                     except RuntimeError as e:
                         logger.error(f"Failed to acquire background at angle {angle}: {e}")
                         continue
@@ -2163,12 +2393,14 @@ def simple_background_collection(
                             max_iterations=10,
                             logger=logger,
                         )
+                        actual_intensity = float(np.median(image))
                         logger.info(
                             f"Acquired background: shape={image.shape}, "
-                            f"median={float(np.median(image)):.1f}, "
+                            f"median={actual_intensity:.1f}, "
                             f"final_exposure={final_exposure:.1f}ms"
                         )
                         final_exposures[angle] = final_exposure
+                        achieved_intensities[angle] = actual_intensity
                     except RuntimeError as e:
                         logger.error(f"Failed to acquire background at angle {angle}: {e}")
                         continue
@@ -2192,6 +2424,7 @@ def simple_background_collection(
                         f"final_exposure={final_exposure:.1f}ms"
                     )
                     final_exposures[angle] = final_exposure
+                    achieved_intensities[angle] = actual_intensity
 
                     # Store reference image for positive polarization angles
                     # This will be used by paired negative angles for biref matching
@@ -2219,6 +2452,22 @@ def simple_background_collection(
 
         logger.info("=== SIMPLE BACKGROUND COLLECTION COMPLETE ===")
         logger.info(f"Successfully collected {len(angles)} background images")
+
+        # Save background exposures and achieved intensities to imageprocessing YAML
+        # This data becomes the source of truth for white balance target intensities
+        try:
+            save_background_exposures_to_yaml(
+                config_path=Path(yaml_file_path),
+                final_exposures=final_exposures,
+                achieved_intensities=achieved_intensities,
+                modality=modality,
+                objective=settings.get("objective"),
+                detector=settings.get("detector"),
+            )
+            logger.info("Background exposures saved to imageprocessing YAML")
+        except Exception as e:
+            logger.warning(f"Failed to save background exposures to YAML: {e}")
+            # Non-fatal - continue returning the exposures
 
         # Return final exposures for metadata writing
         return final_exposures
@@ -2296,8 +2545,9 @@ def background_acquisition_workflow(
 
         logger.info(f"Saving backgrounds to: {output_path}")
 
-        # Track final exposures for each angle
+        # Track final exposures and achieved intensities for each angle
         final_exposures = {}
+        achieved_intensities = {}
 
         # Track reference images for birefringence pair matching
         # Uses the same metric as biref calculation: sum(|R_pos - R_neg| + ...)
@@ -2338,11 +2588,13 @@ def background_acquisition_workflow(
                             max_iterations=10,
                             logger=logger,
                         )
+                        actual_intensity = float(np.median(image))
                         logger.info(
                             f"Acquired background: achieved_biref={achieved_biref:.1f}, "
-                            f"final_exposure={final_exposure:.1f}ms"
+                            f"median={actual_intensity:.1f}, final_exposure={final_exposure:.1f}ms"
                         )
                         final_exposures[angle] = final_exposure
+                        achieved_intensities[angle] = actual_intensity
                     except RuntimeError as e:
                         logger.error(f"Failed to acquire background at angle {angle}: {e}")
                         continue
@@ -2362,11 +2614,13 @@ def background_acquisition_workflow(
                             max_iterations=10,
                             logger=logger,
                         )
+                        actual_intensity = float(np.median(image))
                         logger.info(
-                            f"Acquired background: median={float(np.median(image)):.1f}, "
+                            f"Acquired background: median={actual_intensity:.1f}, "
                             f"final_exposure={final_exposure:.1f}ms"
                         )
                         final_exposures[angle] = final_exposure
+                        achieved_intensities[angle] = actual_intensity
                     except RuntimeError as e:
                         logger.error(f"Failed to acquire background at angle {angle}: {e}")
                         continue
@@ -2384,11 +2638,13 @@ def background_acquisition_workflow(
                         max_iterations=10,
                         logger=logger,
                     )
+                    actual_intensity = float(np.median(image))
                     logger.info(
-                        f"Acquired background: median={float(np.median(image)):.1f}, "
+                        f"Acquired background: median={actual_intensity:.1f}, "
                         f"final_exposure={final_exposure:.1f}ms"
                     )
                     final_exposures[angle] = final_exposure
+                    achieved_intensities[angle] = actual_intensity
 
                     # Store reference for positive polarization angles
                     if angle > 0 and angle != 90:
@@ -2408,9 +2664,24 @@ def background_acquisition_workflow(
                 data=image,
             )
 
-            logger.info(f"Saved background for {angle}° to {background_path}")
+            logger.info(f"Saved background for {angle} deg to {background_path}")
 
         logger.info("=== BACKGROUND ACQUISITION COMPLETE ===")
+
+        # Save background exposures and achieved intensities to imageprocessing YAML
+        try:
+            save_background_exposures_to_yaml(
+                config_path=Path(yaml_file_path),
+                final_exposures=final_exposures,
+                achieved_intensities=achieved_intensities,
+                modality=modality,
+                objective=settings.get("objective"),
+                detector=settings.get("detector"),
+            )
+            logger.info("Background exposures saved to imageprocessing YAML")
+        except Exception as e:
+            logger.warning(f"Failed to save background exposures to YAML: {e}")
+
         return str(output_path), final_exposures
 
     except Exception as e:

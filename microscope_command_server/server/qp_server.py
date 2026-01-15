@@ -1266,10 +1266,10 @@ def handle_client(conn, addr):
 
                             # Parse flags for PPM white balance:
                             # --yaml, --output, --camera,
-                            # --positive_exp, --positive_angle,
-                            # --negative_exp, --negative_angle,
-                            # --crossed_exp, --crossed_angle,
-                            # --uncrossed_exp, --uncrossed_angle,
+                            # --positive_exp, --positive_angle, --target_positive,
+                            # --negative_exp, --negative_angle, --target_negative,
+                            # --crossed_exp, --crossed_angle, --target_crossed,
+                            # --uncrossed_exp, --uncrossed_angle, --target_uncrossed,
                             # --target, --tolerance
                             flags = [
                                 "--yaml",
@@ -1277,12 +1277,16 @@ def handle_client(conn, addr):
                                 "--camera",
                                 "--positive_exp",
                                 "--positive_angle",
+                                "--target_positive",
                                 "--negative_exp",
                                 "--negative_angle",
+                                "--target_negative",
                                 "--crossed_exp",
                                 "--crossed_angle",
+                                "--target_crossed",
                                 "--uncrossed_exp",
                                 "--uncrossed_angle",
+                                "--target_uncrossed",
                                 "--target",
                                 "--tolerance",
                             ]
@@ -1310,18 +1314,26 @@ def handle_client(conn, addr):
                                         params["positive_exp"] = float(value)
                                     elif flag == "--positive_angle":
                                         params["positive_angle"] = float(value)
+                                    elif flag == "--target_positive":
+                                        params["target_positive"] = float(value)
                                     elif flag == "--negative_exp":
                                         params["negative_exp"] = float(value)
                                     elif flag == "--negative_angle":
                                         params["negative_angle"] = float(value)
+                                    elif flag == "--target_negative":
+                                        params["target_negative"] = float(value)
                                     elif flag == "--crossed_exp":
                                         params["crossed_exp"] = float(value)
                                     elif flag == "--crossed_angle":
                                         params["crossed_angle"] = float(value)
+                                    elif flag == "--target_crossed":
+                                        params["target_crossed"] = float(value)
                                     elif flag == "--uncrossed_exp":
                                         params["uncrossed_exp"] = float(value)
                                     elif flag == "--uncrossed_angle":
                                         params["uncrossed_angle"] = float(value)
+                                    elif flag == "--target_uncrossed":
+                                        params["target_uncrossed"] = float(value)
                                     elif flag == "--target":
                                         params["target_intensity"] = float(value)
                                     elif flag == "--tolerance":
@@ -1365,6 +1377,51 @@ def handle_client(conn, addr):
                                     "uncrossed": (params["uncrossed_angle"], params["uncrossed_exp"]),
                                 }
 
+                                # Build per-angle targets dictionary
+                                # Priority: client-provided > YAML background_exposures > YAML target_intensities > default
+                                per_angle_targets = {}
+
+                                # Check if client provided per-angle targets
+                                client_targets = {
+                                    "positive": params.get("target_positive"),
+                                    "negative": params.get("target_negative"),
+                                    "crossed": params.get("target_crossed"),
+                                    "uncrossed": params.get("target_uncrossed"),
+                                }
+
+                                # Load targets from YAML if not provided by client
+                                yaml_targets_loaded = False
+                                if "yaml_file_path" in params:
+                                    try:
+                                        from microscope_command_server.acquisition.workflow import (
+                                            get_target_intensity_for_angle,
+                                        )
+                                        for angle_name in ["positive", "negative", "crossed", "uncrossed"]:
+                                            if client_targets[angle_name] is not None:
+                                                # Client provided explicit value
+                                                per_angle_targets[angle_name] = client_targets[angle_name]
+                                            else:
+                                                # Try YAML lookup
+                                                angle_deg = params[f"{angle_name}_angle"]
+                                                target_val, source = get_target_intensity_for_angle(
+                                                    angle=angle_deg,
+                                                    modality="ppm",
+                                                    config_path=Path(params["yaml_file_path"]),
+                                                )
+                                                per_angle_targets[angle_name] = target_val
+                                                logger.info(
+                                                    f"WB target for {angle_name}: {target_val} (from {source})"
+                                                )
+                                        yaml_targets_loaded = True
+                                    except Exception as e:
+                                        logger.warning(f"Failed to load targets from YAML: {e}")
+
+                                # If YAML loading failed, use client values or None
+                                if not yaml_targets_loaded:
+                                    for angle_name in ["positive", "negative", "crossed", "uncrossed"]:
+                                        if client_targets[angle_name] is not None:
+                                            per_angle_targets[angle_name] = client_targets[angle_name]
+
                                 # Create calibrator with hardware
                                 jai_props = JAICameraProperties(hardware.core)
                                 calibrator = JAIWhiteBalanceCalibrator(hardware, jai_props)
@@ -1382,6 +1439,7 @@ def handle_client(conn, addr):
                                     tolerance=params.get("tolerance", 5.0),
                                     output_path=output_path,
                                     ppm_rotation_callback=ppm_callback,
+                                    per_angle_targets=per_angle_targets if per_angle_targets else None,
                                 )
 
                                 # Update imageprocessing config for each angle
