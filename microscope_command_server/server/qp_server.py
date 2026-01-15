@@ -1221,9 +1221,14 @@ def handle_client(conn, addr):
                                     f"exp_g:{result.exposures_ms['green']:.2f},"
                                     f"exp_b:{result.exposures_ms['blue']:.2f}"
                                 )
+                                gain_str = (
+                                    f"gain_r:{result.gains['red']:.3f},"
+                                    f"gain_g:{result.gains['green']:.3f},"
+                                    f"gain_b:{result.gains['blue']:.3f}"
+                                )
                                 status = "CONVERGED" if result.converged else "NOT_CONVERGED"
 
-                                response = f"SUCCESS:{output_path}|{status}|{exp_str}"
+                                response = f"SUCCESS:{output_path}|{status}|{exp_str}|{gain_str}"
                                 conn.sendall(response.encode())
                                 logger.info(f"WBSIMPLE completed: {status}")
 
@@ -1509,6 +1514,7 @@ def handle_client(conn, addr):
                                         )
 
                                 # Format response with results for all angles
+                                # Format: SUCCESS:path|angle:exp_r,exp_g,exp_b:gain_r,gain_g,gain_b:Y/N|...
                                 response_parts = [f"SUCCESS:{output_path}"]
                                 all_converged = True
                                 for name, result in results.items():
@@ -1517,8 +1523,13 @@ def handle_client(conn, addr):
                                         f"{result.exposures_ms['green']:.2f},"
                                         f"{result.exposures_ms['blue']:.2f}"
                                     )
+                                    gain_str = (
+                                        f"{result.gains['red']:.3f},"
+                                        f"{result.gains['green']:.3f},"
+                                        f"{result.gains['blue']:.3f}"
+                                    )
                                     converged = "Y" if result.converged else "N"
-                                    response_parts.append(f"{name}:{exp_str}:{converged}")
+                                    response_parts.append(f"{name}:{exp_str}:{gain_str}:{converged}")
                                     if not result.converged:
                                         all_converged = False
 
