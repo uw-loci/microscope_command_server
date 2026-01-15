@@ -368,7 +368,9 @@ def handle_client(conn, addr):
                     new_settings = config_manager.load_config_file(config_path)
 
                     # Validate essential config sections exist
-                    required_sections = ["microscope", "stage", "id_detector"]
+                    # Note: id_detector specs come from resources file, not main config
+                    # Main config has hardware.detectors which lists detector IDs
+                    required_sections = ["microscope", "stage"]
                     missing = [s for s in required_sections if s not in new_settings or not new_settings[s]]
                     if missing:
                         error_msg = f"Config missing required sections: {', '.join(missing)}"
