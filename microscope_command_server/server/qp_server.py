@@ -1106,7 +1106,8 @@ def handle_client(conn, addr):
                             params = {}
 
                             # Parse flags: --yaml, --output, --camera, --exposure,
-                            #              --target, --tolerance
+                            #              --target, --tolerance, --max_gain_db,
+                            #              --gain_threshold, --max_iterations, --calibrate_black_level
                             flags = [
                                 "--yaml",
                                 "--output",
@@ -1114,18 +1115,33 @@ def handle_client(conn, addr):
                                 "--exposure",
                                 "--target",
                                 "--tolerance",
+                                "--max_gain_db",
+                                "--gain_threshold",
+                                "--max_iterations",
+                                "--calibrate_black_level",
                             ]
 
+                            # Helper to find a flag as a complete word (followed by space)
+                            def find_flag_position(msg, flag):
+                                """Find flag position ensuring it's followed by a space."""
+                                search_pattern = flag + " "
+                                if search_pattern in msg:
+                                    return msg.index(search_pattern)
+                                return -1
+
                             for i, flag in enumerate(flags):
-                                if flag in message:
-                                    start_idx = message.index(flag) + len(flag)
+                                flag_pos = find_flag_position(message, flag)
+                                if flag_pos >= 0:
+                                    start_idx = flag_pos + len(flag)
                                     end_idx = len(message)
-                                    # Find the CLOSEST next flag (check all flags, not just remaining ones)
+                                    # Find the CLOSEST next flag
                                     for next_flag in flags:
-                                        if next_flag != flag and next_flag in message[start_idx:]:
-                                            next_pos = message.index(next_flag, start_idx)
-                                            if next_pos < end_idx:
-                                                end_idx = next_pos
+                                        if next_flag != flag:
+                                            next_pos = find_flag_position(message[start_idx:], next_flag)
+                                            if next_pos >= 0:
+                                                actual_pos = start_idx + next_pos
+                                                if actual_pos < end_idx:
+                                                    end_idx = actual_pos
 
                                     value = message[start_idx:end_idx].strip()
 
@@ -1141,6 +1157,14 @@ def handle_client(conn, addr):
                                         params["target_intensity"] = float(value)
                                     elif flag == "--tolerance":
                                         params["tolerance"] = float(value)
+                                    elif flag == "--max_gain_db":
+                                        params["max_gain_db"] = float(value)
+                                    elif flag == "--gain_threshold":
+                                        params["gain_threshold"] = float(value)
+                                    elif flag == "--max_iterations":
+                                        params["max_iterations"] = int(value)
+                                    elif flag == "--calibrate_black_level":
+                                        params["calibrate_black_level"] = value.lower() == "true"
 
                             # Validate required parameters
                             required = ["output_folder_path", "initial_exposure_ms"]
@@ -1177,6 +1201,10 @@ def handle_client(conn, addr):
                                     target=params.get("target_intensity", 180.0),
                                     tolerance=params.get("tolerance", 5.0),
                                     output_path=output_path,
+                                    max_gain_db=params.get("max_gain_db"),
+                                    gain_threshold_ratio=params.get("gain_threshold"),
+                                    max_iterations=params.get("max_iterations"),
+                                    calibrate_black_level=params.get("calibrate_black_level"),
                                 )
 
                                 # Update imageprocessing config if yaml path provided
@@ -1270,7 +1298,8 @@ def handle_client(conn, addr):
                             # --negative_exp, --negative_angle, --target_negative,
                             # --crossed_exp, --crossed_angle, --target_crossed,
                             # --uncrossed_exp, --uncrossed_angle, --target_uncrossed,
-                            # --target, --tolerance
+                            # --target, --tolerance,
+                            # --max_gain_db, --gain_threshold, --max_iterations, --calibrate_black_level
                             flags = [
                                 "--yaml",
                                 "--output",
@@ -1289,6 +1318,10 @@ def handle_client(conn, addr):
                                 "--target_uncrossed",
                                 "--target",
                                 "--tolerance",
+                                "--max_gain_db",
+                                "--gain_threshold",
+                                "--max_iterations",
+                                "--calibrate_black_level",
                             ]
 
                             # Helper to find a flag as a complete word (followed by space)
@@ -1349,6 +1382,14 @@ def handle_client(conn, addr):
                                         params["target_intensity"] = float(value)
                                     elif flag == "--tolerance":
                                         params["tolerance"] = float(value)
+                                    elif flag == "--max_gain_db":
+                                        params["max_gain_db"] = float(value)
+                                    elif flag == "--gain_threshold":
+                                        params["gain_threshold"] = float(value)
+                                    elif flag == "--max_iterations":
+                                        params["max_iterations"] = int(value)
+                                    elif flag == "--calibrate_black_level":
+                                        params["calibrate_black_level"] = value.lower() == "true"
 
                             # Validate required parameters
                             required = [
@@ -1451,6 +1492,10 @@ def handle_client(conn, addr):
                                     output_path=output_path,
                                     ppm_rotation_callback=ppm_callback,
                                     per_angle_targets=per_angle_targets if per_angle_targets else None,
+                                    max_gain_db=params.get("max_gain_db"),
+                                    gain_threshold_ratio=params.get("gain_threshold"),
+                                    max_iterations=params.get("max_iterations"),
+                                    calibrate_black_level=params.get("calibrate_black_level"),
                                 )
 
                                 # Update imageprocessing config for each angle
