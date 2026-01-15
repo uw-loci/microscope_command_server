@@ -1291,16 +1291,27 @@ def handle_client(conn, addr):
                                 "--tolerance",
                             ]
 
+                            # Helper to find a flag as a complete word (followed by space)
+                            def find_flag_position(msg, flag):
+                                """Find flag position ensuring it's followed by a space."""
+                                search_pattern = flag + " "
+                                if search_pattern in msg:
+                                    return msg.index(search_pattern)
+                                return -1
+
                             for i, flag in enumerate(flags):
-                                if flag in message:
-                                    start_idx = message.index(flag) + len(flag)
+                                flag_pos = find_flag_position(message, flag)
+                                if flag_pos >= 0:
+                                    start_idx = flag_pos + len(flag)
                                     end_idx = len(message)
-                                    # Find the CLOSEST next flag (check all flags, not just remaining ones)
+                                    # Find the CLOSEST next flag
                                     for next_flag in flags:
-                                        if next_flag != flag and next_flag in message[start_idx:]:
-                                            next_pos = message.index(next_flag, start_idx)
-                                            if next_pos < end_idx:
-                                                end_idx = next_pos
+                                        if next_flag != flag:
+                                            next_pos = find_flag_position(message[start_idx:], next_flag)
+                                            if next_pos >= 0:
+                                                actual_pos = start_idx + next_pos
+                                                if actual_pos < end_idx:
+                                                    end_idx = actual_pos
 
                                     value = message[start_idx:end_idx].strip()
 
