@@ -2,8 +2,7 @@
 Microscope Command Server - Remote Microscope Control via Socket
 =================================================================
 
-A socket-based command server for remote microscope control, designed for
-QuPath integration. Provides:
+A socket-based command server for remote microscope control. Provides:
 
 - Socket server for remote control commands
 - Client library for sending commands
@@ -12,9 +11,8 @@ QuPath integration. Provides:
 - Real-time progress monitoring
 - Acquisition cancellation support
 
-This server coordinates between QuPath (Java) and the microscope hardware
-(Python/Micro-Manager), enabling automated acquisition workflows driven by
-annotations in QuPath.
+This server coordinates between client applications and microscope hardware
+(Python/Micro-Manager), enabling automated acquisition workflows.
 
 Example Usage:
 -------------

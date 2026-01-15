@@ -1,4 +1,4 @@
-"""Acquisition workflow and microscope-side operations for QuPath server.
+"""Acquisition workflow and microscope-side operations for the command server.
 
 This module contains the acquisition logic and helpers that interact with the
 microscope hardware, separated from the socket server/transport logic.
@@ -1833,11 +1833,11 @@ def simple_background_collection(
     logger.info("=== SIMPLE BACKGROUND COLLECTION STARTED ===")
 
     try:
-        # Parse angles and exposures from QuPath
-        # Use QuPath's exposures as initial values for adaptive exposure
+        # Parse angles and exposures from client
+        # Use client's exposures as initial values for adaptive exposure
         angles, exposures = parse_angles_exposures(angles_str, exposures_str)
         logger.info(f"Collecting backgrounds for angles: {angles} using adaptive exposure")
-        logger.info(f"Initial exposures from QuPath: {exposures}")
+        logger.info(f"Initial exposures from client: {exposures}")
 
         # Load microscope configuration
         if not Path(yaml_file_path).exists():
@@ -1903,9 +1903,9 @@ def simple_background_collection(
                 )  # Each background is independent
                 logger.info(f"Set angle to {angle}")
 
-            # Use exposure from QuPath as initial value for adaptive exposure
+            # Use exposure from client as initial value for adaptive exposure
             initial_exposure_ms = exposures[angle_idx] if angle_idx < len(exposures) else 100.0
-            logger.info(f"Initial exposure from QuPath: {initial_exposure_ms:.2f}ms")
+            logger.info(f"Initial exposure from client: {initial_exposure_ms:.2f}ms")
 
             # For negative polarization angles, use biref-matching against positive angle
             paired_positive = abs(angle)  # e.g., -7 pairs with 7
@@ -2060,10 +2060,10 @@ def background_acquisition_workflow(
     )
 
     try:
-        # Parse angles and exposures from QuPath
-        # Use QuPath's exposures as initial values for adaptive exposure
+        # Parse angles and exposures from client
+        # Use client's exposures as initial values for adaptive exposure
         angles, exposures = parse_angles_exposures(angles_str, exposures_str)
-        logger.info(f"Initial exposures from QuPath: {exposures}")
+        logger.info(f"Initial exposures from client: {exposures}")
 
         # Load the microscope configuration
         if not Path(yaml_file_path).exists():
@@ -2104,9 +2104,9 @@ def background_acquisition_workflow(
                 )  # Each background is independent
                 logger.info(f"Set angle to {angle}")
 
-            # Use exposure from QuPath as initial value for adaptive exposure
+            # Use exposure from client as initial value for adaptive exposure
             initial_exposure_ms = exposures[angle_idx] if angle_idx < len(exposures) else 100.0
-            logger.info(f"Initial exposure from QuPath: {initial_exposure_ms:.2f}ms")
+            logger.info(f"Initial exposure from client: {initial_exposure_ms:.2f}ms")
 
             # For negative polarization angles, use biref-matching against positive angle
             paired_positive = abs(angle)  # e.g., -7 pairs with 7

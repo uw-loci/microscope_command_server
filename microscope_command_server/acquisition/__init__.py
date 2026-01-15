@@ -2,12 +2,12 @@
 Acquisition package - Workflows for microscope image acquisition.
 
 This package contains the core acquisition workflow logic,
-tile configuration utilities, and QuPath project management.
+tile configuration utilities, and project path management.
 
 Modules:
     workflow: Main acquisition workflow orchestration
     tiles: Tile configuration utilities (TileConfigUtils)
-    project: QuPath project management (QuPathProject)
+    project: Project path management (QuPathProject)
     pipeline: Text-based image processing pipeline
 """
 

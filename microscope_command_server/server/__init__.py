@@ -1,8 +1,8 @@
 """
-Server package - Socket server for QuPath communication.
+Server package - Socket server for remote microscope control.
 
 This package contains the socket-based communication layer between
-QuPath and the microscope control system.
+client applications and the microscope control system.
 
 Modules:
     qp_server: Main socket server implementation

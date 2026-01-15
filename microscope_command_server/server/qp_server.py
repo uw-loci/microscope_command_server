@@ -1,8 +1,9 @@
 """
-QuPath Microscope Server - Enhanced Version
-===========================================
+Microscope Command Server
+=========================
 
 A socket-based server that provides remote control of a microscope through Micro-Manager.
+Can be used by any client software (QuPath, custom applications, scripts, etc.).
 Handles stage movement, image acquisition, and multi-angle imaging workflows.
 
 Enhanced Features:
@@ -119,7 +120,7 @@ manual_focus_retries_remaining = {}  # addr -> int (number of retries remaining)
 # Server configuration state - CRITICAL FOR SAFETY
 # NEVER allow hardware operations with generic config - could damage microscope!
 server_configured = False  # True only after CONFIG command received with valid microscope config
-active_connection_addr = None  # Track single active QuPath connection (blocks other connections)
+active_connection_addr = None  # Track single active client connection (blocks other connections)
 active_connection_config_path = None  # Path to config file provided by active connection
 connection_state_lock = Lock()  # Protect connection state from race conditions
 
@@ -296,7 +297,7 @@ def acquisitionWorkflow(message, client_addr):
 
 def handle_client(conn, addr):
     """
-    Handle commands from a connected QuPath client with enhanced acquisition control.
+    Handle commands from a connected client with enhanced acquisition control.
     """
     logger.info(f">>> New client connected from {addr}")
 
@@ -2482,7 +2483,7 @@ def handle_client(conn, addr):
 def main():
     """Main server loop that accepts client connections and spawns handler threads."""
     logger.info("=" * 60)
-    logger.info("QuPath Microscope Server - Enhanced Version")
+    logger.info("Microscope Command Server")
     logger.info("=" * 60)
 
     # Check for existing server instance BEFORE attempting to bind
