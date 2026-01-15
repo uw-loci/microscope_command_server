@@ -27,6 +27,184 @@ import skimage.filters
 logger = logging.getLogger(__name__)
 
 
+def load_jai_calibration_from_imageprocessing(
+    config_path: Path,
+    per_angle: bool = False,
+    logger=None,
+) -> Optional[Dict[str, Any]]:
+    """
+    Load JAI white balance calibration from imageprocessing YAML.
+
+    The calibration data is stored in the `white_balance_calibration` section
+    of the imageprocessing YAML file (e.g., imageprocessing_PPM.yml).
+
+    Args:
+        config_path: Path to the main config file (config_PPM.yml)
+                    - imageprocessing file is derived from this
+        per_angle: If True, load PPM per-angle calibration (jai_ppm)
+                  If False, load simple calibration (jai_simple)
+        logger: Optional logger instance
+
+    Returns:
+        Dictionary with calibration data or None if not found.
+        For simple mode: {'exposures_ms': {'r': x, 'g': y, 'b': z}, 'gains': {...}}
+        For PPM mode: {'angles': {'positive': {...}, 'negative': {...}, ...}}
+    """
+    config_path = Path(config_path)
+
+    # Derive imageprocessing file path
+    config_name = config_path.stem  # e.g., "config_PPM"
+    if config_name.startswith("config_"):
+        microscope_name = config_name[7:]  # e.g., "PPM"
+        imageprocessing_name = f"imageprocessing_{microscope_name}.yml"
+    else:
+        imageprocessing_name = f"imageprocessing_{config_name}.yml"
+
+    imageprocessing_path = config_path.parent / imageprocessing_name
+
+    if not imageprocessing_path.exists():
+        if logger:
+            logger.info(f"No imageprocessing config found at {imageprocessing_path}")
+        return None
+
+    try:
+        with open(imageprocessing_path, "r") as f:
+            ip_data = yaml.safe_load(f) or {}
+
+        wb_cal = ip_data.get("white_balance_calibration", {})
+
+        if per_angle:
+            # Load PPM per-angle calibration
+            jai_ppm = wb_cal.get("jai_ppm")
+            if jai_ppm and "angles" in jai_ppm:
+                if logger:
+                    angles = list(jai_ppm["angles"].keys())
+                    logger.info(f"Loaded JAI PPM calibration for angles: {angles}")
+                return jai_ppm
+            else:
+                if logger:
+                    logger.info("No JAI PPM calibration found in imageprocessing config")
+                return None
+        else:
+            # Load simple calibration (same for all angles)
+            jai_simple = wb_cal.get("jai_simple")
+            if jai_simple and "exposures_ms" in jai_simple:
+                if logger:
+                    logger.info(f"Loaded JAI simple calibration: {jai_simple.get('exposures_ms')}")
+                return jai_simple
+            else:
+                if logger:
+                    logger.info("No JAI simple calibration found in imageprocessing config")
+                return None
+
+    except Exception as e:
+        if logger:
+            logger.warning(f"Failed to load JAI calibration from {imageprocessing_path}: {e}")
+        return None
+
+
+def apply_jai_calibration_for_angle(
+    hardware: "PycromanagerHardware",
+    jai_calibration: Dict[str, Any],
+    angle: float,
+    per_angle: bool = False,
+    logger=None,
+) -> bool:
+    """
+    Apply JAI white balance calibration settings before image capture.
+
+    This enables individual exposure mode and sets per-channel exposures
+    based on the calibration data.
+
+    Args:
+        hardware: PycromanagerHardware instance
+        jai_calibration: Calibration data from load_jai_calibration_from_imageprocessing()
+        angle: Current rotation angle (used for PPM mode to select angle-specific settings)
+        per_angle: If True, use angle-specific settings from jai_ppm
+                  If False, use single settings from jai_simple
+        logger: Optional logger instance
+
+    Returns:
+        True if settings were applied, False otherwise
+    """
+    # Only applies to JAI camera
+    try:
+        camera_name = hardware.core.get_property("Core", "Camera")
+        if "JAI" not in camera_name.upper():
+            if logger:
+                logger.debug(f"JAI calibration skipped - camera is {camera_name}")
+            return False
+    except Exception:
+        return False
+
+    try:
+        from microscope_control.jai import JAICameraProperties
+
+        # Get calibration settings for this angle
+        if per_angle:
+            # Map numeric angle to angle name
+            angle_mapping = {90.0: "uncrossed", 0.0: "crossed", 7.0: "positive", -7.0: "negative"}
+            angle_name = angle_mapping.get(angle)
+            if not angle_name:
+                # Try to find closest match
+                for a, name in angle_mapping.items():
+                    if abs(a - angle) < 1.0:
+                        angle_name = name
+                        break
+
+            if not angle_name or "angles" not in jai_calibration:
+                if logger:
+                    logger.warning(f"No PPM calibration found for angle {angle}")
+                return False
+
+            angle_cal = jai_calibration["angles"].get(angle_name)
+            if not angle_cal:
+                if logger:
+                    logger.warning(f"No PPM calibration found for angle {angle_name}")
+                return False
+
+            exposures = angle_cal.get("exposures_ms", {})
+            gains = angle_cal.get("gains", {})
+        else:
+            # Simple mode - use same settings for all angles
+            exposures = jai_calibration.get("exposures_ms", {})
+            gains = jai_calibration.get("gains", {})
+
+        if not exposures:
+            if logger:
+                logger.warning("No exposure data in JAI calibration")
+            return False
+
+        # Apply per-channel exposures
+        jai_props = JAICameraProperties(hardware.core)
+        jai_props.set_channel_exposures(
+            red=exposures.get("r", 50.0),
+            green=exposures.get("g", 50.0),
+            blue=exposures.get("b", 50.0),
+            auto_enable=True,  # Automatically enable individual exposure mode
+        )
+
+        if logger:
+            logger.info(
+                f"Applied JAI calibration for angle {angle}: "
+                f"R={exposures.get('r'):.1f}ms, G={exposures.get('g'):.1f}ms, B={exposures.get('b'):.1f}ms"
+            )
+
+        # Apply per-channel gains if available (TODO: implement in JAICameraProperties)
+        # For now, gains are less critical since exposure handles most of the balancing
+
+        return True
+
+    except ImportError:
+        if logger:
+            logger.debug("JAI camera module not available - skipping calibration")
+        return False
+    except Exception as e:
+        if logger:
+            logger.warning(f"Failed to apply JAI calibration: {e}")
+        return False
+
+
 def load_and_apply_white_balance_settings(
     hardware: PycromanagerHardware,
     calibration_folder: str,
@@ -627,8 +805,25 @@ def _acquisition_workflow(
         angles_wb = {}
         white_balance_per_angle = params.get("white_balance_per_angle", False)
 
+        # Load JAI hardware white balance calibration (per-channel exposures)
+        # This is separate from software white balance (RGB multipliers applied post-capture)
+        jai_calibration = None
         if white_balance_enabled:
-            # Load white balance settings from configuration
+            jai_calibration = load_jai_calibration_from_imageprocessing(
+                config_path=Path(params["yaml_file_path"]),
+                per_angle=white_balance_per_angle,
+                logger=logger,
+            )
+            if jai_calibration:
+                logger.info(
+                    f"JAI hardware white balance enabled "
+                    f"({'per-angle' if white_balance_per_angle else 'simple'} mode)"
+                )
+            else:
+                logger.info("No JAI calibration found - using software white balance")
+
+        if white_balance_enabled:
+            # Load software white balance settings from configuration (RGB multipliers)
             angles_wb = get_angles_wb_from_settings(ppm_settings)
 
             if white_balance_per_angle:
@@ -1210,12 +1405,29 @@ def _acquisition_workflow(
                     #     actual_angle = hardware.get_psg_ticks()
                     # logger.info(f"  Angle set to {hardware.get_psg_ticks():.1f}")
 
-                    # Set exposure time if specified
-                    if angle_idx < len(params["exposures"]):
+                    # Set exposure time
+                    # Priority 1: JAI hardware calibration (per-channel exposures for white balance)
+                    # Priority 2: Single exposure from params
+                    t_exp = time.perf_counter()
+                    if jai_calibration is not None:
+                        # Apply JAI per-channel exposures from calibration
+                        applied = apply_jai_calibration_for_angle(
+                            hardware=hardware,
+                            jai_calibration=jai_calibration,
+                            angle=angle,
+                            per_angle=white_balance_per_angle,
+                            logger=logger,
+                        )
+                        if not applied and angle_idx < len(params["exposures"]):
+                            # Fall back to single exposure if JAI calibration failed
+                            exposure_ms = params["exposures"][angle_idx]
+                            hardware.set_exposure(exposure_ms)
+                            logger.info(f"  JAI calibration failed, using single exposure: {exposure_ms}ms")
+                    elif angle_idx < len(params["exposures"]):
+                        # No JAI calibration - use single exposure from params
                         exposure_ms = params["exposures"][angle_idx]
-                        t_exp = time.perf_counter()
                         hardware.set_exposure(exposure_ms)
-                        t_exp = log_timing(logger, f"Set exposure to {exposure_ms}ms", t_exp)
+                    t_exp = log_timing(logger, f"Set exposure for angle {angle}deg", t_exp)
                     logger.info(f"  Exposure set to {hardware.core.get_exposure()}")
 
                     # Acquire image
