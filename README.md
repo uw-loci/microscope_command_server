@@ -51,52 +51,32 @@ pip install -e .
 
 ### Troubleshooting Installation
 
-#### Problem: `ModuleNotFoundError: No module named 'microscope_server'`
+#### Problem: `ModuleNotFoundError: No module named 'microscope_command_server'`
 
-**Cause:** Repository directory is named `microscope_command_server` but the code imports `microscope_server`.
+**Cause:** Package not installed correctly or virtual environment not activated.
 
 **Solution:**
 
-The repository has been updated to fix this issue. If you encounter this error:
-
-1. **Update to latest version:**
+1. **Ensure virtual environment is activated:**
    ```bash
-   cd microscope_command_server
-   git pull
+   # Windows
+   path\to\venv_qpsc\Scripts\Activate.ps1
+
+   # Linux/macOS
+   source path/to/venv_qpsc/bin/activate
    ```
 
-2. **Verify `pyproject.toml` has the correct configuration:**
-   ```toml
-   [tool.hatch.build.targets.wheel]
-   packages = ["."]
-   ```
-
-3. **Create a symlink in the parent directory:**
-
-   **Windows (Command Prompt as Administrator):**
-   ```cmd
-   cd ..
-   mklink /D microscope_server microscope_command_server
-   ```
-
-   **macOS/Linux:**
+2. **Reinstall the package:**
    ```bash
-   cd ..
-   ln -s microscope_command_server microscope_server
+   pip install -e . --force-reinstall
    ```
 
-4. **Reinstall in editable mode:**
+3. **Verify installation:**
    ```bash
-   cd microscope_command_server
-   pip install -e . --force-reinstall --no-deps
+   pip show microscope-command-server
    ```
 
-5. **Verify installation:**
-   ```bash
-   pip show microscope-server
-   ```
-
-#### Problem: Entry point `microscope-server` command not found
+#### Problem: Entry point `microscope-command-server` command not found
 
 **Cause:** Entry points not registered or PATH not updated.
 
@@ -105,11 +85,11 @@ The repository has been updated to fix this issue. If you encounter this error:
 Try running the server directly:
 ```bash
 # Using Python module
-python -m microscope_server.server.qp_server
+python -m microscope_command_server.server.qp_server
 
 # Or with PYTHONPATH set (if needed)
 export PYTHONPATH="/path/to/parent/directory:$PYTHONPATH"
-microscope-server
+microscope-command-server
 ```
 
 #### Problem: Port 5000 already in use
@@ -136,7 +116,7 @@ For more troubleshooting, see the [QPSC Installation Guide](https://github.com/u
 ### Server Side
 
 ```python
-from microscope_server.server.qp_server import run_server
+from microscope_command_server.server.qp_server import run_server
 
 # Start server
 run_server(host='0.0.0.0', port=5000)
@@ -144,13 +124,19 @@ run_server(host='0.0.0.0', port=5000)
 
 Or run from command line:
 ```bash
-microscope-server
+# Option 1: Entry point command (NOTE: uses hyphens, not underscores!)
+microscope-command-server
+
+# Option 2: Python module syntax
+python -m microscope_command_server.server.qp_server
 ```
+
+**Common mistake:** The command is `microscope-command-server` (with **hyphens**), not `microscope_command_server` (with underscores).
 
 ### Client Side
 
 ```python
-from microscope_server.client import get_stageXY, move_stageXY
+from microscope_command_server.client import get_stageXY, move_stageXY
 
 # Get current position
 x, y = get_stageXY()
@@ -222,7 +208,7 @@ pytest
 pytest tests/test_tiles.py
 
 # Run with coverage report
-pytest --cov=microscope_server --cov-report=html
+pytest --cov=microscope_command_server --cov-report=html
 
 # View coverage report
 open htmlcov/index.html  # or xdg-open on Linux
