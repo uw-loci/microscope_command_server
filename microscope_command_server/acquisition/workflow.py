@@ -184,14 +184,27 @@ def apply_jai_calibration_for_angle(
             auto_enable=True,  # Automatically enable individual exposure mode
         )
 
-        if logger:
-            logger.info(
-                f"Applied JAI calibration for angle {angle}: "
-                f"R={exposures.get('r'):.1f}ms, G={exposures.get('g'):.1f}ms, B={exposures.get('b'):.1f}ms"
-            )
+        exp_msg = (
+            f"Applied JAI calibration for angle {angle}: "
+            f"R={exposures.get('r'):.1f}ms, G={exposures.get('g'):.1f}ms, B={exposures.get('b'):.1f}ms"
+        )
 
-        # Apply per-channel gains if available (TODO: implement in JAICameraProperties)
-        # For now, gains are less critical since exposure handles most of the balancing
+        # Apply per-channel gains if calibration required gain compensation
+        gain_r = gains.get("r", 1.0)
+        gain_g = gains.get("g", 1.0)
+        gain_b = gains.get("b", 1.0)
+
+        if gain_r != 1.0 or gain_g != 1.0 or gain_b != 1.0:
+            jai_props.set_analog_gains(
+                red=gain_r,
+                green=gain_g,
+                blue=gain_b,
+                auto_enable=True,  # Automatically enable individual gain mode
+            )
+            exp_msg += f" | Gains: R={gain_r:.3f}, G={gain_g:.3f}, B={gain_b:.3f}"
+
+        if logger:
+            logger.info(exp_msg)
 
         return True
 
