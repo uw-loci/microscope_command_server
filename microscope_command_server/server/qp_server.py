@@ -479,7 +479,7 @@ def handle_client(conn, addr):
                     angle = hardware.get_psg_ticks()
                     response = struct.pack("!f", angle)
                     conn.sendall(response)
-                    logger.debug(f"Sent rotation angle to {addr}: {angle}°")
+                    logger.debug(f"Sent rotation angle to {addr}: {angle} deg")
                 except Exception as e:
                     logger.error(f"Failed to get rotation angle: {e}", exc_info=True)
                     # Send error message (4 bytes to match expected response size)
@@ -517,12 +517,12 @@ def handle_client(conn, addr):
             if data == ExtendedCommand.MOVER:
                 coords = conn.recv(4)
                 angle = struct.unpack("!f", coords)[0]
-                logger.info(f"Client {addr} requested rotation to {angle}°")
+                logger.info(f"Client {addr} requested rotation to {angle} deg")
                 try:
                     hardware.set_psg_ticks(
                         angle
                     )  # , is_sequence_start=True)  # Single rotation command
-                    logger.info(f"Rotation completed to {angle}°")
+                    logger.info(f"Rotation completed to {angle} deg")
                 except Exception as e:
                     logger.error(f"Failed to rotate stage: {e}", exc_info=True)
                 continue

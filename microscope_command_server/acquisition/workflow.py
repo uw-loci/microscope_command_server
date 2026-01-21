@@ -898,7 +898,7 @@ def _acquisition_workflow(
         update_progress(0, total_images)
         logger.info(
             f"Starting acquisition of {total_images} total images "
-            f"({len(positions)} positions × {len(params['angles'])} angles)"
+            f"({len(positions)} positions x {len(params['angles'])} angles)"
         )
 
         image_count = 0
@@ -1021,7 +1021,7 @@ def _acquisition_workflow(
         # This ensures we collect enough tiles to see the AF timing pattern
         # TODO: Move timing window multiplier (3) to settings/preferences instead of hardcoding
         timing_window_size = max(10, 3 * af_n_tiles)  # Minimum 10 tiles
-        logger.info(f"Timing window size for progress estimation: {timing_window_size} tiles (3 × {af_n_tiles} AF positions, min 10)")
+        logger.info(f"Timing window size for progress estimation: {timing_window_size} tiles (3 x {af_n_tiles} AF positions, min 10)")
 
         # Write timing window to file for Java progress dialog
         # Include all information needed for accurate time estimation:
@@ -1218,15 +1218,15 @@ def _acquisition_workflow(
                     f"Checking for autofocus at position {pos_idx}: X={pos.x}, Y={pos.y}, Z={pos.z}"
                 )
 
-                # For PPM, always autofocus at 90° (uncrossed polarizers - brightest, fastest)
+                # For PPM, always autofocus at 90 deg (uncrossed polarizers - brightest, fastest)
                 # This ensures consistent, fast autofocus regardless of angle sequence
                 if "ppm" in modality.lower():
                     t_rot = time.perf_counter()
                     hardware.set_psg_ticks(90.0)
                     t_rot = log_timing(logger, "Rotation to 90deg for autofocus", t_rot)
-                    logger.info("Set rotation to 90° (uncrossed) for PPM autofocus")
-                    # CRITICAL: Set appropriate exposure for 90° before tissue detection
-                    # Find the 90° exposure from acquisition parameters
+                    logger.info("Set rotation to 90 deg (uncrossed) for PPM autofocus")
+                    # CRITICAL: Set appropriate exposure for 90 deg before tissue detection
+                    # Find the 90 deg exposure from acquisition parameters
                     exposure_90 = 2.0  # Default fallback
 
                     if 90.0 in params["angles"]:
@@ -1237,7 +1237,7 @@ def _acquisition_workflow(
                     t_exp = time.perf_counter()
                     hardware.set_exposure(exposure_90)
                     t_exp = log_timing(logger, "Set exposure for tissue detection", t_exp)
-                    logger.info(f"Set exposure to {exposure_90}ms for 90° tissue detection")
+                    logger.info(f"Set exposure to {exposure_90}ms for 90 deg tissue detection")
                 # Take a quick image to assess tissue content
                 t_snap = time.perf_counter()
                 test_img, _ = hardware.snap_image()
@@ -1412,7 +1412,7 @@ def _acquisition_workflow(
                     # actual_angle = hardware.get_psg_ticks()
                     # angle_diff = min(abs(actual_angle - angle), 360 - abs(actual_angle - angle))
                     # if angle_diff > 5.0:
-                    #     logger.warning(f"  Angle mismatch: requested {angle:.1f}°, got {actual_angle:.1f}°, retrying...")
+                    #     logger.warning(f"  Angle mismatch: requested {angle:.1f} deg, got {actual_angle:.1f} deg, retrying...")
                     #     hardware.set_psg_ticks(angle, is_sequence_start=False)
                     #     time.sleep(0.15)
                     #     actual_angle = hardware.get_psg_ticks()
@@ -1509,11 +1509,11 @@ def _acquisition_workflow(
                         logger.info(f"    Post-correction RGB means: {image.mean(axis=(0,1))}")
                     elif background_correction_enabled and angle in background_disabled_angles:
                         logger.info(
-                            f"  Background correction SKIPPED for {angle}° (validation failed - exposure mismatch or missing background)"
+                            f"  Background correction SKIPPED for {angle} deg (validation failed - exposure mismatch or missing background)"
                         )
                     elif background_correction_enabled and angle not in background_images:
                         logger.info(
-                            f"  Background correction SKIPPED for {angle}° (no background image available)"
+                            f"  Background correction SKIPPED for {angle} deg (no background image available)"
                         )
 
                     # ======= APPLY WHITE BALANCE (STEP 2) =======
@@ -1525,7 +1525,7 @@ def _acquisition_workflow(
                             # Default neutral if angle not found
                             wb_profile = [1.0, 1.0, 1.0]
                             logger.warning(
-                                f"    No white balance profile for {angle}°, using neutral"
+                                f"    No white balance profile for {angle} deg, using neutral"
                             )
 
                         t_wb = time.perf_counter()
@@ -1991,7 +1991,7 @@ def acquire_background_with_target_intensity(
     Args:
         hardware: Microscope hardware interface
         target_intensity: Target median grayscale value (0-255)
-        tolerance: Acceptable deviation from target (default ±2.5)
+        tolerance: Acceptable deviation from target (default +/-2.5)
         initial_exposure_ms: Starting exposure time in milliseconds
         max_iterations: Maximum adjustment iterations
         logger: Logger instance for tracking convergence
@@ -2458,7 +2458,7 @@ def simple_background_collection(
                 data=image,
             )
 
-            logger.info(f"Saved background for {angle}° to {background_path}")
+            logger.info(f"Saved background for {angle} deg to {background_path}")
 
             # Update progress
             update_progress(angle_idx + 1, total_images)
