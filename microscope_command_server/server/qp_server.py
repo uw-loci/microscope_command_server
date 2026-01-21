@@ -68,7 +68,11 @@ def check_for_existing_server(host: str, port: int, timeout: float = 2.0) -> boo
         except Exception:
             pass
 from microscope_control.hardware import Position
-from microscope_control.hardware.pycromanager import PycromanagerHardware, init_pycromanager
+from microscope_control.hardware.pycromanager import (
+    PycromanagerHardware,
+    init_pycromanager,
+    MicroManagerConnectionError,
+)
 from microscope_command_server.server.protocol import ExtendedCommand, TCP_PORT, END_MARKER
 from microscope_command_server.acquisition.workflow import _acquisition_workflow
 
@@ -126,14 +130,48 @@ connection_state_lock = Lock()  # Protect connection state from race conditions
 
 
 def init_pycromanager_with_logger():
-    """Initialize Pycro-Manager connection to Micro-Manager."""
+    """
+    Initialize Pycro-Manager connection to Micro-Manager.
+
+    Provides clean error messages if connection fails.
+    """
     logger.info("Initializing Pycro-Manager connection...")
-    core, studio = init_pycromanager()
-    if not core:
-        logger.error("Failed to initialize Micro-Manager connection")
+    try:
+        core, studio = init_pycromanager()
+        if not core:
+            logger.error("Failed to initialize Micro-Manager connection")
+            sys.exit(1)
+        logger.info("Pycro-Manager initialized successfully")
+        return core, studio
+
+    except MicroManagerConnectionError as e:
+        # Clean, informative error message
+        logger.error("")
+        logger.error("=" * 70)
+        logger.error("MICRO-MANAGER CONNECTION FAILED")
+        logger.error("=" * 70)
+        logger.error("")
+        for line in str(e).split('\n'):
+            logger.error(line)
+        logger.error("")
+        logger.error("=" * 70)
+        logger.error("Server cannot start without Micro-Manager.")
+        logger.error("Please fix the issue above and restart the server.")
+        logger.error("=" * 70)
         sys.exit(1)
-    logger.info("Pycro-Manager initialized successfully")
-    return core, studio
+
+    except Exception as e:
+        # Unexpected error - still provide clean output
+        logger.error("")
+        logger.error("=" * 70)
+        logger.error("UNEXPECTED ERROR CONNECTING TO MICRO-MANAGER")
+        logger.error("=" * 70)
+        logger.error(f"Error type: {type(e).__name__}")
+        logger.error(f"Error: {e}")
+        logger.error("")
+        logger.error("Please ensure Micro-Manager is running and responsive.")
+        logger.error("=" * 70)
+        sys.exit(1)
 
 
 # OPTION 3 HELPER (COMMENTED OUT): Auto-reconnect to MM on first command
