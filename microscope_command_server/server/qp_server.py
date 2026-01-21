@@ -784,6 +784,9 @@ def handle_client(conn, addr):
                             # Parse the message
                             params = {}
 
+                            # Check for boolean flags first (no value)
+                            use_per_angle_wb = "--use_per_angle_wb" in message
+
                             # Split by known flags to avoid issues with spaces in paths
                             flags = ["--yaml", "--output", "--modality", "--angles", "--exposures"]
 
@@ -800,6 +803,11 @@ def handle_client(conn, addr):
                                             if next_pos < end_idx:
                                                 end_idx = next_pos
                                                 break
+                                    # Also check for boolean flag --use_per_angle_wb
+                                    if "--use_per_angle_wb" in message[start_idx:]:
+                                        wb_pos = message.index("--use_per_angle_wb", start_idx)
+                                        if wb_pos < end_idx:
+                                            end_idx = wb_pos
 
                                     # Extract the value and clean it up
                                     value = message[start_idx:end_idx].strip()
@@ -815,6 +823,11 @@ def handle_client(conn, addr):
                                         params["angles_str"] = value
                                     elif flag == "--exposures":
                                         params["exposures_str"] = value
+
+                            # Add boolean flag to params
+                            params["use_per_angle_wb"] = use_per_angle_wb
+                            if use_per_angle_wb:
+                                logger.info("Per-angle white balance enabled for background acquisition")
 
                             # Validate required parameters
                             required = ["yaml_file_path", "output_folder_path", "modality"]
@@ -866,6 +879,7 @@ def handle_client(conn, addr):
                                     config_manager=config_manager,
                                     logger=logger,
                                     update_progress=update_progress,
+                                    use_per_angle_wb=params.get("use_per_angle_wb", False),
                                 )
 
                                 # Format exposures as angle:exposure pairs

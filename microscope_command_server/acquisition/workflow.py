@@ -2258,6 +2258,7 @@ def simple_background_collection(
     config_manager,
     logger,
     update_progress: Callable[[int, int], None],
+    use_per_angle_wb: bool = False,
 ):
     """
     Simplified background collection for BackgroundCollectionWorkflow.
@@ -2277,6 +2278,8 @@ def simple_background_collection(
         config_manager: Configuration manager
         logger: Logger instance
         update_progress: Progress callback function
+        use_per_angle_wb: Whether to apply per-angle white balance calibration
+                         before acquiring each background image
 
     Returns:
         Dict[float, float]: Dictionary mapping angles to final exposure times (ms)
@@ -2319,6 +2322,19 @@ def simple_background_collection(
             hardware._initialize_microscope_methods()
             logger.info("Re-initialized hardware methods with updated settings")
 
+        # Load JAI white balance calibration if per-angle mode requested
+        jai_calibration = None
+        if use_per_angle_wb:
+            jai_calibration = load_jai_calibration_from_imageprocessing(
+                config_path=Path(yaml_file_path),
+                per_angle=True,
+                logger=logger,
+            )
+            if jai_calibration:
+                logger.info("Per-angle white balance calibration loaded for background collection")
+            else:
+                logger.warning("Per-angle white balance requested but no calibration found")
+
         # Get current position for reference
         current_pos = hardware.get_current_position()
         logger.info(
@@ -2355,6 +2371,20 @@ def simple_background_collection(
                     angle  # , is_sequence_start=True
                 )  # Each background is independent
                 logger.info(f"Set angle to {angle}")
+
+            # Apply per-angle white balance calibration if available
+            if jai_calibration and use_per_angle_wb:
+                wb_applied = apply_jai_calibration_for_angle(
+                    hardware=hardware,
+                    jai_calibration=jai_calibration,
+                    angle=angle,
+                    per_angle=True,
+                    logger=logger,
+                )
+                if wb_applied:
+                    logger.info(f"Applied per-angle white balance for angle {angle}")
+                else:
+                    logger.warning(f"Failed to apply white balance for angle {angle}")
 
             # Use exposure from client as initial value for adaptive exposure
             initial_exposure_ms = exposures[angle_idx] if angle_idx < len(exposures) else 100.0
