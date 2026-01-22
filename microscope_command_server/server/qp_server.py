@@ -1557,12 +1557,23 @@ def handle_client(conn, addr):
 
                                 # Update imageprocessing config for each angle
                                 if "yaml_file_path" in params:
+                                    # Get objective/detector from settings for imaging_profiles update
+                                    wb_objective = None
+                                    wb_detector = None
+                                    if hasattr(hardware, 'settings') and hardware.settings:
+                                        wb_objective = hardware.settings.get("objective_in_use") or hardware.settings.get("objective")
+                                        wb_detector = hardware.settings.get("detector_in_use") or hardware.settings.get("detector")
+                                        logger.info(f"WB calibration: using objective={wb_objective}, detector={wb_detector}")
+
                                     for angle_name, result in results.items():
                                         calibrator.update_imageprocessing_config(
                                             config_path=Path(params["yaml_file_path"]),
                                             result=result,
                                             calibration_type="ppm",
                                             angle_name=angle_name,
+                                            modality="ppm",
+                                            objective=wb_objective,
+                                            detector=wb_detector,
                                         )
 
                                 # Format response with results for all angles
