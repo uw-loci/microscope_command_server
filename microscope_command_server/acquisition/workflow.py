@@ -30,25 +30,30 @@ logger = logging.getLogger(__name__)
 def load_jai_calibration_from_imageprocessing(
     config_path: Path,
     per_angle: bool = False,
+    modality: str = "ppm",
+    objective: str = None,
+    detector: str = None,
     logger=None,
 ) -> Optional[Dict[str, Any]]:
     """
     Load JAI white balance calibration from imageprocessing YAML.
 
-    The calibration data is stored in the `white_balance_calibration` section
-    of the imageprocessing YAML file (e.g., imageprocessing_PPM.yml).
+    The calibration data is stored in the imaging_profiles section:
+    imaging_profiles.{modality}.{objective}.{detector}.exposures_ms.{angle}.{r,g,b}
 
     Args:
         config_path: Path to the main config file (config_PPM.yml)
                     - imageprocessing file is derived from this
-        per_angle: If True, load PPM per-angle calibration (jai_ppm)
-                  If False, load simple calibration (jai_simple)
+        per_angle: If True, load PPM per-angle calibration with R,G,B values
+                  If False, load simple calibration (single exposure)
+        modality: Modality name (e.g., "ppm", "brightfield")
+        objective: Objective ID (e.g., "LOCI_OBJECTIVE_OLYMPUS_20X_POL_001")
+        detector: Detector ID (e.g., "LOCI_DETECTOR_JAI_001")
         logger: Optional logger instance
 
     Returns:
         Dictionary with calibration data or None if not found.
-        For simple mode: {'exposures_ms': {'r': x, 'g': y, 'b': z}, 'gains': {...}}
-        For PPM mode: {'angles': {'positive': {...}, 'negative': {...}, ...}}
+        For PPM mode: {'angles': {'positive': {'exposures_ms': {'r': x, 'g': y, 'b': z}}, ...}}
     """
     config_path = Path(config_path)
 
@@ -67,35 +72,68 @@ def load_jai_calibration_from_imageprocessing(
             logger.info(f"No imageprocessing config found at {imageprocessing_path}")
         return None
 
+    if not objective or not detector:
+        if logger:
+            logger.warning("Objective or detector not specified for calibration lookup")
+        return None
+
     try:
         with open(imageprocessing_path, "r") as f:
             ip_data = yaml.safe_load(f) or {}
 
-        wb_cal = ip_data.get("white_balance_calibration", {})
+        # Navigate to imaging_profiles.{modality}.{objective}.{detector}
+        imaging_profiles = ip_data.get("imaging_profiles", {})
+        modality_profiles = imaging_profiles.get(modality, {})
+        objective_profiles = modality_profiles.get(objective, {})
+        detector_profile = objective_profiles.get(detector, {})
+
+        if not detector_profile:
+            if logger:
+                logger.info(f"No profile found for {modality}/{objective}/{detector}")
+            return None
+
+        exposures_ms = detector_profile.get("exposures_ms", {})
+        gains = detector_profile.get("gains", {})
+
+        if not exposures_ms:
+            if logger:
+                logger.info(f"No exposures_ms found in profile for {modality}/{objective}/{detector}")
+            return None
 
         if per_angle:
-            # Load PPM per-angle calibration
-            jai_ppm = wb_cal.get("jai_ppm")
-            if jai_ppm and "angles" in jai_ppm:
+            # Build per-angle calibration structure from exposures_ms
+            # Expected format in YAML:
+            #   exposures_ms:
+            #     positive: {all: 800, r: 750, g: 800, b: 850}
+            #     negative: {all: 800, r: 750, g: 800, b: 850}
+            #     ...
+            angles_data = {}
+            for angle_name, exp_data in exposures_ms.items():
+                if isinstance(exp_data, dict) and 'r' in exp_data and 'g' in exp_data and 'b' in exp_data:
+                    angles_data[angle_name] = {
+                        'exposures_ms': {
+                            'r': exp_data.get('r', 50.0),
+                            'g': exp_data.get('g', 50.0),
+                            'b': exp_data.get('b', 50.0),
+                        }
+                    }
+                    # Add gains if available
+                    if gains and angle_name in gains:
+                        angles_data[angle_name]['gains'] = gains[angle_name]
+
+            if angles_data:
                 if logger:
-                    angles = list(jai_ppm["angles"].keys())
-                    logger.info(f"Loaded JAI PPM calibration for angles: {angles}")
-                return jai_ppm
+                    logger.info(f"Loaded JAI PPM calibration for angles: {list(angles_data.keys())}")
+                return {'angles': angles_data}
             else:
                 if logger:
-                    logger.info("No JAI PPM calibration found in imageprocessing config")
+                    logger.info("No per-channel (r,g,b) exposure data found in exposures_ms")
                 return None
         else:
-            # Load simple calibration (same for all angles)
-            jai_simple = wb_cal.get("jai_simple")
-            if jai_simple and "exposures_ms" in jai_simple:
-                if logger:
-                    logger.info(f"Loaded JAI simple calibration: {jai_simple.get('exposures_ms')}")
-                return jai_simple
-            else:
-                if logger:
-                    logger.info("No JAI simple calibration found in imageprocessing config")
-                return None
+            # Simple mode - return first available exposure settings
+            if logger:
+                logger.info(f"Loaded JAI simple calibration from {modality}/{objective}/{detector}")
+            return {'exposures_ms': exposures_ms, 'gains': gains}
 
     except Exception as e:
         if logger:
@@ -2466,9 +2504,17 @@ def simple_background_collection(
         # Load JAI white balance calibration if per-angle mode requested
         jai_calibration = None
         if use_per_angle_wb:
+            # Get objective and detector from settings for calibration lookup
+            objective = settings.get("objective")
+            detector = settings.get("detector")
+            logger.info(f"Looking up calibration for modality={modality}, objective={objective}, detector={detector}")
+
             jai_calibration = load_jai_calibration_from_imageprocessing(
                 config_path=Path(yaml_file_path),
                 per_angle=True,
+                modality=modality,
+                objective=objective,
+                detector=detector,
                 logger=logger,
             )
             if jai_calibration:
