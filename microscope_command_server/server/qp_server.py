@@ -1359,6 +1359,8 @@ def handle_client(conn, addr):
                             # --max_gain_db, --gain_threshold, --max_iterations, --calibrate_black_level
                             flags = [
                                 "--yaml",
+                                "--objective",
+                                "--detector",
                                 "--output",
                                 "--camera",
                                 "--positive_exp",
@@ -1407,6 +1409,10 @@ def handle_client(conn, addr):
 
                                     if flag == "--yaml":
                                         params["yaml_file_path"] = value
+                                    elif flag == "--objective":
+                                        params["objective"] = value
+                                    elif flag == "--detector":
+                                        params["detector"] = value
                                     elif flag == "--output":
                                         params["output_folder_path"] = value
                                     elif flag == "--camera":
@@ -1557,13 +1563,14 @@ def handle_client(conn, addr):
 
                                 # Update imageprocessing config for each angle
                                 if "yaml_file_path" in params:
-                                    # Get objective/detector from settings for imaging_profiles update
-                                    wb_objective = None
-                                    wb_detector = None
-                                    if hasattr(hardware, 'settings') and hardware.settings:
-                                        wb_objective = hardware.settings.get("objective_in_use") or hardware.settings.get("objective")
-                                        wb_detector = hardware.settings.get("detector_in_use") or hardware.settings.get("detector")
-                                        logger.info(f"WB calibration: using objective={wb_objective}, detector={wb_detector}")
+                                    # Get objective/detector from command params (preferred) or hardware.settings (fallback)
+                                    wb_objective = params.get("objective")
+                                    wb_detector = params.get("detector")
+                                    if not wb_objective or not wb_detector:
+                                        if hasattr(hardware, 'settings') and hardware.settings:
+                                            wb_objective = wb_objective or hardware.settings.get("objective_in_use") or hardware.settings.get("objective")
+                                            wb_detector = wb_detector or hardware.settings.get("detector_in_use") or hardware.settings.get("detector")
+                                    logger.info(f"WB calibration: saving to imaging_profiles with objective={wb_objective}, detector={wb_detector}")
 
                                     for angle_name, result in results.items():
                                         calibrator.update_imageprocessing_config(
