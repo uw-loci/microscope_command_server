@@ -2248,6 +2248,147 @@ def acquire_background_with_biref_matching(
     return best_image, best_exposure, best_biref
 
 
+def acquire_background_with_per_channel_adaptive(
+    hardware: PycromanagerHardware,
+    initial_exposures: Dict[str, float],
+    target_intensity: float = 200.0,
+    tolerance: float = 2.5,
+    max_iterations: int = 10,
+    logger=None,
+) -> Tuple[np.ndarray, Dict[str, float]]:
+    """
+    Acquire background image using per-channel exposure mode with adaptive scaling.
+
+    Unlike acquire_background_with_target_intensity which uses a single exposure,
+    this function maintains per-channel exposure ratios (for white balance) while
+    scaling all channels proportionally to reach the target intensity.
+
+    Args:
+        hardware: Microscope hardware interface
+        initial_exposures: Dict with 'r', 'g', 'b' exposure values in ms
+                          e.g., {'r': 45.0, 'g': 50.0, 'b': 55.0}
+        target_intensity: Target median grayscale value (0-255)
+        tolerance: Acceptable deviation from target (default +/-2.5)
+        max_iterations: Maximum adjustment iterations
+        logger: Logger instance for tracking convergence
+
+    Returns:
+        Tuple of (image, final_exposures)
+            image: Acquired image at target intensity
+            final_exposures: Dict with final per-channel exposures {'r': x, 'g': y, 'b': z}
+
+    Raises:
+        RuntimeError: If image acquisition fails
+    """
+    try:
+        from microscope_control.jai import JAICameraProperties
+    except ImportError:
+        if logger:
+            logger.warning("JAI camera module not available - falling back to single exposure")
+        # Fall back to regular adaptive exposure
+        image, final_exp = acquire_background_with_target_intensity(
+            hardware=hardware,
+            target_intensity=target_intensity,
+            tolerance=tolerance,
+            initial_exposure_ms=initial_exposures.get('g', 100.0),
+            max_iterations=max_iterations,
+            logger=logger,
+        )
+        return image, {'r': final_exp, 'g': final_exp, 'b': final_exp}
+
+    # Exposure bounds
+    MIN_EXPOSURE_MS = 0.01
+    MAX_EXPOSURE_MS = 5000.0
+
+    # Get initial per-channel exposures
+    exp_r = max(MIN_EXPOSURE_MS, initial_exposures.get('r', 50.0))
+    exp_g = max(MIN_EXPOSURE_MS, initial_exposures.get('g', 50.0))
+    exp_b = max(MIN_EXPOSURE_MS, initial_exposures.get('b', 50.0))
+
+    # Calculate ratios relative to green (reference channel)
+    ratio_r = exp_r / exp_g
+    ratio_b = exp_b / exp_g
+
+    jai_props = JAICameraProperties(hardware.core)
+
+    if logger:
+        logger.info(
+            f"Starting per-channel adaptive exposure: target={target_intensity:.1f}, "
+            f"initial R={exp_r:.1f}ms, G={exp_g:.1f}ms, B={exp_b:.1f}ms"
+        )
+        logger.info(f"  Channel ratios (R:G:B) = {ratio_r:.3f}:1.000:{ratio_b:.3f}")
+
+    # Apply initial per-channel exposures
+    jai_props.set_channel_exposures(red=exp_r, green=exp_g, blue=exp_b, auto_enable=True)
+
+    last_image = None
+    last_exposures = {'r': exp_r, 'g': exp_g, 'b': exp_b}
+
+    for iteration in range(max_iterations):
+        # Snap image
+        image, metadata = hardware.snap_image()
+
+        if image is None:
+            raise RuntimeError(f"Failed to acquire image at iteration {iteration}")
+
+        # Calculate median intensity
+        median_intensity = float(np.median(image))
+
+        last_image = image
+        last_exposures = {'r': exp_r, 'g': exp_g, 'b': exp_b}
+
+        if logger:
+            logger.info(
+                f"  Iteration {iteration + 1}/{max_iterations}: "
+                f"median={median_intensity:.1f}, G_exp={exp_g:.1f}ms"
+            )
+
+        # Check convergence
+        if abs(median_intensity - target_intensity) <= tolerance:
+            if logger:
+                logger.info(
+                    f"Converged! Final: median={median_intensity:.1f}, "
+                    f"R={exp_r:.1f}ms, G={exp_g:.1f}ms, B={exp_b:.1f}ms"
+                )
+            return image, {'r': exp_r, 'g': exp_g, 'b': exp_b}
+
+        # Calculate scale factor
+        if median_intensity >= 254.0:
+            # Saturated - reduce aggressively
+            scale = 0.5
+            if logger:
+                logger.warning(f"    Image saturated, halving exposures")
+        elif median_intensity > 0:
+            scale = target_intensity / median_intensity
+        else:
+            # Black image - increase
+            scale = 2.0
+            if logger:
+                logger.warning(f"    Image black, doubling exposures")
+
+        # Scale all channel exposures proportionally (maintaining ratios)
+        exp_g = max(MIN_EXPOSURE_MS, min(MAX_EXPOSURE_MS, exp_g * scale))
+        exp_r = max(MIN_EXPOSURE_MS, min(MAX_EXPOSURE_MS, exp_g * ratio_r))
+        exp_b = max(MIN_EXPOSURE_MS, min(MAX_EXPOSURE_MS, exp_g * ratio_b))
+
+        if logger:
+            logger.info(
+                f"    Scaled exposures: R={exp_r:.1f}ms, G={exp_g:.1f}ms, B={exp_b:.1f}ms"
+            )
+
+        # Apply scaled per-channel exposures
+        jai_props.set_channel_exposures(red=exp_r, green=exp_g, blue=exp_b, auto_enable=True)
+
+    # Max iterations reached
+    if logger:
+        logger.warning(
+            f"Did not converge after {max_iterations} iterations. "
+            f"Using last image: median={float(np.median(last_image)):.1f}"
+        )
+
+    return last_image, last_exposures
+
+
 def simple_background_collection(
     yaml_file_path: str,
     output_folder_path: str,
@@ -2372,61 +2513,126 @@ def simple_background_collection(
                 )  # Each background is independent
                 logger.info(f"Set angle to {angle}")
 
-            # Apply per-angle white balance calibration if available
-            if jai_calibration and use_per_angle_wb:
-                wb_applied = apply_jai_calibration_for_angle(
-                    hardware=hardware,
-                    jai_calibration=jai_calibration,
-                    angle=angle,
-                    per_angle=True,
-                    logger=logger,
-                )
-                if wb_applied:
-                    logger.info(f"Applied per-angle white balance for angle {angle}")
-                else:
-                    logger.warning(f"Failed to apply white balance for angle {angle}")
-
-            # Use exposure from client as initial value for adaptive exposure
+            # Get initial exposure from client
             initial_exposure_ms = exposures[angle_idx] if angle_idx < len(exposures) else 100.0
             logger.info(f"Initial exposure from client: {initial_exposure_ms:.2f}ms")
 
-            # For negative polarization angles, use biref-matching against positive angle
-            paired_positive = abs(angle)  # e.g., -7 pairs with 7
-            if angle < 0 and angle != -90:  # Negative polarization angle (not -90 brightfield)
-                if paired_positive in biref_pair_references:
-                    # Use biref-matching: minimize sum of abs channel differences
-                    reference_image = biref_pair_references[paired_positive]
-                    logger.info(
-                        f"Biref pair matching: minimizing biref metric against +{paired_positive} reference"
-                    )
-                    try:
-                        image, final_exposure, achieved_biref = acquire_background_with_biref_matching(
-                            hardware=hardware,
-                            reference_image=reference_image,
-                            tolerance=5.0,  # Target mean biref <= 5
-                            initial_exposure_ms=initial_exposure_ms,
-                            max_iterations=10,
-                            logger=logger,
-                        )
-                        actual_intensity = float(np.median(image))
-                        logger.info(
-                            f"Acquired background: shape={image.shape}, "
-                            f"achieved_biref={achieved_biref:.1f}, median={actual_intensity:.1f}, "
-                            f"final_exposure={final_exposure:.1f}ms"
-                        )
-                        final_exposures[angle] = final_exposure
-                        achieved_intensities[angle] = actual_intensity
-                    except RuntimeError as e:
-                        logger.error(f"Failed to acquire background at angle {angle}: {e}")
-                        continue
+            # Choose acquisition method based on white balance mode
+            if jai_calibration and use_per_angle_wb:
+                # Per-angle white balance mode: use per-channel adaptive exposure
+                # This maintains the R:G:B ratio while scaling to target intensity
+                angle_mapping = {90.0: "uncrossed", 0.0: "crossed", 7.0: "positive", -7.0: "negative"}
+                angle_name = angle_mapping.get(angle)
+                if not angle_name:
+                    for a, name in angle_mapping.items():
+                        if abs(a - angle) < 1.0:
+                            angle_name = name
+                            break
+
+                if angle_name and "angles" in jai_calibration:
+                    angle_cal = jai_calibration["angles"].get(angle_name)
+                    if angle_cal and "exposures_ms" in angle_cal:
+                        per_channel_exp = angle_cal["exposures_ms"]
+                        target_intensity = get_target_intensity_for_background(modality, angle)
+                        logger.info(f"Using per-channel adaptive exposure for angle {angle}")
+                        logger.info(f"  Initial R={per_channel_exp.get('r', 50):.1f}ms, "
+                                   f"G={per_channel_exp.get('g', 50):.1f}ms, B={per_channel_exp.get('b', 50):.1f}ms")
+                        try:
+                            image, final_per_channel = acquire_background_with_per_channel_adaptive(
+                                hardware=hardware,
+                                initial_exposures=per_channel_exp,
+                                target_intensity=target_intensity,
+                                tolerance=2.5,
+                                max_iterations=10,
+                                logger=logger,
+                            )
+                            actual_intensity = float(np.median(image))
+                            # Store green channel as reference exposure for compatibility
+                            final_exposures[angle] = final_per_channel.get('g', 100.0)
+                            achieved_intensities[angle] = actual_intensity
+                            logger.info(
+                                f"Acquired background: shape={image.shape}, median={actual_intensity:.1f}"
+                            )
+
+                            # Store reference for biref pair matching
+                            if angle > 0 and angle != 90:
+                                biref_pair_references[angle] = image.copy()
+                                logger.info(f"Stored +{angle} image as reference for birefringence pair matching")
+                        except RuntimeError as e:
+                            logger.error(f"Failed to acquire background at angle {angle}: {e}")
+                            continue
+                    else:
+                        logger.warning(f"No calibration for angle {angle_name}, falling back to standard mode")
+                        # Fall through to standard acquisition below
+                        jai_calibration = None  # Disable for this angle
                 else:
-                    # Positive angle hasn't been acquired yet - fall back to intensity matching
-                    logger.warning(
-                        f"Biref pair matching: +{paired_positive} not yet acquired. "
-                        f"For best results, acquire positive angles before negative. "
-                        f"Falling back to intensity-based matching."
-                    )
+                    logger.warning(f"Unknown angle {angle}, falling back to standard mode")
+                    jai_calibration = None  # Disable for this angle
+
+            # Standard acquisition mode (no per-angle white balance or fallback)
+            if not (jai_calibration and use_per_angle_wb):
+                # For negative polarization angles, use biref-matching against positive angle
+                paired_positive = abs(angle)  # e.g., -7 pairs with 7
+                if angle < 0 and angle != -90:  # Negative polarization angle (not -90 brightfield)
+                    if paired_positive in biref_pair_references:
+                        # Use biref-matching: minimize sum of abs channel differences
+                        reference_image = biref_pair_references[paired_positive]
+                        logger.info(
+                            f"Biref pair matching: minimizing biref metric against +{paired_positive} reference"
+                        )
+                        try:
+                            image, final_exposure, achieved_biref = acquire_background_with_biref_matching(
+                                hardware=hardware,
+                                reference_image=reference_image,
+                                tolerance=5.0,  # Target mean biref <= 5
+                                initial_exposure_ms=initial_exposure_ms,
+                                max_iterations=10,
+                                logger=logger,
+                            )
+                            actual_intensity = float(np.median(image))
+                            logger.info(
+                                f"Acquired background: shape={image.shape}, "
+                                f"achieved_biref={achieved_biref:.1f}, median={actual_intensity:.1f}, "
+                                f"final_exposure={final_exposure:.1f}ms"
+                            )
+                            final_exposures[angle] = final_exposure
+                            achieved_intensities[angle] = actual_intensity
+                        except RuntimeError as e:
+                            logger.error(f"Failed to acquire background at angle {angle}: {e}")
+                            continue
+                    else:
+                        # Positive angle hasn't been acquired yet - fall back to intensity matching
+                        logger.warning(
+                            f"Biref pair matching: +{paired_positive} not yet acquired. "
+                            f"For best results, acquire positive angles before negative. "
+                            f"Falling back to intensity-based matching."
+                        )
+                        target_intensity = get_target_intensity_for_background(modality, angle)
+                        try:
+                            image, final_exposure = acquire_background_with_target_intensity(
+                                hardware=hardware,
+                                target_intensity=target_intensity,
+                                tolerance=2.5,
+                                initial_exposure_ms=initial_exposure_ms,
+                                max_iterations=10,
+                                logger=logger,
+                            )
+                            actual_intensity = float(np.median(image))
+                            logger.info(
+                                f"Acquired background: shape={image.shape}, "
+                                f"median={actual_intensity:.1f}, "
+                                f"final_exposure={final_exposure:.1f}ms"
+                            )
+                            final_exposures[angle] = final_exposure
+                            achieved_intensities[angle] = actual_intensity
+                        except RuntimeError as e:
+                            logger.error(f"Failed to acquire background at angle {angle}: {e}")
+                            continue
+                else:
+                    # Non-biref angles (0, 90, positive angles): use standard intensity matching
                     target_intensity = get_target_intensity_for_background(modality, angle)
+                    logger.info(f"Target intensity: {target_intensity:.1f}")
+
                     try:
                         image, final_exposure = acquire_background_with_target_intensity(
                             hardware=hardware,
@@ -2438,47 +2644,21 @@ def simple_background_collection(
                         )
                         actual_intensity = float(np.median(image))
                         logger.info(
-                            f"Acquired background: shape={image.shape}, "
-                            f"median={actual_intensity:.1f}, "
+                            f"Acquired background: shape={image.shape}, median={actual_intensity:.1f}, "
                             f"final_exposure={final_exposure:.1f}ms"
                         )
                         final_exposures[angle] = final_exposure
                         achieved_intensities[angle] = actual_intensity
+
+                        # Store reference image for positive polarization angles
+                        # This will be used by paired negative angles for biref matching
+                        if angle > 0 and angle != 90:  # Positive polarization angles (not brightfield)
+                            biref_pair_references[angle] = image.copy()
+                            logger.info(
+                                f"Stored +{angle} image as reference for birefringence pair matching"
+                            )
                     except RuntimeError as e:
                         logger.error(f"Failed to acquire background at angle {angle}: {e}")
-                        continue
-            else:
-                # Non-biref angles (0, 90, positive angles): use standard intensity matching
-                target_intensity = get_target_intensity_for_background(modality, angle)
-                logger.info(f"Target intensity: {target_intensity:.1f}")
-
-                try:
-                    image, final_exposure = acquire_background_with_target_intensity(
-                        hardware=hardware,
-                        target_intensity=target_intensity,
-                        tolerance=2.5,
-                        initial_exposure_ms=initial_exposure_ms,
-                        max_iterations=10,
-                        logger=logger,
-                    )
-                    actual_intensity = float(np.median(image))
-                    logger.info(
-                        f"Acquired background: shape={image.shape}, median={actual_intensity:.1f}, "
-                        f"final_exposure={final_exposure:.1f}ms"
-                    )
-                    final_exposures[angle] = final_exposure
-                    achieved_intensities[angle] = actual_intensity
-
-                    # Store reference image for positive polarization angles
-                    # This will be used by paired negative angles for biref matching
-                    if angle > 0 and angle != 90:  # Positive polarization angles (not brightfield)
-                        biref_pair_references[angle] = image.copy()
-                        logger.info(
-                            f"Stored +{angle} image as reference for birefringence pair matching"
-                        )
-                except RuntimeError as e:
-                    logger.error(f"Failed to acquire background at angle {angle}: {e}")
-                    continue
 
             # Save background image using new format: angle.tif (not in subdirectory)
             background_path = output_path / f"{angle}.tif"
