@@ -2607,22 +2607,32 @@ def simple_background_collection(
                     angle_cal = jai_calibration["angles"].get(angle_name)
                     if angle_cal and "exposures_ms" in angle_cal:
                         per_channel_exp = angle_cal["exposures_ms"]
-                        target_intensity = get_target_intensity_for_background(modality, angle)
-                        logger.info(f"Using per-channel adaptive exposure for angle {angle}")
-                        logger.info(f"  Initial R={per_channel_exp.get('r', 50):.1f}ms, "
+                        # Per-angle white balance: use calibrated exposures DIRECTLY
+                        # No adaptive adjustment - the calibration already determined the
+                        # correct per-channel exposures for white balance at a specific intensity
+                        logger.info(f"Applying calibrated per-channel exposures for angle {angle}")
+                        logger.info(f"  R={per_channel_exp.get('r', 50):.1f}ms, "
                                    f"G={per_channel_exp.get('g', 50):.1f}ms, B={per_channel_exp.get('b', 50):.1f}ms")
                         try:
-                            image, final_per_channel = acquire_background_with_per_channel_adaptive(
-                                hardware=hardware,
-                                initial_exposures=per_channel_exp,
-                                target_intensity=target_intensity,
-                                tolerance=2.5,
-                                max_iterations=10,
-                                logger=logger,
+                            from microscope_control.jai import JAICameraProperties
+                            jai_props = JAICameraProperties(hardware.core)
+
+                            # Apply the calibrated per-channel exposures
+                            jai_props.set_channel_exposures(
+                                red=per_channel_exp.get('r', 50.0),
+                                green=per_channel_exp.get('g', 50.0),
+                                blue=per_channel_exp.get('b', 50.0),
+                                auto_enable=True,
                             )
+
+                            # Capture single image with calibrated settings
+                            image, metadata = hardware.snap_image()
+                            if image is None:
+                                raise RuntimeError("Failed to acquire image")
+
                             actual_intensity = float(np.median(image))
                             # Store green channel as reference exposure for compatibility
-                            final_exposures[angle] = final_per_channel.get('g', 100.0)
+                            final_exposures[angle] = per_channel_exp.get('g', 100.0)
                             achieved_intensities[angle] = actual_intensity
                             logger.info(
                                 f"Acquired background: shape={image.shape}, median={actual_intensity:.1f}"
@@ -2632,6 +2642,9 @@ def simple_background_collection(
                             if angle > 0 and angle != 90:
                                 biref_pair_references[angle] = image.copy()
                                 logger.info(f"Stored +{angle} image as reference for birefringence pair matching")
+                        except ImportError:
+                            logger.warning("JAI camera module not available, falling back to standard mode")
+                            jai_calibration = None
                         except RuntimeError as e:
                             logger.error(f"Failed to acquire background at angle {angle}: {e}")
                             continue
