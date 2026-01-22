@@ -2512,7 +2512,7 @@ def simple_background_collection(
 
             # If not in settings, try to extract from output path
             if not detector or not objective:
-                path_parts = output_path.parts
+                path_parts = Path(output_folder_path).parts
                 # Look for detector pattern (LOCI_DETECTOR_*)
                 for i, part in enumerate(path_parts):
                     if part.startswith("LOCI_DETECTOR_"):
