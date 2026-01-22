@@ -1157,11 +1157,14 @@ def handle_client(conn, addr):
                             # Parse the message
                             params = {}
 
-                            # Parse flags: --yaml, --output, --camera, --exposure,
-                            #              --target, --tolerance, --max_gain_db,
-                            #              --gain_threshold, --max_iterations, --calibrate_black_level
+                            # Parse flags: --yaml, --objective, --detector, --output,
+                            #              --camera, --exposure, --target, --tolerance,
+                            #              --max_gain_db, --gain_threshold,
+                            #              --max_iterations, --calibrate_black_level
                             flags = [
                                 "--yaml",
+                                "--objective",
+                                "--detector",
                                 "--output",
                                 "--camera",
                                 "--exposure",
@@ -1199,6 +1202,10 @@ def handle_client(conn, addr):
 
                                     if flag == "--yaml":
                                         params["yaml_file_path"] = value
+                                    elif flag == "--objective":
+                                        params["objective"] = value
+                                    elif flag == "--detector":
+                                        params["detector"] = value
                                     elif flag == "--output":
                                         params["output_folder_path"] = value
                                     elif flag == "--camera":
@@ -1261,10 +1268,19 @@ def handle_client(conn, addr):
 
                                 # Update imageprocessing config if yaml path provided
                                 if "yaml_file_path" in params:
+                                    wb_objective = params.get("objective")
+                                    wb_detector = params.get("detector")
+                                    logger.info(
+                                        f"Simple WB: saving config with objective={wb_objective}, "
+                                        f"detector={wb_detector}"
+                                    )
                                     calibrator.update_imageprocessing_config(
                                         config_path=Path(params["yaml_file_path"]),
                                         result=result,
                                         calibration_type="simple",
+                                        modality="ppm",
+                                        objective=wb_objective,
+                                        detector=wb_detector,
                                     )
 
                                 # Format response
