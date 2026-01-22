@@ -2625,6 +2625,29 @@ def simple_background_collection(
                                 auto_enable=True,
                             )
 
+                            # Apply calibrated per-channel gains (gain compensation)
+                            # When exposure ratio exceeds threshold, calibration reduces
+                            # the longest exposure and compensates with analog gain
+                            if "gains" in angle_cal:
+                                per_channel_gains = angle_cal["gains"]
+                                jai_props.set_analog_gains(
+                                    red=per_channel_gains.get('r', 1.0),
+                                    green=per_channel_gains.get('g', 1.0),
+                                    blue=per_channel_gains.get('b', 1.0),
+                                    auto_enable=True,
+                                )
+                                logger.info(
+                                    f"  Applied calibrated gains: "
+                                    f"R={per_channel_gains.get('r', 1.0):.3f}x, "
+                                    f"G={per_channel_gains.get('g', 1.0):.3f}x, "
+                                    f"B={per_channel_gains.get('b', 1.0):.3f}x"
+                                )
+                            else:
+                                # No gain compensation needed - reset to unity
+                                jai_props.set_analog_gains(
+                                    red=1.0, green=1.0, blue=1.0, auto_enable=True
+                                )
+
                             # Capture single image with calibrated settings
                             image, metadata = hardware.snap_image()
                             if image is None:
@@ -2759,6 +2782,19 @@ def simple_background_collection(
 
             # Update progress
             update_progress(angle_idx + 1, total_images)
+
+        # Reset per-channel gains to unity after background collection
+        # so subsequent operations don't inherit angle-specific gain settings
+        if jai_calibration and use_per_angle_wb:
+            try:
+                from microscope_control.jai import JAICameraProperties
+                jai_props = JAICameraProperties(hardware.core)
+                jai_props.set_analog_gains(
+                    red=1.0, green=1.0, blue=1.0, auto_enable=True
+                )
+                logger.info("Reset analog gains to unity after background collection")
+            except (ImportError, Exception) as e:
+                logger.warning(f"Could not reset gains: {e}")
 
         logger.info("=== SIMPLE BACKGROUND COLLECTION COMPLETE ===")
         logger.info(f"Successfully collected {len(angles)} background images")
