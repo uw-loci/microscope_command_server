@@ -2504,9 +2504,37 @@ def simple_background_collection(
         # Load JAI white balance calibration if per-angle mode requested
         jai_calibration = None
         if use_per_angle_wb:
-            # Get objective and detector from settings for calibration lookup
-            objective = settings.get("objective")
-            detector = settings.get("detector")
+            # Get objective and detector from settings or parse from output path
+            # Output path structure: {base}/{detector}/{modality}/{magnification}
+            # e.g., D:\data\background_tiles\LOCI_DETECTOR_JAI_001\ppm\20x
+            objective = settings.get("objective_in_use") or settings.get("objective")
+            detector = settings.get("detector_in_use") or settings.get("detector")
+
+            # If not in settings, try to extract from output path
+            if not detector or not objective:
+                path_parts = output_path.parts
+                # Look for detector pattern (LOCI_DETECTOR_*)
+                for i, part in enumerate(path_parts):
+                    if part.startswith("LOCI_DETECTOR_"):
+                        detector = part
+                        # Magnification is typically 2 parts after detector (detector/modality/mag)
+                        if i + 2 < len(path_parts):
+                            magnification = path_parts[i + 2]  # e.g., "20x"
+                            # Find matching objective in imaging_profiles
+                            try:
+                                with open(Path(yaml_file_path).parent / f"imageprocessing_{Path(yaml_file_path).stem.replace('config_', '')}.yml", "r") as f:
+                                    ip_data = yaml.safe_load(f) or {}
+                                modality_profiles = ip_data.get("imaging_profiles", {}).get(modality, {})
+                                for obj_name in modality_profiles.keys():
+                                    # Match magnification in objective name (e.g., "20X" in "LOCI_OBJECTIVE_OLYMPUS_20X_POL_001")
+                                    if magnification.upper().replace("X", "") in obj_name.upper():
+                                        objective = obj_name
+                                        logger.info(f"Matched objective {objective} from magnification {magnification}")
+                                        break
+                            except Exception as e:
+                                logger.warning(f"Failed to find objective from path: {e}")
+                        break
+
             logger.info(f"Looking up calibration for modality={modality}, objective={objective}, detector={detector}")
 
             jai_calibration = load_jai_calibration_from_imageprocessing(
