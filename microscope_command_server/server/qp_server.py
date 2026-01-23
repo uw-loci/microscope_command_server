@@ -1127,7 +1127,7 @@ def handle_client(conn, addr):
                         jai_props = JAICameraProperties(hardware.core)
                         jai_props.disable_individual_exposure()
                         jai_props.disable_individual_gain()
-                        jai_props.set_analog_gains(red=1.0, green=1.0, blue=1.0)
+                        jai_props.set_analog_gains(red=1.0, green=1.0, blue=1.0, auto_enable=False)
                         logger.debug("Reset per-channel mode after WBCALIBR")
                     except (ImportError, Exception):
                         pass
@@ -1346,7 +1346,7 @@ def handle_client(conn, addr):
                         jai_props = JAICameraProperties(hardware.core)
                         jai_props.disable_individual_exposure()
                         jai_props.disable_individual_gain()
-                        jai_props.set_analog_gains(red=1.0, green=1.0, blue=1.0)
+                        jai_props.set_analog_gains(red=1.0, green=1.0, blue=1.0, auto_enable=False)
                         logger.debug("Reset per-channel mode after WBSIMPLE")
                     except (ImportError, Exception):
                         pass
@@ -1680,7 +1680,7 @@ def handle_client(conn, addr):
                         jai_props = JAICameraProperties(hardware.core)
                         jai_props.disable_individual_exposure()
                         jai_props.disable_individual_gain()
-                        jai_props.set_analog_gains(red=1.0, green=1.0, blue=1.0)
+                        jai_props.set_analog_gains(red=1.0, green=1.0, blue=1.0, auto_enable=False)
                         logger.debug("Reset per-channel mode after WBPPM")
                     except (ImportError, Exception):
                         pass
@@ -1778,7 +1778,7 @@ def handle_client(conn, addr):
                                     jai_props = JAICameraProperties(hardware.core)
                                     jai_props.disable_individual_exposure()
                                     jai_props.disable_individual_gain()
-                                    jai_props.set_analog_gains(red=1.0, green=1.0, blue=1.0)
+                                    jai_props.set_analog_gains(red=1.0, green=1.0, blue=1.0, auto_enable=False)
                                 except (ImportError, Exception):
                                     pass  # Not a JAI camera or module not available
 

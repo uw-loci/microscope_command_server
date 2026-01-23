@@ -1141,7 +1141,7 @@ def _acquisition_workflow(
                         jai_props = JAICameraProperties(hardware.core)
                         jai_props.disable_individual_exposure()
                         jai_props.disable_individual_gain()
-                        jai_props.set_analog_gains(red=1.0, green=1.0, blue=1.0)
+                        jai_props.set_analog_gains(red=1.0, green=1.0, blue=1.0, auto_enable=False)
                         logger.info("Disabled per-channel mode and reset gains for pre-acquisition autofocus")
                     except (ImportError, Exception) as e:
                         logger.debug(f"Could not reset per-channel mode: {e}")
@@ -1306,7 +1306,7 @@ def _acquisition_workflow(
                             jai_props = JAICameraProperties(hardware.core)
                             jai_props.disable_individual_exposure()
                             jai_props.disable_individual_gain()
-                            jai_props.set_analog_gains(red=1.0, green=1.0, blue=1.0)
+                            jai_props.set_analog_gains(red=1.0, green=1.0, blue=1.0, auto_enable=False)
                         except (ImportError, Exception) as e:
                             logger.debug(f"Could not reset per-channel mode: {e}")
 
@@ -1534,7 +1534,7 @@ def _acquisition_workflow(
                                 jai_props = JAICameraProperties(hardware.core)
                                 jai_props.disable_individual_exposure()
                                 jai_props.disable_individual_gain()
-                                jai_props.set_analog_gains(red=1.0, green=1.0, blue=1.0)
+                                jai_props.set_analog_gains(red=1.0, green=1.0, blue=1.0, auto_enable=False)
                             except (ImportError, Exception):
                                 pass
                             exposure_ms = params["exposures"][angle_idx]
@@ -2127,7 +2127,7 @@ def acquire_background_with_target_intensity(
         jai_props = JAICameraProperties(hardware.core)
         jai_props.disable_individual_exposure()
         jai_props.disable_individual_gain()
-        jai_props.set_analog_gains(red=1.0, green=1.0, blue=1.0)
+        jai_props.set_analog_gains(red=1.0, green=1.0, blue=1.0, auto_enable=False)
     except (ImportError, Exception):
         pass  # Not a JAI camera or module not available
 
@@ -2266,7 +2266,7 @@ def acquire_background_with_biref_matching(
         jai_props = JAICameraProperties(hardware.core)
         jai_props.disable_individual_exposure()
         jai_props.disable_individual_gain()
-        jai_props.set_analog_gains(red=1.0, green=1.0, blue=1.0)
+        jai_props.set_analog_gains(red=1.0, green=1.0, blue=1.0, auto_enable=False)
     except (ImportError, Exception):
         pass  # Not a JAI camera or module not available
 
@@ -2889,7 +2889,7 @@ def simple_background_collection(
                 jai_props = JAICameraProperties(hardware.core)
                 jai_props.disable_individual_exposure()
                 jai_props.disable_individual_gain()
-                jai_props.set_analog_gains(red=1.0, green=1.0, blue=1.0)
+                jai_props.set_analog_gains(red=1.0, green=1.0, blue=1.0, auto_enable=False)
                 logger.info("Disabled per-channel mode and reset gains after background collection")
             except (ImportError, Exception) as e:
                 logger.warning(f"Could not reset per-channel mode: {e}")
