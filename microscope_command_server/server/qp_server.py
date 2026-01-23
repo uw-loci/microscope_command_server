@@ -1120,6 +1120,17 @@ def handle_client(conn, addr):
                     conn.sendall(f"FAILED:{str(e)}".encode())
                 finally:
                     conn.settimeout(None)  # Reset to blocking mode
+                    # Reset per-channel mode so subsequent operations (autofocus,
+                    # SNAP, acquisition) can use unified set_exposure() correctly
+                    try:
+                        from microscope_control.jai import JAICameraProperties
+                        jai_props = JAICameraProperties(hardware.core)
+                        jai_props.disable_individual_exposure()
+                        jai_props.disable_individual_gain()
+                        jai_props.set_analog_gains(red=1.0, green=1.0, blue=1.0)
+                        logger.debug("Reset per-channel mode after WBCALIBR")
+                    except (ImportError, Exception):
+                        pass
 
                 continue
 
@@ -1328,6 +1339,17 @@ def handle_client(conn, addr):
                     conn.sendall(f"FAILED:{str(e)}".encode())
                 finally:
                     conn.settimeout(None)  # Reset to blocking mode
+                    # Reset per-channel mode so subsequent operations can use
+                    # unified set_exposure() correctly
+                    try:
+                        from microscope_control.jai import JAICameraProperties
+                        jai_props = JAICameraProperties(hardware.core)
+                        jai_props.disable_individual_exposure()
+                        jai_props.disable_individual_gain()
+                        jai_props.set_analog_gains(red=1.0, green=1.0, blue=1.0)
+                        logger.debug("Reset per-channel mode after WBSIMPLE")
+                    except (ImportError, Exception):
+                        pass
 
                 continue
 
@@ -1651,6 +1673,17 @@ def handle_client(conn, addr):
                     conn.sendall(f"FAILED:{str(e)}".encode())
                 finally:
                     conn.settimeout(None)  # Reset to blocking mode
+                    # Reset per-channel mode so subsequent operations can use
+                    # unified set_exposure() correctly
+                    try:
+                        from microscope_control.jai import JAICameraProperties
+                        jai_props = JAICameraProperties(hardware.core)
+                        jai_props.disable_individual_exposure()
+                        jai_props.disable_individual_gain()
+                        jai_props.set_analog_gains(red=1.0, green=1.0, blue=1.0)
+                        logger.debug("Reset per-channel mode after WBPPM")
+                    except (ImportError, Exception):
+                        pass
 
                 continue
 
@@ -1735,6 +1768,19 @@ def handle_client(conn, addr):
 
                                 # Create output directory if needed
                                 output_path.parent.mkdir(parents=True, exist_ok=True)
+
+                                # Ensure per-channel mode is disabled before using
+                                # unified set_exposure(). If per-channel mode is active
+                                # (e.g., from a previous WB calibration), set_exposure()
+                                # would be silently ignored.
+                                try:
+                                    from microscope_control.jai import JAICameraProperties
+                                    jai_props = JAICameraProperties(hardware.core)
+                                    jai_props.disable_individual_exposure()
+                                    jai_props.disable_individual_gain()
+                                    jai_props.set_analog_gains(red=1.0, green=1.0, blue=1.0)
+                                except (ImportError, Exception):
+                                    pass  # Not a JAI camera or module not available
 
                                 # Set exposure (fixed - no adaptive adjustment!)
                                 hardware.set_exposure(exposure_ms)

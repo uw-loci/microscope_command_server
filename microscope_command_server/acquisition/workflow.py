@@ -1525,7 +1525,18 @@ def _acquisition_workflow(
                             logger=logger,
                         )
                         if not applied and angle_idx < len(params["exposures"]):
-                            # Fall back to single exposure if JAI calibration failed
+                            # Fall back to single exposure if JAI calibration failed.
+                            # Must disable per-channel mode first - a previous angle's
+                            # successful apply_jai_calibration_for_angle may have enabled it,
+                            # which would cause this set_exposure() to be silently ignored.
+                            try:
+                                from microscope_control.jai import JAICameraProperties
+                                jai_props = JAICameraProperties(hardware.core)
+                                jai_props.disable_individual_exposure()
+                                jai_props.disable_individual_gain()
+                                jai_props.set_analog_gains(red=1.0, green=1.0, blue=1.0)
+                            except (ImportError, Exception):
+                                pass
                             exposure_ms = params["exposures"][angle_idx]
                             hardware.set_exposure(exposure_ms)
                             logger.info(f"  JAI calibration failed, using single exposure: {exposure_ms}ms")
@@ -2108,6 +2119,18 @@ def acquire_background_with_target_intensity(
     MIN_EXPOSURE_MS = 0.0001
     MAX_EXPOSURE_MS = 5000.0
 
+    # Ensure per-channel mode is disabled before using unified set_exposure().
+    # If per-channel mode is active (from calibration or previous operations),
+    # hardware.set_exposure() would be silently ignored.
+    try:
+        from microscope_control.jai import JAICameraProperties
+        jai_props = JAICameraProperties(hardware.core)
+        jai_props.disable_individual_exposure()
+        jai_props.disable_individual_gain()
+        jai_props.set_analog_gains(red=1.0, green=1.0, blue=1.0)
+    except (ImportError, Exception):
+        pass  # Not a JAI camera or module not available
+
     # Set initial exposure
     current_exposure = max(MIN_EXPOSURE_MS, min(MAX_EXPOSURE_MS, initial_exposure_ms))
     hardware.set_exposure(current_exposure)
@@ -2236,6 +2259,16 @@ def acquire_background_with_biref_matching(
     """
     MIN_EXPOSURE_MS = 0.0001
     MAX_EXPOSURE_MS = 5000.0
+
+    # Ensure per-channel mode is disabled before using unified set_exposure()
+    try:
+        from microscope_control.jai import JAICameraProperties
+        jai_props = JAICameraProperties(hardware.core)
+        jai_props.disable_individual_exposure()
+        jai_props.disable_individual_gain()
+        jai_props.set_analog_gains(red=1.0, green=1.0, blue=1.0)
+    except (ImportError, Exception):
+        pass  # Not a JAI camera or module not available
 
     current_exposure = max(MIN_EXPOSURE_MS, min(MAX_EXPOSURE_MS, initial_exposure_ms))
     hardware.set_exposure(current_exposure)
@@ -2845,18 +2878,21 @@ def simple_background_collection(
             # Update progress
             update_progress(angle_idx + 1, total_images)
 
-        # Reset per-channel gains to unity after background collection
-        # so subsequent operations don't inherit angle-specific gain settings
+        # Reset per-channel mode and gains after background collection
+        # so subsequent operations don't inherit angle-specific settings.
+        # CRITICAL: Must disable per-channel mode entirely, not just reset values.
+        # If per-channel exposure mode stays active, subsequent set_exposure() calls
+        # (e.g., autofocus) will be silently ignored.
         if jai_calibration and use_per_angle_wb:
             try:
                 from microscope_control.jai import JAICameraProperties
                 jai_props = JAICameraProperties(hardware.core)
-                jai_props.set_analog_gains(
-                    red=1.0, green=1.0, blue=1.0, auto_enable=True
-                )
-                logger.info("Reset analog gains to unity after background collection")
+                jai_props.disable_individual_exposure()
+                jai_props.disable_individual_gain()
+                jai_props.set_analog_gains(red=1.0, green=1.0, blue=1.0)
+                logger.info("Disabled per-channel mode and reset gains after background collection")
             except (ImportError, Exception) as e:
-                logger.warning(f"Could not reset gains: {e}")
+                logger.warning(f"Could not reset per-channel mode: {e}")
 
         logger.info("=== SIMPLE BACKGROUND COLLECTION COMPLETE ===")
         logger.info(f"Successfully collected {len(angles)} background images")
