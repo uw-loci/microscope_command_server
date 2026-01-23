@@ -227,18 +227,20 @@ def apply_jai_calibration_for_angle(
             f"R={exposures.get('r'):.1f}ms, G={exposures.get('g'):.1f}ms, B={exposures.get('b'):.1f}ms"
         )
 
-        # Apply per-channel gains if calibration required gain compensation
+        # Apply per-channel gains - ALWAYS set them to ensure previous angle's gains
+        # don't persist. Without this, a crossed angle's B=2.8x gain would carry over
+        # to the next tile's uncrossed angle, causing washed-out images.
         gain_r = gains.get("r", 1.0)
         gain_g = gains.get("g", 1.0)
         gain_b = gains.get("b", 1.0)
 
+        jai_props.set_analog_gains(
+            red=gain_r,
+            green=gain_g,
+            blue=gain_b,
+            auto_enable=True,  # Automatically enable individual gain mode
+        )
         if gain_r != 1.0 or gain_g != 1.0 or gain_b != 1.0:
-            jai_props.set_analog_gains(
-                red=gain_r,
-                green=gain_g,
-                blue=gain_b,
-                auto_enable=True,  # Automatically enable individual gain mode
-            )
             exp_msg += f" | Gains: R={gain_r:.3f}, G={gain_g:.3f}, B={gain_b:.3f}"
 
         if logger:
@@ -1573,8 +1575,11 @@ def _acquisition_workflow(
                         )
 
                     # ======= APPLY WHITE BALANCE (STEP 2) =======
-                    if white_balance_enabled:
-                        # Use pre-configured white balance values
+                    # Skip software WB when hardware WB (JAI per-channel exposures) is active.
+                    # Hardware WB already balances the channels via different exposure times;
+                    # applying software RGB multipliers on top would double-correct.
+                    if white_balance_enabled and jai_calibration is None:
+                        # Use pre-configured white balance values (software-only mode)
                         if angle in angles_wb:
                             wb_profile = angles_wb[angle]
                         else:
@@ -1591,7 +1596,11 @@ def _acquisition_workflow(
                         )
                         t_wb = log_timing(logger, f"White balance at {angle}deg", t_wb)
                         logger.info(
-                            f"  Applied white balance: R={wb_profile[0]:.2f}, G={wb_profile[1]:.2f}, B={wb_profile[2]:.2f}"
+                            f"  Applied software white balance: R={wb_profile[0]:.2f}, G={wb_profile[1]:.2f}, B={wb_profile[2]:.2f}"
+                        )
+                    elif white_balance_enabled and jai_calibration is not None:
+                        logger.info(
+                            f"  Software WB skipped (hardware per-channel WB active for {angle} deg)"
                         )
 
                     # Save processed image
