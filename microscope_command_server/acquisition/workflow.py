@@ -1434,6 +1434,23 @@ def _acquisition_workflow(
                     else:
                         logger.warning(f"Could not find suitable position to defer autofocus to")
 
+                # Restore per-channel exposure/gain mode after autofocus.
+                # Autofocus disabled per-channel mode to use unified exposure.
+                # Re-enable now and apply first angle's calibration to ensure the camera
+                # is in a known-good state before the angle loop starts.
+                if jai_calibration is not None and params["angles"]:
+                    first_angle = params["angles"][0]
+                    logger.info(f"Restoring per-channel WB mode after autofocus (first angle: {first_angle})")
+                    applied = apply_jai_calibration_for_angle(
+                        hardware=hardware,
+                        jai_calibration=jai_calibration,
+                        angle=first_angle,
+                        per_angle=white_balance_per_angle,
+                        logger=logger,
+                    )
+                    if not applied:
+                        logger.warning("Failed to restore per-channel mode after autofocus")
+
             # Collect stage position for this tile (after autofocus, before acquiring angles)
             # This captures the actual XYZ used for acquisition
             current_stage_pos = hardware.get_current_position()
