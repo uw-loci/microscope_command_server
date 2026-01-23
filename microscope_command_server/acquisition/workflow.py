@@ -860,15 +860,21 @@ def _acquisition_workflow(
         # This is separate from software white balance (RGB multipliers applied post-capture)
         jai_calibration = None
         if white_balance_enabled:
+            # Extract base modality for YAML lookup (e.g., "ppm" from "ppm_20x_1")
+            base_modality = params["scan_type"].split("_")[0].lower()
             jai_calibration = load_jai_calibration_from_imageprocessing(
                 config_path=Path(params["yaml_file_path"]),
                 per_angle=white_balance_per_angle,
+                modality=base_modality,
+                objective=params.get("objective"),
+                detector=params.get("detector"),
                 logger=logger,
             )
             if jai_calibration:
                 logger.info(
                     f"JAI hardware white balance enabled "
-                    f"({'per-angle' if white_balance_per_angle else 'simple'} mode)"
+                    f"({'per-angle' if white_balance_per_angle else 'simple'} mode) "
+                    f"for {base_modality}/{params.get('objective')}/{params.get('detector')}"
                 )
             else:
                 logger.info("No JAI calibration found - using software white balance")
