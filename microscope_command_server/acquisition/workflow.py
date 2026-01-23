@@ -1130,6 +1130,22 @@ def _acquisition_workflow(
                     angle_idx = params["angles"].index(90.0)
                     if angle_idx < len(params["exposures"]):
                         exposure_90 = params["exposures"][angle_idx]
+
+                # Disable per-channel exposure/gain mode before autofocus
+                # Camera may still have per-channel mode active from a previous
+                # acquisition, which causes set_exposure() to be ignored.
+                # Also reset gains to unity so autofocus sees a neutral image.
+                if jai_calibration is not None:
+                    try:
+                        from microscope_control.jai import JAICameraProperties
+                        jai_props = JAICameraProperties(hardware.core)
+                        jai_props.disable_individual_exposure()
+                        jai_props.disable_individual_gain()
+                        jai_props.set_analog_gains(red=1.0, green=1.0, blue=1.0)
+                        logger.info("Disabled per-channel mode and reset gains for pre-acquisition autofocus")
+                    except (ImportError, Exception) as e:
+                        logger.debug(f"Could not reset per-channel mode: {e}")
+
                 hardware.set_exposure(exposure_90)
                 logger.info(f"Set exposure to {exposure_90}ms for initial autofocus")
 
@@ -1282,13 +1298,15 @@ def _acquisition_workflow(
 
                     # Disable per-channel exposure/gain mode before autofocus
                     # The previous tile's acquisition may have left per-channel mode active,
-                    # which would cause set_exposure() to be ignored
+                    # which would cause set_exposure() to be ignored.
+                    # Also reset gains to unity so autofocus sees a neutral image.
                     if jai_calibration is not None:
                         try:
                             from microscope_control.jai import JAICameraProperties
                             jai_props = JAICameraProperties(hardware.core)
                             jai_props.disable_individual_exposure()
                             jai_props.disable_individual_gain()
+                            jai_props.set_analog_gains(red=1.0, green=1.0, blue=1.0)
                         except (ImportError, Exception) as e:
                             logger.debug(f"Could not reset per-channel mode: {e}")
 
