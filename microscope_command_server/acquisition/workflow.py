@@ -1278,6 +1278,18 @@ def _acquisition_workflow(
                         if angle_idx < len(params["exposures"]):
                             exposure_90 = params["exposures"][angle_idx]
 
+                    # Disable per-channel exposure/gain mode before autofocus
+                    # The previous tile's acquisition may have left per-channel mode active,
+                    # which would cause set_exposure() to be ignored
+                    if jai_calibration is not None:
+                        try:
+                            from microscope_control.jai import JAICameraProperties
+                            jai_props = JAICameraProperties(hardware.core)
+                            jai_props.disable_individual_exposure()
+                            jai_props.disable_individual_gain()
+                        except (ImportError, Exception) as e:
+                            logger.debug(f"Could not reset per-channel mode: {e}")
+
                     t_exp = time.perf_counter()
                     hardware.set_exposure(exposure_90)
                     t_exp = log_timing(logger, "Set exposure for tissue detection", t_exp)
