@@ -2596,9 +2596,26 @@ def simple_background_collection(
             hardware._initialize_microscope_methods()
             logger.info("Re-initialized hardware methods with updated settings")
 
-        # Load JAI white balance calibration if per-angle mode requested
+        # Auto-detect JAI camera and load calibration automatically
+        # For JAI cameras, per-channel white balance is REQUIRED for correct flat-field correction
+        # because JAI uses different per-channel exposures for each angle during acquisition.
+        # If backgrounds are captured without matching these exposures, flat-field correction
+        # will over/under-correct the images.
         jai_calibration = None
-        if use_per_angle_wb:
+        is_jai_camera = False
+        try:
+            camera_device = hardware.core.get_camera_device()
+            camera_name = hardware.core.get_property(camera_device, "Description") if camera_device else ""
+            is_jai_camera = "JAI" in camera_name.upper()
+            logger.info(f"Camera detected: {camera_name} (JAI={is_jai_camera})")
+        except Exception as e:
+            logger.debug(f"Could not detect camera type: {e}")
+
+        # For JAI cameras, ALWAYS try to load calibration (ignore use_per_angle_wb flag)
+        # For non-JAI cameras, only load if use_per_angle_wb is explicitly requested
+        should_load_calibration = is_jai_camera or use_per_angle_wb
+
+        if should_load_calibration:
             # Get objective and detector from settings or parse from output path
             # Output path structure: {base}/{detector}/{modality}/{magnification}
             # e.g., D:\data\background_tiles\LOCI_DETECTOR_JAI_001\ppm\20x
@@ -2642,8 +2659,21 @@ def simple_background_collection(
             )
             if jai_calibration:
                 logger.info("Per-angle white balance calibration loaded for background collection")
+                if is_jai_camera:
+                    # For JAI cameras, we WILL use the calibration regardless of use_per_angle_wb
+                    # This is intentional - JAI requires per-channel exposures for correct backgrounds
+                    if not use_per_angle_wb:
+                        logger.info("JAI camera detected: automatically enabling per-channel WB for background collection")
+                    use_per_angle_wb = True  # Force enable for JAI cameras with calibration
             else:
-                logger.warning("Per-angle white balance requested but no calibration found")
+                if is_jai_camera:
+                    logger.warning(
+                        "JAI camera detected but no calibration found! "
+                        "Backgrounds may not match acquisition conditions. "
+                        "Run 'White Balance Calibration' first for best results."
+                    )
+                else:
+                    logger.warning("Per-angle white balance requested but no calibration found")
 
         # Get current position for reference
         current_pos = hardware.get_current_position()
