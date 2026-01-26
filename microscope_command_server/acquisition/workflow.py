@@ -2562,6 +2562,16 @@ def simple_background_collection(
     logger.info("=== SIMPLE BACKGROUND COLLECTION STARTED ===")
 
     try:
+        # Stop live mode if running - JAI camera properties cannot be changed during live streaming
+        # This is the same pattern used in calibration.py
+        try:
+            if hardware.core.is_sequence_running():
+                if hardware.studio is not None:
+                    hardware.studio.live().set_live_mode(False)
+                    logger.info("Stopped live mode before background collection")
+        except Exception as e:
+            logger.warning(f"Could not check/stop live mode: {e}")
+
         # Parse angles and exposures from client
         # Use client's exposures as initial values for adaptive exposure
         angles, exposures = parse_angles_exposures(angles_str, exposures_str)
