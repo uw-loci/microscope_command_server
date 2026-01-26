@@ -2768,10 +2768,13 @@ def simple_background_collection(
                                     f"B={per_channel_gains.get('b', 1.0):.3f}x"
                                 )
                             else:
-                                # No gain compensation needed - reset to unity
-                                jai_props.set_analog_gains(
-                                    red=1.0, green=1.0, blue=1.0, auto_enable=True
-                                )
+                                # No gain compensation needed - DISABLE individual gain mode
+                                # to match the state during WB calibration (which didn't
+                                # enable gain mode for angles without compensation).
+                                # CRITICAL: Enabling individual gain mode with unity gains
+                                # behaves differently than disabled gain mode on JAI cameras!
+                                jai_props.disable_individual_gain()
+                                logger.info("  No gain compensation - disabled individual gain mode")
 
                             # Capture single image with calibrated settings
                             image, metadata = hardware.snap_image()
@@ -2782,9 +2785,21 @@ def simple_background_collection(
                             # Store green channel as reference exposure for compatibility
                             final_exposures[angle] = per_channel_exp.get('g', 100.0)
                             achieved_intensities[angle] = actual_intensity
-                            logger.info(
-                                f"Acquired background: shape={image.shape}, median={actual_intensity:.1f}"
-                            )
+
+                            # Log per-channel intensities for WB verification
+                            if image.ndim == 3 and image.shape[2] >= 3:
+                                r_mean = float(np.mean(image[:, :, 0]))
+                                g_mean = float(np.mean(image[:, :, 1]))
+                                b_mean = float(np.mean(image[:, :, 2]))
+                                logger.info(
+                                    f"Acquired background: shape={image.shape}, "
+                                    f"R={r_mean:.1f}, G={g_mean:.1f}, B={b_mean:.1f} "
+                                    f"(median={actual_intensity:.1f})"
+                                )
+                            else:
+                                logger.info(
+                                    f"Acquired background: shape={image.shape}, median={actual_intensity:.1f}"
+                                )
 
                             # Store reference for biref pair matching
                             if angle > 0 and angle != 90:
