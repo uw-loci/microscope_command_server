@@ -877,11 +877,11 @@ def _acquisition_workflow(
         white_balance_per_angle = params.get("white_balance_per_angle", False)
 
         # Auto-detect JAI camera - JAI requires per-channel exposures for correct color
-        # This is the same pattern used in background collection
+        # Use "Core.Camera" property - this reliably contains "JAI" for JAI cameras
+        # Note: get_property(camera_device, "Description") does NOT work reliably
         is_jai_camera = False
         try:
-            camera_device = hardware.core.get_camera_device()
-            camera_name = hardware.core.get_property(camera_device, "Description") if camera_device else ""
+            camera_name = hardware.core.get_property("Core", "Camera")
             is_jai_camera = "JAI" in camera_name.upper()
             if is_jai_camera:
                 logger.info(f"JAI camera detected: {camera_name}")
@@ -2658,8 +2658,9 @@ def simple_background_collection(
         jai_calibration = None
         is_jai_camera = False
         try:
-            camera_device = hardware.core.get_camera_device()
-            camera_name = hardware.core.get_property(camera_device, "Description") if camera_device else ""
+            # Use "Core.Camera" property - this reliably contains "JAI" for JAI cameras
+            # Note: get_property(camera_device, "Description") does NOT work reliably
+            camera_name = hardware.core.get_property("Core", "Camera")
             is_jai_camera = "JAI" in camera_name.upper()
             logger.info(f"Camera detected: {camera_name} (JAI={is_jai_camera})")
         except Exception as e:
