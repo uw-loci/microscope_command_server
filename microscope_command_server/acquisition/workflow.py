@@ -215,33 +215,42 @@ def apply_jai_calibration_for_angle(
 
         # Apply per-channel exposures
         jai_props = JAICameraProperties(hardware.core)
+        exp_r = exposures.get("r", 50.0)
+        exp_g = exposures.get("g", 50.0)
+        exp_b = exposures.get("b", 50.0)
         jai_props.set_channel_exposures(
-            red=exposures.get("r", 50.0),
-            green=exposures.get("g", 50.0),
-            blue=exposures.get("b", 50.0),
+            red=exp_r,
+            green=exp_g,
+            blue=exp_b,
             auto_enable=True,  # Automatically enable individual exposure mode
         )
 
-        exp_msg = (
-            f"Applied JAI calibration for angle {angle}: "
-            f"R={exposures.get('r'):.1f}ms, G={exposures.get('g'):.1f}ms, B={exposures.get('b'):.1f}ms"
-        )
+        exp_msg = f"Applied JAI calibration for angle {angle}: R={exp_r:.1f}ms, G={exp_g:.1f}ms, B={exp_b:.1f}ms"
 
-        # Apply per-channel gains - ALWAYS set them to ensure previous angle's gains
-        # don't persist. Without this, a crossed angle's B=2.8x gain would carry over
-        # to the next tile's uncrossed angle, causing washed-out images.
+        # Apply per-channel gains only if non-unity (same logic as background collection)
+        # CRITICAL: Enabling individual gain mode with unity gains behaves DIFFERENTLY
+        # than having gain mode disabled on JAI cameras!
         gain_r = gains.get("r", 1.0)
         gain_g = gains.get("g", 1.0)
         gain_b = gains.get("b", 1.0)
 
-        jai_props.set_analog_gains(
-            red=gain_r,
-            green=gain_g,
-            blue=gain_b,
-            auto_enable=True,  # Automatically enable individual gain mode
+        has_gain_compensation = (
+            abs(gain_r - 1.0) > 0.01 or
+            abs(gain_g - 1.0) > 0.01 or
+            abs(gain_b - 1.0) > 0.01
         )
-        if gain_r != 1.0 or gain_g != 1.0 or gain_b != 1.0:
+
+        if has_gain_compensation:
+            jai_props.set_analog_gains(
+                red=gain_r,
+                green=gain_g,
+                blue=gain_b,
+                auto_enable=True,
+            )
             exp_msg += f" | Gains: R={gain_r:.3f}, G={gain_g:.3f}, B={gain_b:.3f}"
+        else:
+            # No gain compensation - disable individual gain mode
+            jai_props.disable_individual_gain()
 
         if logger:
             logger.info(exp_msg)
@@ -698,6 +707,15 @@ def _acquisition_workflow(
     logger.info(f"=== ACQUISITION WORKFLOW STARTED for client {client_addr} ===")
 
     try:
+        # Stop live mode if running - JAI camera properties cannot be changed during live streaming
+        try:
+            if hardware.core.is_sequence_running():
+                if hardware.studio is not None:
+                    hardware.studio.live().set_live_mode(False)
+                    logger.info("Stopped live mode before acquisition")
+        except Exception as e:
+            logger.warning(f"Could not check/stop live mode: {e}")
+
         # Parse the acquisition parameters
         params = parse_acquisition_message(message)
 
@@ -858,27 +876,53 @@ def _acquisition_workflow(
         angles_wb = {}
         white_balance_per_angle = params.get("white_balance_per_angle", False)
 
+        # Auto-detect JAI camera - JAI requires per-channel exposures for correct color
+        # This is the same pattern used in background collection
+        is_jai_camera = False
+        try:
+            camera_device = hardware.core.get_camera_device()
+            camera_name = hardware.core.get_property(camera_device, "Description") if camera_device else ""
+            is_jai_camera = "JAI" in camera_name.upper()
+            if is_jai_camera:
+                logger.info(f"JAI camera detected: {camera_name}")
+        except Exception as e:
+            logger.debug(f"Could not detect camera type: {e}")
+
         # Load JAI hardware white balance calibration (per-channel exposures)
         # This is separate from software white balance (RGB multipliers applied post-capture)
         jai_calibration = None
         if white_balance_enabled:
             # Extract base modality for YAML lookup (e.g., "ppm" from "ppm_20x_1")
             base_modality = params["scan_type"].split("_")[0].lower()
+
+            # For JAI cameras, ALWAYS try to load per-angle calibration
+            # because JAI uses different per-channel exposures for each angle
+            load_per_angle = white_balance_per_angle or is_jai_camera
+
             jai_calibration = load_jai_calibration_from_imageprocessing(
                 config_path=Path(params["yaml_file_path"]),
-                per_angle=white_balance_per_angle,
+                per_angle=load_per_angle,
                 modality=base_modality,
                 objective=params.get("objective"),
                 detector=params.get("detector"),
                 logger=logger,
             )
             if jai_calibration:
+                # For JAI cameras with calibration, force per-angle mode
+                if is_jai_camera and not white_balance_per_angle:
+                    logger.info("JAI camera detected: automatically enabling per-channel WB for acquisition")
+                    white_balance_per_angle = True
                 logger.info(
                     f"JAI hardware white balance enabled "
                     f"({'per-angle' if white_balance_per_angle else 'simple'} mode) "
                     f"for {base_modality}/{params.get('objective')}/{params.get('detector')}"
                 )
             else:
+                if is_jai_camera:
+                    logger.warning(
+                        "JAI camera detected but no calibration found! "
+                        "Run 'White Balance Calibration' for proper color balance."
+                    )
                 logger.info("No JAI calibration found - using software white balance")
 
         if white_balance_enabled:
