@@ -2753,19 +2753,31 @@ def simple_background_collection(
                             # Apply calibrated per-channel gains (gain compensation)
                             # When exposure ratio exceeds threshold, calibration reduces
                             # the longest exposure and compensates with analog gain
-                            if "gains" in angle_cal:
-                                per_channel_gains = angle_cal["gains"]
+                            per_channel_gains = angle_cal.get("gains", {})
+                            gain_r = per_channel_gains.get('r', 1.0)
+                            gain_g = per_channel_gains.get('g', 1.0)
+                            gain_b = per_channel_gains.get('b', 1.0)
+
+                            # Check if any gain is non-unity (needs compensation)
+                            # Just checking for "gains" key isn't enough - unity gains
+                            # may be saved even when no compensation was actually used
+                            has_gain_compensation = (
+                                abs(gain_r - 1.0) > 0.01 or
+                                abs(gain_g - 1.0) > 0.01 or
+                                abs(gain_b - 1.0) > 0.01
+                            )
+
+                            if has_gain_compensation:
+                                # Enable individual gain mode and apply non-unity gains
                                 jai_props.set_analog_gains(
-                                    red=per_channel_gains.get('r', 1.0),
-                                    green=per_channel_gains.get('g', 1.0),
-                                    blue=per_channel_gains.get('b', 1.0),
+                                    red=gain_r,
+                                    green=gain_g,
+                                    blue=gain_b,
                                     auto_enable=True,
                                 )
                                 logger.info(
                                     f"  Applied calibrated gains: "
-                                    f"R={per_channel_gains.get('r', 1.0):.3f}x, "
-                                    f"G={per_channel_gains.get('g', 1.0):.3f}x, "
-                                    f"B={per_channel_gains.get('b', 1.0):.3f}x"
+                                    f"R={gain_r:.3f}x, G={gain_g:.3f}x, B={gain_b:.3f}x"
                                 )
                             else:
                                 # No gain compensation needed - DISABLE individual gain mode
