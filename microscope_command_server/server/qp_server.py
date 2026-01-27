@@ -2705,6 +2705,245 @@ def handle_client(conn, addr):
 
                 continue
 
+            # ==================== Camera Control Commands ====================
+
+            # GETCAM - Get camera name from Core
+            if data == ExtendedCommand.GETCAM:
+                logger.debug(f"Client {addr} requested camera name")
+                try:
+                    camera_name = hardware.core.get_property("Core", "Camera")
+                    # Pad or truncate to 32 bytes
+                    camera_name_bytes = camera_name.encode("utf-8")[:32].ljust(32, b"\x00")
+                    conn.sendall(camera_name_bytes)
+                    logger.info(f"Sent camera name to {addr}: {camera_name}")
+                except Exception as e:
+                    logger.error(f"Failed to get camera name: {e}")
+                    # Send error response (32 bytes, starts with ERROR)
+                    error_msg = f"ERROR:{str(e)[:23]}"
+                    conn.sendall(error_msg.encode("utf-8").ljust(32, b"\x00"))
+                continue
+
+            # GETMODE - Get exposure/gain mode flags (individual vs unified)
+            if data == ExtendedCommand.GETMODE:
+                logger.debug(f"Client {addr} requested camera mode flags")
+                try:
+                    # Try to get JAI camera properties
+                    from microscope_control.jai import JAICameraProperties
+                    jai_props = JAICameraProperties(hardware.core)
+
+                    # Check if JAI camera is active
+                    if jai_props.validate_camera():
+                        exp_individual = jai_props.is_individual_exposure_enabled()
+                        gain_individual = jai_props.is_individual_gain_enabled()
+                        # Response: "JAI_EXP:X_GAIN:Y" padded to 16 bytes
+                        # X = 1 for individual, 0 for unified
+                        mode_str = f"JAI_EXP:{1 if exp_individual else 0}_GAIN:{1 if gain_individual else 0}"
+                        conn.sendall(mode_str.encode("utf-8").ljust(16, b"\x00"))
+                        logger.info(f"Sent JAI mode flags: exp_ind={exp_individual}, gain_ind={gain_individual}")
+                    else:
+                        # Not a JAI camera - return unified mode indicator
+                        conn.sendall(b"UNIFIED_________")
+                        logger.info("Non-JAI camera - sent UNIFIED mode")
+                except ImportError:
+                    # JAI module not available - assume unified mode
+                    conn.sendall(b"UNIFIED_________")
+                    logger.info("JAI module not available - sent UNIFIED mode")
+                except Exception as e:
+                    logger.error(f"Failed to get camera mode: {e}")
+                    error_msg = f"ERROR:{str(e)[:8]}"
+                    conn.sendall(error_msg.encode("utf-8").ljust(16, b"\x00"))
+                continue
+
+            # SETMODE - Set exposure/gain mode flags
+            if data == ExtendedCommand.SETMODE:
+                logger.debug(f"Client {addr} requested to set camera mode")
+                try:
+                    # Read 2 bytes: [exp_mode, gain_mode]
+                    mode_bytes = conn.recv(2)
+                    if len(mode_bytes) != 2:
+                        raise ValueError("Expected 2 bytes for mode flags")
+
+                    exp_individual = mode_bytes[0] == 1
+                    gain_individual = mode_bytes[1] == 1
+                    logger.info(f"Setting mode: exp_individual={exp_individual}, gain_individual={gain_individual}")
+
+                    from microscope_control.jai import JAICameraProperties
+                    jai_props = JAICameraProperties(hardware.core)
+
+                    if not jai_props.validate_camera():
+                        raise RuntimeError("JAI camera not active - cannot set individual mode")
+
+                    if exp_individual:
+                        jai_props.enable_individual_exposure()
+                    else:
+                        jai_props.disable_individual_exposure()
+
+                    if gain_individual:
+                        jai_props.enable_individual_gain()
+                    else:
+                        jai_props.disable_individual_gain()
+
+                    conn.sendall(b"ACK_____")
+                    logger.info("Camera mode set successfully")
+                except ImportError:
+                    conn.sendall(b"ERR_NJAI")
+                    logger.error("JAI module not available")
+                except Exception as e:
+                    logger.error(f"Failed to set camera mode: {e}")
+                    conn.sendall(b"ERR_MODE")
+                continue
+
+            # GETEXP - Get exposure values (unified or per-channel RGB)
+            if data == ExtendedCommand.GETEXP:
+                logger.debug(f"Client {addr} requested exposure values")
+                try:
+                    from microscope_control.jai import JAICameraProperties
+                    jai_props = JAICameraProperties(hardware.core)
+
+                    if jai_props.validate_camera() and jai_props.is_individual_exposure_enabled():
+                        # JAI with individual exposures - return 4 floats (all, R, G, B)
+                        exposures = jai_props.get_channel_exposures()
+                        # Get unified exposure as well for "all" value
+                        all_exp = hardware.core.get_exposure()
+                        response = struct.pack("!ffff",
+                            float(all_exp),
+                            float(exposures["red"]),
+                            float(exposures["green"]),
+                            float(exposures["blue"]))
+                        conn.sendall(response)
+                        logger.info(f"Sent per-channel exposures: all={all_exp}, R={exposures['red']}, G={exposures['green']}, B={exposures['blue']}")
+                    else:
+                        # Unified exposure - return 1 float
+                        exposure = hardware.core.get_exposure()
+                        response = struct.pack("!f", float(exposure))
+                        conn.sendall(response)
+                        logger.info(f"Sent unified exposure: {exposure}")
+                except ImportError:
+                    # JAI module not available - get unified exposure
+                    exposure = hardware.core.get_exposure()
+                    response = struct.pack("!f", float(exposure))
+                    conn.sendall(response)
+                    logger.info(f"Sent unified exposure (no JAI): {exposure}")
+                except Exception as e:
+                    logger.error(f"Failed to get exposure: {e}")
+                    # Send error as negative value
+                    conn.sendall(struct.pack("!f", -1.0))
+                continue
+
+            # SETEXP - Set exposure values
+            if data == ExtendedCommand.SETEXP:
+                logger.debug(f"Client {addr} requested to set exposure")
+                try:
+                    # Read count byte first
+                    count_byte = conn.recv(1)
+                    count = count_byte[0]
+                    logger.debug(f"SETEXP: expecting {count} exposure values")
+
+                    # Read float values
+                    float_data = conn.recv(count * 4)
+                    if len(float_data) != count * 4:
+                        raise ValueError(f"Expected {count * 4} bytes, got {len(float_data)}")
+
+                    exposures = struct.unpack(f"!{'f' * count}", float_data)
+                    logger.info(f"Setting exposures: {exposures}")
+
+                    if count == 1:
+                        # Unified exposure
+                        hardware.set_exposure(exposures[0])
+                        logger.info(f"Set unified exposure to {exposures[0]} ms")
+                    elif count >= 3:
+                        # Per-channel exposures (R, G, B)
+                        from microscope_control.jai import JAICameraProperties
+                        jai_props = JAICameraProperties(hardware.core)
+                        jai_props.set_channel_exposures(
+                            red=exposures[0],
+                            green=exposures[1],
+                            blue=exposures[2],
+                            auto_enable=True
+                        )
+                        logger.info(f"Set per-channel exposures: R={exposures[0]}, G={exposures[1]}, B={exposures[2]}")
+
+                    conn.sendall(b"ACK_____")
+                except ImportError:
+                    conn.sendall(b"ERR_NJAI")
+                    logger.error("JAI module not available for per-channel exposure")
+                except Exception as e:
+                    logger.error(f"Failed to set exposure: {e}")
+                    conn.sendall(b"ERR_EXPO")
+                continue
+
+            # GETGAIN - Get gain values (unified or per-channel RGB)
+            if data == ExtendedCommand.GETGAIN:
+                logger.debug(f"Client {addr} requested gain values")
+                try:
+                    from microscope_control.jai import JAICameraProperties
+                    jai_props = JAICameraProperties(hardware.core)
+
+                    if jai_props.validate_camera() and jai_props.is_individual_gain_enabled():
+                        # JAI with individual gains - return 3 floats (R, G, B analog gains)
+                        gains = jai_props.get_analog_gains()
+                        response = struct.pack("!fff",
+                            float(gains["red"]),
+                            float(gains["green"]),
+                            float(gains["blue"]))
+                        conn.sendall(response)
+                        logger.info(f"Sent per-channel gains: R={gains['red']}, G={gains['green']}, B={gains['blue']}")
+                    else:
+                        # Unified gain - return single value (default 1.0)
+                        response = struct.pack("!f", 1.0)
+                        conn.sendall(response)
+                        logger.info("Sent unified gain (1.0)")
+                except ImportError:
+                    # JAI module not available - return default
+                    response = struct.pack("!f", 1.0)
+                    conn.sendall(response)
+                    logger.info("Sent default gain (no JAI): 1.0")
+                except Exception as e:
+                    logger.error(f"Failed to get gain: {e}")
+                    conn.sendall(struct.pack("!f", -1.0))
+                continue
+
+            # SETGAIN - Set gain values
+            if data == ExtendedCommand.SETGAIN:
+                logger.debug(f"Client {addr} requested to set gain")
+                try:
+                    # Read count byte first
+                    count_byte = conn.recv(1)
+                    count = count_byte[0]
+                    logger.debug(f"SETGAIN: expecting {count} gain values")
+
+                    # Read float values
+                    float_data = conn.recv(count * 4)
+                    if len(float_data) != count * 4:
+                        raise ValueError(f"Expected {count * 4} bytes, got {len(float_data)}")
+
+                    gains = struct.unpack(f"!{'f' * count}", float_data)
+                    logger.info(f"Setting gains: {gains}")
+
+                    if count == 1:
+                        # Unified gain - not directly supported by hardware
+                        logger.info(f"Unified gain {gains[0]} - no hardware action (software gain only)")
+                    elif count >= 3:
+                        # Per-channel analog gains (R, G, B)
+                        from microscope_control.jai import JAICameraProperties
+                        jai_props = JAICameraProperties(hardware.core)
+                        jai_props.set_analog_gains(
+                            red=gains[0],
+                            green=gains[1],
+                            blue=gains[2],
+                            auto_enable=True
+                        )
+                        logger.info(f"Set per-channel analog gains: R={gains[0]}, G={gains[1]}, B={gains[2]}")
+
+                    conn.sendall(b"ACK_____")
+                except ImportError:
+                    conn.sendall(b"ERR_NJAI")
+                    logger.error("JAI module not available for per-channel gain")
+                except Exception as e:
+                    logger.error(f"Failed to set gain: {e}")
+                    conn.sendall(b"ERR_GAIN")
+                continue
+
             # Legacy GET/SET commands (not implemented)
             if data == ExtendedCommand.GET:
                 logger.debug("GET property not yet implemented")

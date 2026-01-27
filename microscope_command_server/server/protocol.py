@@ -70,3 +70,12 @@ class ExtendedCommand:
     WBCALIBR = b"wbcalibr"  # White Balance Calibration for JAI camera (legacy)
     WBSIMPLE = b"wbsimple"  # Simple White Balance at single exposure
     WBPPM = b"wbppm___"  # PPM White Balance at 4 angles (padded to 8 bytes)
+
+    # Camera Control Commands (for Camera Control dialog)
+    GETCAM = b"getcam__"  # Get camera name from Core
+    GETMODE = b"getmode_"  # Get exposure/gain mode flags (individual vs unified)
+    SETMODE = b"setmode_"  # Set exposure/gain mode flags
+    GETEXP = b"getexp__"  # Get exposure values (unified or per-channel RGB)
+    SETEXP = b"setexp__"  # Set exposure values
+    GETGAIN = b"getgain_"  # Get gain values (unified or per-channel RGB)
+    SETGAIN = b"setgain_"  # Set gain values
