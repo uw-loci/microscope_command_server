@@ -64,6 +64,8 @@ def run_starburst_calibration(
         logger = logging.getLogger(__name__)
 
     warnings_list = []
+    image_path = None
+    mask_path = None
 
     # Generate calibration name if not provided
     if calibration_name is None:
@@ -97,7 +99,14 @@ def run_starburst_calibration(
         _save_calibration_image(image, image_path, logger)
         logger.info(f"Saved calibration image: {image_path}")
 
-        # Step 4: Run calibration using ppm_library
+        # Step 4: Save debug mask for troubleshooting (before calibration attempt)
+        # This helps users understand what the thresholds are detecting
+        mask_filename = f"{calibration_name}_mask.png"
+        mask_path = output_path / mask_filename
+        _save_debug_mask(image, saturation_threshold, value_threshold, mask_path, logger)
+        logger.info(f"Saved detection mask: {mask_path}")
+
+        # Step 5: Run calibration using ppm_library
         logger.info("Running SunburstCalibrator...")
         try:
             from ppm_library.calibration import SunburstCalibrator
@@ -106,6 +115,8 @@ def run_starburst_calibration(
             return {
                 "success": False,
                 "error": f"ppm_library not available: {e}",
+                "image_path": str(image_path),
+                "mask_path": str(mask_path),
                 "warnings": warnings_list,
             }
 
@@ -139,13 +150,13 @@ def run_starburst_calibration(
             warnings_list.append(warning)
             logger.warning(warning)
 
-        # Step 5: Save calibration file (NPZ)
+        # Step 6: Save calibration file (NPZ)
         calibration_filename = f"{calibration_name}.npz"
         calibration_path = output_path / calibration_filename
         result.save(str(calibration_path))
         logger.info(f"Saved calibration: {calibration_path}")
 
-        # Step 6: Create and save calibration plot
+        # Step 7: Create and save calibration plot
         plot_filename = f"{calibration_name}_plot.png"
         plot_path = output_path / plot_filename
         _create_calibration_plot(image, result, calibrator, plot_path, logger)
@@ -159,6 +170,7 @@ def run_starburst_calibration(
             "plot_path": str(plot_path),
             "calibration_path": str(calibration_path),
             "image_path": str(image_path),
+            "mask_path": str(mask_path),
             "warnings": warnings_list,
         }
 
@@ -167,6 +179,8 @@ def run_starburst_calibration(
         return {
             "success": False,
             "error": f"File not found: {e}",
+            "image_path": str(image_path) if image_path else None,
+            "mask_path": str(mask_path) if mask_path else None,
             "warnings": warnings_list,
         }
     except ValueError as e:
@@ -174,6 +188,8 @@ def run_starburst_calibration(
         return {
             "success": False,
             "error": f"Calibration failed: {e}",
+            "image_path": str(image_path) if image_path else None,
+            "mask_path": str(mask_path) if mask_path else None,
             "warnings": warnings_list,
         }
     except Exception as e:
@@ -181,6 +197,8 @@ def run_starburst_calibration(
         return {
             "success": False,
             "error": f"Unexpected error: {e}",
+            "image_path": str(image_path) if image_path else None,
+            "mask_path": str(mask_path) if mask_path else None,
             "warnings": warnings_list,
         }
 
@@ -269,6 +287,116 @@ def _get_calibration_exposure(hardware, modality: str, logger) -> float:
     except Exception as e:
         logger.warning(f"Error getting exposure from settings: {e}, using default {default_exposure}ms")
         return default_exposure
+
+
+def _save_debug_mask(
+    image: np.ndarray,
+    saturation_threshold: float,
+    value_threshold: float,
+    output_path: Path,
+    logger,
+) -> None:
+    """
+    Save a debug visualization of the foreground detection mask.
+
+    This creates a side-by-side comparison showing:
+    - Original image
+    - Foreground mask (what the thresholds detect)
+    - Overlay of mask on original
+
+    Helps users troubleshoot when rectangle detection fails.
+
+    Args:
+        image: Original RGB image
+        saturation_threshold: HSV saturation threshold used
+        value_threshold: HSV value threshold used
+        output_path: Path to save the debug image
+        logger: Logger instance
+    """
+    try:
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+        from skimage import color, morphology
+        from scipy import ndimage
+
+        # Convert to HSV
+        if image.dtype != np.uint8:
+            if image.max() <= 1.0:
+                img_uint8 = (image * 255).astype(np.uint8)
+            else:
+                img_uint8 = image.astype(np.uint8)
+        else:
+            img_uint8 = image
+
+        hsv = color.rgb2hsv(img_uint8)
+        saturation = hsv[:, :, 1]
+        value = hsv[:, :, 2]
+
+        # Create foreground mask using same logic as SunburstCalibrator
+        foreground_mask = (saturation > saturation_threshold) & (value > value_threshold)
+
+        # Clean up mask
+        min_area = 100
+        try:
+            foreground_clean = morphology.remove_small_objects(foreground_mask, min_size=min_area)
+            foreground_clean = morphology.remove_small_holes(foreground_clean, area_threshold=500)
+            foreground_clean = ndimage.median_filter(foreground_clean.astype(np.uint8), size=5).astype(bool)
+        except Exception:
+            foreground_clean = foreground_mask
+
+        # Count connected components
+        from skimage import measure
+        labels = measure.label(foreground_clean)
+        n_regions = labels.max()
+
+        # Create visualization
+        fig, axes = plt.subplots(2, 2, figsize=(14, 12))
+
+        # Plot 1: Original image
+        ax1 = axes[0, 0]
+        ax1.imshow(img_uint8)
+        ax1.set_title("Original Image")
+        ax1.axis("off")
+
+        # Plot 2: Raw foreground mask
+        ax2 = axes[0, 1]
+        ax2.imshow(foreground_mask, cmap="gray")
+        ax2.set_title(f"Foreground Mask (sat>{saturation_threshold}, val>{value_threshold})")
+        ax2.axis("off")
+
+        # Plot 3: Cleaned mask with region labels
+        ax3 = axes[1, 0]
+        ax3.imshow(labels, cmap="nipy_spectral")
+        ax3.set_title(f"Detected Regions: {n_regions} found")
+        ax3.axis("off")
+
+        # Plot 4: Overlay on original
+        ax4 = axes[1, 1]
+        overlay = img_uint8.copy()
+        # Highlight detected regions in green
+        overlay[foreground_clean, 1] = np.minimum(255, overlay[foreground_clean, 1] + 100)
+        ax4.imshow(overlay)
+        ax4.set_title("Overlay (detected regions highlighted)")
+        ax4.axis("off")
+
+        # Add text with threshold info
+        fig.suptitle(
+            f"Detection Debug - Saturation threshold: {saturation_threshold}, "
+            f"Value threshold: {value_threshold}\n"
+            f"Regions found: {n_regions} (need at least 3 for calibration)",
+            fontsize=12,
+        )
+
+        plt.tight_layout()
+        plt.savefig(str(output_path), dpi=150, bbox_inches="tight")
+        plt.close(fig)
+
+        logger.debug(f"Saved debug mask to {output_path}")
+
+    except Exception as e:
+        logger.warning(f"Failed to save debug mask: {e}")
+        # Don't raise - debug output is optional
 
 
 def _save_calibration_image(image: np.ndarray, path: Path, logger) -> None:
