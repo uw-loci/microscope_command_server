@@ -3126,13 +3126,54 @@ def handle_client(conn, addr):
                     conn.sendall(b"ERR_GAIN")
                 continue
 
-            # Legacy GET/SET commands (not implemented)
-            if data == ExtendedCommand.GET:
-                logger.debug("GET property not yet implemented")
+            # ==================== Live Mode Control Commands ====================
+
+            # GETLIVE - Check if live mode is currently running
+            if data == ExtendedCommand.GETLIVE:
+                logger.debug(f"Client {addr} requested live mode status")
+                try:
+                    is_live = False
+                    # Check if sequence is running (indicates live mode)
+                    if hardware.core.is_sequence_running():
+                        is_live = True
+                    # Also check via studio if available
+                    elif hardware.studio is not None:
+                        try:
+                            is_live = hardware.studio.live().is_live_mode_on()
+                        except Exception:
+                            pass  # Fall back to is_sequence_running result
+
+                    # Response: 1 byte (0 = not live, 1 = live)
+                    conn.sendall(bytes([1 if is_live else 0]))
+                    logger.info(f"Live mode status: {'ON' if is_live else 'OFF'}")
+                except Exception as e:
+                    logger.error(f"Failed to get live mode status: {e}")
+                    conn.sendall(bytes([0]))  # Default to not live on error
                 continue
 
-            if data == ExtendedCommand.SET:
-                logger.debug("SET property not yet implemented")
+            # SETLIVE - Set live mode on or off
+            if data == ExtendedCommand.SETLIVE:
+                logger.debug(f"Client {addr} requested to set live mode")
+                try:
+                    # Read 1 byte: 0 = off, 1 = on
+                    enable_byte = conn.recv(1)
+                    if len(enable_byte) != 1:
+                        raise ValueError("Expected 1 byte for live mode flag")
+
+                    enable_live = enable_byte[0] == 1
+                    logger.info(f"Setting live mode: {'ON' if enable_live else 'OFF'}")
+
+                    if hardware.studio is not None:
+                        hardware.studio.live().set_live_mode(enable_live)
+                        conn.sendall(b"ACK_____")
+                        logger.info(f"Live mode set to {'ON' if enable_live else 'OFF'}")
+                    else:
+                        # No studio available - cannot control live mode
+                        conn.sendall(b"ERR_NSTD")
+                        logger.warning("No studio available to control live mode")
+                except Exception as e:
+                    logger.error(f"Failed to set live mode: {e}")
+                    conn.sendall(b"ERR_LIVE")
                 continue
 
             # Unknown command

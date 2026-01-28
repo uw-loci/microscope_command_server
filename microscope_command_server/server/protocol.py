@@ -12,8 +12,6 @@ class Command(Enum):
     GETR = b"getr____"
     MOVER = b"move_r__"
     MOVE = b"move____"
-    GET = b"get_____"
-    SET = b"set_____"
     ACQUIRE = b"acquire_"
     SHUTDOWN = b"shutdown"
     DISCONNECT = b"quitclnt"
@@ -44,8 +42,6 @@ class ExtendedCommand:
     DISCONNECT = Command.DISCONNECT.value
     GETFOV = Command.FOV.value
     ACQUIRE = Command.ACQUIRE.value
-    GET = Command.GET.value
-    SET = Command.SET.value
 
     # New commands (8 bytes each)
     CONFIG = b"config__"  # Set microscope configuration file (CRITICAL - must be first command)
@@ -80,3 +76,7 @@ class ExtendedCommand:
     SETEXP = b"setexp__"  # Set exposure values
     GETGAIN = b"getgain_"  # Get gain values (unified or per-channel RGB)
     SETGAIN = b"setgain_"  # Set gain values
+
+    # Live Mode Control Commands
+    GETLIVE = b"getlive_"  # Check if live mode is currently running
+    SETLIVE = b"setlive_"  # Set live mode on (1) or off (0)
