@@ -396,12 +396,25 @@ def handle_client(conn, addr):
                     # Check connection locking
                     with connection_state_lock:
                         if active_connection_addr is not None and active_connection_addr != addr:
-                            # Another connection is active - reject this CONFIG
-                            logger.warning(f"CONFIG: Rejected - connection {active_connection_addr} already active")
-                            error_msg = f"BLOCKED: Active connection from {active_connection_addr}".encode("utf-8")
-                            error_length = struct.pack("!I", len(error_msg))
-                            conn.sendall(b"CFG_BLCK" + error_length + error_msg)
-                            continue
+                            # Another connection exists - check if same IP (likely reconnect)
+                            # addr is (ip, port) tuple - compare IP only
+                            active_ip = active_connection_addr[0]
+                            new_ip = addr[0]
+
+                            if active_ip == new_ip:
+                                # Same IP reconnecting - allow takeover (previous connection likely crashed)
+                                logger.warning(f"CONFIG: Same IP reconnecting - taking over from {active_connection_addr}")
+                                logger.warning("CONFIG: Previous connection may have been improperly closed")
+                                # Clear the old connection state (will be set to new addr below)
+                                active_connection_addr = None
+                                active_connection_config_path = None
+                            else:
+                                # Different IP - reject this CONFIG
+                                logger.warning(f"CONFIG: Rejected - connection {active_connection_addr} already active")
+                                error_msg = f"BLOCKED: Active connection from {active_connection_addr}".encode("utf-8")
+                                error_length = struct.pack("!I", len(error_msg))
+                                conn.sendall(b"CFG_BLCK" + error_length + error_msg)
+                                continue
 
                     # Load the config file
                     new_settings = config_manager.load_config_file(config_path)
