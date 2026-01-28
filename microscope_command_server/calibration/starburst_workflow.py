@@ -83,12 +83,34 @@ def run_starburst_calibration(
     try:
         # Step 1: Get camera exposure from hardware settings
         # Use the uncrossed (90 deg) exposure as it provides good signal
-        exposure_ms = _get_calibration_exposure(hardware, modality, logger)
-        logger.info(f"Using exposure: {exposure_ms} ms")
+        exposure_config = _get_calibration_exposures(hardware, modality, logger)
 
-        # Step 2: Set camera exposure and acquire image
+        # Step 2: Set camera exposure based on camera type
         logger.info("Setting camera exposure...")
-        hardware.set_exposure(exposure_ms)
+
+        if exposure_config.get('per_channel', False):
+            # JAI camera with per-channel exposures
+            try:
+                from microscope_control.jai import JAICameraProperties
+                jai_props = JAICameraProperties(hardware.core)
+                jai_props.set_channel_exposures(
+                    red=exposure_config['r'],
+                    green=exposure_config['g'],
+                    blue=exposure_config['b'],
+                    auto_enable=True
+                )
+                logger.info(f"Set per-channel exposures: R={exposure_config['r']}, "
+                           f"G={exposure_config['g']}, B={exposure_config['b']}")
+            except ImportError:
+                # Fall back to unified exposure if JAI module not available
+                avg_exposure = (exposure_config['r'] + exposure_config['g'] + exposure_config['b']) / 3
+                logger.warning(f"JAI module not available, using average exposure: {avg_exposure} ms")
+                hardware.set_exposure(avg_exposure)
+        else:
+            # Unified exposure for non-JAI cameras
+            exposure_ms = exposure_config.get('exposure_ms', 100.0)
+            logger.info(f"Using unified exposure: {exposure_ms} ms")
+            hardware.set_exposure(exposure_ms)
 
         logger.info("Acquiring calibration image...")
         image, metadata = hardware.snap_image()
@@ -203,13 +225,16 @@ def run_starburst_calibration(
         }
 
 
-def _get_calibration_exposure(hardware, modality: str, logger) -> float:
+def _get_calibration_exposures(hardware, modality: str, logger) -> Dict[str, Any]:
     """
-    Get camera exposure for calibration from hardware settings.
+    Get camera exposure settings for calibration from hardware settings.
 
     Looks up exposure settings from hardware.settings which contains
     the loaded configuration. Uses 90-degree (uncrossed) exposure if
     available, otherwise uses a sensible default.
+
+    For JAI cameras, returns per-channel (R/G/B) exposures.
+    For other cameras, returns a single unified exposure.
 
     Args:
         hardware: Hardware interface with settings dictionary
@@ -217,7 +242,10 @@ def _get_calibration_exposure(hardware, modality: str, logger) -> float:
         logger: Logger instance
 
     Returns:
-        Exposure time in milliseconds
+        Dict with keys:
+            - 'per_channel': bool - True if per-channel exposures
+            - 'r', 'g', 'b': floats - per-channel exposures (if per_channel=True)
+            - 'exposure_ms': float - unified exposure (if per_channel=False)
     """
     default_exposure = 100.0  # Sensible default for calibration
 
@@ -225,17 +253,101 @@ def _get_calibration_exposure(hardware, modality: str, logger) -> float:
         settings = getattr(hardware, 'settings', None)
         if settings is None:
             logger.warning("No settings available in hardware, using default exposure")
-            return default_exposure
+            return {'per_channel': False, 'exposure_ms': default_exposure}
 
-        # Try to find modality-specific settings
-        # Settings structure varies, try common patterns
-
-        # Pattern 1: modalities -> ppm -> rotation_angles
-        modalities = settings.get("modalities", {})
+        # Check camera type
+        camera = None
+        try:
+            camera = hardware.core.get_property("Core", "Camera")
+        except Exception:
+            pass
+        is_jai = camera == "JAICamera"
 
         # Extract base modality (e.g., "ppm" from "ppm_20x")
         base_modality = modality.split("_")[0] if "_" in modality else modality
 
+        # Get current objective and detector from settings
+        objective_id = settings.get("id_objective")
+        detector_id = settings.get("id_detector")
+
+        # If we have a specific detector, extract its ID
+        if isinstance(detector_id, dict):
+            # Use the first detector ID found
+            detector_id = list(detector_id.keys())[0] if detector_id else None
+
+        logger.info(f"Looking up exposures for modality={base_modality}, "
+                   f"objective={objective_id}, detector={detector_id}, camera={camera}")
+
+        # Check imaging_profiles for per-channel exposures (PPM format)
+        imaging_profiles = settings.get("imaging_profiles", {})
+        modality_profiles = imaging_profiles.get(base_modality, {})
+
+        # Try to find profile for current objective
+        profile = None
+        if objective_id and objective_id in modality_profiles:
+            obj_profiles = modality_profiles[objective_id]
+            if detector_id and detector_id in obj_profiles:
+                profile = obj_profiles[detector_id]
+            elif obj_profiles:
+                # Use first detector profile
+                profile = list(obj_profiles.values())[0]
+        elif modality_profiles:
+            # Use first objective's first detector
+            first_obj = list(modality_profiles.values())[0]
+            if isinstance(first_obj, dict) and first_obj:
+                profile = list(first_obj.values())[0]
+
+        if profile and "exposures_ms" in profile:
+            exposures_config = profile["exposures_ms"]
+
+            # PPM has angle-based exposures: negative, crossed, positive, uncrossed
+            # For calibration, use "uncrossed" (90 deg parallel polars - brightest)
+            if "uncrossed" in exposures_config:
+                uncrossed = exposures_config["uncrossed"]
+
+                # Check for per-channel exposures
+                if isinstance(uncrossed, dict):
+                    if all(k in uncrossed for k in ['r', 'g', 'b']):
+                        logger.info(f"Using per-channel uncrossed exposures: "
+                                   f"R={uncrossed['r']}, G={uncrossed['g']}, B={uncrossed['b']}")
+                        return {
+                            'per_channel': True,
+                            'r': float(uncrossed['r']),
+                            'g': float(uncrossed['g']),
+                            'b': float(uncrossed['b']),
+                        }
+                    elif 'all' in uncrossed:
+                        exp_all = float(uncrossed['all'])
+                        logger.info(f"Using uncrossed exposure (all channels): {exp_all} ms")
+                        return {'per_channel': False, 'exposure_ms': exp_all}
+                else:
+                    # Single value
+                    logger.info(f"Using uncrossed exposure: {uncrossed} ms")
+                    return {'per_channel': False, 'exposure_ms': float(uncrossed)}
+
+            # Fall back to checking for simple exposure format
+            if "single" in exposures_config:
+                single = exposures_config["single"]
+                if isinstance(single, dict):
+                    if all(k in single for k in ['r', 'g', 'b']):
+                        logger.info(f"Using per-channel single exposures: "
+                                   f"R={single['r']}, G={single['g']}, B={single['b']}")
+                        return {
+                            'per_channel': True,
+                            'r': float(single['r']),
+                            'g': float(single['g']),
+                            'b': float(single['b']),
+                        }
+                    elif 'all' in single:
+                        exp_all = float(single['all'])
+                        logger.info(f"Using single exposure (all channels): {exp_all} ms")
+                        return {'per_channel': False, 'exposure_ms': exp_all}
+                else:
+                    logger.info(f"Using single exposure: {single} ms")
+                    return {'per_channel': False, 'exposure_ms': float(single)}
+
+        # Pattern 2: modalities -> ppm -> rotation_angles (older format)
+        modalities = settings.get("modalities", {})
         modality_settings = modalities.get(base_modality, {})
         rotation_angles = modality_settings.get("rotation_angles", [])
 
@@ -247,34 +359,7 @@ def _get_calibration_exposure(hardware, modality: str, logger) -> float:
                     exposure = angle_config.get("exposure_ms")
                     if exposure:
                         logger.info(f"Using 90-deg exposure from modality config: {exposure} ms")
-                        return float(exposure)
-
-        # Pattern 2: Check imaging_profiles if loaded
-        imaging_profiles = settings.get("imaging_profiles", {})
-        modality_profiles = imaging_profiles.get(base_modality, {})
-
-        # Try to find any profile with exposures_ms
-        for objective, detectors in modality_profiles.items():
-            if isinstance(detectors, dict):
-                for detector, profile in detectors.items():
-                    if isinstance(profile, dict):
-                        exposures = profile.get("exposures_ms", {})
-                        # Get 90-degree exposure if available
-                        if 90 in exposures:
-                            exposure = exposures[90]
-                            logger.info(f"Using 90-deg exposure from imaging profile: {exposure} ms")
-                            return float(exposure)
-                        # Fall back to any available exposure
-                        if exposures:
-                            exposure = list(exposures.values())[0]
-                            logger.info(f"Using first available exposure from profile: {exposure} ms")
-                            return float(exposure)
-
-        # Pattern 3: Simple exposure_ms at modality level
-        simple_exposure = modality_settings.get("exposure_ms")
-        if simple_exposure:
-            logger.info(f"Using modality exposure_ms: {simple_exposure} ms")
-            return float(simple_exposure)
+                        return {'per_channel': False, 'exposure_ms': float(exposure)}
 
         # No exposure found in config
         logger.warning(
@@ -282,11 +367,11 @@ def _get_calibration_exposure(hardware, modality: str, logger) -> float:
             f"using default {default_exposure}ms. "
             "Consider setting exposure in your configuration."
         )
-        return default_exposure
+        return {'per_channel': False, 'exposure_ms': default_exposure}
 
     except Exception as e:
         logger.warning(f"Error getting exposure from settings: {e}, using default {default_exposure}ms")
-        return default_exposure
+        return {'per_channel': False, 'exposure_ms': default_exposure}
 
 
 def _save_debug_mask(
