@@ -79,9 +79,9 @@ def run_starburst_calibration(
     logger.info(f"Expected rectangles: {expected_rectangles}")
 
     try:
-        # Step 1: Get camera exposure from modality profile
+        # Step 1: Get camera exposure from hardware settings
         # Use the uncrossed (90 deg) exposure as it provides good signal
-        exposure_ms = _get_calibration_exposure(config_manager, modality, logger)
+        exposure_ms = _get_calibration_exposure(hardware, modality, logger)
         logger.info(f"Using exposure: {exposure_ms} ms")
 
         # Step 2: Set camera exposure and acquire image
@@ -185,50 +185,90 @@ def run_starburst_calibration(
         }
 
 
-def _get_calibration_exposure(config_manager, modality: str, logger) -> float:
+def _get_calibration_exposure(hardware, modality: str, logger) -> float:
     """
-    Get camera exposure for calibration from modality profile.
+    Get camera exposure for calibration from hardware settings.
 
-    Uses the uncrossed (90 deg) exposure from the modality's angle settings,
-    which typically provides good signal for calibration.
+    Looks up exposure settings from hardware.settings which contains
+    the loaded configuration. Uses 90-degree (uncrossed) exposure if
+    available, otherwise uses a sensible default.
 
     Args:
-        config_manager: MicroscopeConfigManager instance
-        modality: Modality name (e.g., "ppm_20x")
+        hardware: Hardware interface with settings dictionary
+        modality: Modality name (e.g., "ppm_20x", "ppm")
         logger: Logger instance
 
     Returns:
         Exposure time in milliseconds
     """
+    default_exposure = 100.0  # Sensible default for calibration
+
     try:
-        # Try to get exposure from modality profile
-        modality_config = config_manager.get_modality_config(modality)
+        settings = getattr(hardware, 'settings', None)
+        if settings is None:
+            logger.warning("No settings available in hardware, using default exposure")
+            return default_exposure
 
-        if modality_config:
-            angles = modality_config.get("angles", [])
-            exposures = modality_config.get("exposures_ms", [])
+        # Try to find modality-specific settings
+        # Settings structure varies, try common patterns
 
-            # Look for 90 degree angle (uncrossed)
-            if 90 in angles and len(exposures) > angles.index(90):
-                exposure = exposures[angles.index(90)]
-                logger.debug(f"Using 90 deg exposure from modality: {exposure} ms")
-                return float(exposure)
+        # Pattern 1: modalities -> ppm -> rotation_angles
+        modalities = settings.get("modalities", {})
 
-            # Fall back to first exposure if available
-            if exposures:
-                exposure = exposures[0]
-                logger.debug(f"Using first exposure from modality: {exposure} ms")
-                return float(exposure)
+        # Extract base modality (e.g., "ppm" from "ppm_20x")
+        base_modality = modality.split("_")[0] if "_" in modality else modality
 
-        # Default exposure if modality config not found
+        modality_settings = modalities.get(base_modality, {})
+        rotation_angles = modality_settings.get("rotation_angles", [])
+
+        # Look for 90-degree angle (uncrossed, good signal)
+        for angle_config in rotation_angles:
+            if isinstance(angle_config, dict):
+                angle = angle_config.get("angle", angle_config.get("rotation_angle"))
+                if angle == 90:
+                    exposure = angle_config.get("exposure_ms")
+                    if exposure:
+                        logger.info(f"Using 90-deg exposure from modality config: {exposure} ms")
+                        return float(exposure)
+
+        # Pattern 2: Check imaging_profiles if loaded
+        imaging_profiles = settings.get("imaging_profiles", {})
+        modality_profiles = imaging_profiles.get(base_modality, {})
+
+        # Try to find any profile with exposures_ms
+        for objective, detectors in modality_profiles.items():
+            if isinstance(detectors, dict):
+                for detector, profile in detectors.items():
+                    if isinstance(profile, dict):
+                        exposures = profile.get("exposures_ms", {})
+                        # Get 90-degree exposure if available
+                        if 90 in exposures:
+                            exposure = exposures[90]
+                            logger.info(f"Using 90-deg exposure from imaging profile: {exposure} ms")
+                            return float(exposure)
+                        # Fall back to any available exposure
+                        if exposures:
+                            exposure = list(exposures.values())[0]
+                            logger.info(f"Using first available exposure from profile: {exposure} ms")
+                            return float(exposure)
+
+        # Pattern 3: Simple exposure_ms at modality level
+        simple_exposure = modality_settings.get("exposure_ms")
+        if simple_exposure:
+            logger.info(f"Using modality exposure_ms: {simple_exposure} ms")
+            return float(simple_exposure)
+
+        # No exposure found in config
         logger.warning(
-            f"Could not find exposure for modality {modality}, using default 50ms"
+            f"Could not find exposure for modality '{modality}' in settings, "
+            f"using default {default_exposure}ms. "
+            "Consider setting exposure in your configuration."
         )
-        return 50.0
+        return default_exposure
 
     except Exception as e:
-        logger.warning(f"Error getting exposure from config: {e}, using default 50ms")
-        return 50.0
+        logger.warning(f"Error getting exposure from settings: {e}, using default {default_exposure}ms")
+        return default_exposure
 
 
 def _save_calibration_image(image: np.ndarray, path: Path, logger) -> None:
