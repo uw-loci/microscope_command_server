@@ -65,6 +65,7 @@ class ExtendedCommand:
     # PPM Testing Commands (for QPSC menu integration)
     PPMSENS = b"ppmsens_"  # PPM Rotation Sensitivity Test
     PPMBIREF = b"ppmbiref"  # PPM Birefringence Maximization Test
+    SBCALIB = b"sbcalib_"  # Starburst/Sunburst Calibration for hue-to-angle mapping
 
     # JAI Camera Commands
     WBCALIBR = b"wbcalibr"  # White Balance Calibration for JAI camera (legacy)

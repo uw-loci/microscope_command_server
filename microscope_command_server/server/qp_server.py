@@ -2705,6 +2705,149 @@ def handle_client(conn, addr):
 
                 continue
 
+            # ==================== SBCALIB - Starburst Calibration ====================
+            if data == ExtendedCommand.SBCALIB:
+                logger.info(f"Client {addr} requested starburst calibration")
+
+                # Read the message with parameters
+                message_parts = []
+                total_bytes = 0
+                start_time = time.time()
+
+                conn.settimeout(5.0)
+
+                try:
+                    while True:
+                        chunk = conn.recv(1024)
+                        if not chunk:
+                            logger.error("Connection closed while reading SBCALIB message")
+                            conn.sendall(b"FAILED:Connection closed")
+                            break
+
+                        message_parts.append(chunk.decode("utf-8"))
+                        total_bytes += len(chunk)
+
+                        full_message = "".join(message_parts)
+
+                        if END_MARKER in full_message:
+                            message = full_message.replace(END_MARKER, "").strip()
+
+                            # Parse parameters
+                            params = {}
+                            flags = ["--yaml", "--output", "--modality", "--rectangles",
+                                    "--saturation", "--value", "--name"]
+
+                            for i, flag in enumerate(flags):
+                                if flag in message:
+                                    start_idx = message.index(flag) + len(flag)
+                                    end_idx = len(message)
+                                    for next_flag in flags[i + 1:]:
+                                        if next_flag in message[start_idx:]:
+                                            next_pos = message.index(next_flag, start_idx)
+                                            if next_pos < end_idx:
+                                                end_idx = next_pos
+                                                break
+                                    value = message[start_idx:end_idx].strip()
+
+                                    if flag == "--yaml":
+                                        params["yaml_file_path"] = value
+                                    elif flag == "--output":
+                                        params["output_folder_path"] = value
+                                    elif flag == "--modality":
+                                        params["modality"] = value
+                                    elif flag == "--rectangles":
+                                        params["expected_rectangles"] = int(value)
+                                    elif flag == "--saturation":
+                                        params["saturation_threshold"] = float(value)
+                                    elif flag == "--value":
+                                        params["value_threshold"] = float(value)
+                                    elif flag == "--name":
+                                        params["calibration_name"] = value
+
+                            # Set defaults
+                            params.setdefault("modality", "ppm_20x")
+                            params.setdefault("expected_rectangles", 16)
+                            params.setdefault("saturation_threshold", 0.1)
+                            params.setdefault("value_threshold", 0.1)
+                            params.setdefault("calibration_name", None)
+
+                            # Validate required parameters
+                            required = ["yaml_file_path", "output_folder_path"]
+                            missing = [key for key in required if key not in params]
+                            if missing:
+                                error_msg = f"Missing required parameters: {missing}"
+                                logger.error(error_msg)
+                                conn.sendall(f"FAILED:{error_msg}".encode())
+                                break
+
+                            try:
+                                ack_response = f"STARTED:{params['output_folder_path']}".encode()
+                                conn.sendall(ack_response)
+                                logger.info("Sent STARTED acknowledgment for starburst calibration")
+
+                                # Run starburst calibration workflow
+                                from microscope_command_server.calibration.starburst_workflow import (
+                                    run_starburst_calibration,
+                                )
+
+                                result = run_starburst_calibration(
+                                    hardware=hardware,
+                                    config_manager=config_manager,
+                                    output_folder=params["output_folder_path"],
+                                    modality=params["modality"],
+                                    expected_rectangles=params["expected_rectangles"],
+                                    saturation_threshold=params["saturation_threshold"],
+                                    value_threshold=params["value_threshold"],
+                                    calibration_name=params["calibration_name"],
+                                    logger=logger,
+                                )
+
+                                # Send result as JSON
+                                if result.get("success"):
+                                    import json
+                                    result_json = json.dumps(result)
+                                    response = f"SUCCESS:{result_json}".encode()
+                                    conn.sendall(response)
+                                    logger.info(f"Starburst calibration successful. R^2={result.get('r_squared', 0):.4f}")
+                                else:
+                                    error_msg = result.get("error", "Unknown error")
+                                    response = f"FAILED:{error_msg}".encode()
+                                    conn.sendall(response)
+                                    logger.error(f"Starburst calibration failed: {error_msg}")
+
+                            except ImportError as e:
+                                logger.error(f"Module not available: {e}")
+                                response = f"FAILED:Module not available - {e}".encode()
+                                conn.sendall(response)
+                            except Exception as e:
+                                logger.error(f"Starburst calibration failed: {str(e)}", exc_info=True)
+                                response = f"FAILED:{str(e)}".encode()
+                                conn.sendall(response)
+
+                            break
+
+                        # Safety checks
+                        if total_bytes > 10000:
+                            logger.error(f"SBCALIB message too large: {total_bytes} bytes")
+                            conn.sendall(b"FAILED:Message too large")
+                            break
+
+                        if time.time() - start_time > 10:
+                            logger.error("Timeout reading SBCALIB message")
+                            conn.sendall(b"FAILED:Timeout waiting for complete message")
+                            break
+
+                except socket.timeout:
+                    logger.error(f"Timeout reading SBCALIB message from {addr}")
+                    conn.sendall(b"FAILED:Timeout reading message")
+                except Exception as e:
+                    logger.error(f"Error in SBCALIB: {str(e)}", exc_info=True)
+                    conn.sendall(f"FAILED:{str(e)}".encode())
+                finally:
+                    conn.settimeout(None)
+
+                continue
+
             # ==================== Camera Control Commands ====================
 
             # GETCAM - Get camera name from Core
