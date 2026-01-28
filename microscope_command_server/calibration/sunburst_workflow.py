@@ -1,8 +1,8 @@
 """
-Starburst Calibration Workflow.
+Sunburst Calibration Workflow.
 
-This module provides the server-side workflow for starburst/sunburst calibration,
-which creates a hue-to-angle mapping from a calibration slide with oriented rectangles.
+This module provides the server-side workflow for sunburst calibration,
+which creates a hue-to-angle mapping from a PPM reference slide with oriented rectangles.
 
 The workflow:
 1. Retrieves camera exposure from modality profile (uncrossed/90 deg settings)
@@ -22,7 +22,7 @@ from typing import Any, Dict, Optional
 import numpy as np
 
 
-def run_starburst_calibration(
+def run_sunburst_calibration(
     hardware,
     config_manager,
     output_folder: str,
@@ -34,7 +34,7 @@ def run_starburst_calibration(
     logger: Optional[logging.Logger] = None,
 ) -> Dict[str, Any]:
     """
-    Run starburst calibration workflow.
+    Run sunburst calibration workflow.
 
     Acquires an image of the calibration slide and runs SunburstCalibrator
     to create a hue-to-angle mapping.
@@ -70,13 +70,13 @@ def run_starburst_calibration(
     # Generate calibration name if not provided
     if calibration_name is None:
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        calibration_name = f"starburst_cal_{timestamp}"
+        calibration_name = f"sunburst_cal_{timestamp}"
 
     # Create modality-specific output folder
     output_path = Path(output_folder) / modality
     output_path.mkdir(parents=True, exist_ok=True)
 
-    logger.info(f"Starting starburst calibration for modality: {modality}")
+    logger.info(f"Starting sunburst calibration for modality: {modality}")
     logger.info(f"Output folder: {output_path}")
     logger.info(f"Expected rectangles: {expected_rectangles}")
 
@@ -597,7 +597,7 @@ def _create_calibration_plot(
         ax4 = axes[1, 1]
         ax4.axis("off")
         info_text = (
-            f"Starburst Calibration Results\n"
+            f"Sunburst Calibration Results\n"
             f"{'=' * 35}\n\n"
             f"R-squared: {result.r_squared:.6f}\n"
             f"Rectangles detected: {len(result.rectangles)}\n\n"

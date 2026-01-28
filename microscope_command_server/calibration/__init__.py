@@ -5,6 +5,6 @@ This module provides server-side calibration workflows that interface
 with hardware and call calibration functions from ppm_library.
 """
 
-from .starburst_workflow import run_starburst_calibration
+from .sunburst_workflow import run_sunburst_calibration
 
-__all__ = ["run_starburst_calibration"]
+__all__ = ["run_sunburst_calibration"]

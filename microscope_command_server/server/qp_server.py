@@ -1171,7 +1171,8 @@ def handle_client(conn, addr):
                             # Parse flags: --yaml, --objective, --detector, --output,
                             #              --camera, --exposure, --target, --tolerance,
                             #              --max_gain_db, --gain_threshold,
-                            #              --max_iterations, --calibrate_black_level
+                            #              --max_iterations, --calibrate_black_level,
+                            #              --base_gain, --exposure_soft_cap_ms, --boosted_max_gain_db
                             flags = [
                                 "--yaml",
                                 "--objective",
@@ -1185,6 +1186,9 @@ def handle_client(conn, addr):
                                 "--gain_threshold",
                                 "--max_iterations",
                                 "--calibrate_black_level",
+                                "--base_gain",
+                                "--exposure_soft_cap_ms",
+                                "--boosted_max_gain_db",
                             ]
 
                             # Helper to find a flag as a complete word (followed by space)
@@ -1235,6 +1239,12 @@ def handle_client(conn, addr):
                                         params["max_iterations"] = int(value)
                                     elif flag == "--calibrate_black_level":
                                         params["calibrate_black_level"] = value.lower() == "true"
+                                    elif flag == "--base_gain":
+                                        params["base_gain"] = float(value)
+                                    elif flag == "--exposure_soft_cap_ms":
+                                        params["exposure_soft_cap_ms"] = float(value)
+                                    elif flag == "--boosted_max_gain_db":
+                                        params["boosted_max_gain_db"] = float(value)
 
                             # Validate required parameters
                             required = ["output_folder_path", "initial_exposure_ms"]
@@ -1275,6 +1285,9 @@ def handle_client(conn, addr):
                                     gain_threshold_ratio=params.get("gain_threshold"),
                                     max_iterations=params.get("max_iterations"),
                                     calibrate_black_level=params.get("calibrate_black_level"),
+                                    base_gain=params.get("base_gain"),
+                                    exposure_soft_cap_ms=params.get("exposure_soft_cap_ms"),
+                                    boosted_max_gain_db=params.get("boosted_max_gain_db"),
                                 )
 
                                 # Update imageprocessing config if yaml path provided
@@ -1394,7 +1407,8 @@ def handle_client(conn, addr):
                             # --crossed_exp, --crossed_angle, --target_crossed,
                             # --uncrossed_exp, --uncrossed_angle, --target_uncrossed,
                             # --target, --tolerance,
-                            # --max_gain_db, --gain_threshold, --max_iterations, --calibrate_black_level
+                            # --max_gain_db, --gain_threshold, --max_iterations, --calibrate_black_level,
+                            # --base_gain, --exposure_soft_cap_ms, --boosted_max_gain_db
                             flags = [
                                 "--yaml",
                                 "--objective",
@@ -1419,6 +1433,9 @@ def handle_client(conn, addr):
                                 "--gain_threshold",
                                 "--max_iterations",
                                 "--calibrate_black_level",
+                                "--base_gain",
+                                "--exposure_soft_cap_ms",
+                                "--boosted_max_gain_db",
                             ]
 
                             # Helper to find a flag as a complete word (followed by space)
@@ -1491,6 +1508,12 @@ def handle_client(conn, addr):
                                         params["max_iterations"] = int(value)
                                     elif flag == "--calibrate_black_level":
                                         params["calibrate_black_level"] = value.lower() == "true"
+                                    elif flag == "--base_gain":
+                                        params["base_gain"] = float(value)
+                                    elif flag == "--exposure_soft_cap_ms":
+                                        params["exposure_soft_cap_ms"] = float(value)
+                                    elif flag == "--boosted_max_gain_db":
+                                        params["boosted_max_gain_db"] = float(value)
 
                             # Validate required parameters
                             required = [
@@ -1597,6 +1620,9 @@ def handle_client(conn, addr):
                                     gain_threshold_ratio=params.get("gain_threshold"),
                                     max_iterations=params.get("max_iterations"),
                                     calibrate_black_level=params.get("calibrate_black_level"),
+                                    base_gain=params.get("base_gain"),
+                                    exposure_soft_cap_ms=params.get("exposure_soft_cap_ms"),
+                                    boosted_max_gain_db=params.get("boosted_max_gain_db"),
                                 )
 
                                 # Update imageprocessing config for each angle
@@ -2705,9 +2731,9 @@ def handle_client(conn, addr):
 
                 continue
 
-            # ==================== SBCALIB - Starburst Calibration ====================
+            # ==================== SBCALIB - Sunburst Calibration ====================
             if data == ExtendedCommand.SBCALIB:
-                logger.info(f"Client {addr} requested starburst calibration")
+                logger.info(f"Client {addr} requested sunburst calibration")
 
                 # Read the message with parameters
                 message_parts = []
@@ -2783,14 +2809,14 @@ def handle_client(conn, addr):
                             try:
                                 ack_response = f"STARTED:{params['output_folder_path']}".encode()
                                 conn.sendall(ack_response)
-                                logger.info("Sent STARTED acknowledgment for starburst calibration")
+                                logger.info("Sent STARTED acknowledgment for sunburst calibration")
 
-                                # Run starburst calibration workflow
-                                from microscope_command_server.calibration.starburst_workflow import (
-                                    run_starburst_calibration,
+                                # Run sunburst calibration workflow
+                                from microscope_command_server.calibration.sunburst_workflow import (
+                                    run_sunburst_calibration,
                                 )
 
-                                result = run_starburst_calibration(
+                                result = run_sunburst_calibration(
                                     hardware=hardware,
                                     config_manager=config_manager,
                                     output_folder=params["output_folder_path"],
@@ -2808,19 +2834,19 @@ def handle_client(conn, addr):
                                     result_json = json.dumps(result)
                                     response = f"SUCCESS:{result_json}".encode()
                                     conn.sendall(response)
-                                    logger.info(f"Starburst calibration successful. R^2={result.get('r_squared', 0):.4f}")
+                                    logger.info(f"Sunburst calibration successful. R^2={result.get('r_squared', 0):.4f}")
                                 else:
                                     error_msg = result.get("error", "Unknown error")
                                     response = f"FAILED:{error_msg}".encode()
                                     conn.sendall(response)
-                                    logger.error(f"Starburst calibration failed: {error_msg}")
+                                    logger.error(f"Sunburst calibration failed: {error_msg}")
 
                             except ImportError as e:
                                 logger.error(f"Module not available: {e}")
                                 response = f"FAILED:Module not available - {e}".encode()
                                 conn.sendall(response)
                             except Exception as e:
-                                logger.error(f"Starburst calibration failed: {str(e)}", exc_info=True)
+                                logger.error(f"Sunburst calibration failed: {str(e)}", exc_info=True)
                                 response = f"FAILED:{str(e)}".encode()
                                 conn.sendall(response)
 
