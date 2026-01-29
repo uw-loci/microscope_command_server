@@ -33,7 +33,6 @@ def run_sunburst_calibration(
     calibration_name: Optional[str] = None,
     radius_inner: int = 30,
     radius_outer: int = 150,
-    rotation_search_degrees: float = 5.0,
     logger: Optional[logging.Logger] = None,
 ) -> Dict[str, Any]:
     """
@@ -45,7 +44,7 @@ def run_sunburst_calibration(
     Args:
         hardware: Hardware interface for camera control
         config_manager: MicroscopeConfigManager instance for accessing modality settings
-        output_folder: Directory to save calibration results
+        output_folder: Directory to save calibration results (files saved directly here)
         modality: Modality name (e.g., "ppm_20x") for exposure lookup
         expected_rectangles: Number of spokes in the sunburst pattern (default 16)
         saturation_threshold: Minimum saturation for foreground detection (default 0.1)
@@ -53,7 +52,6 @@ def run_sunburst_calibration(
         calibration_name: Optional name for calibration files (auto-generated if None)
         radius_inner: Inner sampling radius in pixels from center (default 30)
         radius_outer: Outer sampling radius in pixels from center (default 150)
-        rotation_search_degrees: Search range +/- degrees for spoke alignment (default 5.0)
         logger: Logger instance (creates one if None)
 
     Returns:
@@ -79,15 +77,18 @@ def run_sunburst_calibration(
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         calibration_name = f"sunburst_cal_{timestamp}"
 
-    # Create modality-specific output folder
-    output_path = Path(output_folder) / modality
+    # Use output folder directly (no modality subfolder)
+    output_path = Path(output_folder)
     output_path.mkdir(parents=True, exist_ok=True)
+
+    # Derive rotation search from number of spokes (one spoke width + 1 deg margin)
+    rotation_search_degrees = 360.0 / (expected_rectangles * 2) + 1.0
 
     logger.info(f"Starting radial calibration for modality: {modality}")
     logger.info(f"Output folder: {output_path}")
     logger.info(f"Number of spokes: {expected_rectangles}")
     logger.info(f"Radial sampling: inner={radius_inner}px, outer={radius_outer}px")
-    logger.info(f"Rotation search: +/- {rotation_search_degrees} deg")
+    logger.info(f"Rotation search: +/- {rotation_search_degrees:.1f} deg (derived from {expected_rectangles} spokes)")
 
     try:
         # Step 1: Get camera exposure from hardware settings
@@ -201,7 +202,8 @@ def run_sunburst_calibration(
         # Step 7: Create and save calibration plot
         plot_filename = f"{calibration_name}_plot.png"
         plot_path = output_path / plot_filename
-        _create_calibration_plot(image, result, calibrator, plot_path, logger)
+        _create_calibration_plot(image, result, calibrator, plot_path, logger,
+                                exposure_config=exposure_config)
         logger.info(f"Saved calibration plot: {plot_path}")
 
         # Return success result
@@ -536,7 +538,8 @@ def _save_calibration_image(image: np.ndarray, path: Path, logger) -> None:
 
 
 def _create_calibration_plot(
-    image: np.ndarray, result, calibrator, output_path: Path, logger
+    image: np.ndarray, result, calibrator, output_path: Path, logger,
+    exposure_config: Optional[Dict[str, Any]] = None,
 ) -> None:
     """
     Create and save calibration visualization plot.
@@ -545,7 +548,7 @@ def _create_calibration_plot(
     - Original image with center crosshair and radial sampling lines
     - B&W foreground mask
     - Color-coded scatter plot with hue colorbar
-    - Calibration info text
+    - Calibration info text with imaging settings
 
     Args:
         image: Original calibration image
@@ -553,6 +556,7 @@ def _create_calibration_plot(
         calibrator: RadialCalibrator instance
         output_path: Path to save plot
         logger: Logger instance
+        exposure_config: Optional exposure settings dict for display
     """
     try:
         import matplotlib
@@ -637,9 +641,6 @@ def _create_calibration_plot(
         ax3.set_xlim(0, 1)
         ax3.set_ylim(0, 180)
 
-        # Add shifted rainbow colorbar below the scatter plot
-        _add_shifted_hue_colorbar(ax3, result.hue_offset)
-
         # Plot 4: Calibration info text
         ax4 = axes[1, 1]
         ax4.axis("off")
@@ -657,6 +658,17 @@ def _create_calibration_plot(
             f"Sampling: r_inner={calibrator.radius_inner}, "
             f"r_outer={calibrator.radius_outer}\n"
         )
+        # Add imaging settings
+        if exposure_config:
+            info_text += "\nImaging Settings:\n"
+            if exposure_config.get('per_channel', False):
+                info_text += (
+                    f"  Exposure R: {exposure_config.get('r', '?')} ms\n"
+                    f"  Exposure G: {exposure_config.get('g', '?')} ms\n"
+                    f"  Exposure B: {exposure_config.get('b', '?')} ms\n"
+                )
+            else:
+                info_text += f"  Exposure: {exposure_config.get('exposure_ms', '?')} ms\n"
         if result.warnings:
             info_text += f"\nWarnings: {len(result.warnings)}\n"
             for w in result.warnings:
@@ -674,8 +686,13 @@ def _create_calibration_plot(
             bbox=dict(boxstyle="round", facecolor="wheat", alpha=0.5),
         )
 
+        # Finalize layout BEFORE adding the colorbar so get_position() is correct
         plt.tight_layout()
-        plt.subplots_adjust(bottom=0.08)  # Room for colorbar
+        plt.subplots_adjust(bottom=0.08)
+
+        # Add shifted rainbow colorbar below the scatter plot (after layout)
+        _add_shifted_hue_colorbar(ax3, result.hue_offset)
+
         plt.savefig(str(output_path), dpi=150, bbox_inches="tight")
         plt.close(fig)
 

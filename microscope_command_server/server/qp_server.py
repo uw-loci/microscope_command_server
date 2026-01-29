@@ -2775,7 +2775,7 @@ def handle_client(conn, addr):
                             params = {}
                             flags = ["--yaml", "--output", "--modality", "--rectangles",
                                     "--saturation", "--value", "--name",
-                                    "--radius_inner", "--radius_outer", "--rotation_search"]
+                                    "--radius_inner", "--radius_outer"]
 
                             for i, flag in enumerate(flags):
                                 if flag in message:
@@ -2807,8 +2807,6 @@ def handle_client(conn, addr):
                                         params["radius_inner"] = int(value)
                                     elif flag == "--radius_outer":
                                         params["radius_outer"] = int(value)
-                                    elif flag == "--rotation_search":
-                                        params["rotation_search_degrees"] = float(value)
 
                             # Set defaults
                             params.setdefault("modality", "ppm_20x")
@@ -2818,7 +2816,6 @@ def handle_client(conn, addr):
                             params.setdefault("calibration_name", None)
                             params.setdefault("radius_inner", 30)
                             params.setdefault("radius_outer", 150)
-                            params.setdefault("rotation_search_degrees", 5.0)
 
                             # Validate required parameters
                             required = ["yaml_file_path", "output_folder_path"]
@@ -2850,7 +2847,6 @@ def handle_client(conn, addr):
                                     calibration_name=params["calibration_name"],
                                     radius_inner=params["radius_inner"],
                                     radius_outer=params["radius_outer"],
-                                    rotation_search_degrees=params["rotation_search_degrees"],
                                     logger=logger,
                                 )
 
