@@ -2774,7 +2774,8 @@ def handle_client(conn, addr):
                             # Parse parameters
                             params = {}
                             flags = ["--yaml", "--output", "--modality", "--rectangles",
-                                    "--saturation", "--value", "--name"]
+                                    "--saturation", "--value", "--name",
+                                    "--radius_inner", "--radius_outer", "--rotation_search"]
 
                             for i, flag in enumerate(flags):
                                 if flag in message:
@@ -2802,6 +2803,12 @@ def handle_client(conn, addr):
                                         params["value_threshold"] = float(value)
                                     elif flag == "--name":
                                         params["calibration_name"] = value
+                                    elif flag == "--radius_inner":
+                                        params["radius_inner"] = int(value)
+                                    elif flag == "--radius_outer":
+                                        params["radius_outer"] = int(value)
+                                    elif flag == "--rotation_search":
+                                        params["rotation_search_degrees"] = float(value)
 
                             # Set defaults
                             params.setdefault("modality", "ppm_20x")
@@ -2809,6 +2816,9 @@ def handle_client(conn, addr):
                             params.setdefault("saturation_threshold", 0.1)
                             params.setdefault("value_threshold", 0.1)
                             params.setdefault("calibration_name", None)
+                            params.setdefault("radius_inner", 30)
+                            params.setdefault("radius_outer", 150)
+                            params.setdefault("rotation_search_degrees", 5.0)
 
                             # Validate required parameters
                             required = ["yaml_file_path", "output_folder_path"]
@@ -2838,6 +2848,9 @@ def handle_client(conn, addr):
                                     saturation_threshold=params["saturation_threshold"],
                                     value_threshold=params["value_threshold"],
                                     calibration_name=params["calibration_name"],
+                                    radius_inner=params["radius_inner"],
+                                    radius_outer=params["radius_outer"],
+                                    rotation_search_degrees=params["rotation_search_degrees"],
                                     logger=logger,
                                 )
 

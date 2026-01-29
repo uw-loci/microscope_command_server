@@ -1,13 +1,13 @@
 """
 Sunburst Calibration Workflow.
 
-This module provides the server-side workflow for sunburst calibration,
-which creates a hue-to-angle mapping from a PPM reference slide with oriented rectangles.
+This module provides the server-side workflow for PPM reference slide calibration,
+which creates a hue-to-angle mapping using radial spoke sampling.
 
 The workflow:
 1. Retrieves camera exposure from modality profile (uncrossed/90 deg settings)
 2. Sets camera exposure and acquires a single image
-3. Runs ppm_library.SunburstCalibrator on the acquired image
+3. Runs ppm_library.RadialCalibrator on the acquired image
 4. Saves calibration results (NPZ file and plot PNG)
 5. Returns results as JSON for the client
 """
@@ -31,30 +31,37 @@ def run_sunburst_calibration(
     saturation_threshold: float = 0.1,
     value_threshold: float = 0.1,
     calibration_name: Optional[str] = None,
+    radius_inner: int = 30,
+    radius_outer: int = 150,
+    rotation_search_degrees: float = 5.0,
     logger: Optional[logging.Logger] = None,
 ) -> Dict[str, Any]:
     """
     Run sunburst calibration workflow.
 
-    Acquires an image of the calibration slide and runs SunburstCalibrator
-    to create a hue-to-angle mapping.
+    Acquires an image of the calibration slide and runs RadialCalibrator
+    to create a hue-to-angle mapping using radial spoke sampling.
 
     Args:
         hardware: Hardware interface for camera control
         config_manager: MicroscopeConfigManager instance for accessing modality settings
         output_folder: Directory to save calibration results
         modality: Modality name (e.g., "ppm_20x") for exposure lookup
-        expected_rectangles: Number of rectangles expected on calibration slide (default 16)
+        expected_rectangles: Number of spokes in the sunburst pattern (default 16)
         saturation_threshold: Minimum saturation for foreground detection (default 0.1)
         value_threshold: Minimum brightness for foreground detection (default 0.1)
         calibration_name: Optional name for calibration files (auto-generated if None)
+        radius_inner: Inner sampling radius in pixels from center (default 30)
+        radius_outer: Outer sampling radius in pixels from center (default 150)
+        rotation_search_degrees: Search range +/- degrees for spoke alignment (default 5.0)
         logger: Logger instance (creates one if None)
 
     Returns:
         Dict with results:
             - success: bool
             - r_squared: float (0-1)
-            - rectangles_detected: int
+            - spokes_detected: int
+            - center: list [y, x] center coordinates
             - plot_path: str (path to calibration plot PNG)
             - calibration_path: str (path to calibration NPZ)
             - image_path: str (path to acquired calibration image)
@@ -76,9 +83,11 @@ def run_sunburst_calibration(
     output_path = Path(output_folder) / modality
     output_path.mkdir(parents=True, exist_ok=True)
 
-    logger.info(f"Starting sunburst calibration for modality: {modality}")
+    logger.info(f"Starting radial calibration for modality: {modality}")
     logger.info(f"Output folder: {output_path}")
-    logger.info(f"Expected rectangles: {expected_rectangles}")
+    logger.info(f"Number of spokes: {expected_rectangles}")
+    logger.info(f"Radial sampling: inner={radius_inner}px, outer={radius_outer}px")
+    logger.info(f"Rotation search: +/- {rotation_search_degrees} deg")
 
     try:
         # Step 1: Get camera exposure from hardware settings
@@ -128,10 +137,10 @@ def run_sunburst_calibration(
         _save_debug_mask(image, saturation_threshold, value_threshold, mask_path, logger)
         logger.info(f"Saved detection mask: {mask_path}")
 
-        # Step 5: Run calibration using ppm_library
-        logger.info("Running SunburstCalibrator...")
+        # Step 5: Run calibration using ppm_library RadialCalibrator
+        logger.info("Running RadialCalibrator...")
         try:
-            from ppm_library.calibration import SunburstCalibrator
+            from ppm_library.calibration import RadialCalibrator
         except ImportError as e:
             logger.error(f"Failed to import ppm_library: {e}")
             return {
@@ -142,23 +151,28 @@ def run_sunburst_calibration(
                 "warnings": warnings_list,
             }
 
-        calibrator = SunburstCalibrator(
-            n_expected_rectangles=expected_rectangles,
+        calibrator = RadialCalibrator(
+            n_spokes=expected_rectangles,
             saturation_threshold=saturation_threshold,
             value_threshold=value_threshold,
+            radius_inner=radius_inner,
+            radius_outer=radius_outer,
+            rotation_search_degrees=rotation_search_degrees,
         )
 
         # Run calibration (without debug_plot since we save it manually)
         result = calibrator.calibrate(str(image_path), debug_plot=False)
 
         # Check results
-        rectangles_detected = len(result.rectangles)
-        logger.info(f"Detected {rectangles_detected} rectangles")
+        spokes_detected = len(result.samples)
+        logger.info(f"Detected {spokes_detected} spokes")
         logger.info(f"R-squared: {result.r_squared:.4f}")
+        logger.info(f"Center: y={result.center[0]}, x={result.center[1]}")
+        logger.info(f"Hue offset: {result.hue_offset:.4f}")
 
-        if rectangles_detected != expected_rectangles:
+        if spokes_detected < expected_rectangles:
             warning = (
-                f"Expected {expected_rectangles} rectangles but found {rectangles_detected}. "
+                f"Expected {expected_rectangles} spokes but found {spokes_detected}. "
                 "Consider repositioning slide or adjusting detection thresholds."
             )
             warnings_list.append(warning)
@@ -171,6 +185,12 @@ def run_sunburst_calibration(
             )
             warnings_list.append(warning)
             logger.warning(warning)
+
+        # Include any warnings from the calibrator itself (e.g., saturation warnings)
+        if result.warnings:
+            for w in result.warnings:
+                warnings_list.append(w)
+                logger.warning(f"Calibrator warning: {w}")
 
         # Step 6: Save calibration file (NPZ)
         calibration_filename = f"{calibration_name}.npz"
@@ -188,7 +208,10 @@ def run_sunburst_calibration(
         return {
             "success": True,
             "r_squared": float(result.r_squared),
-            "rectangles_detected": rectangles_detected,
+            "spokes_detected": spokes_detected,
+            "rectangles_detected": spokes_detected,  # backward compat for Java client
+            "center": [int(result.center[0]), int(result.center[1])],
+            "hue_offset": float(result.hue_offset),
             "plot_path": str(plot_path),
             "calibration_path": str(calibration_path),
             "image_path": str(image_path),
@@ -519,15 +542,15 @@ def _create_calibration_plot(
     Create and save calibration visualization plot.
 
     Creates a 2x2 plot showing:
-    - Original image with detected rectangles
-    - Segmentation mask colored by hue
-    - Hue vs angle scatter with regression line
-    - Color wheel representation
+    - Original image with center crosshair and radial sampling lines
+    - B&W foreground mask
+    - Color-coded scatter plot with hue colorbar
+    - Calibration info text
 
     Args:
         image: Original calibration image
-        result: CalibrationResult from SunburstCalibrator
-        calibrator: SunburstCalibrator instance
+        result: RadialCalibrationResult from RadialCalibrator
+        calibrator: RadialCalibrator instance
         output_path: Path to save plot
         logger: Logger instance
     """
@@ -536,89 +559,123 @@ def _create_calibration_plot(
 
         matplotlib.use("Agg")  # Non-interactive backend for server
         import matplotlib.pyplot as plt
+        import matplotlib.colors as mcolors
         from skimage import color
 
-        fig, axes = plt.subplots(2, 2, figsize=(14, 12))
+        fig, axes = plt.subplots(2, 2, figsize=(14, 14))
 
-        # Plot 1: Original image with detected rectangles
+        # Plot 1: Original image with center crosshair and radial sampling lines
         ax1 = axes[0, 0]
         ax1.imshow(image)
-        for rect in result.rectangles:
-            cy, cx = rect.centroid
-            ax1.plot(cx, cy, "ro", markersize=8)
-            ax1.annotate(
-                f"{rect.angle:.1f} deg",
-                (cx, cy),
-                textcoords="offset points",
-                xytext=(5, 5),
-                fontsize=8,
-                color="white",
-                bbox=dict(boxstyle="round", facecolor="black", alpha=0.7),
-            )
-        ax1.set_title(f"Detected Rectangles ({len(result.rectangles)} found)")
+        cy, cx = result.center
+        ax1.plot(cx, cy, 'w+', markersize=20, markeredgewidth=3)
+        for sample in result.samples:
+            angle_rad = np.radians(sample.angle)
+            x_inner = cx + calibrator.radius_inner * np.cos(angle_rad)
+            y_inner = cy - calibrator.radius_inner * np.sin(angle_rad)
+            x_outer = cx + calibrator.radius_outer * np.cos(angle_rad)
+            y_outer = cy - calibrator.radius_outer * np.sin(angle_rad)
+            ax1.plot([x_inner, x_outer], [y_inner, y_outer], 'w-', alpha=0.5, linewidth=1)
+        rot_text = f", rot={result.rotation:.1f} deg" if result.rotation != 0 else ""
+        ax1.set_title(f"Radial Sampling ({len(result.samples)} spokes{rot_text})")
         ax1.axis("off")
 
-        # Plot 2: Segmentation mask
+        # Plot 2: B&W foreground mask
         ax2 = axes[0, 1]
-        mask_combined = np.zeros(image.shape[:2], dtype=np.float32)
-        for rect in result.rectangles:
-            if rect.mask is not None:
-                mask_combined[rect.mask] = rect.hue_mode
-        ax2.imshow(mask_combined, cmap="hsv", vmin=0, vmax=1)
-        ax2.set_title("Segmented Regions (colored by hue)")
+        hsv = color.rgb2hsv(image if image.dtype == np.uint8 else
+                            (image * 255).astype(np.uint8) if image.max() <= 1.0 else
+                            image.astype(np.uint8))
+        foreground_mask = (
+            (hsv[:, :, 1] > calibrator.saturation_threshold) &
+            (hsv[:, :, 2] > calibrator.value_threshold)
+        )
+        ax2.imshow(foreground_mask, cmap="gray")
+        ax2.plot(cx, cy, 'r+', markersize=15, markeredgewidth=2)
+        ax2.set_title(
+            f"Foreground Mask (sat>{calibrator.saturation_threshold}, "
+            f"val>{calibrator.value_threshold})"
+        )
         ax2.axis("off")
 
-        # Plot 3: Scatter plot of hue vs angle with regression
+        # Plot 3: Color-coded scatter plot with hue colorbar
         ax3 = axes[1, 0]
-        ax3.scatter(
-            result.hue_values, result.angles, s=100, c="blue", edgecolors="black"
-        )
+
+        # Build color array from raw hue values
+        raw_hue_values = np.array([s.hue_mean for s in result.samples])
+
+        # Check for saturation warnings
+        saturated_angles = set()
+        if result.warnings:
+            for warning in result.warnings:
+                if "SATURATION" in warning.upper():
+                    for sample in result.samples:
+                        saturated_angles.add(sample.angle)
+
+        for i, (shifted_hue, angle) in enumerate(zip(result.hue_values, result.angles)):
+            raw_hue = raw_hue_values[i]
+            hsv_color = np.array([[[raw_hue, 1.0, 1.0]]])
+            rgb_color = mcolors.hsv_to_rgb(hsv_color)[0, 0]
+            marker = 'X' if result.samples[i].angle in saturated_angles else 'o'
+            edge_color = 'red' if result.samples[i].angle in saturated_angles else 'black'
+            ax3.scatter(
+                shifted_hue, angle,
+                s=100, c=[rgb_color], edgecolors=edge_color,
+                linewidths=2, marker=marker, zorder=5,
+            )
 
         # Plot regression line
-        hue_range = np.linspace(0, 1, 100)
-        predicted_angles = result.hue_to_angle(hue_range)
-        ax3.plot(
-            hue_range,
-            predicted_angles,
-            "r-",
-            linewidth=2,
-            label=f"Regression (R^2={result.r_squared:.4f})",
-        )
+        hue_line = np.linspace(0, 1, 100)
+        predicted_angles = result.inv_slope * hue_line + result.inv_intercept
+        ax3.plot(hue_line, predicted_angles, 'r-', linewidth=2,
+                 label=f"R^2={result.r_squared:.4f}")
 
-        ax3.set_xlabel("Hue Value [0-1]")
+        ax3.set_xlabel("Shifted Hue Value")
         ax3.set_ylabel("Angle (degrees)")
         ax3.set_title("Hue to Angle Calibration")
-        ax3.legend()
+        ax3.legend(loc='best')
         ax3.grid(True, alpha=0.3)
         ax3.set_xlim(0, 1)
         ax3.set_ylim(0, 180)
+
+        # Add shifted rainbow colorbar below the scatter plot
+        _add_shifted_hue_colorbar(ax3, result.hue_offset)
 
         # Plot 4: Calibration info text
         ax4 = axes[1, 1]
         ax4.axis("off")
         info_text = (
-            f"Sunburst Calibration Results\n"
+            f"Radial Calibration Results\n"
             f"{'=' * 35}\n\n"
             f"R-squared: {result.r_squared:.6f}\n"
-            f"Rectangles detected: {len(result.rectangles)}\n\n"
+            f"Spokes detected: {len(result.samples)}\n"
+            f"Center: y={result.center[0]}, x={result.center[1]}\n"
+            f"Hue offset: {result.hue_offset:.4f}\n\n"
             f"Regression (hue -> angle):\n"
             f"  angle = {result.inv_slope:.4f} * hue + {result.inv_intercept:.4f}\n\n"
             f"Regression (angle -> hue):\n"
             f"  hue = {result.slope:.6f} * angle + {result.intercept:.4f}\n\n"
-            f"Calibration file saved for use in PPM analysis."
+            f"Sampling: r_inner={calibrator.radius_inner}, "
+            f"r_outer={calibrator.radius_outer}\n"
         )
+        if result.warnings:
+            info_text += f"\nWarnings: {len(result.warnings)}\n"
+            for w in result.warnings:
+                info_text += f"  - {w}\n"
+        info_text += "\nCalibration file saved for use in PPM analysis."
+
         ax4.text(
             0.1,
             0.9,
             info_text,
             transform=ax4.transAxes,
-            fontsize=11,
+            fontsize=10,
             verticalalignment="top",
             fontfamily="monospace",
             bbox=dict(boxstyle="round", facecolor="wheat", alpha=0.5),
         )
 
         plt.tight_layout()
+        plt.subplots_adjust(bottom=0.08)  # Room for colorbar
         plt.savefig(str(output_path), dpi=150, bbox_inches="tight")
         plt.close(fig)
 
@@ -627,3 +684,47 @@ def _create_calibration_plot(
     except Exception as e:
         logger.error(f"Failed to create calibration plot: {e}")
         # Don't raise - plot is optional
+
+
+# ROYGBIV color positions in hue space (0-1)
+_ROYGBIV_COLORS = [
+    (0.000, 'R', 'red'),
+    (0.083, 'O', 'orange'),
+    (0.167, 'Y', 'yellow'),
+    (0.333, 'G', 'green'),
+    (0.583, 'B', 'blue'),
+    (0.667, 'I', 'indigo'),
+    (0.750, 'V', 'violet'),
+]
+
+
+def _add_shifted_hue_colorbar(ax, hue_offset: float) -> None:
+    """
+    Add a rainbow colorbar shifted by hue_offset below the given axes.
+
+    Args:
+        ax: Matplotlib axes
+        hue_offset: Hue offset to shift the colorbar
+    """
+    import matplotlib.colors as mcolors
+
+    pos = ax.get_position()
+    cbar_ax = ax.figure.add_axes([pos.x0, pos.y0 - 0.05, pos.width, 0.015])
+
+    # Create shifted hue gradient
+    gradient = np.linspace(0, 1, 256).reshape(1, -1)
+    hsv = np.zeros((1, 256, 3))
+    hsv[0, :, 0] = (gradient + hue_offset) % 1.0
+    hsv[0, :, 1] = 1.0
+    hsv[0, :, 2] = 1.0
+    rgb = mcolors.hsv_to_rgb(hsv)
+
+    cbar_ax.imshow(rgb, aspect='auto', extent=[0, 1, 0, 1])
+    cbar_ax.set_xlim(0, 1)
+    cbar_ax.set_xticks([])
+    cbar_ax.set_yticks([])
+
+    for hue, letter, color_name in _ROYGBIV_COLORS:
+        shifted_pos = (hue - hue_offset) % 1.0
+        cbar_ax.text(shifted_pos, -0.5, letter, ha='center', va='top',
+                     fontsize=9, fontweight='bold', color='black')
