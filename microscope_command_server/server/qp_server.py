@@ -2775,7 +2775,8 @@ def handle_client(conn, addr):
                             params = {}
                             flags = ["--yaml", "--output", "--modality", "--rectangles",
                                     "--saturation", "--value", "--name",
-                                    "--radius_inner", "--radius_outer"]
+                                    "--radius_inner", "--radius_outer",
+                                    "--image_path", "--center_y", "--center_x"]
 
                             for i, flag in enumerate(flags):
                                 if flag in message:
@@ -2807,6 +2808,12 @@ def handle_client(conn, addr):
                                         params["radius_inner"] = int(value)
                                     elif flag == "--radius_outer":
                                         params["radius_outer"] = int(value)
+                                    elif flag == "--image_path":
+                                        params["image_path"] = value
+                                    elif flag == "--center_y":
+                                        params["center_y"] = int(value)
+                                    elif flag == "--center_x":
+                                        params["center_x"] = int(value)
 
                             # Set defaults
                             params.setdefault("modality", "ppm_20x")
@@ -2816,6 +2823,9 @@ def handle_client(conn, addr):
                             params.setdefault("calibration_name", None)
                             params.setdefault("radius_inner", 30)
                             params.setdefault("radius_outer", 150)
+                            params.setdefault("image_path", None)
+                            params.setdefault("center_y", None)
+                            params.setdefault("center_x", None)
 
                             # Validate required parameters
                             required = ["yaml_file_path", "output_folder_path"]
@@ -2836,6 +2846,11 @@ def handle_client(conn, addr):
                                     run_sunburst_calibration,
                                 )
 
+                                # Build center tuple if both coordinates provided
+                                center = None
+                                if params["center_y"] is not None and params["center_x"] is not None:
+                                    center = (params["center_y"], params["center_x"])
+
                                 result = run_sunburst_calibration(
                                     hardware=hardware,
                                     config_manager=config_manager,
@@ -2848,20 +2863,20 @@ def handle_client(conn, addr):
                                     radius_inner=params["radius_inner"],
                                     radius_outer=params["radius_outer"],
                                     logger=logger,
+                                    existing_image_path=params["image_path"],
+                                    center=center,
                                 )
 
-                                # Send result as JSON
+                                # Send result as JSON (always SUCCESS: prefix with
+                                # full JSON so client gets image_path even on failure)
+                                import json
+                                result_json = json.dumps(result)
+                                response = f"SUCCESS:{result_json}".encode()
+                                conn.sendall(response)
                                 if result.get("success"):
-                                    import json
-                                    result_json = json.dumps(result)
-                                    response = f"SUCCESS:{result_json}".encode()
-                                    conn.sendall(response)
                                     logger.info(f"Sunburst calibration successful. R^2={result.get('r_squared', 0):.4f}")
                                 else:
-                                    error_msg = result.get("error", "Unknown error")
-                                    response = f"FAILED:{error_msg}".encode()
-                                    conn.sendall(response)
-                                    logger.error(f"Sunburst calibration failed: {error_msg}")
+                                    logger.error(f"Sunburst calibration failed: {result.get('error', 'Unknown')}")
 
                             except ImportError as e:
                                 logger.error(f"Module not available: {e}")

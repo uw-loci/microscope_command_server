@@ -17,7 +17,7 @@ import logging
 import os
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, Tuple
 
 import numpy as np
 
@@ -34,12 +34,18 @@ def run_sunburst_calibration(
     radius_inner: int = 30,
     radius_outer: int = 150,
     logger: Optional[logging.Logger] = None,
+    existing_image_path: Optional[str] = None,
+    center: Optional[Tuple[int, int]] = None,
 ) -> Dict[str, Any]:
     """
     Run sunburst calibration workflow.
 
     Acquires an image of the calibration slide and runs RadialCalibrator
     to create a hue-to-angle mapping using radial spoke sampling.
+
+    When existing_image_path is provided, skips image acquisition and
+    loads the specified image for re-analysis. When center is provided,
+    passes it to RadialCalibrator to bypass auto-detection.
 
     Args:
         hardware: Hardware interface for camera control
@@ -53,6 +59,8 @@ def run_sunburst_calibration(
         radius_inner: Inner sampling radius in pixels from center (default 30)
         radius_outer: Outer sampling radius in pixels from center (default 150)
         logger: Logger instance (creates one if None)
+        existing_image_path: Optional path to existing image (skips acquisition)
+        center: Optional (y, x) center coordinates for manual override
 
     Returns:
         Dict with results:
@@ -75,7 +83,8 @@ def run_sunburst_calibration(
     # Generate calibration name if not provided
     if calibration_name is None:
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        calibration_name = f"sunburst_cal_{timestamp}"
+        suffix = "_retry" if existing_image_path is not None else ""
+        calibration_name = f"sunburst_cal_{timestamp}{suffix}"
 
     # Use output folder directly (no modality subfolder)
     output_path = Path(output_folder)
@@ -91,45 +100,61 @@ def run_sunburst_calibration(
     logger.info(f"Rotation search: +/- {rotation_search_degrees:.1f} deg (derived from {expected_rectangles} spokes)")
 
     try:
-        # Step 1: Get camera exposure from hardware settings
-        # Use the uncrossed (90 deg) exposure as it provides good signal
-        exposure_config = _get_calibration_exposures(hardware, modality, logger)
+        if existing_image_path is not None:
+            # Reuse existing image - skip acquisition (Steps 1-3)
+            logger.info(f"Reusing existing image: {existing_image_path}")
+            if center is not None:
+                logger.info(f"Using manually specified center: y={center[0]}, x={center[1]}")
 
-        # Step 2: Set camera exposure based on camera type
-        logger.info("Setting camera exposure...")
-
-        if exposure_config.get('per_channel', False):
-            # JAI camera with per-channel exposures
             try:
-                from microscope_control.jai import JAICameraProperties
-                jai_props = JAICameraProperties(hardware.core)
-                jai_props.set_channel_exposures(
-                    red=exposure_config['r'],
-                    green=exposure_config['g'],
-                    blue=exposure_config['b'],
-                    auto_enable=True
-                )
-                logger.info(f"Set per-channel exposures: R={exposure_config['r']}, "
-                           f"G={exposure_config['g']}, B={exposure_config['b']}")
+                import tifffile
+                image = tifffile.imread(str(existing_image_path))
             except ImportError:
-                # Fall back to unified exposure if JAI module not available
-                avg_exposure = (exposure_config['r'] + exposure_config['g'] + exposure_config['b']) / 3
-                logger.warning(f"JAI module not available, using average exposure: {avg_exposure} ms")
-                hardware.set_exposure(avg_exposure)
+                from PIL import Image as PILImage
+                image = np.array(PILImage.open(str(existing_image_path)))
+
+            image_path = Path(existing_image_path)
+            exposure_config = None
         else:
-            # Unified exposure for non-JAI cameras
-            exposure_ms = exposure_config.get('exposure_ms', 100.0)
-            logger.info(f"Using unified exposure: {exposure_ms} ms")
-            hardware.set_exposure(exposure_ms)
+            # Step 1: Get camera exposure from hardware settings
+            # Use the uncrossed (90 deg) exposure as it provides good signal
+            exposure_config = _get_calibration_exposures(hardware, modality, logger)
 
-        logger.info("Acquiring calibration image...")
-        image, metadata = hardware.snap_image()
+            # Step 2: Set camera exposure based on camera type
+            logger.info("Setting camera exposure...")
 
-        # Step 3: Save the raw calibration image
-        image_filename = f"{calibration_name}_image.tif"
-        image_path = output_path / image_filename
-        _save_calibration_image(image, image_path, logger)
-        logger.info(f"Saved calibration image: {image_path}")
+            if exposure_config.get('per_channel', False):
+                # JAI camera with per-channel exposures
+                try:
+                    from microscope_control.jai import JAICameraProperties
+                    jai_props = JAICameraProperties(hardware.core)
+                    jai_props.set_channel_exposures(
+                        red=exposure_config['r'],
+                        green=exposure_config['g'],
+                        blue=exposure_config['b'],
+                        auto_enable=True
+                    )
+                    logger.info(f"Set per-channel exposures: R={exposure_config['r']}, "
+                               f"G={exposure_config['g']}, B={exposure_config['b']}")
+                except ImportError:
+                    # Fall back to unified exposure if JAI module not available
+                    avg_exposure = (exposure_config['r'] + exposure_config['g'] + exposure_config['b']) / 3
+                    logger.warning(f"JAI module not available, using average exposure: {avg_exposure} ms")
+                    hardware.set_exposure(avg_exposure)
+            else:
+                # Unified exposure for non-JAI cameras
+                exposure_ms = exposure_config.get('exposure_ms', 100.0)
+                logger.info(f"Using unified exposure: {exposure_ms} ms")
+                hardware.set_exposure(exposure_ms)
+
+            logger.info("Acquiring calibration image...")
+            image, metadata = hardware.snap_image()
+
+            # Step 3: Save the raw calibration image
+            image_filename = f"{calibration_name}_image.tif"
+            image_path = output_path / image_filename
+            _save_calibration_image(image, image_path, logger)
+            logger.info(f"Saved calibration image: {image_path}")
 
         # Step 4: Save debug mask for troubleshooting (before calibration attempt)
         # This helps users understand what the thresholds are detecting
@@ -162,7 +187,7 @@ def run_sunburst_calibration(
         )
 
         # Run calibration (without debug_plot since we save it manually)
-        result = calibrator.calibrate(str(image_path), debug_plot=False)
+        result = calibrator.calibrate(str(image_path), center=center, debug_plot=False)
 
         # Check results
         spokes_detected = len(result.samples)
