@@ -27,7 +27,7 @@ def run_sunburst_calibration(
     config_manager,
     output_folder: str,
     modality: str,
-    expected_rectangles: int = 16,
+    expected_spokes: int = 16,
     saturation_threshold: float = 0.1,
     value_threshold: float = 0.1,
     calibration_name: Optional[str] = None,
@@ -52,7 +52,7 @@ def run_sunburst_calibration(
         config_manager: MicroscopeConfigManager instance for accessing modality settings
         output_folder: Directory to save calibration results (files saved directly here)
         modality: Modality name (e.g., "ppm_20x") for exposure lookup
-        expected_rectangles: Number of spokes in the sunburst pattern (default 16)
+        expected_spokes: Number of spokes in the sunburst pattern (default 16)
         saturation_threshold: Minimum saturation for foreground detection (default 0.1)
         value_threshold: Minimum brightness for foreground detection (default 0.1)
         calibration_name: Optional name for calibration files (auto-generated if None)
@@ -91,13 +91,13 @@ def run_sunburst_calibration(
     output_path.mkdir(parents=True, exist_ok=True)
 
     # Derive rotation search from number of spokes (one spoke width + 1 deg margin)
-    rotation_search_degrees = 360.0 / (expected_rectangles * 2) + 1.0
+    rotation_search_degrees = 360.0 / (expected_spokes * 2) + 1.0
 
     logger.info(f"Starting radial calibration for modality: {modality}")
     logger.info(f"Output folder: {output_path}")
-    logger.info(f"Number of spokes: {expected_rectangles}")
+    logger.info(f"Number of spokes: {expected_spokes}")
     logger.info(f"Radial sampling: inner={radius_inner}px, outer={radius_outer}px")
-    logger.info(f"Rotation search: +/- {rotation_search_degrees:.1f} deg (derived from {expected_rectangles} spokes)")
+    logger.info(f"Rotation search: +/- {rotation_search_degrees:.1f} deg (derived from {expected_spokes} spokes)")
 
     try:
         if existing_image_path is not None:
@@ -178,7 +178,7 @@ def run_sunburst_calibration(
             }
 
         calibrator = RadialCalibrator(
-            n_spokes=expected_rectangles,
+            n_spokes=expected_spokes,
             saturation_threshold=saturation_threshold,
             value_threshold=value_threshold,
             radius_inner=radius_inner,
@@ -196,9 +196,9 @@ def run_sunburst_calibration(
         logger.info(f"Center: y={result.center[0]}, x={result.center[1]}")
         logger.info(f"Hue offset: {result.hue_offset:.4f}")
 
-        if spokes_detected < expected_rectangles:
+        if spokes_detected < expected_spokes:
             warning = (
-                f"Expected {expected_rectangles} spokes but found {spokes_detected}. "
+                f"Expected {expected_spokes} spokes but found {spokes_detected}. "
                 "Consider repositioning slide or adjusting detection thresholds."
             )
             warnings_list.append(warning)
@@ -236,7 +236,6 @@ def run_sunburst_calibration(
             "success": True,
             "r_squared": float(result.r_squared),
             "spokes_detected": spokes_detected,
-            "rectangles_detected": spokes_detected,  # backward compat for Java client
             "center": [int(result.center[0]), int(result.center[1])],
             "hue_offset": float(result.hue_offset),
             "plot_path": str(plot_path),
@@ -439,7 +438,7 @@ def _save_debug_mask(
     - Foreground mask (what the thresholds detect)
     - Overlay of mask on original
 
-    Helps users troubleshoot when rectangle detection fails.
+    Helps users troubleshoot when spoke detection fails.
 
     Args:
         image: Original RGB image

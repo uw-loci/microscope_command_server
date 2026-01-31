@@ -2773,7 +2773,7 @@ def handle_client(conn, addr):
 
                             # Parse parameters
                             params = {}
-                            flags = ["--yaml", "--output", "--modality", "--rectangles",
+                            flags = ["--yaml", "--output", "--modality", "--spokes",
                                     "--saturation", "--value", "--name",
                                     "--radius_inner", "--radius_outer",
                                     "--image_path", "--center_y", "--center_x"]
@@ -2796,8 +2796,8 @@ def handle_client(conn, addr):
                                         params["output_folder_path"] = value
                                     elif flag == "--modality":
                                         params["modality"] = value
-                                    elif flag == "--rectangles":
-                                        params["expected_rectangles"] = int(value)
+                                    elif flag == "--spokes":
+                                        params["expected_spokes"] = int(value)
                                     elif flag == "--saturation":
                                         params["saturation_threshold"] = float(value)
                                     elif flag == "--value":
@@ -2817,7 +2817,7 @@ def handle_client(conn, addr):
 
                             # Set defaults
                             params.setdefault("modality", "ppm_20x")
-                            params.setdefault("expected_rectangles", 16)
+                            params.setdefault("expected_spokes", 16)
                             params.setdefault("saturation_threshold", 0.1)
                             params.setdefault("value_threshold", 0.1)
                             params.setdefault("calibration_name", None)
@@ -2856,7 +2856,7 @@ def handle_client(conn, addr):
                                     config_manager=config_manager,
                                     output_folder=params["output_folder_path"],
                                     modality=params["modality"],
-                                    expected_rectangles=params["expected_rectangles"],
+                                    expected_spokes=params["expected_spokes"],
                                     saturation_threshold=params["saturation_threshold"],
                                     value_threshold=params["value_threshold"],
                                     calibration_name=params["calibration_name"],
