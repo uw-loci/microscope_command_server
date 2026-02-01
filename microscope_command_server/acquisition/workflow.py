@@ -2805,25 +2805,26 @@ def simple_background_collection(
                                 auto_enable=True,
                             )
 
-                            # Apply calibrated per-channel gains (gain compensation)
-                            # When exposure ratio exceeds threshold, calibration reduces
-                            # the longest exposure and compensates with analog gain
+                            # Apply calibrated gain settings
+                            # Check for unified gain first (new calibration format)
+                            unified_gain = angle_cal.get("unified_gain", 1.0)
                             per_channel_gains = angle_cal.get("gains", {})
                             gain_r = per_channel_gains.get('r', 1.0)
                             gain_g = per_channel_gains.get('g', 1.0)
                             gain_b = per_channel_gains.get('b', 1.0)
 
-                            # Check if any gain is non-unity (needs compensation)
-                            # Just checking for "gains" key isn't enough - unity gains
-                            # may be saved even when no compensation was actually used
                             has_gain_compensation = (
                                 abs(gain_r - 1.0) > 0.01 or
                                 abs(gain_g - 1.0) > 0.01 or
                                 abs(gain_b - 1.0) > 0.01
                             )
 
-                            if has_gain_compensation:
-                                # Enable individual gain mode and apply non-unity gains
+                            if unified_gain > 1.0:
+                                # Unified gain mode - set single gain for all channels
+                                jai_props.set_unified_gain(unified_gain)
+                                logger.info(f"  Applied unified gain: {unified_gain:.2f}x")
+                            elif has_gain_compensation:
+                                # Legacy per-channel gain mode
                                 jai_props.set_analog_gains(
                                     red=gain_r,
                                     green=gain_g,
