@@ -3127,8 +3127,11 @@ def handle_client(conn, addr):
                     logger.info(f"Setting gains: {gains}")
 
                     if count == 1:
-                        # Unified gain - not directly supported by hardware
-                        logger.info(f"Unified gain {gains[0]} - no hardware action (software gain only)")
+                        # Unified gain - set via JAI unified gain property (1.0-8.0 range)
+                        from microscope_control.jai import JAICameraProperties
+                        jai_props = JAICameraProperties(hardware.core)
+                        jai_props.set_unified_gain(gains[0])
+                        logger.info(f"Set unified gain: {gains[0]}")
                     elif count >= 3:
                         # Per-channel analog gains (R, G, B)
                         from microscope_control.jai import JAICameraProperties
@@ -3148,6 +3151,40 @@ def handle_client(conn, addr):
                 except Exception as e:
                     logger.error(f"Failed to set gain: {e}")
                     conn.sendall(b"ERR_GAIN")
+                continue
+
+            # ==================== White Balance Mode Control ====================
+
+            # SETWBMD - Set camera white balance mode (0=Off, 1=Continuous, 2=Once)
+            if data == ExtendedCommand.SETWBMD:
+                logger.debug(f"Client {addr} requested to set WB mode")
+                try:
+                    mode_byte = conn.recv(1)
+                    mode = mode_byte[0]
+                    logger.info(f"Setting WB mode: {mode}")
+
+                    from microscope_control.jai import JAICameraProperties
+                    jai_props = JAICameraProperties(hardware.core)
+
+                    if mode == 0:
+                        jai_props.set_white_balance_mode("Off")
+                        logger.info("Set white balance mode to Off")
+                    elif mode == 1:
+                        jai_props.set_white_balance_mode("Continuous")
+                        logger.info("Set white balance mode to Continuous")
+                    elif mode == 2:
+                        jai_props.run_auto_white_balance()
+                        logger.info("Ran one-shot auto white balance")
+                    else:
+                        logger.warning(f"Unknown WB mode: {mode}")
+
+                    conn.sendall(b"ACK_____")
+                except ImportError:
+                    conn.sendall(b"ERR_NJAI")
+                    logger.error("JAI module not available for WB mode control")
+                except Exception as e:
+                    logger.error(f"Failed to set WB mode: {e}")
+                    conn.sendall(b"ERR_WBMD")
                 continue
 
             # ==================== Live Mode Control Commands ====================

@@ -77,6 +77,9 @@ class ExtendedCommand:
     GETGAIN = b"getgain_"  # Get gain values (unified or per-channel RGB)
     SETGAIN = b"setgain_"  # Set gain values
 
+    # White Balance Mode Control
+    SETWBMD = b"setwbmd_"  # Set camera white balance mode (0=Off, 1=Continuous, 2=Once)
+
     # Live Mode Control Commands
     GETLIVE = b"getlive_"  # Check if live mode is currently running
     SETLIVE = b"setlive_"  # Set live mode on (1) or off (0)
