@@ -84,5 +84,7 @@ class ExtendedCommand:
     GETLIVE = b"getlive_"  # Check if live mode is currently running
     SETLIVE = b"setlive_"  # Set live mode on (1) or off (0)
 
-    # Live Viewer Commands
-    GETFRAME = b"getframe"  # Get latest frame from MM circular buffer (for live viewer)
+    # Live Viewer Commands (core-level, bypasses MM studio/live window)
+    GETFRAME = b"getframe"  # Get latest frame from MM circular buffer
+    STRTSEQ = b"strtseq_"  # Start continuous sequence acquisition (core-level)
+    STOPSEQ = b"stopseq_"  # Stop continuous sequence acquisition (core-level)

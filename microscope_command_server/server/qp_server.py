@@ -3269,6 +3269,30 @@ def handle_client(conn, addr):
                         pass
                 continue
 
+            # STRTSEQ - Start continuous sequence acquisition (core-level, bypasses MM live window)
+            if data == ExtendedCommand.STRTSEQ:
+                logger.info(f"Client {addr} requested start continuous acquisition")
+                try:
+                    hardware.start_continuous_acquisition()
+                    conn.sendall(b"ACK_____")
+                    logger.info("Continuous sequence acquisition started")
+                except Exception as e:
+                    logger.error(f"Failed to start continuous acquisition: {e}")
+                    conn.sendall(b"ERR_SEQ_")
+                continue
+
+            # STOPSEQ - Stop continuous sequence acquisition (core-level)
+            if data == ExtendedCommand.STOPSEQ:
+                logger.info(f"Client {addr} requested stop continuous acquisition")
+                try:
+                    hardware.stop_continuous_acquisition()
+                    conn.sendall(b"ACK_____")
+                    logger.info("Continuous sequence acquisition stopped")
+                except Exception as e:
+                    logger.error(f"Failed to stop continuous acquisition: {e}")
+                    conn.sendall(b"ERR_SEQ_")
+                continue
+
             # Unknown command
             logger.warning(f"Unknown command from {addr}: {data}")
 
