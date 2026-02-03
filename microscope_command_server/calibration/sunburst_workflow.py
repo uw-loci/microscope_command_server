@@ -91,7 +91,7 @@ def run_sunburst_calibration(
     output_path.mkdir(parents=True, exist_ok=True)
 
     # Derive rotation search from number of spokes (one spoke width + 1 deg margin)
-    rotation_search_degrees = 360.0 / (expected_spokes * 2) + 1.0
+    rotation_search_degrees = 180.0 / (expected_spokes * 2) + 1.0
 
     logger.info(f"Starting radial calibration for modality: {modality}")
     logger.info(f"Output folder: {output_path}")
@@ -136,6 +136,10 @@ def run_sunburst_calibration(
                     )
                     logger.info(f"Set per-channel exposures: R={exposure_config['r']}, "
                                f"G={exposure_config['g']}, B={exposure_config['b']}")
+                    # Apply unified gain if available in calibration profile
+                    if exposure_config.get('unified_gain', 1.0) > 1.0:
+                        jai_props.set_unified_gain(exposure_config['unified_gain'])
+                        logger.info(f"Applied unified gain: {exposure_config['unified_gain']:.2f}x")
                 except ImportError:
                     # Fall back to unified exposure if JAI module not available
                     avg_exposure = (exposure_config['r'] + exposure_config['g'] + exposure_config['b']) / 3
@@ -319,10 +323,16 @@ def _get_calibration_exposures(hardware, modality: str, logger) -> Dict[str, Any
         objective_id = settings.get("id_objective")
         detector_id = settings.get("id_detector")
 
-        # If we have a specific detector, extract its ID
+        # If we have a specific detector, match to the active camera
         if isinstance(detector_id, dict):
-            # Use the first detector ID found
-            detector_id = list(detector_id.keys())[0] if detector_id else None
+            if is_jai:
+                detector_id = next((d for d in detector_id.keys() if "JAI" in d.upper()), None)
+            else:
+                # Non-JAI: try non-JAI detector first, then first available
+                detector_id = next(
+                    (d for d in detector_id.keys() if "JAI" not in d.upper()),
+                    list(detector_id.keys())[0] if detector_id else None
+                )
 
         logger.info(f"Looking up exposures for modality={base_modality}, "
                    f"objective={objective_id}, detector={detector_id}, camera={camera}")
@@ -359,12 +369,20 @@ def _get_calibration_exposures(hardware, modality: str, logger) -> Dict[str, Any
                     if all(k in uncrossed for k in ['r', 'g', 'b']):
                         logger.info(f"Using per-channel uncrossed exposures: "
                                    f"R={uncrossed['r']}, G={uncrossed['g']}, B={uncrossed['b']}")
-                        return {
+                        result = {
                             'per_channel': True,
                             'r': float(uncrossed['r']),
                             'g': float(uncrossed['g']),
                             'b': float(uncrossed['b']),
                         }
+                        # Check for unified gain in gains section
+                        gains_config = profile.get("gains", {})
+                        uncrossed_gains = gains_config.get("uncrossed", {})
+                        unified_gain = uncrossed_gains.get("unified_gain", 1.0)
+                        if unified_gain > 1.0:
+                            result['unified_gain'] = float(unified_gain)
+                            logger.info(f"Found unified gain for uncrossed: {unified_gain:.2f}x")
+                        return result
                     elif 'all' in uncrossed:
                         exp_all = float(uncrossed['all'])
                         logger.info(f"Using uncrossed exposure (all channels): {exp_all} ms")
