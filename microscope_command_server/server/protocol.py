@@ -83,3 +83,6 @@ class ExtendedCommand:
     # Live Mode Control Commands
     GETLIVE = b"getlive_"  # Check if live mode is currently running
     SETLIVE = b"setlive_"  # Set live mode on (1) or off (0)
+
+    # Live Viewer Commands
+    GETFRAME = b"getframe"  # Get latest frame from MM circular buffer (for live viewer)

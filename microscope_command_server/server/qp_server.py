@@ -25,6 +25,8 @@ from threading import Lock
 import logging
 from datetime import datetime
 
+import numpy as np
+
 from microscope_control.config import ConfigManager
 
 
@@ -3235,6 +3237,36 @@ def handle_client(conn, addr):
                 except Exception as e:
                     logger.error(f"Failed to set live mode: {e}")
                     conn.sendall(b"ERR_LIVE")
+                continue
+
+            # ==================== Live Viewer Commands ====================
+
+            # GETFRAME - Get latest frame from MM circular buffer (for live viewer)
+            if data == ExtendedCommand.GETFRAME:
+                try:
+                    image, meta = hardware.get_live_frame()
+                    if image is None:
+                        # No frame available - send zero header
+                        conn.sendall(struct.pack(">5i", 0, 0, 0, 0, 0))
+                        continue
+
+                    h, w = image.shape[:2]
+                    channels = 1 if image.ndim == 2 else image.shape[2]
+                    bpp = image.dtype.itemsize
+
+                    # Convert uint16 to big-endian for wire transfer
+                    if image.dtype == np.uint16:
+                        image = image.astype(">u2")
+
+                    raw_bytes = np.ascontiguousarray(image).tobytes()
+                    header = struct.pack(">5i", w, h, channels, bpp, len(raw_bytes))
+                    conn.sendall(header + raw_bytes)
+                except Exception as e:
+                    logger.error(f"GETFRAME failed: {e}")
+                    try:
+                        conn.sendall(struct.pack(">5i", 0, 0, 0, 0, 0))
+                    except Exception:
+                        pass
                 continue
 
             # Unknown command
