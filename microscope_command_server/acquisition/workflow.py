@@ -249,8 +249,17 @@ def apply_jai_calibration_for_angle(
             )
             exp_msg += f" | Gains: R={gain_r:.3f}, G={gain_g:.3f}, B={gain_b:.3f}"
         else:
-            # No gain compensation - disable individual gain mode
+            # No per-channel gain compensation - disable individual gain mode
             jai_props.disable_individual_gain()
+
+        # Apply unified gain if present and > 1.0
+        # When unified gain mode is used during calibration, the per-channel gains
+        # are all 1.0 but unified_gain carries the overall brightness boost.
+        # Without this, images will be darker than calibration intended.
+        unified_gain = gains.get("unified_gain", 1.0)
+        if unified_gain > 1.0 + 0.01:
+            jai_props.set_unified_gain(unified_gain)
+            exp_msg += f" | Unified gain: {unified_gain:.3f}"
 
         if logger:
             logger.info(exp_msg)
