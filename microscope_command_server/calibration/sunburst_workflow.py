@@ -90,14 +90,10 @@ def run_sunburst_calibration(
     output_path = Path(output_folder)
     output_path.mkdir(parents=True, exist_ok=True)
 
-    # Derive rotation search from number of spokes (one spoke width + 1 deg margin)
-    rotation_search_degrees = 180.0 / (expected_spokes * 2) + 1.0
-
     logger.info(f"Starting radial calibration for modality: {modality}")
     logger.info(f"Output folder: {output_path}")
     logger.info(f"Number of spokes: {expected_spokes}")
     logger.info(f"Radial sampling: inner={radius_inner}px, outer={radius_outer}px")
-    logger.info(f"Rotation search: +/- {rotation_search_degrees:.1f} deg (derived from {expected_spokes} spokes)")
 
     try:
         if existing_image_path is not None:
@@ -187,7 +183,6 @@ def run_sunburst_calibration(
             value_threshold=value_threshold,
             radius_inner=radius_inner,
             radius_outer=radius_outer,
-            rotation_search_degrees=rotation_search_degrees,
         )
 
         # Run calibration (without debug_plot since we save it manually)
