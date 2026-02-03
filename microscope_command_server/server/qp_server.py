@@ -1888,6 +1888,25 @@ def handle_client(conn, addr):
 
                 continue
 
+            if data == ExtendedCommand.RAWSNAP:
+                # Raw snap_image() call WITHOUT resetting camera mode.
+                # Used for crash reproduction testing -- this matches the code path
+                # that SBCALIB uses (sunburst_workflow.py calls hardware.snap_image()
+                # directly without touching per-channel mode).
+                logger.info(f"Client {addr} requested raw snap (no mode reset)")
+                try:
+                    image, metadata = hardware.snap_image()
+                    if image is None:
+                        conn.sendall(b"FAILED:snap_image returned None")
+                    else:
+                        msg = f"SUCCESS:shape={image.shape},median={float(image.mean()):.1f}"
+                        conn.sendall(msg.encode())
+                        logger.info(f"RAWSNAP complete: shape={image.shape}")
+                except Exception as e:
+                    logger.error(f"RAWSNAP failed: {str(e)}", exc_info=True)
+                    conn.sendall(f"FAILED:{str(e)}".encode())
+                continue
+
             if data == ExtendedCommand.TESTAF:
                 logger.info(f"Client {addr} requested autofocus test")
 

@@ -86,3 +86,6 @@ class ExtendedCommand:
 
     # Live Viewer Commands
     GETFRAME = b"getframe"  # Get latest frame from MM circular buffer (for live viewer)
+
+    # Debug/Test Commands
+    RAWSNAP = b"rawsnap_"  # Raw snap_image() without resetting camera mode (for crash testing)
