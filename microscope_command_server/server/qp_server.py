@@ -79,18 +79,82 @@ from microscope_command_server.server.protocol import ExtendedCommand, TCP_PORT,
 from microscope_command_server.acquisition.workflow import _acquisition_workflow
 
 
-# Configure logging
+# Configure logging - boot/pre-connection logging goes to console + fallback file
 current_file_path = pathlib.Path(__file__).resolve()
-base_dir = current_file_path.parent  # e.g., smart-wsi-scanner/src/smart_wsi_scanner
+base_dir = current_file_path.parent
 log_dir = base_dir / "server_logfiles"
-log_dir.mkdir(parents=True, exist_ok=True)  # Create it if it doesn't exist
-filename = log_dir / f'qp_server_{datetime.now().strftime("%Y%m%d_%H%M%S")}.log'
+log_dir.mkdir(parents=True, exist_ok=True)
+boot_log_filename = log_dir / f'qp_server_boot_{datetime.now().strftime("%Y%m%d_%H%M%S")}.log'
 logging.basicConfig(
-    level=logging.INFO,  # Changed from INFO to DEBUG to see [TIMING-INTERNAL] logs
+    level=logging.INFO,
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
-    handlers=[logging.FileHandler(filename), logging.StreamHandler()],
+    handlers=[logging.FileHandler(boot_log_filename), logging.StreamHandler()],
 )
 logger = logging.getLogger(__name__)
+
+# Session log handler - added to root logger when CONFIG provides a config path,
+# removed on client disconnect. Writes to <config_dir>/logs/server_session_*.log
+_session_log_handler = None
+
+
+def _start_session_logging(config_path: str) -> None:
+    """
+    Start session-based file logging in the config file's parent directory.
+
+    Creates a log file at <config_parent>/logs/server_session_YYYYMMDD_HHMMSS.log.
+    The handler is added to the root logger so all module loggers are captured.
+    The handler flushes immediately on each log record (no buffered data lost on crash).
+
+    Args:
+        config_path: Path to the YAML config file sent by QuPath via CONFIG command
+    """
+    global _session_log_handler
+
+    # Remove any existing session handler first
+    _stop_session_logging()
+
+    try:
+        config_dir = pathlib.Path(config_path).resolve().parent
+        session_log_dir = config_dir / "logs"
+        session_log_dir.mkdir(parents=True, exist_ok=True)
+
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        session_log_file = session_log_dir / f"server_session_{timestamp}.log"
+
+        # Create a handler that flushes immediately via a custom emit override
+        handler = logging.FileHandler(session_log_file, encoding="utf-8")
+        handler.setLevel(logging.DEBUG)
+        handler.setFormatter(logging.Formatter(
+            "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+        ))
+
+        # Add to root logger so all child loggers are captured
+        logging.getLogger().addHandler(handler)
+        _session_log_handler = handler
+
+        logger.info(f"Session logging started: {session_log_file}")
+    except Exception as e:
+        logger.error(f"Failed to start session logging: {e}", exc_info=True)
+
+
+def _stop_session_logging() -> None:
+    """
+    Stop session-based file logging and clean up the handler.
+
+    Flushes and closes the session log handler, then removes it from the root logger.
+    """
+    global _session_log_handler
+
+    if _session_log_handler is not None:
+        try:
+            logger.info("Session logging stopped")
+            _session_log_handler.flush()
+            _session_log_handler.close()
+            logging.getLogger().removeHandler(_session_log_handler)
+        except Exception as e:
+            logger.debug(f"Error closing session log handler: {e}")
+        finally:
+            _session_log_handler = None
 
 
 # Server configuration
@@ -447,6 +511,9 @@ def handle_client(conn, addr):
                     microscope_name = new_settings.get("microscope", {}).get("name", "Unknown")
                     logger.info(f"CONFIG: Successfully loaded config for microscope: {microscope_name}")
                     logger.info(f"CONFIG: Server now configured and ready for operations")
+
+                    # Start session logging to <config_dir>/logs/
+                    _start_session_logging(config_path)
 
                     # Send success response
                     conn.sendall(b"CFG___OK")
@@ -3326,6 +3393,8 @@ def handle_client(conn, addr):
             if active_connection_addr == addr:
                 logger.info(f"Active connection {addr} disconnected - server now UNCONFIGURED")
                 logger.info("Next connection will need to provide CONFIG command")
+                # Stop session logging before clearing state
+                _stop_session_logging()
                 server_configured = False
                 active_connection_addr = None
                 active_connection_config_path = None
