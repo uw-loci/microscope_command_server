@@ -254,8 +254,6 @@ class QuPathTestClient:
             Path to saved image
         """
         return self.snap_image(output_path, angle, exposure_ms)
-        else:
-            raise RuntimeError(f"Unexpected response: {response}")
 
 
 def main():
