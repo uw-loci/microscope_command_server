@@ -13,6 +13,7 @@ from microscope_command_server.client.client import (
     move_stageZ,
     get_stageR,
     move_stageR,
+    QuPathTestClient,
 )
 
 __all__ = [
@@ -22,4 +23,5 @@ __all__ = [
     "move_stageZ",
     "get_stageR",
     "move_stageR",
+    "QuPathTestClient",
 ]
