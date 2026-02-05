@@ -3308,6 +3308,7 @@ def polarizer_calibration_workflow(
     hardware: PycromanagerHardware,
     config_manager,
     logger,
+    progress_callback=None,
 ) -> str:
     """
     Calibrate PPM polarizer rotation stage to find crossed polarizer positions.
@@ -3326,6 +3327,7 @@ def polarizer_calibration_workflow(
         hardware: Microscope hardware interface
         config_manager: Configuration manager
         logger: Logger instance
+        progress_callback: Optional callback(current, total, stage, message) for socket keepalive
 
     Returns:
         str: Path to the calibration report text file
@@ -3394,6 +3396,7 @@ def polarizer_calibration_workflow(
             exposure_ms=exposure_ms,
             channel=1,  # Green channel
             logger_instance=logger,
+            progress_callback=progress_callback,  # Keep socket alive during long calibration
         )
 
         # Write calibration report
