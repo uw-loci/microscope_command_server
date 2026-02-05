@@ -1217,6 +1217,23 @@ def handle_client(conn, addr):
                 continue
 
             # ==================== WBSIMPLE: Simple White Balance ====================
+            # JAI-SPECIFIC: Per-channel exposure/gain calibration for a single
+            # imaging condition (one exposure, one target intensity).
+            #
+            # Protocol: 8-byte command, then variable-length text message with
+            #   flag-based parameters (--yaml, --output, --camera, --exposure,
+            #   --target, --tolerance, --max_gain_db, etc.)
+            #
+            # Response sequence:
+            #   1. Immediately sends "STARTED:{output_path}" acknowledgment
+            #   2. Runs iterative calibration (may take seconds to minutes)
+            #   3. Sends "SUCCESS:{path}|CONVERGED|exp_r:...|gain_r:..." or
+            #      "FAILED:{reason}" on completion
+            #
+            # Post-calibration cleanup (in finally block):
+            #   Resets camera to unified exposure/gain mode and sets all analog
+            #   gains to 1.0. This prevents per-channel settings from leaking
+            #   into subsequent non-calibrated acquisitions.
             if data == ExtendedCommand.WBSIMPLE:
                 logger.info(f"Client {addr} requested simple white balance calibration")
 
@@ -1389,20 +1406,30 @@ def handle_client(conn, addr):
                                         detector=wb_detector,
                                     )
 
-                                # Format response
+                                # Format response with new gain model
                                 exp_str = (
                                     f"exp_r:{result.exposures_ms['red']:.2f},"
                                     f"exp_g:{result.exposures_ms['green']:.2f},"
                                     f"exp_b:{result.exposures_ms['blue']:.2f}"
                                 )
                                 gain_str = (
-                                    f"gain_r:{result.gains['red']:.3f},"
-                                    f"gain_g:{result.gains['green']:.3f},"
-                                    f"gain_b:{result.gains['blue']:.3f}"
+                                    f"unified:{result.unified_gain:.3f},"
+                                    f"analog_r:{result.analog_red:.3f},"
+                                    f"analog_b:{result.analog_blue:.3f}"
                                 )
                                 status = "CONVERGED" if result.converged else "NOT_CONVERGED"
 
                                 response = f"SUCCESS:{output_path}|{status}|{exp_str}|{gain_str}"
+
+                                # Append noise stats if available
+                                if result.noise_stats is not None:
+                                    ns = result.noise_stats
+                                    response += (
+                                        f"|noise_r:{ns.channel_stddevs['red']:.2f},"
+                                        f"noise_g:{ns.channel_stddevs['green']:.2f},"
+                                        f"noise_b:{ns.channel_stddevs['blue']:.2f}"
+                                    )
+
                                 conn.sendall(response.encode())
                                 logger.info(f"WBSIMPLE completed: {status}")
 
@@ -1434,21 +1461,42 @@ def handle_client(conn, addr):
                     conn.sendall(f"FAILED:{str(e)}".encode())
                 finally:
                     conn.settimeout(None)  # Reset to blocking mode
-                    # Reset per-channel mode so subsequent operations can use
-                    # unified set_exposure() correctly
+                    # Reset camera to clean state after calibration
                     try:
                         from microscope_control.jai import JAICameraProperties
                         jai_props = JAICameraProperties(hardware.core)
+                        jai_props.set_rb_analog_gains(red=1.0, blue=1.0)
+                        jai_props.set_unified_gain(1.0)
                         jai_props.disable_individual_exposure()
-                        jai_props.disable_individual_gain()
-                        jai_props.set_analog_gains(red=1.0, green=1.0, blue=1.0, auto_enable=False)
-                        logger.debug("Reset per-channel mode after WBSIMPLE")
+                        logger.debug("Reset camera state after WBSIMPLE")
                     except (ImportError, Exception):
                         pass
 
                 continue
 
             # ==================== WBPPM: PPM White Balance (4 angles) ====================
+            # JAI-SPECIFIC: Per-channel exposure/gain calibration repeated at
+            # each of 4 PPM polarizer angles (positive, negative, crossed,
+            # uncrossed). Each angle may have a different target intensity
+            # because optical transmission varies dramatically with polarizer
+            # orientation (e.g., crossed ~125 vs uncrossed ~245).
+            #
+            # Protocol: 8-byte command, then variable-length text with
+            #   per-angle flags (--positive_exp, --positive_angle, --target_positive, ...)
+            #   plus shared calibration tuning flags (same as WBSIMPLE).
+            #
+            # Per-angle target priority (highest to lowest):
+            #   1. Client-provided --target_{angle} flags
+            #   2. YAML background_exposures.angles.{angle}.achieved_intensity
+            #   3. YAML calibration_targets.target_intensities.{angle}
+            #   4. Default fallback: 180.0
+            #
+            # Gain reset between angles: The calibrator resets per-channel
+            # gains to 1.0 at the start of each angle's calibration to ensure
+            # clean convergence without carryover from the previous angle.
+            #
+            # Response: "SUCCESS:{path}|{angle}:{exp_r},{exp_g},{exp_b}:{gain_r},{gain_g},{gain_b}:{Y/N}|..."
+            # Post-calibration: Same mode reset as WBSIMPLE (unified mode, gains to 1.0).
             if data == ExtendedCommand.WBPPM:
                 logger.info(f"Client {addr} requested PPM white balance calibration (4 angles)")
 
@@ -1730,7 +1778,7 @@ def handle_client(conn, addr):
                                         )
 
                                 # Format response with results for all angles
-                                # Format: SUCCESS:path|angle:exp_r,exp_g,exp_b:gain_r,gain_g,gain_b:Y/N|...
+                                # Format: SUCCESS:path|angle:exp_r,exp_g,exp_b:unified,aR,aB:Y/N|...
                                 response_parts = [f"SUCCESS:{output_path}"]
                                 all_converged = True
                                 for name, result in results.items():
@@ -1740,9 +1788,9 @@ def handle_client(conn, addr):
                                         f"{result.exposures_ms['blue']:.2f}"
                                     )
                                     gain_str = (
-                                        f"{result.gains['red']:.3f},"
-                                        f"{result.gains['green']:.3f},"
-                                        f"{result.gains['blue']:.3f}"
+                                        f"{result.unified_gain:.3f},"
+                                        f"{result.analog_red:.3f},"
+                                        f"{result.analog_blue:.3f}"
                                     )
                                     converged = "Y" if result.converged else "N"
                                     response_parts.append(f"{name}:{exp_str}:{gain_str}:{converged}")
@@ -1781,15 +1829,14 @@ def handle_client(conn, addr):
                     conn.sendall(f"FAILED:{str(e)}".encode())
                 finally:
                     conn.settimeout(None)  # Reset to blocking mode
-                    # Reset per-channel mode so subsequent operations can use
-                    # unified set_exposure() correctly
+                    # Reset camera to clean state after calibration
                     try:
                         from microscope_control.jai import JAICameraProperties
                         jai_props = JAICameraProperties(hardware.core)
+                        jai_props.set_rb_analog_gains(red=1.0, blue=1.0)
+                        jai_props.set_unified_gain(1.0)
                         jai_props.disable_individual_exposure()
-                        jai_props.disable_individual_gain()
-                        jai_props.set_analog_gains(red=1.0, green=1.0, blue=1.0, auto_enable=False)
-                        logger.debug("Reset per-channel mode after WBPPM")
+                        logger.debug("Reset camera state after WBPPM")
                     except (ImportError, Exception):
                         pass
 
@@ -2999,28 +3046,24 @@ def handle_client(conn, addr):
                 continue
 
             # GETMODE - Get exposure/gain mode flags (individual vs unified)
+            # Gain is always reported as unified (0) since individual gain mode
+            # is no longer used. R/B analog gains work in unified mode.
             if data == ExtendedCommand.GETMODE:
                 logger.debug(f"Client {addr} requested camera mode flags")
                 try:
-                    # Try to get JAI camera properties
                     from microscope_control.jai import JAICameraProperties
                     jai_props = JAICameraProperties(hardware.core)
 
-                    # Check if JAI camera is active
                     if jai_props.validate_camera():
                         exp_individual = jai_props.is_individual_exposure_enabled()
-                        gain_individual = jai_props.is_individual_gain_enabled()
-                        # Response: "JAI_EXP:X_GAIN:Y" padded to 16 bytes
-                        # X = 1 for individual, 0 for unified
-                        mode_str = f"JAI_EXP:{1 if exp_individual else 0}_GAIN:{1 if gain_individual else 0}"
+                        # Gain is always unified in new model
+                        mode_str = f"JAI_EXP:{1 if exp_individual else 0}_GAIN:0"
                         conn.sendall(mode_str.encode("utf-8").ljust(16, b"\x00"))
-                        logger.info(f"Sent JAI mode flags: exp_ind={exp_individual}, gain_ind={gain_individual}")
+                        logger.info(f"Sent JAI mode flags: exp_ind={exp_individual}, gain_ind=false")
                     else:
-                        # Not a JAI camera - return unified mode indicator
                         conn.sendall(b"UNIFIED_________")
                         logger.info("Non-JAI camera - sent UNIFIED mode")
                 except ImportError:
-                    # JAI module not available - assume unified mode
                     conn.sendall(b"UNIFIED_________")
                     logger.info("JAI module not available - sent UNIFIED mode")
                 except Exception as e:
@@ -3030,6 +3073,15 @@ def handle_client(conn, addr):
                 continue
 
             # SETMODE - Set exposure/gain mode flags
+            # JAI-SPECIFIC: Sets exposure mode (individual or unified).
+            # Gain mode byte is accepted but ignored - gain is always unified.
+            # R/B analog gains work in unified mode via set_rb_analog_gains().
+            #
+            # Protocol: 8-byte command + 2 bytes [exp_mode, gain_mode]
+            #   exp_mode:  1 = individual (R,G,B separate), 0 = unified
+            #   gain_mode: ignored (always unified), logged if True requested
+            #
+            # Response: "ACK_____" on success, "ERR_NJAI" if not JAI, "ERR_MODE" on failure.
             if data == ExtendedCommand.SETMODE:
                 logger.debug(f"Client {addr} requested to set camera mode")
                 try:
@@ -3040,7 +3092,14 @@ def handle_client(conn, addr):
 
                     exp_individual = mode_bytes[0] == 1
                     gain_individual = mode_bytes[1] == 1
-                    logger.info(f"Setting mode: exp_individual={exp_individual}, gain_individual={gain_individual}")
+
+                    if gain_individual:
+                        logger.warning(
+                            "Individual gain mode requested but ignored - "
+                            "gain is always unified. Use R/B analog gains instead."
+                        )
+
+                    logger.info(f"Setting mode: exp_individual={exp_individual}, gain_individual=false(forced)")
 
                     from microscope_control.jai import JAICameraProperties
                     jai_props = JAICameraProperties(hardware.core)
@@ -3053,10 +3112,8 @@ def handle_client(conn, addr):
                     else:
                         jai_props.disable_individual_exposure()
 
-                    if gain_individual:
-                        jai_props.enable_individual_gain()
-                    else:
-                        jai_props.disable_individual_gain()
+                    # Always ensure gain is unified
+                    jai_props.disable_individual_gain()
 
                     conn.sendall(b"ACK_____")
                     logger.info("Camera mode set successfully")
@@ -3106,6 +3163,16 @@ def handle_client(conn, addr):
                 continue
 
             # SETEXP - Set exposure values
+            # MIXED: count=1 is GENERIC (calls hardware.set_exposure for any camera),
+            # count>=3 is JAI-SPECIFIC (sets per-channel R,G,B exposures via
+            # JAICameraProperties.set_channel_exposures with auto_enable=True,
+            # which implicitly enables individual exposure mode).
+            #
+            # Protocol: 8-byte command + 1 count byte + (count * 4) bytes of
+            #   big-endian floats (exposure values in ms).
+            #
+            # Response: "ACK_____" on success, "ERR_NJAI" if JAI module unavailable
+            #   for per-channel, "ERR_EXPO" on other failure.
             if data == ExtendedCommand.SETEXP:
                 logger.debug(f"Client {addr} requested to set exposure")
                 try:
@@ -3147,38 +3214,50 @@ def handle_client(conn, addr):
                     conn.sendall(b"ERR_EXPO")
                 continue
 
-            # GETGAIN - Get gain values (unified or per-channel RGB)
+            # GETGAIN - Get gain values
+            # Always returns 3 floats: [unified_gain, analog_red, analog_blue]
             if data == ExtendedCommand.GETGAIN:
                 logger.debug(f"Client {addr} requested gain values")
                 try:
                     from microscope_control.jai import JAICameraProperties
                     jai_props = JAICameraProperties(hardware.core)
 
-                    if jai_props.validate_camera() and jai_props.is_individual_gain_enabled():
-                        # JAI with individual gains - return 3 floats (R, G, B analog gains)
-                        gains = jai_props.get_analog_gains()
+                    if jai_props.validate_camera():
+                        unified = jai_props.get_unified_gain()
+                        rb_gains = jai_props.get_rb_analog_gains()
                         response = struct.pack("!fff",
-                            float(gains["red"]),
-                            float(gains["green"]),
-                            float(gains["blue"]))
+                            float(unified),
+                            float(rb_gains["red"]),
+                            float(rb_gains["blue"]))
                         conn.sendall(response)
-                        logger.info(f"Sent per-channel gains: R={gains['red']}, G={gains['green']}, B={gains['blue']}")
+                        logger.info(
+                            f"Sent gains: unified={unified}, "
+                            f"analog_red={rb_gains['red']}, analog_blue={rb_gains['blue']}"
+                        )
                     else:
-                        # Unified gain - return single value (default 1.0)
-                        response = struct.pack("!f", 1.0)
+                        # Not JAI - return defaults
+                        response = struct.pack("!fff", 1.0, 1.0, 1.0)
                         conn.sendall(response)
-                        logger.info("Sent unified gain (1.0)")
+                        logger.info("Non-JAI camera - sent default gains (1.0, 1.0, 1.0)")
                 except ImportError:
-                    # JAI module not available - return default
-                    response = struct.pack("!f", 1.0)
+                    response = struct.pack("!fff", 1.0, 1.0, 1.0)
                     conn.sendall(response)
-                    logger.info("Sent default gain (no JAI): 1.0")
+                    logger.info("JAI module not available - sent default gains")
                 except Exception as e:
                     logger.error(f"Failed to get gain: {e}")
-                    conn.sendall(struct.pack("!f", -1.0))
+                    conn.sendall(struct.pack("!fff", -1.0, -1.0, -1.0))
                 continue
 
             # SETGAIN - Set gain values
+            # JAI-SPECIFIC (both paths):
+            #   count=1: Sets unified gain via set_unified_gain (range 1.0-8.0)
+            #   count=3: Sets [unified_gain, analog_red, analog_blue]
+            #            - unified gain applied to all channels
+            #            - analog_red/blue applied via set_rb_analog_gains (0.47-4.0)
+            #            - Does NOT enable individual gain mode
+            #
+            # Protocol: 8-byte command + 1 count byte + (count * 4) bytes floats.
+            # Response: "ACK_____", "ERR_NJAI", or "ERR_GAIN".
             if data == ExtendedCommand.SETGAIN:
                 logger.debug(f"Client {addr} requested to set gain")
                 try:
@@ -3195,28 +3274,26 @@ def handle_client(conn, addr):
                     gains = struct.unpack(f"!{'f' * count}", float_data)
                     logger.info(f"Setting gains: {gains}")
 
+                    from microscope_control.jai import JAICameraProperties
+                    jai_props = JAICameraProperties(hardware.core)
+
                     if count == 1:
-                        # Unified gain - set via JAI unified gain property (1.0-8.0 range)
-                        from microscope_control.jai import JAICameraProperties
-                        jai_props = JAICameraProperties(hardware.core)
+                        # Unified gain only
                         jai_props.set_unified_gain(gains[0])
                         logger.info(f"Set unified gain: {gains[0]}")
                     elif count >= 3:
-                        # Per-channel analog gains (R, G, B)
-                        from microscope_control.jai import JAICameraProperties
-                        jai_props = JAICameraProperties(hardware.core)
-                        jai_props.set_analog_gains(
-                            red=gains[0],
-                            green=gains[1],
-                            blue=gains[2],
-                            auto_enable=True
+                        # New semantics: [unified_gain, analog_red, analog_blue]
+                        jai_props.set_unified_gain(gains[0])
+                        jai_props.set_rb_analog_gains(red=gains[1], blue=gains[2])
+                        logger.info(
+                            f"Set gains: unified={gains[0]}, "
+                            f"analog_red={gains[1]}, analog_blue={gains[2]}"
                         )
-                        logger.info(f"Set per-channel analog gains: R={gains[0]}, G={gains[1]}, B={gains[2]}")
 
                     conn.sendall(b"ACK_____")
                 except ImportError:
                     conn.sendall(b"ERR_NJAI")
-                    logger.error("JAI module not available for per-channel gain")
+                    logger.error("JAI module not available for gain control")
                 except Exception as e:
                     logger.error(f"Failed to set gain: {e}")
                     conn.sendall(b"ERR_GAIN")
@@ -3225,6 +3302,22 @@ def handle_client(conn, addr):
             # ==================== White Balance Mode Control ====================
 
             # SETWBMD - Set camera white balance mode (0=Off, 1=Continuous, 2=Once)
+            # JAI-SPECIFIC: Controls the camera's built-in hardware auto white
+            # balance feature. This is SEPARATE from the calibration commands
+            # (WBSIMPLE/WBPPM) which manually compute and apply per-channel
+            # exposure/gain values.
+            #
+            # WARNING: Hardware auto-WB (Continuous/Once) adjusts internal
+            # camera parameters that are NOT saved or reproducible. For
+            # reproducible scientific imaging, use WBSIMPLE/WBPPM calibration
+            # instead and keep hardware WB mode set to Off.
+            #
+            # Protocol: 8-byte command + 1 byte mode value.
+            #   0 = Off (disable auto WB)
+            #   1 = Continuous (camera auto-adjusts WB every frame)
+            #   2 = Once (camera runs single auto-WB then stops)
+            #
+            # Response: "ACK_____", "ERR_NJAI", or "ERR_WBMD".
             if data == ExtendedCommand.SETWBMD:
                 logger.debug(f"Client {addr} requested to set WB mode")
                 try:
@@ -3358,6 +3451,51 @@ def handle_client(conn, addr):
                 except Exception as e:
                     logger.error(f"Failed to stop continuous acquisition: {e}")
                     conn.sendall(b"ERR_SEQ_")
+                continue
+
+            # GETNOISE - Get per-channel noise statistics via multi-frame analysis
+            # Protocol: 8-byte command + 1 byte (num_frames, 0 = default 10)
+            # Response: 9 big-endian floats:
+            #   R_mean, G_mean, B_mean, R_std, G_std, B_std, R_snr, G_snr, B_snr
+            if data == ExtendedCommand.GETNOISE:
+                logger.info(f"Client {addr} requested noise measurement")
+                try:
+                    # Read 1 byte for num_frames (0 = default 10)
+                    nf_byte = conn.recv(1)
+                    num_frames = nf_byte[0] if nf_byte and nf_byte[0] > 0 else 10
+
+                    from microscope_control.jai import JAINoiseMeasurement
+                    noise_meter = JAINoiseMeasurement(hardware)
+                    stats = noise_meter.measure_noise(
+                        num_frames=num_frames, settle_frames=2
+                    )
+
+                    # Pack 9 floats: means (R,G,B), stddevs (R,G,B), SNRs (R,G,B)
+                    response = struct.pack(
+                        "!fffffffff",
+                        float(stats.channel_means["red"]),
+                        float(stats.channel_means["green"]),
+                        float(stats.channel_means["blue"]),
+                        float(stats.channel_stddevs["red"]),
+                        float(stats.channel_stddevs["green"]),
+                        float(stats.channel_stddevs["blue"]),
+                        float(stats.channel_snr["red"]),
+                        float(stats.channel_snr["green"]),
+                        float(stats.channel_snr["blue"]),
+                    )
+                    conn.sendall(response)
+                    logger.info(
+                        f"Noise stats sent: R_snr={stats.channel_snr['red']:.1f}, "
+                        f"G_snr={stats.channel_snr['green']:.1f}, "
+                        f"B_snr={stats.channel_snr['blue']:.1f}"
+                    )
+                except ImportError as e:
+                    logger.error(f"Noise measurement module not available: {e}")
+                    # Send 9 zeros on error
+                    conn.sendall(struct.pack("!fffffffff", *([0.0] * 9)))
+                except Exception as e:
+                    logger.error(f"Noise measurement failed: {e}", exc_info=True)
+                    conn.sendall(struct.pack("!fffffffff", *([0.0] * 9)))
                 continue
 
             # Unknown command

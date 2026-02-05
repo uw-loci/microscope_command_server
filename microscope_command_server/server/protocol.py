@@ -63,26 +63,39 @@ class ExtendedCommand:
     PPMBIREF = b"ppmbiref"  # PPM Birefringence Maximization Test
     SBCALIB = b"sbcalib_"  # Sunburst Calibration for hue-to-angle mapping
 
-    # JAI Camera Commands
+    # ---- JAI-Specific: White Balance Calibration Commands ----
+    # These commands require a JAI trilinear color camera with per-channel
+    # exposure and gain control. They use the JAIWhiteBalanceCalibrator from
+    # microscope_control.jai to iteratively converge on target intensity.
+    # Non-JAI cameras should use software white balance (see pipeline.py).
     WBCALIBR = b"wbcalibr"  # White Balance Calibration for JAI camera (legacy)
-    WBSIMPLE = b"wbsimple"  # Simple White Balance at single exposure
-    WBPPM = b"wbppm___"  # PPM White Balance at 4 angles (padded to 8 bytes)
+    WBSIMPLE = b"wbsimple"  # Simple WB at single exposure (JAI per-channel)
+    WBPPM = b"wbppm___"  # PPM WB at 4 polarizer angles (JAI per-channel)
 
-    # Camera Control Commands (for Camera Control dialog)
-    GETCAM = b"getcam__"  # Get camera name from Core
-    GETMODE = b"getmode_"  # Get exposure/gain mode flags (individual vs unified)
-    SETMODE = b"setmode_"  # Set exposure/gain mode flags
-    GETEXP = b"getexp__"  # Get exposure values (unified or per-channel RGB)
-    SETEXP = b"setexp__"  # Set exposure values
-    GETGAIN = b"getgain_"  # Get gain values (unified or per-channel RGB)
-    SETGAIN = b"setgain_"  # Set gain values
+    # ---- JAI-Specific: Camera Control Commands (Camera Control dialog) ----
+    # Per-channel (count>=3) paths require JAI. Unified (count=1) paths for
+    # SETEXP use generic hardware.set_exposure(), but SETGAIN unified path
+    # still uses JAI's set_unified_gain(). GETMODE/SETMODE are JAI-only.
+    GETCAM = b"getcam__"  # Get camera name from Core (generic)
+    GETMODE = b"getmode_"  # Get exposure/gain mode flags (JAI: individual vs unified)
+    SETMODE = b"setmode_"  # Set exposure/gain mode flags (JAI-only, 2-byte payload)
+    GETEXP = b"getexp__"  # Get exposure values (unified or JAI per-channel RGB)
+    SETEXP = b"setexp__"  # Set exposure (count=1: generic, count>=3: JAI per-channel)
+    GETGAIN = b"getgain_"  # Get gain values (unified or JAI per-channel RGB)
+    SETGAIN = b"setgain_"  # Set gain (count=1: JAI unified, count>=3: JAI per-channel)
 
-    # White Balance Mode Control
-    SETWBMD = b"setwbmd_"  # Set camera white balance mode (0=Off, 1=Continuous, 2=Once)
+    # ---- JAI-Specific: White Balance Mode Control ----
+    # Controls the camera's built-in auto white balance hardware feature.
+    # NOTE: Hardware auto-WB (Continuous/Once) is NOT reproducible across
+    # sessions. For reproducible results, use WBSIMPLE/WBPPM calibration.
+    SETWBMD = b"setwbmd_"  # Set camera WB mode (0=Off, 1=Continuous, 2=Once)
 
     # Live Mode Control Commands
     GETLIVE = b"getlive_"  # Check if live mode is currently running
     SETLIVE = b"setlive_"  # Set live mode on (1) or off (0)
+
+    # Noise measurement
+    GETNOISE = b"getnoise"  # Get per-channel noise stats (multi-frame temporal analysis)
 
     # Live Viewer Commands (core-level, bypasses MM studio/live window)
     GETFRAME = b"getframe"  # Get latest frame from MM circular buffer

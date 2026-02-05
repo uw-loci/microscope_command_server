@@ -57,7 +57,13 @@ def load_jai_calibration_from_imageprocessing(
     """
     config_path = Path(config_path)
 
-    # Derive imageprocessing file path
+    # Derive imageprocessing file path from the config file name.
+    # Naming convention: config_PPM.yml -> imageprocessing_PPM.yml
+    # The imageprocessing file stores calibrated per-channel exposure/gain
+    # values that were computed by JAIWhiteBalanceCalibrator. This separation
+    # keeps hardware config (config_*.yml) independent from calibration
+    # results (imageprocessing_*.yml) so recalibration doesn't modify the
+    # main config and calibration data can be updated independently.
     config_name = config_path.stem  # e.g., "config_PPM"
     if config_name.startswith("config_"):
         microscope_name = config_name[7:]  # e.g., "PPM"
@@ -101,6 +107,12 @@ def load_jai_calibration_from_imageprocessing(
             return None
 
         if per_angle:
+            # PPM requires per-angle calibration because each polarizer angle
+            # produces dramatically different light levels (crossed is very dim,
+            # uncrossed is very bright). A single set of per-channel exposures
+            # cannot achieve white balance across all angles, so each angle
+            # gets its own independently calibrated R,G,B exposure and gain set.
+            #
             # Build per-angle calibration structure from exposures_ms
             # Expected format in YAML:
             #   exposures_ms:
@@ -119,7 +131,26 @@ def load_jai_calibration_from_imageprocessing(
                     }
                     # Add gains if available
                     if gains and angle_name in gains:
-                        angles_data[angle_name]['gains'] = gains[angle_name]
+                        angle_gains = gains[angle_name]
+                        # Support both new format (analog_red/analog_blue) and
+                        # old format (r/g/b) for backward compatibility
+                        if 'analog_red' in angle_gains:
+                            angles_data[angle_name]['gains'] = angle_gains
+                        elif 'r' in angle_gains:
+                            # Old format: map r -> analog_red, b -> analog_blue
+                            angles_data[angle_name]['gains'] = {
+                                'unified_gain': angle_gains.get('unified_gain', 1.0),
+                                'analog_red': angle_gains.get('r', 1.0),
+                                'analog_blue': angle_gains.get('b', 1.0),
+                                'wb_method': angle_gains.get('wb_method', 'unknown'),
+                            }
+                            if logger:
+                                logger.info(
+                                    f"Mapped old gain format (r/g/b) to new "
+                                    f"(analog_red/analog_blue) for angle {angle_name}"
+                                )
+                        else:
+                            angles_data[angle_name]['gains'] = angle_gains
 
             if angles_data:
                 if logger:
@@ -180,7 +211,15 @@ def apply_jai_calibration_for_angle(
 
         # Get calibration settings for this angle
         if per_angle:
-            # Map numeric angle to angle name
+            # Map numeric PSG rotation angle (degrees) to PPM angle name.
+            # These angles are defined by the polarized light microscopy
+            # geometry relative to the crossed-polarizer position (0 deg):
+            #   0.0  = crossed (polarizers at 90 deg to each other, minimum light)
+            #   90.0 = uncrossed (polarizers parallel, maximum light)
+            #   +7.0 = positive birefringence (slight rotation from crossed)
+            #   -7.0 = negative birefringence (slight rotation the other way)
+            # A tolerance of 1.0 degree is used for matching because the
+            # rotation stage may not land exactly on the target angle.
             angle_mapping = {90.0: "uncrossed", 0.0: "crossed", 7.0: "positive", -7.0: "negative"}
             angle_name = angle_mapping.get(angle)
             if not angle_name:
@@ -227,39 +266,37 @@ def apply_jai_calibration_for_angle(
 
         exp_msg = f"Applied JAI calibration for angle {angle}: R={exp_r:.1f}ms, G={exp_g:.1f}ms, B={exp_b:.1f}ms"
 
-        # Apply per-channel gains only if non-unity (same logic as background collection)
-        # CRITICAL: Enabling individual gain mode with unity gains behaves DIFFERENTLY
-        # than having gain mode disabled on JAI cameras!
-        gain_r = gains.get("r", 1.0)
-        gain_g = gains.get("g", 1.0)
-        gain_b = gains.get("b", 1.0)
-
-        has_gain_compensation = (
-            abs(gain_r - 1.0) > 0.01 or
-            abs(gain_g - 1.0) > 0.01 or
-            abs(gain_b - 1.0) > 0.01
-        )
-
-        if has_gain_compensation:
-            jai_props.set_analog_gains(
-                red=gain_r,
-                green=gain_g,
-                blue=gain_b,
-                auto_enable=True,
-            )
-            exp_msg += f" | Gains: R={gain_r:.3f}, G={gain_g:.3f}, B={gain_b:.3f}"
-        else:
-            # No per-channel gain compensation - disable individual gain mode
-            jai_props.disable_individual_gain()
-
-        # Apply unified gain if present and > 1.0
-        # When unified gain mode is used during calibration, the per-channel gains
-        # are all 1.0 but unified_gain carries the overall brightness boost.
-        # Without this, images will be darker than calibration intended.
+        # Apply gains using new model: unified gain + R/B analog corrections
+        # New format keys: unified_gain, analog_red, analog_blue
+        # Old format keys: unified_gain, r, g, b
         unified_gain = gains.get("unified_gain", 1.0)
-        if unified_gain > 1.0 + 0.01:
+        analog_red = gains.get("analog_red", None)
+        analog_blue = gains.get("analog_blue", None)
+
+        # Backward compatibility: if old r/g/b keys found, map them
+        if analog_red is None and "r" in gains:
+            analog_red = gains.get("r", 1.0)
+            analog_blue = gains.get("b", 1.0)
+            if logger:
+                logger.info(
+                    "Using old gain format (r/g/b) - "
+                    "mapped to analog_red/analog_blue"
+                )
+
+        if analog_red is None:
+            analog_red = 1.0
+        if analog_blue is None:
+            analog_blue = 1.0
+
+        # Apply unified gain
+        if unified_gain > 1.01:
             jai_props.set_unified_gain(unified_gain)
             exp_msg += f" | Unified gain: {unified_gain:.3f}"
+
+        # Apply R/B analog corrections (works without individual gain mode)
+        if abs(analog_red - 1.0) > 0.01 or abs(analog_blue - 1.0) > 0.01:
+            jai_props.set_rb_analog_gains(red=analog_red, blue=analog_blue)
+            exp_msg += f" | Analog R={analog_red:.3f}, B={analog_blue:.3f}"
 
         if logger:
             logger.info(exp_msg)
@@ -301,7 +338,13 @@ def load_and_apply_white_balance_settings(
     Returns:
         True if settings were loaded and applied, False otherwise
     """
-    # Only applies to JAI camera
+    # Strict camera name check: only applies to exactly "JAICamera".
+    # Unlike the other WB functions that check for "JAI" substring (which
+    # would match hypothetical "JAI_Fusion" etc.), this function uses an
+    # exact match because the white_balance_settings.yml file format is
+    # tightly coupled to JAICameraProperties.apply_white_balance_settings()
+    # and its specific property names. A different JAI model would likely
+    # need a different settings loader.
     camera_name = hardware.core.get_property("Core", "Camera")
     if camera_name != "JAICamera":
         if logger:
@@ -3330,7 +3373,7 @@ def polarizer_calibration_workflow(
             )
 
         # Import the calibration utility
-        from ppm_library.ppm.calibration import PolarizerCalibrationUtils
+        from ppm_library.ppm.polarizer_calibration import PolarizerCalibrationUtils
 
         # Run two-stage calibration to determine exact hardware offset
         logger.info(
