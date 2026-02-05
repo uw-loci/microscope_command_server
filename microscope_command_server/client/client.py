@@ -217,6 +217,46 @@ class QuPathTestClient:
         else:
             raise RuntimeError(f"Unexpected response: {response}")
 
+    # ===== test_ prefixed methods for compatibility with sensitivity_test.py =====
+
+    def test_status(self) -> str:
+        """Test STATUS command - returns acquisition status."""
+        self.socket.send(ExtendedCommand.STATUS)
+        response = self.socket.recv(16)
+        return response.decode().strip()
+
+    def test_get_rotation(self) -> float:
+        """Get current rotation angle (test_ prefix for compatibility)."""
+        return self.get_rotation()
+
+    def test_move_rotation(self, angle: float):
+        """Move rotation stage (test_ prefix for compatibility)."""
+        self.move_rotation(angle)
+
+    def test_get_xy(self) -> Tuple[float, float]:
+        """Get XY position (test_ prefix for compatibility)."""
+        return self.get_xy()
+
+    def test_get_z(self) -> float:
+        """Get Z position (test_ prefix for compatibility)."""
+        return self.get_z()
+
+    def test_snap(self, angle: float, exposure_ms: float, output_path: str) -> str:
+        """
+        Snap image (test_ prefix for compatibility with sensitivity_test.py).
+
+        Args:
+            angle: Rotation angle
+            exposure_ms: Exposure time in ms
+            output_path: Output directory path
+
+        Returns:
+            Path to saved image
+        """
+        return self.snap_image(output_path, angle, exposure_ms)
+        else:
+            raise RuntimeError(f"Unexpected response: {response}")
+
 
 def main():
     while True:
