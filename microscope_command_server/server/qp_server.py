@@ -1924,16 +1924,19 @@ def handle_client(conn, addr):
                                 # Create output directory if needed
                                 output_path.parent.mkdir(parents=True, exist_ok=True)
 
-                                # Ensure per-channel mode is disabled before using
+                                # Ensure per-channel exposure mode is disabled before using
                                 # unified set_exposure(). If per-channel mode is active
                                 # (e.g., from a previous WB calibration), set_exposure()
                                 # would be silently ignored.
+                                # NOTE: We preserve the analog R/B gains from WB calibration
+                                # for color balance - only disable per-channel exposure mode.
                                 try:
                                     from microscope_control.jai import JAICameraProperties
                                     jai_props = JAICameraProperties(hardware.core)
                                     jai_props.disable_individual_exposure()
                                     jai_props.disable_individual_gain()
-                                    jai_props.set_analog_gains(red=1.0, green=1.0, blue=1.0, auto_enable=False)
+                                    # Don't reset analog gains - preserve WB color balance
+                                    # jai_props.set_analog_gains(red=1.0, green=1.0, blue=1.0, auto_enable=False)
                                 except (ImportError, Exception):
                                     pass  # Not a JAI camera or module not available
 
@@ -2801,6 +2804,32 @@ def handle_client(conn, addr):
                                     except Exception as e:
                                         logger.warning(f"Failed to send progress: {e}")
 
+                                # Create stage move callback for calibrate mode
+                                def stage_move_callback() -> bool:
+                                    """
+                                    Send STAGEMOVE message and wait for CONTINUE/ABORT response.
+                                    Returns True if user confirmed, False if aborted.
+                                    """
+                                    try:
+                                        # Send stage move request
+                                        conn.sendall(b"STAGEMOVE:Background calibration complete. Move stage to tissue.")
+                                        logger.info("Sent STAGEMOVE request, waiting for user confirmation...")
+
+                                        # Wait for response with long timeout (user may take time)
+                                        conn.settimeout(300.0)  # 5 minute timeout
+                                        response = conn.recv(1024).decode().strip()
+                                        conn.settimeout(30.0)  # Restore normal timeout
+
+                                        if response == "CONTINUE":
+                                            logger.info("User confirmed stage move, continuing...")
+                                            return True
+                                        else:
+                                            logger.info(f"User response: {response}, aborting...")
+                                            return False
+                                    except Exception as e:
+                                        logger.error(f"Stage move callback failed: {e}")
+                                        return False
+
                                 # Run PPM birefringence test using programmatic interface
                                 from ppm_library.ppm.birefringence_test import run_birefringence_maximization_test
 
@@ -2816,6 +2845,7 @@ def handle_client(conn, addr):
                                     keep_images=True,
                                     target_intensity=params["target_intensity"],
                                     progress_callback=send_progress,
+                                    stage_move_callback=stage_move_callback if params["exposure_mode"] == "calibrate" else None,
                                 )
 
                                 if result_dir:
