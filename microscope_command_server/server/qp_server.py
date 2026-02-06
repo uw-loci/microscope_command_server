@@ -2514,17 +2514,6 @@ def handle_client(conn, addr):
                                 conn.sendall(ack_response)
                                 logger.info("Sent STARTED acknowledgment for polarizer calibration")
 
-                                # Create progress callback to send updates through socket
-                                # This keeps the connection alive during long calibration runs
-                                # Format: PROGRESS:current:total:stage:message
-                                def send_progress(current: int, total: int, stage: str, message: str):
-                                    """Send progress update through socket."""
-                                    try:
-                                        progress_msg = f"PROGRESS:{current}:{total}:{stage}:{message}".encode()
-                                        conn.sendall(progress_msg)
-                                    except Exception as e:
-                                        logger.warning(f"Failed to send progress update: {e}")
-
                                 # Execute polarizer calibration workflow
                                 from microscope_command_server.acquisition.workflow import (
                                     polarizer_calibration_workflow,
@@ -2540,7 +2529,6 @@ def handle_client(conn, addr):
                                     hardware=hardware,
                                     config_manager=config_manager,
                                     logger=logger,
-                                    progress_callback=send_progress,
                                 )
 
                                 # Send success response with report path
