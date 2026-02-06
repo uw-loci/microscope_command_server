@@ -201,7 +201,7 @@ class QuPathTestClient:
         Returns:
             Path to saved image file
         """
-        message = f"--output {output_path} --angle {angle} --exposure {exposure_ms} {END_MARKER}"
+        message = f"--angle {angle} --exposure {exposure_ms} --output {output_path} {END_MARKER}"
         self.socket.send(ExtendedCommand.SNAP)
         self.socket.send(message.encode())
 
