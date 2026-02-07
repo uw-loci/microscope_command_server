@@ -2815,8 +2815,9 @@ def handle_client(conn, addr):
                                         conn.sendall(b"STAGEMOVE:Background calibration complete. Move stage to tissue.")
                                         logger.info("Sent STAGEMOVE request, waiting for user confirmation...")
 
-                                        # Wait for response with long timeout (user may take time)
-                                        conn.settimeout(300.0)  # 5 minute timeout
+                                        # Wait indefinitely for user response (no timeout)
+                                        # User may need significant time to find tissue and position stage
+                                        conn.settimeout(None)  # No timeout - wait indefinitely
                                         response = conn.recv(1024).decode().strip()
                                         conn.settimeout(30.0)  # Restore normal timeout
 
