@@ -1873,8 +1873,8 @@ def handle_client(conn, addr):
                             # Parse the message
                             params = {}
 
-                            # Parse flags: --angle, --exposure, --output, --debayer
-                            flags = ["--angle", "--exposure", "--output", "--debayer"]
+                            # Parse flags: --angle, --exposure, --output, --debayer, --white_balance, --yaml, --objective, --detector
+                            flags = ["--angle", "--exposure", "--output", "--debayer", "--white_balance", "--yaml", "--objective", "--detector"]
 
                             for i, flag in enumerate(flags):
                                 if flag in message:
@@ -1902,6 +1902,14 @@ def handle_client(conn, addr):
                                             params["debayer"] = "auto"
                                         else:
                                             params["debayer"] = val in ("true", "1", "yes")
+                                    elif flag == "--white_balance":
+                                        params["white_balance"] = value.lower() in ("true", "1", "yes")
+                                    elif flag == "--yaml":
+                                        params["yaml_path"] = value
+                                    elif flag == "--objective":
+                                        params["objective"] = value
+                                    elif flag == "--detector":
+                                        params["detector"] = value
 
                             # Validate required parameters
                             required = ["angle", "exposure_ms", "output_path"]
@@ -1920,29 +1928,80 @@ def handle_client(conn, addr):
                                 exposure_ms = params["exposure_ms"]
                                 output_path = Path(params["output_path"])
                                 debayer = params.get("debayer", "auto")
+                                use_white_balance = params.get("white_balance", False)
+                                yaml_path = params.get("yaml_path")
 
                                 # Create output directory if needed
                                 output_path.parent.mkdir(parents=True, exist_ok=True)
 
-                                # Ensure per-channel exposure mode is disabled before using
-                                # unified set_exposure(). If per-channel mode is active
-                                # (e.g., from a previous WB calibration), set_exposure()
-                                # would be silently ignored.
-                                # NOTE: We preserve the analog R/B gains from WB calibration
-                                # for color balance - only disable per-channel exposure mode.
-                                try:
-                                    from microscope_control.jai import JAICameraProperties
-                                    jai_props = JAICameraProperties(hardware.core)
-                                    jai_props.disable_individual_exposure()
-                                    jai_props.disable_individual_gain()
-                                    # Don't reset analog gains - preserve WB color balance
-                                    # jai_props.set_analog_gains(red=1.0, green=1.0, blue=1.0, auto_enable=False)
-                                except (ImportError, Exception):
-                                    pass  # Not a JAI camera or module not available
+                                # Determine if we should apply per-angle white balance calibration
+                                # This requires both the white_balance flag and a yaml path
+                                wb_applied = False
+                                if use_white_balance and yaml_path:
+                                    try:
+                                        from microscope_command_server.acquisition.workflow import (
+                                            load_jai_calibration_from_imageprocessing,
+                                            apply_jai_calibration_for_angle,
+                                        )
 
-                                # Set exposure (fixed - no adaptive adjustment!)
-                                hardware.set_exposure(exposure_ms)
-                                logger.info(f"Set exposure to {exposure_ms:.2f} ms (FIXED)")
+                                        # Get objective/detector from params or hardware.settings
+                                        wb_objective = params.get("objective")
+                                        wb_detector = params.get("detector")
+                                        if not wb_objective or not wb_detector:
+                                            if hasattr(hardware, 'settings') and hardware.settings:
+                                                wb_objective = wb_objective or hardware.settings.get("objective_in_use") or hardware.settings.get("objective")
+                                                wb_detector = wb_detector or hardware.settings.get("detector_in_use") or hardware.settings.get("detector")
+
+                                        if wb_objective and wb_detector:
+                                            jai_cal = load_jai_calibration_from_imageprocessing(
+                                                config_path=Path(yaml_path),
+                                                per_angle=True,
+                                                modality="ppm",
+                                                objective=wb_objective,
+                                                detector=wb_detector,
+                                                logger=logger,
+                                            )
+                                            if jai_cal:
+                                                wb_applied = apply_jai_calibration_for_angle(
+                                                    hardware=hardware,
+                                                    jai_calibration=jai_cal,
+                                                    angle=angle,
+                                                    per_angle=True,
+                                                    logger=logger,
+                                                )
+                                                if wb_applied:
+                                                    logger.info(f"SNAP: Applied per-angle white balance for {angle:.2f} deg")
+                                                else:
+                                                    logger.warning(f"SNAP: Failed to apply white balance for {angle:.2f} deg")
+                                            else:
+                                                logger.warning(f"SNAP: No JAI calibration found in {yaml_path}")
+                                        else:
+                                            logger.warning(f"SNAP: Cannot apply WB - missing objective ({wb_objective}) or detector ({wb_detector})")
+                                    except ImportError as e:
+                                        logger.warning(f"SNAP: White balance modules not available: {e}")
+                                    except Exception as e:
+                                        logger.warning(f"SNAP: Error loading white balance calibration: {e}")
+
+                                # If white balance was not applied, use the default behavior:
+                                # disable per-channel mode and use unified exposure
+                                if not wb_applied:
+                                    try:
+                                        from microscope_control.jai import JAICameraProperties
+                                        jai_props = JAICameraProperties(hardware.core)
+                                        jai_props.disable_individual_exposure()
+                                        jai_props.disable_individual_gain()
+                                        # Don't reset analog gains - preserve WB color balance
+                                    except (ImportError, Exception):
+                                        pass  # Not a JAI camera or module not available
+
+                                    # Set unified exposure (fixed - no adaptive adjustment!)
+                                    hardware.set_exposure(exposure_ms)
+                                    logger.info(f"Set exposure to {exposure_ms:.2f} ms (FIXED)")
+                                else:
+                                    # White balance was applied - per-channel exposures are set,
+                                    # so we don't call hardware.set_exposure() which would be ignored
+                                    # (or potentially interfere with per-channel mode)
+                                    logger.debug(f"SNAP: Using per-channel exposures from WB calibration (exposure_ms={exposure_ms:.2f} ignored)")
 
                                 # Set rotation angle
                                 if hasattr(hardware, "set_psg_ticks"):

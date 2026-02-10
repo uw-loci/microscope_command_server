@@ -189,7 +189,16 @@ class QuPathTestClient:
         self.socket.send(struct.pack("!f", angle))
         time.sleep(0.5)
 
-    def snap_image(self, output_path: str, angle: float, exposure_ms: float) -> str:
+    def snap_image(
+        self,
+        output_path: str,
+        angle: float,
+        exposure_ms: float,
+        white_balance: bool = False,
+        yaml_path: str = None,
+        objective: str = None,
+        detector: str = None,
+    ) -> str:
         """
         Snap a single image using SNAP command.
 
@@ -197,11 +206,22 @@ class QuPathTestClient:
             output_path: Directory to save the image
             angle: Rotation angle (for filename)
             exposure_ms: Exposure time in milliseconds
+            white_balance: If True, apply per-angle white balance calibration from YAML
+            yaml_path: Path to config YAML file (required if white_balance=True)
+            objective: Objective ID for calibration lookup (optional, uses hardware.settings if not provided)
+            detector: Detector ID for calibration lookup (optional, uses hardware.settings if not provided)
 
         Returns:
             Path to saved image file
         """
-        message = f"--angle {angle} --exposure {exposure_ms} --output {output_path} {END_MARKER}"
+        message = f"--angle {angle} --exposure {exposure_ms} --output {output_path}"
+        if white_balance and yaml_path:
+            message += f" --white_balance true --yaml {yaml_path}"
+            if objective:
+                message += f" --objective {objective}"
+            if detector:
+                message += f" --detector {detector}"
+        message += f" {END_MARKER}"
         self.socket.send(ExtendedCommand.SNAP)
         self.socket.send(message.encode())
 
@@ -241,7 +261,16 @@ class QuPathTestClient:
         """Get Z position (test_ prefix for compatibility)."""
         return self.get_z()
 
-    def test_snap(self, angle: float, exposure_ms: float, output_path: str) -> str:
+    def test_snap(
+        self,
+        angle: float,
+        exposure_ms: float,
+        output_path: str,
+        white_balance: bool = False,
+        yaml_path: str = None,
+        objective: str = None,
+        detector: str = None,
+    ) -> str:
         """
         Snap image (test_ prefix for compatibility with sensitivity_test.py).
 
@@ -249,11 +278,23 @@ class QuPathTestClient:
             angle: Rotation angle
             exposure_ms: Exposure time in ms
             output_path: Output directory path
+            white_balance: If True, apply per-angle white balance calibration from YAML
+            yaml_path: Path to config YAML file (required if white_balance=True)
+            objective: Objective ID for calibration lookup (optional)
+            detector: Detector ID for calibration lookup (optional)
 
         Returns:
             Path to saved image
         """
-        return self.snap_image(output_path, angle, exposure_ms)
+        return self.snap_image(
+            output_path,
+            angle,
+            exposure_ms,
+            white_balance=white_balance,
+            yaml_path=yaml_path,
+            objective=objective,
+            detector=detector,
+        )
 
 
 def main():

@@ -172,6 +172,130 @@ def load_jai_calibration_from_imageprocessing(
         return None
 
 
+def get_interpolated_calibration_for_angle(
+    angle: float,
+    angles_cal: Dict[str, Dict],
+    logger=None,
+) -> Optional[Dict[str, Any]]:
+    """
+    Get calibration data for an angle, interpolating unified gain if necessary.
+
+    For PPM birefringence sweep angles (-10 to +10 degrees), this function:
+    1. Returns exact calibration for angles matching 0, +/-7, or 90 degrees (within 1 deg)
+    2. For other angles, interpolates the unified gain between calibrated angles
+    3. Uses per-channel exposures from the nearest birefringence angle (+/-7 deg)
+       since color balance characteristics are similar across the sweep range
+
+    The interpolation is based on the relationship between polarizer angle and
+    light transmission. For angles between 0 (crossed) and +/-7 (birefringence),
+    the unified gain is linearly interpolated.
+
+    Args:
+        angle: Rotation angle in degrees
+        angles_cal: Dictionary of calibration data keyed by angle name
+                   ('crossed', 'uncrossed', 'positive', 'negative')
+        logger: Optional logger instance
+
+    Returns:
+        Dictionary with 'exposures_ms' and 'gains' keys, or None if interpolation fails.
+        If interpolation was used, includes 'interpolated': True flag.
+    """
+    # Calibrated angle reference points
+    ANGLE_TO_NAME = {
+        0.0: "crossed",
+        7.0: "positive",
+        -7.0: "negative",
+        90.0: "uncrossed",
+    }
+
+    # Check for exact match (within 1 degree tolerance)
+    for cal_angle, name in ANGLE_TO_NAME.items():
+        if abs(angle - cal_angle) < 1.0:
+            cal_data = angles_cal.get(name)
+            if cal_data:
+                if logger:
+                    logger.debug(f"Using exact calibration '{name}' for angle {angle:.2f} deg")
+                return cal_data
+            else:
+                if logger:
+                    logger.warning(f"Calibration '{name}' not found for angle {angle:.2f} deg")
+                return None
+
+    # Interpolate for birefringence sweep range (-10 to +10 degrees)
+    if -15.0 <= angle <= 15.0:
+        # Determine interpolation endpoints based on angle sign
+        if angle > 0:
+            # Positive angles: interpolate between crossed (0) and positive (7)
+            low_name, high_name = "crossed", "positive"
+            low_angle, high_angle = 0.0, 7.0
+        else:
+            # Negative angles: interpolate between crossed (0) and negative (-7)
+            low_name, high_name = "crossed", "negative"
+            low_angle, high_angle = 0.0, -7.0
+
+        low_cal = angles_cal.get(low_name)
+        high_cal = angles_cal.get(high_name)
+
+        if not low_cal or not high_cal:
+            if logger:
+                logger.warning(
+                    f"Cannot interpolate for {angle:.2f} deg - "
+                    f"missing '{low_name}' or '{high_name}' calibration"
+                )
+            return None
+
+        # Calculate interpolation factor based on absolute angle
+        # factor = 0 at crossed (0 deg), factor = 1 at birefringence (+/-7 deg)
+        abs_angle = abs(angle)
+        if abs_angle <= 7.0:
+            factor = abs_angle / 7.0
+        else:
+            # Beyond +/-7 deg, extrapolate linearly but cap the factor
+            # to avoid extreme values. Use factor > 1 for extrapolation.
+            factor = abs_angle / 7.0
+            if factor > 1.5:
+                factor = 1.5  # Cap extrapolation at 1.5x
+
+        # Interpolate unified gain
+        low_gains = low_cal.get("gains", {})
+        high_gains = high_cal.get("gains", {})
+
+        low_unified = low_gains.get("unified_gain", 1.0)
+        high_unified = high_gains.get("unified_gain", 1.0)
+        interp_unified = low_unified + factor * (high_unified - low_unified)
+
+        # For per-channel exposures and analog R/B gains, use the birefringence
+        # angle calibration (positive/negative) since all sweep angles have
+        # similar color characteristics in the partially-crossed regime
+        base_cal = high_cal  # Use +/-7 deg as base for exposures
+
+        # Build interpolated calibration result
+        result = {
+            "exposures_ms": base_cal.get("exposures_ms", {}),
+            "gains": {
+                "unified_gain": interp_unified,
+                "analog_red": high_gains.get("analog_red", 1.0),
+                "analog_blue": high_gains.get("analog_blue", 1.0),
+            },
+            "interpolated": True,
+            "interpolation_factor": factor,
+        }
+
+        if logger:
+            logger.info(
+                f"Interpolated calibration for {angle:.2f} deg: "
+                f"unified_gain={interp_unified:.3f} "
+                f"(factor={factor:.3f}, between {low_name}={low_unified:.3f} and {high_name}={high_unified:.3f})"
+            )
+
+        return result
+
+    # Angle outside supported range
+    if logger:
+        logger.warning(f"Angle {angle:.2f} deg outside calibration range (-15 to +15 or 90)")
+    return None
+
+
 def apply_jai_calibration_for_angle(
     hardware: "PycromanagerHardware",
     jai_calibration: Dict[str, Any],
@@ -211,33 +335,21 @@ def apply_jai_calibration_for_angle(
 
         # Get calibration settings for this angle
         if per_angle:
-            # Map numeric PSG rotation angle (degrees) to PPM angle name.
-            # These angles are defined by the polarized light microscopy
-            # geometry relative to the crossed-polarizer position (0 deg):
-            #   0.0  = crossed (polarizers at 90 deg to each other, minimum light)
-            #   90.0 = uncrossed (polarizers parallel, maximum light)
-            #   +7.0 = positive birefringence (slight rotation from crossed)
-            #   -7.0 = negative birefringence (slight rotation the other way)
-            # A tolerance of 1.0 degree is used for matching because the
-            # rotation stage may not land exactly on the target angle.
-            angle_mapping = {90.0: "uncrossed", 0.0: "crossed", 7.0: "positive", -7.0: "negative"}
-            angle_name = angle_mapping.get(angle)
-            if not angle_name:
-                # Try to find closest match
-                for a, name in angle_mapping.items():
-                    if abs(a - angle) < 1.0:
-                        angle_name = name
-                        break
-
-            if not angle_name or "angles" not in jai_calibration:
+            # Use interpolation-aware calibration lookup for PPM angles.
+            # This supports exact matches at 0, +/-7, 90 degrees, and interpolates
+            # the unified gain for intermediate angles in the birefringence sweep range.
+            if "angles" not in jai_calibration:
                 if logger:
-                    logger.warning(f"No PPM calibration found for angle {angle}")
+                    logger.warning(f"No PPM calibration angles found")
                 return False
 
-            angle_cal = jai_calibration["angles"].get(angle_name)
+            angle_cal = get_interpolated_calibration_for_angle(
+                angle=angle,
+                angles_cal=jai_calibration["angles"],
+                logger=logger,
+            )
             if not angle_cal:
-                if logger:
-                    logger.warning(f"No PPM calibration found for angle {angle_name}")
+                # Interpolation failed - no calibration available for this angle
                 return False
 
             exposures = angle_cal.get("exposures_ms", {})
