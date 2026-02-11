@@ -1931,13 +1931,39 @@ def handle_client(conn, addr):
                                 use_white_balance = params.get("white_balance", False)
                                 yaml_path = params.get("yaml_path")
 
+                                # Per-channel exposures for direct control (e.g., WB calibration loops)
+                                exp_r = params.get("exp_r")
+                                exp_g = params.get("exp_g")
+                                exp_b = params.get("exp_b")
+
                                 # Create output directory if needed
                                 output_path.parent.mkdir(parents=True, exist_ok=True)
 
-                                # Determine if we should apply per-angle white balance calibration
-                                # This requires both the white_balance flag and a yaml path
+                                # Priority 1: Direct per-channel exposures (for calibration loops)
+                                # Priority 2: WB calibration lookup from YAML
+                                # Priority 3: Unified exposure
                                 wb_applied = False
-                                if use_white_balance and yaml_path:
+                                if exp_r is not None and exp_g is not None and exp_b is not None:
+                                    # Direct per-channel control - used for WB calibration loops
+                                    try:
+                                        from microscope_control.jai import JAICameraProperties
+                                        jai_props = JAICameraProperties(hardware.core)
+                                        jai_props.set_channel_exposures(
+                                            red=exp_r,
+                                            green=exp_g,
+                                            blue=exp_b,
+                                            auto_enable=True,
+                                        )
+                                        wb_applied = True
+                                        logger.info(
+                                            f"SNAP: Applied direct per-channel exposures: "
+                                            f"R={exp_r:.2f}ms, G={exp_g:.2f}ms, B={exp_b:.2f}ms"
+                                        )
+                                    except (ImportError, Exception) as e:
+                                        logger.warning(f"SNAP: Failed to set per-channel exposures: {e}")
+                                        wb_applied = False
+
+                                elif use_white_balance and yaml_path:
                                     try:
                                         from microscope_command_server.acquisition.workflow import (
                                             load_jai_calibration_from_imageprocessing,

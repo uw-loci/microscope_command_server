@@ -198,6 +198,9 @@ class QuPathTestClient:
         yaml_path: str = None,
         objective: str = None,
         detector: str = None,
+        exp_r: float = None,
+        exp_g: float = None,
+        exp_b: float = None,
     ) -> str:
         """
         Snap a single image using SNAP command.
@@ -205,17 +208,26 @@ class QuPathTestClient:
         Args:
             output_path: Directory to save the image
             angle: Rotation angle (for filename)
-            exposure_ms: Exposure time in milliseconds
+            exposure_ms: Exposure time in milliseconds (used if per-channel not specified)
             white_balance: If True, apply per-angle white balance calibration from YAML
             yaml_path: Path to config YAML file (required if white_balance=True)
             objective: Objective ID for calibration lookup (optional, uses hardware.settings if not provided)
             detector: Detector ID for calibration lookup (optional, uses hardware.settings if not provided)
+            exp_r: Red channel exposure in ms (for direct per-channel control)
+            exp_g: Green channel exposure in ms (for direct per-channel control)
+            exp_b: Blue channel exposure in ms (for direct per-channel control)
+                   When exp_r/g/b are all provided, they override white_balance lookup
+                   and exposure_ms, enabling custom WB calibration loops.
 
         Returns:
             Path to saved image file
         """
         message = f"--angle {angle} --exposure {exposure_ms} --output {output_path}"
-        if white_balance and yaml_path:
+
+        # Per-channel exposures take priority over WB lookup
+        if exp_r is not None and exp_g is not None and exp_b is not None:
+            message += f" --exp_r {exp_r} --exp_g {exp_g} --exp_b {exp_b}"
+        elif white_balance and yaml_path:
             message += f" --white_balance true --yaml {yaml_path}"
             if objective:
                 message += f" --objective {objective}"
@@ -270,6 +282,9 @@ class QuPathTestClient:
         yaml_path: str = None,
         objective: str = None,
         detector: str = None,
+        exp_r: float = None,
+        exp_g: float = None,
+        exp_b: float = None,
     ) -> str:
         """
         Snap image (test_ prefix for compatibility with sensitivity_test.py).
@@ -282,6 +297,9 @@ class QuPathTestClient:
             yaml_path: Path to config YAML file (required if white_balance=True)
             objective: Objective ID for calibration lookup (optional)
             detector: Detector ID for calibration lookup (optional)
+            exp_r: Red channel exposure in ms (for direct per-channel control)
+            exp_g: Green channel exposure in ms (for direct per-channel control)
+            exp_b: Blue channel exposure in ms (for direct per-channel control)
 
         Returns:
             Path to saved image
@@ -294,6 +312,9 @@ class QuPathTestClient:
             yaml_path=yaml_path,
             objective=objective,
             detector=detector,
+            exp_r=exp_r,
+            exp_g=exp_g,
+            exp_b=exp_b,
         )
 
 
