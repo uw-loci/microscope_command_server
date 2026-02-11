@@ -1930,6 +1930,7 @@ def handle_client(conn, addr):
                                 debayer = params.get("debayer", "auto")
                                 use_white_balance = params.get("white_balance", False)
                                 yaml_path = params.get("yaml_path")
+                                wb_reference_angle = params.get("wb_ref_angle")  # For calibration mode
 
                                 # Create output directory if needed
                                 output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -1963,6 +1964,18 @@ def handle_client(conn, addr):
                                                 logger=logger,
                                             )
                                             if jai_cal:
+                                                # Determine which angle to use for WB calibration lookup.
+                                                # If wb_reference_angle is provided (calibration mode),
+                                                # use that for ALL images to ensure consistent color.
+                                                # Otherwise use the actual capture angle.
+                                                wb_lookup_angle = wb_reference_angle if wb_reference_angle is not None else angle
+
+                                                if wb_reference_angle is not None:
+                                                    logger.info(
+                                                        f"SNAP: Using fixed WB reference angle {wb_reference_angle:.1f} deg "
+                                                        f"for capture at {angle:.2f} deg (calibration mode)"
+                                                    )
+
                                                 # Calculate exposure scale factor to allow adaptive
                                                 # exposure control while preserving WB color ratios.
                                                 # The calibration provides per-channel exposures for
@@ -1971,7 +1984,7 @@ def handle_client(conn, addr):
                                                 exposure_scale = None
                                                 if "angles" in jai_cal:
                                                     angle_cal = get_interpolated_calibration_for_angle(
-                                                        angle=angle,
+                                                        angle=wb_lookup_angle,
                                                         angles_cal=jai_cal["angles"],
                                                         logger=logger,
                                                     )
@@ -1992,13 +2005,18 @@ def handle_client(conn, addr):
                                                 wb_applied, exp_info = apply_jai_calibration_for_angle(
                                                     hardware=hardware,
                                                     jai_calibration=jai_cal,
-                                                    angle=angle,
+                                                    angle=wb_lookup_angle,
                                                     per_angle=True,
                                                     logger=logger,
                                                     exposure_scale=exposure_scale,
                                                 )
                                                 if wb_applied:
-                                                    if exposure_scale is not None and exposure_scale != 1.0:
+                                                    if wb_reference_angle is not None:
+                                                        logger.info(
+                                                            f"SNAP: Applied fixed WB (ref={wb_reference_angle:.1f} deg) "
+                                                            f"with scale={exposure_scale:.2f}x for capture at {angle:.2f} deg"
+                                                        )
+                                                    elif exposure_scale is not None and exposure_scale != 1.0:
                                                         logger.info(
                                                             f"SNAP: Applied WB with intensity scaling for {angle:.2f} deg "
                                                             f"(scale={exposure_scale:.2f}x)"

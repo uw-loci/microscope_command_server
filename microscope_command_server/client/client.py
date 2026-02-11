@@ -198,6 +198,7 @@ class QuPathTestClient:
         yaml_path: str = None,
         objective: str = None,
         detector: str = None,
+        wb_reference_angle: float = None,
     ) -> str:
         """
         Snap a single image using SNAP command.
@@ -210,6 +211,9 @@ class QuPathTestClient:
             yaml_path: Path to config YAML file (required if white_balance=True)
             objective: Objective ID for calibration lookup (optional, uses hardware.settings if not provided)
             detector: Detector ID for calibration lookup (optional, uses hardware.settings if not provided)
+            wb_reference_angle: If provided, use this angle for WB calibration lookup instead
+                               of the actual capture angle. Useful for calibration mode where
+                               consistent color is needed across all angles.
 
         Returns:
             Path to saved image file
@@ -221,6 +225,8 @@ class QuPathTestClient:
                 message += f" --objective {objective}"
             if detector:
                 message += f" --detector {detector}"
+            if wb_reference_angle is not None:
+                message += f" --wb_ref_angle {wb_reference_angle}"
         message += f" {END_MARKER}"
         self.socket.send(ExtendedCommand.SNAP)
         self.socket.send(message.encode())
@@ -270,6 +276,7 @@ class QuPathTestClient:
         yaml_path: str = None,
         objective: str = None,
         detector: str = None,
+        wb_reference_angle: float = None,
     ) -> str:
         """
         Snap image (test_ prefix for compatibility with sensitivity_test.py).
@@ -282,6 +289,8 @@ class QuPathTestClient:
             yaml_path: Path to config YAML file (required if white_balance=True)
             objective: Objective ID for calibration lookup (optional)
             detector: Detector ID for calibration lookup (optional)
+            wb_reference_angle: If provided, use this angle for WB calibration lookup
+                               instead of the actual capture angle. For calibration mode.
 
         Returns:
             Path to saved image
@@ -294,6 +303,7 @@ class QuPathTestClient:
             yaml_path=yaml_path,
             objective=objective,
             detector=detector,
+            wb_reference_angle=wb_reference_angle,
         )
 
 
