@@ -1942,6 +1942,7 @@ def handle_client(conn, addr):
                                         from microscope_command_server.acquisition.workflow import (
                                             load_jai_calibration_from_imageprocessing,
                                             apply_jai_calibration_for_angle,
+                                            get_interpolated_calibration_for_angle,
                                         )
 
                                         # Get objective/detector from params or hardware.settings
@@ -1962,15 +1963,48 @@ def handle_client(conn, addr):
                                                 logger=logger,
                                             )
                                             if jai_cal:
-                                                wb_applied = apply_jai_calibration_for_angle(
+                                                # Calculate exposure scale factor to allow adaptive
+                                                # exposure control while preserving WB color ratios.
+                                                # The calibration provides per-channel exposures for
+                                                # color balance; we scale them by the ratio of the
+                                                # adaptive exposure_ms to the calibration base exposure.
+                                                exposure_scale = None
+                                                if "angles" in jai_cal:
+                                                    angle_cal = get_interpolated_calibration_for_angle(
+                                                        angle=angle,
+                                                        angles_cal=jai_cal["angles"],
+                                                        logger=logger,
+                                                    )
+                                                    if angle_cal:
+                                                        cal_exposures = angle_cal.get("exposures_ms", {})
+                                                        base_exp = (
+                                                            cal_exposures.get("r", 50.0) +
+                                                            cal_exposures.get("g", 50.0) +
+                                                            cal_exposures.get("b", 50.0)
+                                                        ) / 3.0
+                                                        if base_exp > 0:
+                                                            exposure_scale = exposure_ms / base_exp
+                                                            logger.debug(
+                                                                f"SNAP: WB exposure scale={exposure_scale:.2f}x "
+                                                                f"(adaptive={exposure_ms:.1f}ms / base={base_exp:.1f}ms)"
+                                                            )
+
+                                                wb_applied, exp_info = apply_jai_calibration_for_angle(
                                                     hardware=hardware,
                                                     jai_calibration=jai_cal,
                                                     angle=angle,
                                                     per_angle=True,
                                                     logger=logger,
+                                                    exposure_scale=exposure_scale,
                                                 )
                                                 if wb_applied:
-                                                    logger.info(f"SNAP: Applied per-angle white balance for {angle:.2f} deg")
+                                                    if exposure_scale is not None and exposure_scale != 1.0:
+                                                        logger.info(
+                                                            f"SNAP: Applied WB with intensity scaling for {angle:.2f} deg "
+                                                            f"(scale={exposure_scale:.2f}x)"
+                                                        )
+                                                    else:
+                                                        logger.info(f"SNAP: Applied per-angle white balance for {angle:.2f} deg")
                                                 else:
                                                     logger.warning(f"SNAP: Failed to apply white balance for {angle:.2f} deg")
                                             else:

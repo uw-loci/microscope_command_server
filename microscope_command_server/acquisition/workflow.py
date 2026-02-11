@@ -302,12 +302,14 @@ def apply_jai_calibration_for_angle(
     angle: float,
     per_angle: bool = False,
     logger=None,
-) -> bool:
+    exposure_scale: float = None,
+) -> Tuple[bool, Optional[Dict[str, Any]]]:
     """
     Apply JAI white balance calibration settings before image capture.
 
     This enables individual exposure mode and sets per-channel exposures
-    based on the calibration data.
+    based on the calibration data. Optionally scales exposures while
+    preserving color balance ratios.
 
     Args:
         hardware: PycromanagerHardware instance
@@ -316,9 +318,19 @@ def apply_jai_calibration_for_angle(
         per_angle: If True, use angle-specific settings from jai_ppm
                   If False, use single settings from jai_simple
         logger: Optional logger instance
+        exposure_scale: If provided, scale all per-channel exposures by this factor.
+                       This preserves color balance ratios while adjusting intensity.
+                       Example: if calibrated exposures are R=21ms, G=25ms, B=19ms
+                       and exposure_scale=2.0, applied exposures will be
+                       R=42ms, G=50ms, B=38ms.
 
     Returns:
-        True if settings were applied, False otherwise
+        Tuple of (success, exposure_info):
+        - success: True if settings were applied, False otherwise
+        - exposure_info: Dict with 'exposures_ms' (r,g,b values actually applied),
+                        'base_exposure' (mean of calibrated values before scaling),
+                        'scale_applied' (the scale factor used, or 1.0 if none).
+                        None if application failed.
     """
     # Only applies to JAI camera
     try:
@@ -326,9 +338,9 @@ def apply_jai_calibration_for_angle(
         if "JAI" not in camera_name.upper():
             if logger:
                 logger.debug(f"JAI calibration skipped - camera is {camera_name}")
-            return False
+            return False, None
     except Exception:
-        return False
+        return False, None
 
     try:
         from microscope_control.jai import JAICameraProperties
@@ -341,7 +353,7 @@ def apply_jai_calibration_for_angle(
             if "angles" not in jai_calibration:
                 if logger:
                     logger.warning(f"No PPM calibration angles found")
-                return False
+                return False, None
 
             angle_cal = get_interpolated_calibration_for_angle(
                 angle=angle,
@@ -350,7 +362,7 @@ def apply_jai_calibration_for_angle(
             )
             if not angle_cal:
                 # Interpolation failed - no calibration available for this angle
-                return False
+                return False, None
 
             exposures = angle_cal.get("exposures_ms", {})
             gains = angle_cal.get("gains", {})
@@ -362,13 +374,24 @@ def apply_jai_calibration_for_angle(
         if not exposures:
             if logger:
                 logger.warning("No exposure data in JAI calibration")
-            return False
+            return False, None
+
+        # Get base per-channel exposures from calibration
+        jai_props = JAICameraProperties(hardware.core)
+        base_exp_r = exposures.get("r", 50.0)
+        base_exp_g = exposures.get("g", 50.0)
+        base_exp_b = exposures.get("b", 50.0)
+
+        # Calculate base exposure (mean of calibrated values)
+        base_exposure = (base_exp_r + base_exp_g + base_exp_b) / 3.0
+
+        # Apply scaling if provided (preserves color balance ratios)
+        scale_applied = exposure_scale if exposure_scale is not None else 1.0
+        exp_r = base_exp_r * scale_applied
+        exp_g = base_exp_g * scale_applied
+        exp_b = base_exp_b * scale_applied
 
         # Apply per-channel exposures
-        jai_props = JAICameraProperties(hardware.core)
-        exp_r = exposures.get("r", 50.0)
-        exp_g = exposures.get("g", 50.0)
-        exp_b = exposures.get("b", 50.0)
         jai_props.set_channel_exposures(
             red=exp_r,
             green=exp_g,
@@ -376,7 +399,21 @@ def apply_jai_calibration_for_angle(
             auto_enable=True,  # Automatically enable individual exposure mode
         )
 
-        exp_msg = f"Applied JAI calibration for angle {angle}: R={exp_r:.1f}ms, G={exp_g:.1f}ms, B={exp_b:.1f}ms"
+        # Build exposure info for return value
+        exposure_info = {
+            "exposures_ms": {"r": exp_r, "g": exp_g, "b": exp_b},
+            "base_exposure": base_exposure,
+            "scale_applied": scale_applied,
+        }
+
+        if scale_applied != 1.0:
+            exp_msg = (
+                f"Applied JAI calibration for angle {angle}: "
+                f"R={exp_r:.1f}ms, G={exp_g:.1f}ms, B={exp_b:.1f}ms "
+                f"(scale={scale_applied:.2f}x, base={base_exposure:.1f}ms)"
+            )
+        else:
+            exp_msg = f"Applied JAI calibration for angle {angle}: R={exp_r:.1f}ms, G={exp_g:.1f}ms, B={exp_b:.1f}ms"
 
         # Apply gains using new model: unified gain + R/B analog corrections
         # New format keys: unified_gain, analog_red, analog_blue
@@ -413,16 +450,16 @@ def apply_jai_calibration_for_angle(
         if logger:
             logger.info(exp_msg)
 
-        return True
+        return True, exposure_info
 
     except ImportError:
         if logger:
             logger.debug("JAI camera module not available - skipping calibration")
-        return False
+        return False, None
     except Exception as e:
         if logger:
             logger.warning(f"Failed to apply JAI calibration: {e}")
-        return False
+        return False, None
 
 
 def load_and_apply_white_balance_settings(
@@ -1667,7 +1704,7 @@ def _acquisition_workflow(
                 if jai_calibration is not None and params["angles"]:
                     first_angle = params["angles"][0]
                     logger.info(f"Restoring per-channel WB mode after autofocus (first angle: {first_angle})")
-                    applied = apply_jai_calibration_for_angle(
+                    applied, _ = apply_jai_calibration_for_angle(
                         hardware=hardware,
                         jai_calibration=jai_calibration,
                         angle=first_angle,
@@ -1725,7 +1762,7 @@ def _acquisition_workflow(
                     t_exp = time.perf_counter()
                     if jai_calibration is not None:
                         # Apply JAI per-channel exposures from calibration
-                        applied = apply_jai_calibration_for_angle(
+                        applied, _ = apply_jai_calibration_for_angle(
                             hardware=hardware,
                             jai_calibration=jai_calibration,
                             angle=angle,
