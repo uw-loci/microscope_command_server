@@ -3257,6 +3257,27 @@ def handle_client(conn, addr):
 
                     logger.info(f"Setting mode: exp_individual={exp_individual}, gain_individual=false(forced)")
 
+                    # Safety net: stop any active streaming before changing camera properties.
+                    # JAI cameras cannot change ExposureIsIndividual while hardware is busy.
+                    stopped_sequence = False
+                    stopped_studio_live = False
+                    try:
+                        if hardware.core.is_sequence_running():
+                            logger.warning("Core sequence running during SETMODE - auto-stopping")
+                            hardware.core.stop_sequence_acquisition()
+                            stopped_sequence = True
+                            time.sleep(0.2)
+                    except Exception as seq_err:
+                        logger.debug(f"Could not check/stop sequence: {seq_err}")
+                    try:
+                        if hardware.studio is not None and hardware.studio.live().is_live_mode_on():
+                            logger.warning("MM Studio live mode on during SETMODE - auto-stopping")
+                            hardware.studio.live().set_live_mode(False)
+                            stopped_studio_live = True
+                            time.sleep(0.2)
+                    except Exception as live_err:
+                        logger.debug(f"Could not check/stop studio live: {live_err}")
+
                     from microscope_control.jai import JAICameraProperties
                     jai_props = JAICameraProperties(hardware.core)
 
@@ -3272,7 +3293,10 @@ def handle_client(conn, addr):
                     jai_props.disable_individual_gain()
 
                     conn.sendall(b"ACK_____")
-                    logger.info("Camera mode set successfully")
+                    if stopped_sequence or stopped_studio_live:
+                        logger.info("Camera mode set successfully (auto-stopped streaming first)")
+                    else:
+                        logger.info("Camera mode set successfully")
                 except ImportError:
                     conn.sendall(b"ERR_NJAI")
                     logger.error("JAI module not available")
@@ -3531,6 +3555,8 @@ def handle_client(conn, addr):
                 continue
 
             # SETLIVE - Set live mode on or off
+            # When turning OFF, also stops core-level sequence acquisition so that
+            # SETLIVE OFF is comprehensive (matches what GETLIVE reports).
             if data == ExtendedCommand.SETLIVE:
                 logger.debug(f"Client {addr} requested to set live mode")
                 try:
@@ -3541,6 +3567,15 @@ def handle_client(conn, addr):
 
                     enable_live = enable_byte[0] == 1
                     logger.info(f"Setting live mode: {'ON' if enable_live else 'OFF'}")
+
+                    if not enable_live:
+                        # Also stop core-level sequence acquisition (QPSC Live Viewer uses this)
+                        try:
+                            if hardware.core.is_sequence_running():
+                                hardware.core.stop_sequence_acquisition()
+                                logger.info("Stopped core sequence acquisition via SETLIVE OFF")
+                        except Exception as seq_err:
+                            logger.debug(f"Could not stop core sequence: {seq_err}")
 
                     if hardware.studio is not None:
                         hardware.studio.live().set_live_mode(enable_live)
