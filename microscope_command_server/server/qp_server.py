@@ -1873,8 +1873,8 @@ def handle_client(conn, addr):
                             # Parse the message
                             params = {}
 
-                            # Parse flags: --angle, --exposure, --output, --debayer, --white_balance, --yaml, --objective, --detector
-                            flags = ["--angle", "--exposure", "--output", "--debayer", "--white_balance", "--yaml", "--objective", "--detector"]
+                            # Parse flags: --angle, --exposure, --output, --debayer, --white_balance, --yaml, --objective, --detector, --exp_r, --exp_g, --exp_b
+                            flags = ["--angle", "--exposure", "--output", "--debayer", "--white_balance", "--yaml", "--objective", "--detector", "--exp_r", "--exp_g", "--exp_b"]
 
                             for i, flag in enumerate(flags):
                                 if flag in message:
@@ -1910,6 +1910,12 @@ def handle_client(conn, addr):
                                         params["objective"] = value
                                     elif flag == "--detector":
                                         params["detector"] = value
+                                    elif flag == "--exp_r":
+                                        params["exp_r"] = float(value)
+                                    elif flag == "--exp_g":
+                                        params["exp_g"] = float(value)
+                                    elif flag == "--exp_b":
+                                        params["exp_b"] = float(value)
 
                             # Validate required parameters
                             required = ["angle", "exposure_ms", "output_path"]
