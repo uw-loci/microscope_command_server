@@ -208,9 +208,10 @@ def get_interpolated_calibration_for_angle(
         90.0: "uncrossed",
     }
 
-    # Check for exact match (within 1 degree tolerance)
+    # Check for exact match (within 0.2 degree tolerance)
+    # Reduced from 1.0 to minimize discontinuity at interpolation boundary
     for cal_angle, name in ANGLE_TO_NAME.items():
-        if abs(angle - cal_angle) < 1.0:
+        if abs(angle - cal_angle) < 0.2:
             cal_data = angles_cal.get(name)
             if cal_data:
                 if logger:
@@ -264,18 +265,34 @@ def get_interpolated_calibration_for_angle(
         high_unified = high_gains.get("unified_gain", 1.0)
         interp_unified = low_unified + factor * (high_unified - low_unified)
 
-        # For per-channel exposures and analog R/B gains, use the birefringence
-        # angle calibration (positive/negative) since all sweep angles have
-        # similar color characteristics in the partially-crossed regime
-        base_cal = high_cal  # Use +/-7 deg as base for exposures
+        # Interpolate per-channel exposures for smooth color transition
+        # Previously this used high_cal directly, causing a sharp discontinuity
+        # at the boundary between exact match (0 deg) and interpolation (>1 deg)
+        low_exp = low_cal.get("exposures_ms", {})
+        high_exp = high_cal.get("exposures_ms", {})
+
+        interp_exposures = {
+            "r": low_exp.get("r", 50.0) + factor * (high_exp.get("r", 50.0) - low_exp.get("r", 50.0)),
+            "g": low_exp.get("g", 50.0) + factor * (high_exp.get("g", 50.0) - low_exp.get("g", 50.0)),
+            "b": low_exp.get("b", 50.0) + factor * (high_exp.get("b", 50.0) - low_exp.get("b", 50.0)),
+        }
+
+        # Interpolate analog R/B gains as well for consistency
+        low_analog_red = low_gains.get("analog_red", 1.0)
+        low_analog_blue = low_gains.get("analog_blue", 1.0)
+        high_analog_red = high_gains.get("analog_red", 1.0)
+        high_analog_blue = high_gains.get("analog_blue", 1.0)
+
+        interp_analog_red = low_analog_red + factor * (high_analog_red - low_analog_red)
+        interp_analog_blue = low_analog_blue + factor * (high_analog_blue - low_analog_blue)
 
         # Build interpolated calibration result
         result = {
-            "exposures_ms": base_cal.get("exposures_ms", {}),
+            "exposures_ms": interp_exposures,
             "gains": {
                 "unified_gain": interp_unified,
-                "analog_red": high_gains.get("analog_red", 1.0),
-                "analog_blue": high_gains.get("analog_blue", 1.0),
+                "analog_red": interp_analog_red,
+                "analog_blue": interp_analog_blue,
             },
             "interpolated": True,
             "interpolation_factor": factor,
