@@ -43,3 +43,4 @@ htmlcov/
 .DS_Store
 Thumbs.db
 server_logfiles/
+codemap/
