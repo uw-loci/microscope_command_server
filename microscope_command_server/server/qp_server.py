@@ -3689,6 +3689,296 @@ def handle_client(conn, addr):
                     conn.sendall(struct.pack("!fffffffff", *([0.0] * 9)))
                 continue
 
+            # ==================== NOISCHAR: JAI Noise Characterization ====================
+            # JAI-SPECIFIC: Systematic noise characterization across a grid of gain and
+            # exposure settings. Tests multiple combinations to find optimal SNR.
+            #
+            # Protocol: 8-byte command, then variable-length text message with
+            #   flag-based parameters (--output, --preset, --frames, --plots,
+            #   --gains, --exposures)
+            #
+            # Response sequence:
+            #   1. Immediately sends "STARTED:{output_path}" acknowledgment
+            #   2. Sends "PROGRESS:{current}:{total}" after each configuration
+            #   3. Sends "SUCCESS:{path}|{totalConfigs}|{plots}|{bestGain},{bestExp}"
+            #      or "FAILED:{reason}" on completion
+            #
+            # Post-characterization cleanup (in finally block):
+            #   Resets camera to unified gain 1.0, analog gains 1.0, disables
+            #   individual exposure mode.
+            if data == ExtendedCommand.NOISCHAR:
+                logger.info(f"Client {addr} requested JAI noise characterization")
+
+                # Read the message using chunked pattern (same as WBSIMPLE)
+                message_parts = []
+                total_bytes = 0
+                start_time = time.time()
+
+                conn.settimeout(5.0)
+
+                try:
+                    while True:
+                        chunk = conn.recv(1024)
+                        if not chunk:
+                            logger.error(
+                                "Connection closed while reading NOISCHAR message"
+                            )
+                            conn.sendall(b"FAILED:Connection closed")
+                            break
+
+                        message_parts.append(chunk.decode("utf-8"))
+                        total_bytes += len(chunk)
+                        logger.debug(f"NOISCHAR: received {total_bytes} bytes so far")
+
+                        full_message = "".join(message_parts)
+
+                        if END_MARKER in full_message:
+                            message = full_message.replace(END_MARKER, "").strip()
+                            logger.info(f"NOISCHAR message: {message}")
+
+                            # Parse flags
+                            params = {}
+                            flags = [
+                                "--output",
+                                "--preset",
+                                "--frames",
+                                "--plots",
+                                "--gains",
+                                "--exposures",
+                            ]
+
+                            def find_flag_position(msg, flag):
+                                """Find flag position ensuring it's followed by a space."""
+                                search_pattern = flag + " "
+                                if search_pattern in msg:
+                                    return msg.index(search_pattern)
+                                return -1
+
+                            for i, flag in enumerate(flags):
+                                flag_pos = find_flag_position(message, flag)
+                                if flag_pos >= 0:
+                                    start_idx = flag_pos + len(flag)
+                                    end_idx = len(message)
+                                    for next_flag in flags:
+                                        if next_flag != flag:
+                                            next_pos = find_flag_position(
+                                                message[start_idx:], next_flag
+                                            )
+                                            if next_pos >= 0:
+                                                actual_pos = start_idx + next_pos
+                                                if actual_pos < end_idx:
+                                                    end_idx = actual_pos
+
+                                    value = message[start_idx:end_idx].strip()
+
+                                    if flag == "--output":
+                                        params["output_path"] = value
+                                    elif flag == "--preset":
+                                        params["preset"] = value
+                                    elif flag == "--frames":
+                                        params["num_frames"] = int(value)
+                                    elif flag == "--plots":
+                                        params["generate_plots"] = (
+                                            value.lower() == "true"
+                                        )
+                                    elif flag == "--gains":
+                                        params["gains"] = [
+                                            float(v.strip())
+                                            for v in value.split(",")
+                                        ]
+                                    elif flag == "--exposures":
+                                        params["exposures"] = [
+                                            float(v.strip())
+                                            for v in value.split(",")
+                                        ]
+
+                            # Validate required parameters
+                            required = ["output_path"]
+                            missing = [
+                                key for key in required if key not in params
+                            ]
+                            if missing:
+                                error_msg = (
+                                    f"Missing required parameters: {missing}"
+                                )
+                                logger.error(error_msg)
+                                conn.sendall(f"FAILED:{error_msg}".encode())
+                                break
+
+                            # Send immediate acknowledgment
+                            try:
+                                from pathlib import Path
+
+                                output_path = Path(params["output_path"])
+                                output_path.mkdir(parents=True, exist_ok=True)
+
+                                ack_response = (
+                                    f"STARTED:{params['output_path']}".encode()
+                                )
+                                conn.sendall(ack_response)
+                                logger.info(
+                                    "Sent STARTED acknowledgment for NOISCHAR"
+                                )
+
+                                # Increase socket timeout for long-running
+                                # characterization (up to 20 minutes)
+                                conn.settimeout(1200.0)
+
+                                # Import the characterization module
+                                from microscope_control.jai import (
+                                    JAINoiseCharacterization,
+                                    JAICameraProperties,
+                                )
+
+                                # Create characterization tool
+                                jai_props = JAICameraProperties(hardware.core)
+                                tool = JAINoiseCharacterization(
+                                    hardware,
+                                    jai_props,
+                                    num_frames=params.get("num_frames", 10),
+                                )
+
+                                # Build progress callback that sends PROGRESS
+                                # messages back to the Java client
+                                def progress_callback(current, total, msg=""):
+                                    try:
+                                        progress_msg = (
+                                            f"PROGRESS:{current}:{total}"
+                                        )
+                                        conn.sendall(progress_msg.encode())
+                                        logger.debug(
+                                            f"NOISCHAR progress: "
+                                            f"{current}/{total}"
+                                        )
+                                    except Exception as pe:
+                                        logger.warning(
+                                            f"Failed to send progress: {pe}"
+                                        )
+
+                                # Determine preset / custom gains+exposures
+                                preset = params.get("preset", "full")
+                                custom_gains = params.get("gains")
+                                custom_exposures = params.get("exposures")
+
+                                # Run characterization
+                                is_quick = preset == "quick"
+                                results = tool.run_characterization(
+                                    gains=custom_gains,
+                                    exposures=custom_exposures,
+                                    quick=is_quick,
+                                    progress_callback=progress_callback,
+                                )
+
+                                # Generate report/plots or just CSV
+                                generate_plots = params.get(
+                                    "generate_plots", False
+                                )
+                                if generate_plots:
+                                    tool.generate_report(
+                                        results, output_path
+                                    )
+                                    logger.info(
+                                        "NOISCHAR: generated report with plots"
+                                    )
+                                else:
+                                    # Just save CSV
+                                    results.to_csv(
+                                        output_path
+                                        / "noise_characterization.csv"
+                                    )
+                                    logger.info(
+                                        "NOISCHAR: saved CSV results only"
+                                    )
+
+                                # Find best SNR from unsaturated results
+                                best_gain = 0.0
+                                best_exp = 0.0
+                                best_snr = 0.0
+                                total_configs = len(results.results)
+                                for r in results.results:
+                                    if r.saturation_pct > 1.0:
+                                        continue
+                                    # Average SNR across channels
+                                    avg_snr = (
+                                        r.red_snr + r.green_snr + r.blue_snr
+                                    ) / 3.0
+                                    if avg_snr > best_snr:
+                                        best_snr = avg_snr
+                                        best_gain = r.unified_gain
+                                        best_exp = r.exposure_ms
+
+                                # Format: SUCCESS:{path}|{count}|{plots}|
+                                #         {bestGain},{bestExp}
+                                plots_str = (
+                                    "true" if generate_plots else "false"
+                                )
+                                response = (
+                                    f"SUCCESS:{output_path}|"
+                                    f"{total_configs}|"
+                                    f"{plots_str}|"
+                                    f"{best_gain},{best_exp}"
+                                )
+                                conn.sendall(response.encode())
+                                logger.info(
+                                    f"NOISCHAR completed: {total_configs} "
+                                    f"configs, best SNR at "
+                                    f"gain={best_gain}, "
+                                    f"exp={best_exp}ms"
+                                )
+
+                            except ImportError as e:
+                                error_msg = (
+                                    f"JAI noise characterization module "
+                                    f"not available: {e}"
+                                )
+                                logger.error(error_msg)
+                                conn.sendall(f"FAILED:{error_msg}".encode())
+                            except Exception as e:
+                                error_msg = f"NOISCHAR failed: {str(e)}"
+                                logger.error(error_msg, exc_info=True)
+                                conn.sendall(f"FAILED:{error_msg}".encode())
+                            break
+
+                        if total_bytes > 100000:
+                            logger.error(
+                                "NOISCHAR message exceeds maximum size"
+                            )
+                            conn.sendall(b"FAILED:Message too large")
+                            break
+
+                        if time.time() - start_time > 10:
+                            logger.error("Timeout reading NOISCHAR message")
+                            conn.sendall(
+                                b"FAILED:Timeout waiting for complete message"
+                            )
+                            break
+
+                except socket.timeout:
+                    logger.error(
+                        f"Timeout reading NOISCHAR message from {addr}"
+                    )
+                    conn.sendall(b"FAILED:Timeout reading message")
+                except Exception as e:
+                    logger.error(
+                        f"Error in NOISCHAR: {str(e)}", exc_info=True
+                    )
+                    conn.sendall(f"FAILED:{str(e)}".encode())
+                finally:
+                    conn.settimeout(None)  # Reset to blocking mode
+                    # Reset camera to clean state after characterization
+                    try:
+                        from microscope_control.jai import JAICameraProperties
+
+                        jai_props = JAICameraProperties(hardware.core)
+                        jai_props.set_rb_analog_gains(red=1.0, blue=1.0)
+                        jai_props.set_unified_gain(1.0)
+                        jai_props.disable_individual_exposure()
+                        logger.debug("Reset camera state after NOISCHAR")
+                    except (ImportError, Exception):
+                        pass
+
+                continue
+
             # Unknown command
             logger.warning(f"Unknown command from {addr}: {data}")
 

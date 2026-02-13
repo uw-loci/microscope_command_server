@@ -96,6 +96,7 @@ class ExtendedCommand:
 
     # Noise measurement
     GETNOISE = b"getnoise"  # Get per-channel noise stats (multi-frame temporal analysis)
+    NOISCHAR = b"noischar"  # JAI noise characterization across gain/exposure grid
 
     # Live Viewer Commands (core-level, bypasses MM studio/live window)
     GETFRAME = b"getframe"  # Get latest frame from MM circular buffer
