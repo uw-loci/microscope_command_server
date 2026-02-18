@@ -870,7 +870,8 @@ def handle_client(conn, addr):
                             use_per_angle_wb = "--use_per_angle_wb" in message
 
                             # Split by known flags to avoid issues with spaces in paths
-                            flags = ["--yaml", "--output", "--modality", "--angles", "--exposures"]
+                            # Include --wb-mode as a valued flag
+                            flags = ["--yaml", "--output", "--modality", "--angles", "--exposures", "--wb-mode"]
 
                             for i, flag in enumerate(flags):
                                 if flag in message:
@@ -905,11 +906,20 @@ def handle_client(conn, addr):
                                         params["angles_str"] = value
                                     elif flag == "--exposures":
                                         params["exposures_str"] = value
+                                    elif flag == "--wb-mode":
+                                        params["wb_mode"] = value.lower()
 
-                            # Add boolean flag to params
+                            # Resolve wb_mode: prefer explicit --wb-mode, fall back to boolean flag
+                            if "wb_mode" in params:
+                                logger.info(f"WB mode for background acquisition: {params['wb_mode']}")
+                            elif use_per_angle_wb:
+                                params["wb_mode"] = "per_angle"
+                                logger.info("Per-angle white balance enabled for background acquisition (legacy flag)")
+                            # If neither --wb-mode nor --use_per_angle_wb, leave wb_mode unset
+                            # and let simple_background_collection use its default
+
+                            # Keep legacy flag for backward compat
                             params["use_per_angle_wb"] = use_per_angle_wb
-                            if use_per_angle_wb:
-                                logger.info("Per-angle white balance enabled for background acquisition")
 
                             # Validate required parameters
                             required = ["yaml_file_path", "output_folder_path", "modality"]
@@ -962,6 +972,7 @@ def handle_client(conn, addr):
                                     logger=logger,
                                     update_progress=update_progress,
                                     use_per_angle_wb=params.get("use_per_angle_wb", False),
+                                    wb_mode=params.get("wb_mode"),
                                 )
 
                                 # Format exposures as angle:exposure pairs

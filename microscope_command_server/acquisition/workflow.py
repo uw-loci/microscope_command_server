@@ -172,6 +172,91 @@ def load_jai_calibration_from_imageprocessing(
         return None
 
 
+def load_simple_wb_from_imageprocessing(
+    config_path: Path,
+    modality: str = "ppm",
+    objective: str = None,
+    detector: str = None,
+    logger=None,
+) -> Optional[Dict[str, Any]]:
+    """
+    Load simple WB (Mode 2) pre-computed per-angle scaled exposures from YAML.
+
+    The simple_wb section stores per-angle exposures that preserve the uncrossed
+    R:G:B ratio while scaling intensity for each angle. This data is written
+    by background collection in simple WB mode.
+
+    Args:
+        config_path: Path to the main config file (config_PPM.yml)
+        modality: Modality name (e.g., "ppm")
+        objective: Objective ID
+        detector: Detector ID
+        logger: Optional logger instance
+
+    Returns:
+        Dictionary with simple_wb data or None if not found.
+        Format: {
+            'base_angle': 'uncrossed',
+            'base_exposures_ms': {'r': x, 'g': y, 'b': z},
+            'angles': {
+                'uncrossed': {'scale': 1.0, 'unified_gain': 1.0, 'r': x, 'g': y, 'b': z},
+                'positive': {'scale': s, 'unified_gain': g, 'r': x*s, 'g': y*s, 'b': z*s},
+                ...
+            }
+        }
+    """
+    config_path = Path(config_path)
+
+    config_name = config_path.stem
+    if config_name.startswith("config_"):
+        microscope_name = config_name[7:]
+        imageprocessing_name = f"imageprocessing_{microscope_name}.yml"
+    else:
+        imageprocessing_name = f"imageprocessing_{config_name}.yml"
+
+    imageprocessing_path = config_path.parent / imageprocessing_name
+
+    if not imageprocessing_path.exists():
+        if logger:
+            logger.debug(f"No imageprocessing config for simple_wb at {imageprocessing_path}")
+        return None
+
+    if not objective or not detector:
+        if logger:
+            logger.debug("Objective or detector not specified for simple_wb lookup")
+        return None
+
+    try:
+        with open(imageprocessing_path, "r") as f:
+            ip_data = yaml.safe_load(f) or {}
+
+        detector_profile = (
+            ip_data
+            .get("imaging_profiles", {})
+            .get(modality, {})
+            .get(objective, {})
+            .get(detector, {})
+        )
+
+        simple_wb = detector_profile.get("simple_wb")
+        if simple_wb and "angles" in simple_wb:
+            if logger:
+                logger.info(
+                    f"Loaded simple_wb data: base_angle={simple_wb.get('base_angle')}, "
+                    f"angles={list(simple_wb['angles'].keys())}"
+                )
+            return simple_wb
+        else:
+            if logger:
+                logger.debug("No simple_wb section found in detector profile")
+            return None
+
+    except Exception as e:
+        if logger:
+            logger.warning(f"Failed to load simple_wb from {imageprocessing_path}: {e}")
+        return None
+
+
 def get_interpolated_calibration_for_angle(
     angle: float,
     angles_cal: Dict[str, Dict],
@@ -454,15 +539,16 @@ def apply_jai_calibration_for_angle(
         if analog_blue is None:
             analog_blue = 1.0
 
-        # Apply unified gain
-        if unified_gain > 1.01:
-            jai_props.set_unified_gain(unified_gain)
-            exp_msg += f" | Unified gain: {unified_gain:.3f}"
+        # ALWAYS apply unified gain and R/B analog gains for every angle.
+        # Previous code only applied gains when they differed from 1.0, but
+        # during PPM acquisition the camera cycles through angles with different
+        # gains. If angle N has gain=3.0 and angle N+1 has gain=1.0, skipping
+        # the 1.0 set leaves the camera at 3.0 -> saturated image at angle N+1.
+        jai_props.set_unified_gain(unified_gain)
+        exp_msg += f" | Unified gain: {unified_gain:.3f}"
 
-        # Apply R/B analog corrections (works without individual gain mode)
-        if abs(analog_red - 1.0) > 0.01 or abs(analog_blue - 1.0) > 0.01:
-            jai_props.set_rb_analog_gains(red=analog_red, blue=analog_blue)
-            exp_msg += f" | Analog R={analog_red:.3f}, B={analog_blue:.3f}"
+        jai_props.set_rb_analog_gains(red=analog_red, blue=analog_blue)
+        exp_msg += f" | Analog R={analog_red:.3f}, B={analog_blue:.3f}"
 
         if logger:
             logger.info(exp_msg)
@@ -785,6 +871,9 @@ def parse_acquisition_message(message: str) -> dict:
             elif parts[i] == "--bg-disabled-angles" and i + 1 < len(parts):
                 params["background_disabled_angles_str"] = parts[i + 1]
                 i += 2
+            elif parts[i] == "--wb-mode" and i + 1 < len(parts):
+                params["wb_mode"] = parts[i + 1].lower()
+                i += 2
             elif parts[i] == "--white-balance" and i + 1 < len(parts):
                 params["white_balance_enabled"] = parts[i + 1].lower() == "true"
                 i += 2
@@ -928,11 +1017,13 @@ def _acquisition_workflow(
         # Stop live mode if running - JAI camera properties cannot be changed during live streaming
         try:
             if hardware.core.is_sequence_running():
-                if hardware.studio is not None:
-                    hardware.studio.live().set_live_mode(False)
-                    logger.info("Stopped live mode before acquisition")
+                hardware.core.stop_sequence_acquisition()
+                logger.info("Stopped core sequence acquisition before acquisition")
+            if hardware.studio is not None and hardware.studio.live().isLiveModeOn():
+                hardware.studio.live().set_live_mode(False)
+                logger.info("Stopped studio live mode before acquisition")
         except Exception as e:
-            logger.warning(f"Could not check/stop live mode: {e}")
+            logger.warning(f"Could not stop live/sequence mode: {e}")
 
         # Parse the acquisition parameters
         params = parse_acquisition_message(message)
@@ -1092,7 +1183,26 @@ def _acquisition_workflow(
 
         # ======= WHITE BALANCE SETUP =======
         angles_wb = {}
-        white_balance_per_angle = params.get("white_balance_per_angle", False)
+
+        # Resolve wb_mode from new --wb-mode flag or derive from old boolean flags
+        # Priority: explicit --wb-mode > old flags > default
+        wb_mode = params.get("wb_mode")
+        if wb_mode is None:
+            # Backward compatibility: derive from old boolean flags
+            wb_enabled = params.get("white_balance_enabled", True)
+            wb_per_angle = params.get("white_balance_per_angle", False)
+            if not wb_enabled:
+                wb_mode = "off"
+            elif wb_per_angle:
+                wb_mode = "per_angle"
+            else:
+                wb_mode = "per_angle"  # Default for JAI cameras
+        logger.info(f"White balance mode: {wb_mode}")
+
+        # Keep white_balance_enabled and white_balance_per_angle in sync for
+        # downstream code that still references them (software WB, etc.)
+        white_balance_enabled = wb_mode != "off"
+        white_balance_per_angle = wb_mode == "per_angle"
 
         # Auto-detect JAI camera - JAI requires per-channel exposures for correct color
         # Use "Core.Camera" property - this reliably contains "JAI" for JAI cameras
@@ -1109,30 +1219,90 @@ def _acquisition_workflow(
         # Load JAI hardware white balance calibration (per-channel exposures)
         # This is separate from software white balance (RGB multipliers applied post-capture)
         jai_calibration = None
-        if white_balance_enabled:
-            # Extract base modality for YAML lookup (e.g., "ppm" from "ppm_20x_1")
-            base_modality = params["scan_type"].split("_")[0].lower()
+        simple_wb_data = None  # Mode 2 pre-computed per-angle scaled exposures
+        base_modality = params["scan_type"].split("_")[0].lower()
 
-            # For JAI cameras, ALWAYS try to load per-angle calibration
-            # because JAI uses different per-channel exposures for each angle
-            load_per_angle = white_balance_per_angle or is_jai_camera
-
+        if wb_mode == "camera_awb":
+            # Camera AWB mode: no per-channel calibration needed.
+            # Camera handles color internally. Load per-angle unified gains
+            # from Mode 3 data for brightness boosting at dim angles.
             jai_calibration = load_jai_calibration_from_imageprocessing(
                 config_path=Path(params["yaml_file_path"]),
-                per_angle=load_per_angle,
+                per_angle=True,
+                modality=base_modality,
+                objective=params.get("objective"),
+                detector=params.get("detector"),
+                logger=logger,
+            )
+            # Explicitly disable individual exposure/gain mode for camera AWB
+            if is_jai_camera:
+                try:
+                    from microscope_control.jai import JAICameraProperties
+                    jai_props = JAICameraProperties(hardware.core)
+                    jai_props.disable_individual_exposure()
+                    jai_props.disable_individual_gain()
+                    jai_props.set_analog_gains(red=1.0, green=1.0, blue=1.0, auto_enable=False)
+                    logger.info("Camera AWB mode: disabled per-channel exposure/gain, neutral analog gains")
+                except (ImportError, Exception) as e:
+                    logger.warning(f"Could not configure camera AWB mode: {e}")
+            if jai_calibration:
+                logger.info(f"Camera AWB: loaded unified gains from calibration for brightness control")
+            else:
+                logger.info("Camera AWB: no calibration data found, using client exposures only")
+            # Set jai_calibration to None so per-angle loop doesn't apply per-channel
+            # We extracted unified gains; store them separately.
+            camera_awb_gains = {}
+            if jai_calibration and "angles" in jai_calibration:
+                for angle_name, angle_data in jai_calibration["angles"].items():
+                    gains = angle_data.get("gains", {})
+                    camera_awb_gains[angle_name] = gains.get("unified_gain", 1.0)
+                logger.info(f"Camera AWB unified gains: {camera_awb_gains}")
+            jai_calibration = None  # Don't use per-channel calibration in acquisition loop
+
+        elif wb_mode == "simple":
+            # Simple WB mode: load 90deg R:G:B ratios from Mode 3 calibration,
+            # then load pre-computed simple_wb section if available
+            jai_calibration = load_jai_calibration_from_imageprocessing(
+                config_path=Path(params["yaml_file_path"]),
+                per_angle=True,
                 modality=base_modality,
                 objective=params.get("objective"),
                 detector=params.get("detector"),
                 logger=logger,
             )
             if jai_calibration:
-                # For JAI cameras with calibration, force per-angle mode
-                if is_jai_camera and not white_balance_per_angle:
-                    logger.info("JAI camera detected: automatically enabling per-channel WB for acquisition")
-                    white_balance_per_angle = True
+                logger.info("Simple WB: loaded per-angle calibration as base for ratio-scaling")
+                # Also load simple_wb section from YAML if it exists
+                simple_wb_data = load_simple_wb_from_imageprocessing(
+                    config_path=Path(params["yaml_file_path"]),
+                    modality=base_modality,
+                    objective=params.get("objective"),
+                    detector=params.get("detector"),
+                    logger=logger,
+                )
+                if simple_wb_data:
+                    logger.info(f"Simple WB: loaded pre-computed scales for {len(simple_wb_data.get('angles', {}))} angles")
+                else:
+                    logger.info("Simple WB: no pre-computed data, will use uncrossed ratios with exposure_scale")
+            else:
+                logger.warning(
+                    "Simple WB mode requested but no Mode 3 calibration found! "
+                    "Run 'PPM White Balance Calibration' first."
+                )
+
+        elif wb_mode == "per_angle":
+            # Per-angle WB mode (Mode 3): existing behavior
+            jai_calibration = load_jai_calibration_from_imageprocessing(
+                config_path=Path(params["yaml_file_path"]),
+                per_angle=True,
+                modality=base_modality,
+                objective=params.get("objective"),
+                detector=params.get("detector"),
+                logger=logger,
+            )
+            if jai_calibration:
                 logger.info(
-                    f"JAI hardware white balance enabled "
-                    f"({'per-angle' if white_balance_per_angle else 'simple'} mode) "
+                    f"Per-angle WB: loaded calibration "
                     f"for {base_modality}/{params.get('objective')}/{params.get('detector')}"
                 )
             else:
@@ -1142,6 +1312,10 @@ def _acquisition_workflow(
                         "Run 'White Balance Calibration' for proper color balance."
                     )
                 logger.info("No JAI calibration found - using software white balance")
+
+        else:
+            # wb_mode == "off" or unknown
+            logger.info("White balance disabled (wb_mode=%s)", wb_mode)
 
         if white_balance_enabled:
             # Load software white balance settings from configuration (RGB multipliers)
@@ -1773,12 +1947,87 @@ def _acquisition_workflow(
                     #     actual_angle = hardware.get_psg_ticks()
                     # logger.info(f"  Angle set to {hardware.get_psg_ticks():.1f}")
 
-                    # Set exposure time
-                    # Priority 1: JAI hardware calibration (per-channel exposures for white balance)
-                    # Priority 2: Single exposure from params
+                    # Set exposure time based on wb_mode
                     t_exp = time.perf_counter()
-                    if jai_calibration is not None:
-                        # Apply JAI per-channel exposures from calibration
+
+                    if wb_mode == "camera_awb":
+                        # Camera AWB mode: unified exposure only, no per-channel.
+                        # Camera handles color balance internally.
+                        if angle_idx < len(params["exposures"]):
+                            exposure_ms = params["exposures"][angle_idx]
+                            hardware.set_exposure(exposure_ms)
+                        # Apply unified gain for brightness at dim angles
+                        angle_name = angle_to_name(angle)
+                        if camera_awb_gains and angle_name in camera_awb_gains:
+                            try:
+                                from microscope_control.jai import JAICameraProperties
+                                jai_props = JAICameraProperties(hardware.core)
+                                gain_val = camera_awb_gains[angle_name]
+                                jai_props.set_unified_gain(gain_val)
+                                logger.info(f"  Camera AWB: unified gain={gain_val:.2f} for {angle_name}")
+                            except (ImportError, Exception) as e:
+                                logger.debug(f"Could not set unified gain: {e}")
+
+                    elif wb_mode == "simple" and simple_wb_data:
+                        # Simple WB mode with pre-computed data: apply uncrossed R:G:B
+                        # ratio uniformly scaled for this angle
+                        angle_name = angle_to_name(angle)
+                        sw_angles = simple_wb_data.get("angles", {})
+                        if angle_name in sw_angles:
+                            angle_sw = sw_angles[angle_name]
+                            try:
+                                from microscope_control.jai import JAICameraProperties
+                                jai_props = JAICameraProperties(hardware.core)
+                                jai_props.set_channel_exposures(
+                                    red=angle_sw["r"],
+                                    green=angle_sw["g"],
+                                    blue=angle_sw["b"],
+                                    auto_enable=True,
+                                )
+                                jai_props.set_unified_gain(angle_sw.get("unified_gain", 1.0))
+                                jai_props.set_rb_analog_gains(red=1.0, blue=1.0)
+                                logger.info(
+                                    f"  Simple WB: R={angle_sw['r']:.1f}ms, "
+                                    f"G={angle_sw['g']:.1f}ms, B={angle_sw['b']:.1f}ms "
+                                    f"(scale={angle_sw.get('scale', '?')}x, "
+                                    f"gain={angle_sw.get('unified_gain', 1.0):.2f})"
+                                )
+                            except (ImportError, Exception) as e:
+                                logger.warning(f"Simple WB failed for {angle_name}: {e}")
+                                if angle_idx < len(params["exposures"]):
+                                    hardware.set_exposure(params["exposures"][angle_idx])
+                        else:
+                            # Angle not in simple_wb data - fall back to base ratio
+                            # with exposure_scale from calibration
+                            logger.info(f"  Simple WB: no data for {angle_name}, using calibration with scale")
+                            if jai_calibration is not None:
+                                applied, _ = apply_jai_calibration_for_angle(
+                                    hardware=hardware,
+                                    jai_calibration=jai_calibration,
+                                    angle=angle,
+                                    per_angle=False,
+                                    logger=logger,
+                                )
+                                if not applied and angle_idx < len(params["exposures"]):
+                                    hardware.set_exposure(params["exposures"][angle_idx])
+                            elif angle_idx < len(params["exposures"]):
+                                hardware.set_exposure(params["exposures"][angle_idx])
+
+                    elif wb_mode == "simple" and jai_calibration is not None:
+                        # Simple WB mode without pre-computed data: use uncrossed
+                        # ratio from Mode 3 calibration with uniform scaling
+                        applied, _ = apply_jai_calibration_for_angle(
+                            hardware=hardware,
+                            jai_calibration=jai_calibration,
+                            angle=angle,
+                            per_angle=False,
+                            logger=logger,
+                        )
+                        if not applied and angle_idx < len(params["exposures"]):
+                            hardware.set_exposure(params["exposures"][angle_idx])
+
+                    elif jai_calibration is not None:
+                        # Per-angle WB mode (Mode 3): apply full per-angle calibration
                         applied, _ = apply_jai_calibration_for_angle(
                             hardware=hardware,
                             jai_calibration=jai_calibration,
@@ -1886,7 +2135,7 @@ def _acquisition_workflow(
                     # Skip software WB when hardware WB (JAI per-channel exposures) is active.
                     # Hardware WB already balances the channels via different exposure times;
                     # applying software RGB multipliers on top would double-correct.
-                    if white_balance_enabled and jai_calibration is None:
+                    if white_balance_enabled and jai_calibration is None and wb_mode not in ("camera_awb", "simple"):
                         # Use pre-configured white balance values (software-only mode)
                         if angle in angles_wb:
                             wb_profile = angles_wb[angle]
@@ -1906,9 +2155,9 @@ def _acquisition_workflow(
                         logger.info(
                             f"  Applied software white balance: R={wb_profile[0]:.2f}, G={wb_profile[1]:.2f}, B={wb_profile[2]:.2f}"
                         )
-                    elif white_balance_enabled and jai_calibration is not None:
+                    elif white_balance_enabled and (jai_calibration is not None or wb_mode in ("camera_awb", "simple")):
                         logger.info(
-                            f"  Software WB skipped (hardware per-channel WB active for {angle} deg)"
+                            f"  Software WB skipped (hardware WB active for {angle} deg, mode={wb_mode})"
                         )
 
                     # Save processed image
@@ -2343,6 +2592,96 @@ def save_background_exposures_to_yaml(
 
     except Exception as e:
         logger.error(f"Failed to save background exposures to YAML: {e}")
+        return False
+
+
+def save_simple_wb_to_yaml(
+    config_path: Path,
+    simple_wb_results: Dict[str, Dict[str, float]],
+    base_exposures: Dict[str, float],
+    modality: str = "ppm",
+    objective: Optional[str] = None,
+    detector: Optional[str] = None,
+    logger=None,
+) -> bool:
+    """
+    Save simple WB (Mode 2) per-angle scaled exposures to imageprocessing YAML.
+
+    Writes the simple_wb section under the detector profile so that acquisition
+    can load pre-computed ratio-preserving per-angle exposures.
+
+    Args:
+        config_path: Path to main config file (config_PPM.yml)
+        simple_wb_results: Dict mapping angle names to per-angle data, e.g.:
+            {'uncrossed': {'scale': 1.0, 'unified_gain': 1.0, 'r': 0.66, 'g': 0.97, 'b': 4.76}, ...}
+        base_exposures: Dict with base uncrossed R:G:B values ('r', 'g', 'b' keys)
+        modality: Modality name
+        objective: Objective LOCI ID
+        detector: Detector LOCI ID
+        logger: Optional logger
+
+    Returns:
+        True if saved successfully, False otherwise
+    """
+    from datetime import datetime
+
+    config_path = Path(config_path)
+
+    config_name = config_path.stem
+    if config_name.startswith("config_"):
+        microscope_name = config_name[7:]
+        imageprocessing_name = f"imageprocessing_{microscope_name}.yml"
+    else:
+        imageprocessing_name = f"imageprocessing_{config_name}.yml"
+
+    imageprocessing_path = config_path.parent / imageprocessing_name
+
+    if not objective or not detector:
+        if logger:
+            logger.warning("Cannot save simple_wb: objective or detector not specified")
+        return False
+
+    try:
+        if imageprocessing_path.exists():
+            with open(imageprocessing_path, "r") as f:
+                ip_data = yaml.safe_load(f) or {}
+        else:
+            ip_data = {}
+
+        # Navigate/create to imaging_profiles.{modality}.{objective}.{detector}
+        ip_data.setdefault("imaging_profiles", {})
+        ip_data["imaging_profiles"].setdefault(modality, {})
+        ip_data["imaging_profiles"][modality].setdefault(objective, {})
+        ip_data["imaging_profiles"][modality][objective].setdefault(detector, {})
+
+        detector_profile = ip_data["imaging_profiles"][modality][objective][detector]
+
+        # Build simple_wb section
+        detector_profile["simple_wb"] = {
+            "last_calibrated": datetime.now().isoformat(),
+            "base_angle": "uncrossed",
+            "base_exposures_ms": {
+                "r": round(base_exposures.get("r", 0), 2),
+                "g": round(base_exposures.get("g", 0), 2),
+                "b": round(base_exposures.get("b", 0), 2),
+            },
+            "base_gains": base_exposures.get("gains", {}),
+            "angles": simple_wb_results,
+        }
+
+        with open(imageprocessing_path, "w") as f:
+            yaml.dump(ip_data, f, default_flow_style=False, sort_keys=False)
+
+        if logger:
+            logger.info(
+                f"Saved simple_wb to {imageprocessing_path}: "
+                f"{len(simple_wb_results)} angles"
+            )
+        return True
+
+    except Exception as e:
+        if logger:
+            logger.error(f"Failed to save simple_wb to YAML: {e}")
         return False
 
 
@@ -2795,6 +3134,7 @@ def simple_background_collection(
     logger,
     update_progress: Callable[[int, int], None],
     use_per_angle_wb: bool = False,
+    wb_mode: str = None,
 ):
     """
     Simplified background collection for BackgroundCollectionWorkflow.
@@ -2815,12 +3155,20 @@ def simple_background_collection(
         logger: Logger instance
         update_progress: Progress callback function
         use_per_angle_wb: Whether to apply per-angle white balance calibration
-                         before acquiring each background image
+                         before acquiring each background image (legacy param)
+        wb_mode: White balance mode string: "camera_awb", "simple", "per_angle", "off".
+                 If None, derived from use_per_angle_wb for backward compatibility.
 
     Returns:
         Dict[float, float]: Dictionary mapping angles to final exposure times (ms)
                            e.g., {90.0: 1.2, 5.0: 45.8, ...}
     """
+    # Resolve wb_mode from new param or derive from old boolean for backward compat
+    if wb_mode is None:
+        wb_mode = "per_angle" if use_per_angle_wb else "per_angle"
+    # Keep use_per_angle_wb in sync for downstream code
+    use_per_angle_wb = wb_mode == "per_angle"
+    logger.info(f"Background collection wb_mode: {wb_mode}")
     logger.info("=== SIMPLE BACKGROUND COLLECTION STARTED ===")
 
     try:
@@ -2828,11 +3176,13 @@ def simple_background_collection(
         # This is the same pattern used in calibration.py
         try:
             if hardware.core.is_sequence_running():
-                if hardware.studio is not None:
-                    hardware.studio.live().set_live_mode(False)
-                    logger.info("Stopped live mode before background collection")
+                hardware.core.stop_sequence_acquisition()
+                logger.info("Stopped core sequence acquisition before background collection")
+            if hardware.studio is not None and hardware.studio.live().isLiveModeOn():
+                hardware.studio.live().set_live_mode(False)
+                logger.info("Stopped studio live mode before background collection")
         except Exception as e:
-            logger.warning(f"Could not check/stop live mode: {e}")
+            logger.warning(f"Could not stop live/sequence mode: {e}")
 
         # Parse angles and exposures from client
         # Use client's exposures as initial values for adaptive exposure
@@ -2884,16 +3234,18 @@ def simple_background_collection(
         except Exception as e:
             logger.debug(f"Could not detect camera type: {e}")
 
-        # For JAI cameras, ALWAYS try to load calibration (ignore use_per_angle_wb flag)
-        # For non-JAI cameras, only load if use_per_angle_wb is explicitly requested
-        should_load_calibration = is_jai_camera or use_per_angle_wb
+        # Load calibration based on wb_mode
+        # All modes except "off" need Mode 3 calibration data for reference
+        should_load_calibration = wb_mode != "off" and (is_jai_camera or use_per_angle_wb or wb_mode in ("camera_awb", "simple"))
+
+        # Resolve objective/detector for calibration lookup
+        objective = settings.get("objective_in_use") or settings.get("objective")
+        detector = settings.get("detector_in_use") or settings.get("detector")
 
         if should_load_calibration:
             # Get objective and detector from settings or parse from output path
             # Output path structure: {base}/{detector}/{modality}/{magnification}
             # e.g., D:\data\background_tiles\LOCI_DETECTOR_JAI_001\ppm\20x
-            objective = settings.get("objective_in_use") or settings.get("objective")
-            detector = settings.get("detector_in_use") or settings.get("detector")
 
             # If not in settings, try to extract from output path
             if not detector or not objective:
@@ -2931,13 +3283,11 @@ def simple_background_collection(
                 logger=logger,
             )
             if jai_calibration:
-                logger.info("Per-angle white balance calibration loaded for background collection")
-                if is_jai_camera:
-                    # For JAI cameras, we WILL use the calibration regardless of use_per_angle_wb
-                    # This is intentional - JAI requires per-channel exposures for correct backgrounds
+                logger.info(f"Per-angle calibration loaded for background collection (wb_mode={wb_mode})")
+                if wb_mode == "per_angle" and is_jai_camera:
                     if not use_per_angle_wb:
                         logger.info("JAI camera detected: automatically enabling per-channel WB for background collection")
-                    use_per_angle_wb = True  # Force enable for JAI cameras with calibration
+                    use_per_angle_wb = True
             else:
                 if is_jai_camera:
                     logger.warning(
@@ -2947,6 +3297,49 @@ def simple_background_collection(
                     )
                 else:
                     logger.warning("Per-angle white balance requested but no calibration found")
+
+        # Camera AWB mode: disable per-channel exposure/gain, neutral analog gains
+        camera_awb_gains = {}
+        if wb_mode == "camera_awb" and is_jai_camera:
+            try:
+                from microscope_control.jai import JAICameraProperties
+                jai_props = JAICameraProperties(hardware.core)
+                jai_props.disable_individual_exposure()
+                jai_props.disable_individual_gain()
+                jai_props.set_analog_gains(red=1.0, green=1.0, blue=1.0, auto_enable=False)
+                logger.info("Camera AWB: disabled per-channel exposure/gain for background collection")
+            except (ImportError, Exception) as e:
+                logger.warning(f"Could not configure camera AWB mode: {e}")
+            # Extract unified gains from Mode 3 calibration for brightness
+            if jai_calibration and "angles" in jai_calibration:
+                for angle_name, angle_data in jai_calibration["angles"].items():
+                    gains = angle_data.get("gains", {})
+                    camera_awb_gains[angle_name] = gains.get("unified_gain", 1.0)
+                logger.info(f"Camera AWB unified gains for background: {camera_awb_gains}")
+            # Don't use per-channel calibration in the per-angle loop
+            jai_calibration = None
+
+        # Simple WB mode: extract uncrossed R:G:B base ratios from Mode 3 calibration
+        simple_wb_base = None
+        if wb_mode == "simple" and jai_calibration and "angles" in jai_calibration:
+            uncrossed_cal = jai_calibration["angles"].get("uncrossed")
+            if uncrossed_cal and "exposures_ms" in uncrossed_cal:
+                simple_wb_base = {
+                    "r": uncrossed_cal["exposures_ms"]["r"],
+                    "g": uncrossed_cal["exposures_ms"]["g"],
+                    "b": uncrossed_cal["exposures_ms"]["b"],
+                    "gains": uncrossed_cal.get("gains", {}),
+                }
+                logger.info(
+                    f"Simple WB base ratios from uncrossed: "
+                    f"R={simple_wb_base['r']:.2f}ms, "
+                    f"G={simple_wb_base['g']:.2f}ms, "
+                    f"B={simple_wb_base['b']:.2f}ms"
+                )
+            else:
+                logger.warning("Simple WB: no uncrossed calibration found, falling back to standard mode")
+                wb_mode = "per_angle"
+                use_per_angle_wb = True
 
         # Get current position for reference
         current_pos = hardware.get_current_position()
@@ -2990,7 +3383,132 @@ def simple_background_collection(
             logger.info(f"Initial exposure from client: {initial_exposure_ms:.2f}ms")
 
             # Choose acquisition method based on white balance mode
-            if jai_calibration and use_per_angle_wb:
+            image = None  # Will be set by whichever branch acquires
+
+            if wb_mode == "camera_awb":
+                # Camera AWB mode: unified exposure only, adaptive intensity matching
+                # Apply unified gain for brightness at dim angles
+                angle_name = angle_to_name(angle)
+                if camera_awb_gains and angle_name in camera_awb_gains:
+                    try:
+                        from microscope_control.jai import JAICameraProperties
+                        jai_props = JAICameraProperties(hardware.core)
+                        gain_val = camera_awb_gains[angle_name]
+                        jai_props.set_unified_gain(gain_val)
+                        logger.info(f"  Camera AWB: unified gain={gain_val:.2f} for {angle_name}")
+                    except (ImportError, Exception) as e:
+                        logger.debug(f"Could not set unified gain: {e}")
+
+                # Use standard adaptive intensity matching (single unified exposure)
+                target_intensity = get_target_intensity_for_background(modality, angle)
+                logger.info(f"Camera AWB target intensity: {target_intensity:.1f}")
+                try:
+                    image, final_exposure = acquire_background_with_target_intensity(
+                        hardware=hardware,
+                        target_intensity=target_intensity,
+                        tolerance=2.5,
+                        initial_exposure_ms=initial_exposure_ms,
+                        max_iterations=10,
+                        logger=logger,
+                    )
+                    actual_intensity = float(np.median(image))
+                    logger.info(
+                        f"Camera AWB background: shape={image.shape}, "
+                        f"median={actual_intensity:.1f}, exposure={final_exposure:.1f}ms"
+                    )
+                    final_exposures[angle] = final_exposure
+                    achieved_intensities[angle] = actual_intensity
+                except RuntimeError as e:
+                    logger.error(f"Failed to acquire camera AWB background at angle {angle}: {e}")
+                    continue
+
+            elif wb_mode == "simple" and simple_wb_base is not None:
+                # Simple WB mode: ratio-preserving adaptive scaling
+                # Use uncrossed R:G:B ratios, uniformly scale per angle to hit target
+                angle_name = angle_to_name(angle)
+                try:
+                    from microscope_control.jai import JAICameraProperties
+                    jai_props = JAICameraProperties(hardware.core)
+
+                    # Get unified gain from Mode 3 calibration for this angle
+                    unified_gain = 1.0
+                    if jai_calibration and "angles" in jai_calibration:
+                        angle_cal = jai_calibration["angles"].get(angle_name, {})
+                        unified_gain = angle_cal.get("gains", {}).get("unified_gain", 1.0)
+                    jai_props.set_unified_gain(unified_gain)
+                    jai_props.set_rb_analog_gains(red=1.0, blue=1.0)  # neutral analog
+
+                    # Start with base uncrossed R:G:B (scale=1.0)
+                    base_r = simple_wb_base["r"]
+                    base_g = simple_wb_base["g"]
+                    base_b = simple_wb_base["b"]
+                    target_intensity = get_target_intensity_for_background(modality, angle)
+                    logger.info(
+                        f"Simple WB adaptive: base R={base_r:.1f}, G={base_g:.1f}, B={base_b:.1f}, "
+                        f"gain={unified_gain:.2f}, target={target_intensity:.1f}"
+                    )
+
+                    # Iterative scaling: snap image, measure, scale all channels uniformly
+                    scale = 1.0
+                    tolerance = 2.5
+                    max_iter = 8
+                    for iteration in range(max_iter):
+                        exp_r = base_r * scale
+                        exp_g = base_g * scale
+                        exp_b = base_b * scale
+                        jai_props.set_channel_exposures(
+                            red=exp_r, green=exp_g, blue=exp_b, auto_enable=True,
+                        )
+                        image, metadata = hardware.snap_image()
+                        if image is None:
+                            raise RuntimeError("Failed to acquire image")
+                        measured = float(np.median(image))
+                        logger.info(
+                            f"  Iteration {iteration}: scale={scale:.3f}, "
+                            f"R={exp_r:.1f}ms G={exp_g:.1f}ms B={exp_b:.1f}ms, "
+                            f"median={measured:.1f} (target={target_intensity:.1f})"
+                        )
+                        if abs(measured - target_intensity) <= tolerance:
+                            logger.info(f"  Converged at iteration {iteration}")
+                            break
+                        if measured < 1.0:
+                            scale *= 5.0  # Very dark, big jump
+                        else:
+                            scale *= target_intensity / measured
+
+                    actual_intensity = float(np.median(image))
+                    final_exposures[angle] = exp_g  # Store green as reference
+                    achieved_intensities[angle] = actual_intensity
+
+                    # Store the simple_wb data for this angle
+                    if not hasattr(simple_background_collection, '_simple_wb_results'):
+                        simple_background_collection._simple_wb_results = {}
+                    simple_background_collection._simple_wb_results[angle_name] = {
+                        "scale": round(scale, 3),
+                        "unified_gain": unified_gain,
+                        "r": round(exp_r, 2),
+                        "g": round(exp_g, 2),
+                        "b": round(exp_b, 2),
+                    }
+
+                    logger.info(
+                        f"Simple WB background: shape={image.shape}, "
+                        f"median={actual_intensity:.1f}, scale={scale:.3f}"
+                    )
+
+                    # Store reference for biref pair matching
+                    if angle > 0 and angle != 90:
+                        biref_pair_references[angle] = image.copy()
+                except ImportError:
+                    logger.warning("JAI camera module not available for simple WB, falling back to standard")
+                    # Fall through to standard below
+                    wb_mode = "per_angle"
+                    use_per_angle_wb = True
+                except RuntimeError as e:
+                    logger.error(f"Failed to acquire simple WB background at angle {angle}: {e}")
+                    continue
+
+            elif jai_calibration and use_per_angle_wb:
                 # Per-angle white balance mode: use per-channel adaptive exposure
                 # This maintains the R:G:B ratio while scaling to target intensity
                 angle_mapping = {90.0: "uncrossed", 0.0: "crossed", 7.0: "positive", -7.0: "negative"}
@@ -3024,43 +3542,24 @@ def simple_background_collection(
                             )
 
                             # Apply calibrated gain settings
-                            # Check for unified gain first (new calibration format)
-                            unified_gain = angle_cal.get("unified_gain", 1.0)
+                            # Read from gains sub-dict (new calibration format)
                             per_channel_gains = angle_cal.get("gains", {})
-                            gain_r = per_channel_gains.get('r', 1.0)
-                            gain_g = per_channel_gains.get('g', 1.0)
-                            gain_b = per_channel_gains.get('b', 1.0)
+                            unified_gain = per_channel_gains.get("unified_gain", 1.0)
+                            analog_red = per_channel_gains.get("analog_red", 1.0)
+                            analog_blue = per_channel_gains.get("analog_blue", 1.0)
 
-                            has_gain_compensation = (
-                                abs(gain_r - 1.0) > 0.01 or
-                                abs(gain_g - 1.0) > 0.01 or
-                                abs(gain_b - 1.0) > 0.01
+                            # ALWAYS apply unified gain and R/B analog gains.
+                            # During PPM acquisition the camera cycles through angles
+                            # with different gains. Skipping unity-gain angles leaves
+                            # the previous angle's gain active -> saturated images.
+                            jai_props.set_unified_gain(unified_gain)
+                            jai_props.set_rb_analog_gains(
+                                red=analog_red, blue=analog_blue
                             )
-
-                            if unified_gain > 1.0:
-                                # Unified gain mode - set single gain for all channels
-                                jai_props.set_unified_gain(unified_gain)
-                                logger.info(f"  Applied unified gain: {unified_gain:.2f}x")
-                            elif has_gain_compensation:
-                                # Legacy per-channel gain mode
-                                jai_props.set_analog_gains(
-                                    red=gain_r,
-                                    green=gain_g,
-                                    blue=gain_b,
-                                    auto_enable=True,
-                                )
-                                logger.info(
-                                    f"  Applied calibrated gains: "
-                                    f"R={gain_r:.3f}x, G={gain_g:.3f}x, B={gain_b:.3f}x"
-                                )
-                            else:
-                                # No gain compensation needed - DISABLE individual gain mode
-                                # to match the state during WB calibration (which didn't
-                                # enable gain mode for angles without compensation).
-                                # CRITICAL: Enabling individual gain mode with unity gains
-                                # behaves differently than disabled gain mode on JAI cameras!
-                                jai_props.disable_individual_gain()
-                                logger.info("  No gain compensation - disabled individual gain mode")
+                            logger.info(
+                                f"  Applied gains: unified={unified_gain:.2f}x, "
+                                f"analog R={analog_red:.3f}, B={analog_blue:.3f}"
+                            )
 
                             # Capture single image with calibrated settings
                             image, metadata = hardware.snap_image()
@@ -3106,7 +3605,10 @@ def simple_background_collection(
                     jai_calibration = None  # Disable for this angle
 
             # Standard acquisition mode (no per-angle white balance or fallback)
-            if not (jai_calibration and use_per_angle_wb):
+            # Skip if image was already acquired by camera_awb or simple mode above
+            if image is not None and wb_mode in ("camera_awb", "simple"):
+                pass  # Image already acquired above
+            elif not (jai_calibration and use_per_angle_wb):
                 # For negative polarization angles, use biref-matching against positive angle
                 paired_positive = abs(angle)  # e.g., -7 pairs with 7
                 if angle < 0 and angle != -90:  # Negative polarization angle (not -90 brightfield)
@@ -3214,7 +3716,7 @@ def simple_background_collection(
         # CRITICAL: Must disable per-channel mode entirely, not just reset values.
         # If per-channel exposure mode stays active, subsequent set_exposure() calls
         # (e.g., autofocus) will be silently ignored.
-        if jai_calibration and use_per_angle_wb:
+        if wb_mode in ("per_angle", "simple") or (jai_calibration and use_per_angle_wb):
             try:
                 from microscope_control.jai import JAICameraProperties
                 jai_props = JAICameraProperties(hardware.core)
@@ -3226,7 +3728,7 @@ def simple_background_collection(
                 logger.warning(f"Could not reset per-channel mode: {e}")
 
         logger.info("=== SIMPLE BACKGROUND COLLECTION COMPLETE ===")
-        logger.info(f"Successfully collected {len(angles)} background images")
+        logger.info(f"Successfully collected {len(angles)} background images (wb_mode={wb_mode})")
 
         # Save background exposures and achieved intensities to imageprocessing YAML
         # This data becomes the source of truth for white balance target intensities
@@ -3236,13 +3738,33 @@ def simple_background_collection(
                 final_exposures=final_exposures,
                 achieved_intensities=achieved_intensities,
                 modality=modality,
-                objective=settings.get("objective"),
-                detector=settings.get("detector"),
+                objective=settings.get("objective") or objective,
+                detector=settings.get("detector") or detector,
             )
             logger.info("Background exposures saved to imageprocessing YAML")
         except Exception as e:
             logger.warning(f"Failed to save background exposures to YAML: {e}")
             # Non-fatal - continue returning the exposures
+
+        # Save simple_wb section to imageprocessing YAML for Mode 2
+        if wb_mode == "simple" and hasattr(simple_background_collection, '_simple_wb_results'):
+            try:
+                save_simple_wb_to_yaml(
+                    config_path=Path(yaml_file_path),
+                    simple_wb_results=simple_background_collection._simple_wb_results,
+                    base_exposures=simple_wb_base,
+                    modality=modality,
+                    objective=objective,
+                    detector=detector,
+                    logger=logger,
+                )
+                logger.info("Simple WB per-angle data saved to imageprocessing YAML")
+                # Clean up the function attribute
+                del simple_background_collection._simple_wb_results
+            except Exception as e:
+                logger.warning(f"Failed to save simple_wb data to YAML: {e}")
+                if hasattr(simple_background_collection, '_simple_wb_results'):
+                    del simple_background_collection._simple_wb_results
 
         # Return final exposures for metadata writing
         return final_exposures
