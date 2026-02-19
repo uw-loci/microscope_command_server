@@ -27,6 +27,28 @@ import skimage.filters
 logger = logging.getLogger(__name__)
 
 
+def _check_saturation(image, angle_name, log, threshold_pct=1.0):
+    """Check per-channel saturation and warn if above threshold.
+
+    Args:
+        image: RGB image array (H, W, 3) or None
+        angle_name: Label for the image (e.g., angle or "background")
+        log: Logger instance
+        threshold_pct: Saturation warning threshold as percentage (default 1.0%)
+    """
+    if image is None or image.ndim != 3 or image.shape[2] < 3:
+        return
+    total_px = image.shape[0] * image.shape[1]
+    for i, ch in enumerate(["R", "G", "B"]):
+        sat_count = int(np.sum(image[:, :, i] >= 255))
+        sat_pct = 100.0 * sat_count / total_px
+        if sat_pct > threshold_pct:
+            log.warning(
+                f"SATURATION WARNING [{angle_name}]: {ch} channel has "
+                f"{sat_pct:.1f}% saturated pixels ({sat_count}/{total_px})"
+            )
+
+
 def load_jai_calibration_from_imageprocessing(
     config_path: Path,
     per_angle: bool = False,
@@ -2773,6 +2795,7 @@ def acquire_background_with_target_intensity(
                     f"Converged! Final: median={mean_intensity:.1f}, "
                     f"exposure={current_exposure:.1f}ms, iterations={iteration + 1}"
                 )
+            _check_saturation(image, "background", logger or logging.getLogger(__name__))
             return image, current_exposure
 
         # Calculate proportional adjustment
@@ -2818,6 +2841,7 @@ def acquire_background_with_target_intensity(
             f"Did not converge after {max_iterations} iterations. "
             f"Using last image: median={float(np.median(last_image)):.1f}, exposure={last_exposure:.1f}ms"
         )
+    _check_saturation(last_image, "background", logger or logging.getLogger(__name__))
 
     return last_image, last_exposure
 
@@ -2926,6 +2950,7 @@ def acquire_background_with_biref_matching(
                     f"Converged! Final biref={mean_biref:.1f}, "
                     f"exposure={current_exposure:.1f}ms, iterations={iteration + 1}"
                 )
+            _check_saturation(image, "biref-background", logger or logging.getLogger(__name__))
             return image, current_exposure, mean_biref
 
         # Check if we can improve further with exposure adjustment
@@ -2978,6 +3003,7 @@ def acquire_background_with_biref_matching(
             f"Max iterations reached. Using best result: "
             f"biref={best_biref:.1f}, exposure={best_exposure:.1f}ms"
         )
+    _check_saturation(best_image, "biref-background", logger or logging.getLogger(__name__))
 
     return best_image, best_exposure, best_biref
 
@@ -3416,6 +3442,7 @@ def simple_background_collection(
                         f"Camera AWB background: shape={image.shape}, "
                         f"median={actual_intensity:.1f}, exposure={final_exposure:.1f}ms"
                     )
+                    _check_saturation(image, f"AWB angle={angle}", logger)
                     final_exposures[angle] = final_exposure
                     achieved_intensities[angle] = actual_intensity
                 except RuntimeError as e:
@@ -3495,6 +3522,7 @@ def simple_background_collection(
                         f"Simple WB background: shape={image.shape}, "
                         f"median={actual_intensity:.1f}, scale={scale:.3f}"
                     )
+                    _check_saturation(image, f"simple WB angle={angle}", logger)
 
                     # Store reference for biref pair matching
                     if angle > 0 and angle != 90:
@@ -3585,6 +3613,7 @@ def simple_background_collection(
                                 logger.info(
                                     f"Acquired background: shape={image.shape}, median={actual_intensity:.1f}"
                                 )
+                            _check_saturation(image, f"per-angle WB angle={angle}", logger)
 
                             # Store reference for biref pair matching
                             if angle > 0 and angle != 90:
@@ -3633,6 +3662,7 @@ def simple_background_collection(
                                 f"achieved_biref={achieved_biref:.1f}, median={actual_intensity:.1f}, "
                                 f"final_exposure={final_exposure:.1f}ms"
                             )
+                            _check_saturation(image, f"biref-match angle={angle}", logger)
                             final_exposures[angle] = final_exposure
                             achieved_intensities[angle] = actual_intensity
                         except RuntimeError as e:
@@ -3661,6 +3691,7 @@ def simple_background_collection(
                                 f"median={actual_intensity:.1f}, "
                                 f"final_exposure={final_exposure:.1f}ms"
                             )
+                            _check_saturation(image, f"fallback angle={angle}", logger)
                             final_exposures[angle] = final_exposure
                             achieved_intensities[angle] = actual_intensity
                         except RuntimeError as e:
@@ -3685,6 +3716,7 @@ def simple_background_collection(
                             f"Acquired background: shape={image.shape}, median={actual_intensity:.1f}, "
                             f"final_exposure={final_exposure:.1f}ms"
                         )
+                        _check_saturation(image, f"standard angle={angle}", logger)
                         final_exposures[angle] = final_exposure
                         achieved_intensities[angle] = actual_intensity
 
