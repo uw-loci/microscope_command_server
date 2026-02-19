@@ -990,12 +990,16 @@ def get_angles_wb_from_settings(settings: Dict[str, Any]) -> Dict[float, List[fl
                 # Format: "1.0 1.0 1.0"
                 angles_wb[angle_value] = [float(x) for x in wb_values.split()]
 
-    # Default fallback values if not found
+    # Neutral fallback if no software WB settings found in config.
+    # All [1.0, 1.0, 1.0] = no software color correction applied.
     if not angles_wb:
-        logger.warning("No white balance settings found, using defaults")
+        logger.warning(
+            "No software white balance settings found in config "
+            "(settings['white_balance']['ppm']), using neutral [1,1,1] for all angles"
+        )
         angles_wb = {
             0.0: [1.0, 1.0, 1.0],  # crossed
-            90.0: [1.2, 1.0, 1.1],  # uncrossed
+            90.0: [1.0, 1.0, 1.0],  # uncrossed
             7.0: [1.0, 1.0, 1.0],  # positive
             -7.0: [1.0, 1.0, 1.0],  # negative
         }
@@ -1142,13 +1146,16 @@ def _acquisition_workflow(
         else:
             logger.info("Background correction disabled")
 
-        # ======= WARNING FOR BOTH CORRECTIONS ENABLED =======
+        # Background correction (flat-field) and white balance are complementary:
+        # - WB corrects per-channel color balance (R~=G~=B on neutral target)
+        # - Background correction removes spatial non-uniformity (vignetting)
+        # They work together as long as backgrounds are captured with the SAME
+        # WB mode/settings that will be used for acquisition.
         if background_correction_enabled and white_balance_enabled:
-            logger.warning("=" * 70)
-            logger.warning("WARNING: Both background correction and white balance are enabled!")
-            logger.warning("This may lead to over-correction of the images.")
-            logger.warning("Consider using only one correction method.")
-            logger.warning("=" * 70)
+            logger.info(
+                "Both background correction and white balance enabled "
+                "(backgrounds must be captured with matching WB settings)"
+            )
 
         # ======= BACKGROUND CORRECTION SETUP =======
         background_images = {}
@@ -1206,8 +1213,9 @@ def _acquisition_workflow(
         # ======= WHITE BALANCE SETUP =======
         angles_wb = {}
 
-        # Resolve wb_mode from new --wb-mode flag or derive from old boolean flags
-        # Priority: explicit --wb-mode > old flags > default
+        # Resolve wb_mode from --wb-mode flag (REQUIRED).
+        # Multiple WB calibrations may coexist in the config; the user's explicit
+        # choice must be respected -- never silently pick a mode for them.
         wb_mode = params.get("wb_mode")
         if wb_mode is None:
             # Backward compatibility: derive from old boolean flags
@@ -1218,7 +1226,12 @@ def _acquisition_workflow(
             elif wb_per_angle:
                 wb_mode = "per_angle"
             else:
-                wb_mode = "per_angle"  # Default for JAI cameras
+                raise ValueError(
+                    "No --wb-mode specified in acquisition request. "
+                    "White balance mode must be explicitly chosen by the user: "
+                    "camera_awb, simple, or per_angle. "
+                    "Update the client to always send --wb-mode."
+                )
         logger.info(f"White balance mode: {wb_mode}")
 
         # Keep white_balance_enabled and white_balance_per_angle in sync for
@@ -3189,9 +3202,17 @@ def simple_background_collection(
         Dict[float, float]: Dictionary mapping angles to final exposure times (ms)
                            e.g., {90.0: 1.2, 5.0: 45.8, ...}
     """
-    # Resolve wb_mode from new param or derive from old boolean for backward compat
+    # Resolve wb_mode: require explicit choice, never silently pick a mode
     if wb_mode is None:
-        wb_mode = "per_angle" if use_per_angle_wb else "per_angle"
+        if use_per_angle_wb:
+            wb_mode = "per_angle"
+        else:
+            raise ValueError(
+                "No wb_mode specified for background collection. "
+                "White balance mode must be explicitly chosen by the user: "
+                "camera_awb, simple, or per_angle. "
+                "Update the client to always send --wb-mode."
+            )
     # Keep use_per_angle_wb in sync for downstream code
     use_per_angle_wb = wb_mode == "per_angle"
     logger.info(f"Background collection wb_mode: {wb_mode}")
@@ -3363,9 +3384,11 @@ def simple_background_collection(
                     f"B={simple_wb_base['b']:.2f}ms"
                 )
             else:
-                logger.warning("Simple WB: no uncrossed calibration found, falling back to standard mode")
-                wb_mode = "per_angle"
-                use_per_angle_wb = True
+                raise ValueError(
+                    "Simple WB mode requires uncrossed (90 deg) calibration data "
+                    "but none was found. Run 'PPM White Balance Calibration' first, "
+                    "or select a different WB mode."
+                )
 
         # Get current position for reference
         current_pos = hardware.get_current_position()
@@ -3528,10 +3551,10 @@ def simple_background_collection(
                     if angle > 0 and angle != 90:
                         biref_pair_references[angle] = image.copy()
                 except ImportError:
-                    logger.warning("JAI camera module not available for simple WB, falling back to standard")
-                    # Fall through to standard below
-                    wb_mode = "per_angle"
-                    use_per_angle_wb = True
+                    raise ImportError(
+                        "Simple WB mode requires the JAI camera module "
+                        "(microscope_control.jai) but it is not available."
+                    )
                 except RuntimeError as e:
                     logger.error(f"Failed to acquire simple WB background at angle {angle}: {e}")
                     continue
