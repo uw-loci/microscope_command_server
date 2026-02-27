@@ -98,6 +98,9 @@ class ExtendedCommand:
     GETNOISE = b"getnoise"  # Get per-channel noise stats (multi-frame temporal analysis)
     NOISCHAR = b"noischar"  # JAI noise characterization across gain/exposure grid
 
+    # Pixel size query
+    GETPXSZ = b"getpxsz_"  # Get MicroManager pixel size (um/pixel)
+
     # Live Viewer Commands (core-level, bypasses MM studio/live window)
     GETFRAME = b"getframe"  # Get latest frame from MM circular buffer
     STRTSEQ = b"strtseq_"  # Start continuous sequence acquisition (core-level)

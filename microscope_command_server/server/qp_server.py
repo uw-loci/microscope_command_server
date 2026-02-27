@@ -600,6 +600,27 @@ def handle_client(conn, addr):
                     conn.sendall(response)
                 continue
 
+            if data == ExtendedCommand.GETPXSZ:
+                logger.debug(f"Client {addr} requested pixel size")
+
+                # SAFETY CHECK: Require CONFIG before GETPXSZ
+                if not server_configured:
+                    logger.warning(f"GETPXSZ: Blocked - server not configured (CONFIG command required first)")
+                    response = struct.pack("!f", 0.0)
+                    conn.sendall(response)
+                    continue
+
+                try:
+                    pixel_size = hardware.core.get_pixel_size_um()
+                    response = struct.pack("!f", float(pixel_size))
+                    conn.sendall(response)
+                    logger.debug(f"Sent pixel size to {addr}: {pixel_size} um/pixel")
+                except Exception as e:
+                    logger.error(f"Failed to get pixel size: {e}")
+                    response = struct.pack("!f", 0.0)
+                    conn.sendall(response)
+                continue
+
             if data == ExtendedCommand.GETR:
                 logger.debug(f"Client {addr} requested rotation angle")
                 try:
