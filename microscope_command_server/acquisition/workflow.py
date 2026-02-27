@@ -30,6 +30,10 @@ logger = logging.getLogger(__name__)
 def _check_saturation(image, angle_name, log, threshold_pct=1.0):
     """Check per-channel saturation and warn if above threshold.
 
+    Uses >= 250 threshold to catch near-saturation where the channel mean
+    is pulled down by a small fraction of non-clipped pixels (e.g., mean
+    254.99 indicates virtually all pixels at 255).
+
     Args:
         image: RGB image array (H, W, 3) or None
         angle_name: Label for the image (e.g., angle or "background")
@@ -40,7 +44,7 @@ def _check_saturation(image, angle_name, log, threshold_pct=1.0):
         return
     total_px = image.shape[0] * image.shape[1]
     for i, ch in enumerate(["R", "G", "B"]):
-        sat_count = int(np.sum(image[:, :, i] >= 255))
+        sat_count = int(np.sum(image[:, :, i] >= 250))
         sat_pct = 100.0 * sat_count / total_px
         if sat_pct > threshold_pct:
             log.warning(
@@ -1018,6 +1022,7 @@ def _acquisition_workflow(
     is_cancelled: Callable[[], bool],
     request_manual_focus: Optional[Callable[[], None]] = None,
     connection_config_path: Optional[str] = None,
+    awb_calibrated: bool = False,
 ):
     """Execute the main image acquisition workflow with progress and cancellation.
 
@@ -1035,6 +1040,8 @@ def _acquisition_workflow(
                              raise exceptions as before.
         connection_config_path: Optional path to config from initial CONFIG command,
                                used to warn if ACQUIRE uses different config.
+        awb_calibrated: Whether Camera AWB has been calibrated this session.
+                       Used to warn if camera_awb mode is selected without prior calibration.
     """
 
     logger.info(f"=== ACQUISITION WORKFLOW STARTED for client {client_addr} ===")
@@ -1045,7 +1052,7 @@ def _acquisition_workflow(
             if hardware.core.is_sequence_running():
                 hardware.core.stop_sequence_acquisition()
                 logger.info("Stopped core sequence acquisition before acquisition")
-            if hardware.studio is not None and hardware.studio.live().isLiveModeOn():
+            if hardware.studio is not None and hardware.studio.live().is_live_mode_on():
                 hardware.studio.live().set_live_mode(False)
                 logger.info("Stopped studio live mode before acquisition")
         except Exception as e:
@@ -1160,6 +1167,7 @@ def _acquisition_workflow(
         # ======= BACKGROUND CORRECTION SETUP =======
         background_images = {}
         background_scaling_factors = {}
+        background_wb_coeffs = {}
 
         if background_correction_enabled:
             background_dir = None
@@ -1194,7 +1202,7 @@ def _acquisition_workflow(
             # Load background images if directory is valid
             if background_dir and background_dir.exists():
                 logger.info(f"Loading background images from: {background_dir}")
-                background_images, background_scaling_factors, _ = (
+                background_images, background_scaling_factors, background_wb_coeffs = (
                     BackgroundCorrectionUtils.load_background_images(
                         background_dir, params["angles"], logger
                     )
@@ -1202,6 +1210,9 @@ def _acquisition_workflow(
 
                 if background_images:
                     logger.info(f"Loaded {len(background_images)} background images")
+                    # Check loaded backgrounds for saturation issues
+                    for bg_angle, bg_img in background_images.items():
+                        _check_saturation(bg_img, f"loaded background at {bg_angle}deg", logger)
                 else:
                     logger.warning("No background images found - disabling background correction")
                     background_correction_enabled = False
@@ -1258,6 +1269,12 @@ def _acquisition_workflow(
         base_modality = params["scan_type"].split("_")[0].lower()
 
         if wb_mode == "camera_awb":
+            # Warn if AWB hasn't been calibrated this session
+            if not awb_calibrated:
+                logger.warning(
+                    "Camera AWB mode selected but no AWB calibration detected this session. "
+                    "Colors may be incorrect. Run 'Camera AWB Calibration' first."
+                )
             # Camera AWB mode: no per-channel calibration needed.
             # Camera handles color internally. Load per-angle unified gains
             # from Mode 3 data for brightness boosting at dim angles.
@@ -1276,8 +1293,9 @@ def _acquisition_workflow(
                     jai_props = JAICameraProperties(hardware.core)
                     jai_props.disable_individual_exposure()
                     jai_props.disable_individual_gain()
-                    jai_props.set_analog_gains(red=1.0, green=1.0, blue=1.0, auto_enable=False)
-                    logger.info("Camera AWB mode: disabled per-channel exposure/gain, neutral analog gains")
+                    # NOTE: Do NOT reset analog gains here -- AWB corrections are stored in
+                    # Gain_AnalogRed/Gain_AnalogBlue and must be preserved for camera_awb mode.
+                    logger.info("Camera AWB mode: disabled per-channel exposure/gain (preserving AWB analog gains)")
                 except (ImportError, Exception) as e:
                     logger.warning(f"Could not configure camera AWB mode: {e}")
             if jai_calibration:
@@ -1295,6 +1313,16 @@ def _acquisition_workflow(
             jai_calibration = None  # Don't use per-channel calibration in acquisition loop
 
         elif wb_mode == "simple":
+            # Clear any lingering AWB corrections before simple WB setup.
+            # Simple mode sets explicit per-channel exposures + analog gains per tile;
+            # residual AWB analog gain corrections would compound incorrectly.
+            if is_jai_camera:
+                try:
+                    from microscope_control.jai import JAICameraProperties
+                    jai_props = JAICameraProperties(hardware.core)
+                    jai_props.clear_awb_corrections()
+                except (ImportError, Exception) as e:
+                    logger.warning(f"Could not clear AWB corrections before simple WB: {e}")
             # Simple WB mode: load 90deg R:G:B ratios from Mode 3 calibration,
             # then load pre-computed simple_wb section if available
             jai_calibration = load_jai_calibration_from_imageprocessing(
@@ -1326,6 +1354,16 @@ def _acquisition_workflow(
                 )
 
         elif wb_mode == "per_angle":
+            # Clear any lingering AWB corrections before per-angle WB setup.
+            # Per-angle mode sets explicit per-channel exposures + analog gains per tile;
+            # residual AWB analog gain corrections would compound incorrectly.
+            if is_jai_camera:
+                try:
+                    from microscope_control.jai import JAICameraProperties
+                    jai_props = JAICameraProperties(hardware.core)
+                    jai_props.clear_awb_corrections()
+                except (ImportError, Exception) as e:
+                    logger.warning(f"Could not clear AWB corrections before per-angle WB: {e}")
             # Per-angle WB mode (Mode 3): existing behavior
             jai_calibration = load_jai_calibration_from_imageprocessing(
                 config_path=Path(params["yaml_file_path"]),
@@ -1355,6 +1393,22 @@ def _acquisition_workflow(
         if white_balance_enabled:
             # Load software white balance settings from configuration (RGB multipliers)
             angles_wb = get_angles_wb_from_settings(ppm_settings)
+
+            # If config had no WB settings (all neutral), use background-derived
+            # coefficients as fallback. These are computed from the mean R/G/B of each
+            # background image and represent the correction needed to equalize channels.
+            all_neutral = all(
+                v == [1.0, 1.0, 1.0] for v in angles_wb.values()
+            )
+            if all_neutral and background_wb_coeffs:
+                logger.info(
+                    "No WB settings in config - using background-derived "
+                    "coefficients for %d angles", len(background_wb_coeffs)
+                )
+                angles_wb = {
+                    angle: list(coeffs)
+                    for angle, coeffs in background_wb_coeffs.items()
+                }
 
             if white_balance_per_angle:
                 # Use per-angle white balance profiles (PPM mode)
@@ -1612,10 +1666,10 @@ def _acquisition_workflow(
                         jai_props = JAICameraProperties(hardware.core)
                         jai_props.disable_individual_exposure()
                         jai_props.disable_individual_gain()
-                        jai_props.set_analog_gains(red=1.0, green=1.0, blue=1.0, auto_enable=False)
+                        jai_props.set_rb_analog_gains(red=1.0, blue=1.0)
                         logger.info("Disabled per-channel mode and reset gains for pre-acquisition autofocus")
                     except (ImportError, Exception) as e:
-                        logger.debug(f"Could not reset per-channel mode: {e}")
+                        logger.warning(f"Could not reset per-channel mode: {e}")
 
                 hardware.set_exposure(exposure_90)
                 logger.info(f"Set exposure to {exposure_90}ms for initial autofocus")
@@ -1777,9 +1831,9 @@ def _acquisition_workflow(
                             jai_props = JAICameraProperties(hardware.core)
                             jai_props.disable_individual_exposure()
                             jai_props.disable_individual_gain()
-                            jai_props.set_analog_gains(red=1.0, green=1.0, blue=1.0, auto_enable=False)
+                            jai_props.set_rb_analog_gains(red=1.0, blue=1.0)
                         except (ImportError, Exception) as e:
-                            logger.debug(f"Could not reset per-channel mode: {e}")
+                            logger.warning(f"Could not reset per-channel mode: {e}")
 
                     t_exp = time.perf_counter()
                     hardware.set_exposure(exposure_90)
@@ -2080,7 +2134,7 @@ def _acquisition_workflow(
                                 jai_props = JAICameraProperties(hardware.core)
                                 jai_props.disable_individual_exposure()
                                 jai_props.disable_individual_gain()
-                                jai_props.set_analog_gains(red=1.0, green=1.0, blue=1.0, auto_enable=False)
+                                jai_props.set_rb_analog_gains(red=1.0, blue=1.0)
                             except (ImportError, Exception):
                                 pass
                             exposure_ms = params["exposures"][angle_idx]
@@ -2107,6 +2161,7 @@ def _acquisition_workflow(
                     img_mean = image.mean((0,1))
                     t_stats = log_timing(logger, f"Calculate image stats at {angle}deg", t_stats)
                     logger.info(f"  Image shape: {image.shape}, mean: {img_mean}")
+                    _check_saturation(image, f"tile {filename} at {angle}deg", logger)
 
                     # Save raw (unprocessed) image for comparison
                     raw_output_path = output_path.parent / "Raw" / output_path.name
@@ -2157,6 +2212,7 @@ def _acquisition_workflow(
                             f"    Correction applied with method: {background_correction_method}"
                         )
                         logger.info(f"    Post-correction RGB means: {image.mean(axis=(0,1))}")
+                        _check_saturation(image, f"post-correction tile {filename} at {angle}deg", logger)
                     elif background_correction_enabled and angle in background_disabled_angles:
                         logger.info(
                             f"  Background correction SKIPPED for {angle} deg (validation failed - exposure mismatch or missing background)"
@@ -2763,7 +2819,7 @@ def acquire_background_with_target_intensity(
         jai_props = JAICameraProperties(hardware.core)
         jai_props.disable_individual_exposure()
         jai_props.disable_individual_gain()
-        jai_props.set_analog_gains(red=1.0, green=1.0, blue=1.0, auto_enable=False)
+        jai_props.set_rb_analog_gains(red=1.0, blue=1.0)
     except (ImportError, Exception):
         pass  # Not a JAI camera or module not available
 
@@ -2904,7 +2960,7 @@ def acquire_background_with_biref_matching(
         jai_props = JAICameraProperties(hardware.core)
         jai_props.disable_individual_exposure()
         jai_props.disable_individual_gain()
-        jai_props.set_analog_gains(red=1.0, green=1.0, blue=1.0, auto_enable=False)
+        jai_props.set_rb_analog_gains(red=1.0, blue=1.0)
     except (ImportError, Exception):
         pass  # Not a JAI camera or module not available
 
@@ -3225,7 +3281,7 @@ def simple_background_collection(
             if hardware.core.is_sequence_running():
                 hardware.core.stop_sequence_acquisition()
                 logger.info("Stopped core sequence acquisition before background collection")
-            if hardware.studio is not None and hardware.studio.live().isLiveModeOn():
+            if hardware.studio is not None and hardware.studio.live().is_live_mode_on():
                 hardware.studio.live().set_live_mode(False)
                 logger.info("Stopped studio live mode before background collection")
         except Exception as e:
@@ -3345,6 +3401,17 @@ def simple_background_collection(
                 else:
                     logger.warning("Per-angle white balance requested but no calibration found")
 
+        # Clear any lingering AWB corrections for simple/per_angle modes.
+        # These modes set explicit per-channel exposures + analog gains per tile;
+        # residual AWB analog gain corrections would compound incorrectly.
+        if wb_mode in ("simple", "per_angle") and is_jai_camera:
+            try:
+                from microscope_control.jai import JAICameraProperties
+                jai_props = JAICameraProperties(hardware.core)
+                jai_props.clear_awb_corrections()
+            except (ImportError, Exception) as e:
+                logger.warning(f"Could not clear AWB corrections before {wb_mode} WB: {e}")
+
         # Camera AWB mode: disable per-channel exposure/gain, neutral analog gains
         camera_awb_gains = {}
         if wb_mode == "camera_awb" and is_jai_camera:
@@ -3353,8 +3420,9 @@ def simple_background_collection(
                 jai_props = JAICameraProperties(hardware.core)
                 jai_props.disable_individual_exposure()
                 jai_props.disable_individual_gain()
-                jai_props.set_analog_gains(red=1.0, green=1.0, blue=1.0, auto_enable=False)
-                logger.info("Camera AWB: disabled per-channel exposure/gain for background collection")
+                # NOTE: Do NOT reset analog gains here -- AWB corrections are stored in
+                # Gain_AnalogRed/Gain_AnalogBlue and must be preserved for camera_awb mode.
+                logger.info("Camera AWB: disabled per-channel exposure/gain for background collection (preserving AWB analog gains)")
             except (ImportError, Exception) as e:
                 logger.warning(f"Could not configure camera AWB mode: {e}")
             # Extract unified gains from Mode 3 calibration for brightness
@@ -3771,13 +3839,19 @@ def simple_background_collection(
         # CRITICAL: Must disable per-channel mode entirely, not just reset values.
         # If per-channel exposure mode stays active, subsequent set_exposure() calls
         # (e.g., autofocus) will be silently ignored.
-        if wb_mode in ("per_angle", "simple") or (jai_calibration and use_per_angle_wb):
+        if wb_mode in ("per_angle", "simple", "camera_awb") or (jai_calibration and use_per_angle_wb):
             try:
                 from microscope_control.jai import JAICameraProperties
                 jai_props = JAICameraProperties(hardware.core)
                 jai_props.disable_individual_exposure()
                 jai_props.disable_individual_gain()
-                jai_props.set_analog_gains(red=1.0, green=1.0, blue=1.0, auto_enable=False)
+                if wb_mode != "camera_awb":
+                    # For simple/per_angle: clear analog gains to neutral state
+                    jai_props.set_rb_analog_gains(red=1.0, blue=1.0)
+                else:
+                    # For camera_awb: preserve AWB corrections in analog gains
+                    logger.info("Camera AWB: preserving analog gain corrections through cleanup")
+                jai_props.set_unified_gain(1.0)
                 logger.info("Disabled per-channel mode and reset gains after background collection")
             except (ImportError, Exception) as e:
                 logger.warning(f"Could not reset per-channel mode: {e}")

@@ -194,6 +194,12 @@ active_connection_addr = None  # Track single active client connection (blocks o
 active_connection_config_path = None  # Path to config file provided by active connection
 connection_state_lock = Lock()  # Protect connection state from race conditions
 
+# AWB state tracking -- True when Camera AWB corrections are present in analog gains.
+# Set True when SETWBMD mode=1 (Continuous) or mode=2 (Once) completes.
+# Remains True when mode=0 (Off) -- Off doesn't clear analog gain registers.
+# Reset to False only when analog gains are explicitly cleared (e.g., by simple/per_angle mode setup).
+awb_calibrated = False
+
 
 def init_pycromanager_with_logger():
     """
@@ -396,6 +402,7 @@ def acquisitionWorkflow(message, client_addr):
         is_cancelled=_is_cancelled,
         request_manual_focus=_request_manual_focus,
         connection_config_path=active_connection_config_path,
+        awb_calibrated=awb_calibrated,
     )
 
 
@@ -1220,7 +1227,7 @@ def handle_client(conn, addr):
                         jai_props = JAICameraProperties(hardware.core)
                         jai_props.disable_individual_exposure()
                         jai_props.disable_individual_gain()
-                        jai_props.set_analog_gains(red=1.0, green=1.0, blue=1.0, auto_enable=False)
+                        jai_props.set_rb_analog_gains(red=1.0, blue=1.0)
                         logger.debug("Reset per-channel mode after WBCALIBR")
                     except (ImportError, Exception):
                         pass
@@ -1247,6 +1254,10 @@ def handle_client(conn, addr):
             #   into subsequent non-calibrated acquisitions.
             if data == ExtendedCommand.WBSIMPLE:
                 logger.info(f"Client {addr} requested simple white balance calibration")
+
+                # Track calibration result so the finally block can apply it
+                # to the camera for live view (instead of resetting to defaults).
+                _wb_calibration_result = None
 
                 # Read the message using the same pattern as WBCALIBR
                 message_parts = []
@@ -1443,6 +1454,7 @@ def handle_client(conn, addr):
 
                                 conn.sendall(response.encode())
                                 logger.info(f"WBSIMPLE completed: {status}")
+                                _wb_calibration_result = result
 
                             except ImportError as e:
                                 error_msg = f"JAI calibration module not available: {e}"
@@ -1472,14 +1484,42 @@ def handle_client(conn, addr):
                     conn.sendall(f"FAILED:{str(e)}".encode())
                 finally:
                     conn.settimeout(None)  # Reset to blocking mode
-                    # Reset camera to clean state after calibration
+                    # Apply calibration result to camera so live view shows
+                    # the white-balanced image, or reset on failure.
                     try:
                         from microscope_control.jai import JAICameraProperties
                         jai_props = JAICameraProperties(hardware.core)
-                        jai_props.set_rb_analog_gains(red=1.0, blue=1.0)
-                        jai_props.set_unified_gain(1.0)
-                        jai_props.disable_individual_exposure()
-                        logger.debug("Reset camera state after WBSIMPLE")
+                        if (_wb_calibration_result is not None
+                                and _wb_calibration_result.converged):
+                            jai_props.set_channel_exposures(
+                                red=_wb_calibration_result.exposures_ms['red'],
+                                green=_wb_calibration_result.exposures_ms['green'],
+                                blue=_wb_calibration_result.exposures_ms['blue'],
+                                auto_enable=True,
+                            )
+                            jai_props.set_unified_gain(
+                                _wb_calibration_result.unified_gain)
+                            jai_props.set_rb_analog_gains(
+                                red=_wb_calibration_result.analog_red,
+                                blue=_wb_calibration_result.analog_blue)
+                            logger.info(
+                                "Applied calibration to camera for live view: "
+                                "R=%.2f G=%.2f B=%.2f, "
+                                "unified=%.2f, aR=%.3f, aB=%.3f",
+                                _wb_calibration_result.exposures_ms['red'],
+                                _wb_calibration_result.exposures_ms['green'],
+                                _wb_calibration_result.exposures_ms['blue'],
+                                _wb_calibration_result.unified_gain,
+                                _wb_calibration_result.analog_red,
+                                _wb_calibration_result.analog_blue,
+                            )
+                        else:
+                            # Reset to clean state on failure
+                            jai_props.set_rb_analog_gains(red=1.0, blue=1.0)
+                            jai_props.set_unified_gain(1.0)
+                            jai_props.disable_individual_exposure()
+                            logger.debug("Reset camera state after WBSIMPLE "
+                                         "(calibration did not converge)")
                     except (ImportError, Exception):
                         pass
 
@@ -1510,6 +1550,10 @@ def handle_client(conn, addr):
             # Post-calibration: Same mode reset as WBSIMPLE (unified mode, gains to 1.0).
             if data == ExtendedCommand.WBPPM:
                 logger.info(f"Client {addr} requested PPM white balance calibration (4 angles)")
+
+                # Track calibration results so the finally block can apply them
+                # to the camera for live view (using uncrossed angle settings).
+                _wb_ppm_results = None
 
                 # Read the message
                 message_parts = []
@@ -1811,6 +1855,7 @@ def handle_client(conn, addr):
                                 response = "|".join(response_parts)
                                 conn.sendall(response.encode())
                                 logger.info(f"WBPPM completed: all_converged={all_converged}")
+                                _wb_ppm_results = results
 
                             except ImportError as e:
                                 error_msg = f"JAI calibration module not available: {e}"
@@ -1840,14 +1885,46 @@ def handle_client(conn, addr):
                     conn.sendall(f"FAILED:{str(e)}".encode())
                 finally:
                     conn.settimeout(None)  # Reset to blocking mode
-                    # Reset camera to clean state after calibration
+                    # Apply uncrossed calibration to camera so live view shows
+                    # the white-balanced image, or reset on failure.
                     try:
                         from microscope_control.jai import JAICameraProperties
                         jai_props = JAICameraProperties(hardware.core)
-                        jai_props.set_rb_analog_gains(red=1.0, blue=1.0)
-                        jai_props.set_unified_gain(1.0)
-                        jai_props.disable_individual_exposure()
-                        logger.debug("Reset camera state after WBPPM")
+                        # Use uncrossed (90 deg) result for live view -- it is
+                        # the brightest angle and most natural for visual QC.
+                        uncrossed = (
+                            _wb_ppm_results.get("uncrossed")
+                            if _wb_ppm_results else None
+                        )
+                        if uncrossed is not None and uncrossed.converged:
+                            jai_props.set_channel_exposures(
+                                red=uncrossed.exposures_ms['red'],
+                                green=uncrossed.exposures_ms['green'],
+                                blue=uncrossed.exposures_ms['blue'],
+                                auto_enable=True,
+                            )
+                            jai_props.set_unified_gain(uncrossed.unified_gain)
+                            jai_props.set_rb_analog_gains(
+                                red=uncrossed.analog_red,
+                                blue=uncrossed.analog_blue)
+                            logger.info(
+                                "Applied uncrossed calibration to camera for "
+                                "live view: R=%.2f G=%.2f B=%.2f, "
+                                "unified=%.2f, aR=%.3f, aB=%.3f",
+                                uncrossed.exposures_ms['red'],
+                                uncrossed.exposures_ms['green'],
+                                uncrossed.exposures_ms['blue'],
+                                uncrossed.unified_gain,
+                                uncrossed.analog_red,
+                                uncrossed.analog_blue,
+                            )
+                        else:
+                            # Reset to clean state on failure
+                            jai_props.set_rb_analog_gains(red=1.0, blue=1.0)
+                            jai_props.set_unified_gain(1.0)
+                            jai_props.disable_individual_exposure()
+                            logger.debug("Reset camera state after WBPPM "
+                                         "(no uncrossed result to apply)")
                     except (ImportError, Exception):
                         pass
 
@@ -3468,6 +3545,15 @@ def handle_client(conn, addr):
                     from microscope_control.jai import JAICameraProperties
                     jai_props = JAICameraProperties(hardware.core)
 
+                    # Stop any active streaming before changing gain properties
+                    # (same pattern as SETMODE handler)
+                    try:
+                        if hardware.core.is_sequence_running():
+                            hardware.core.stop_sequence_acquisition()
+                            time.sleep(0.2)
+                    except Exception:
+                        pass
+
                     if count == 1:
                         # Unified gain only
                         jai_props.set_unified_gain(gains[0])
@@ -3516,18 +3602,23 @@ def handle_client(conn, addr):
                     mode = mode_byte[0]
                     logger.info(f"Setting WB mode: {mode}")
 
+                    global awb_calibrated
                     from microscope_control.jai import JAICameraProperties
                     jai_props = JAICameraProperties(hardware.core)
 
                     if mode == 0:
                         jai_props.set_white_balance_mode("Off")
+                        # Note: does NOT clear analog gain corrections.
+                        # awb_calibrated stays True if AWB was previously run.
                         logger.info("Set white balance mode to Off")
                     elif mode == 1:
                         jai_props.set_white_balance_mode("Continuous")
-                        logger.info("Set white balance mode to Continuous")
+                        awb_calibrated = True
+                        logger.info("Set white balance mode to Continuous (AWB active)")
                     elif mode == 2:
                         jai_props.run_auto_white_balance()
-                        logger.info("Ran one-shot auto white balance")
+                        awb_calibrated = True
+                        logger.info("Ran one-shot auto white balance (AWB calibrated)")
                     else:
                         logger.warning(f"Unknown WB mode: {mode}")
 
