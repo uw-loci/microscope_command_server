@@ -2783,6 +2783,7 @@ def acquire_background_with_target_intensity(
     initial_exposure_ms: float = 100.0,
     max_iterations: int = 10,
     logger=None,
+    preserve_analog_gains: bool = False,
 ) -> Tuple[np.ndarray, float]:
     """
     Acquire background image with adaptive exposure to reach target intensity.
@@ -2798,6 +2799,9 @@ def acquire_background_with_target_intensity(
         initial_exposure_ms: Starting exposure time in milliseconds
         max_iterations: Maximum adjustment iterations
         logger: Logger instance for tracking convergence
+        preserve_analog_gains: If True, do not reset analog R/B gains to 1.0.
+            Used by camera_awb mode where AWB corrections are stored in
+            Gain_AnalogRed/Blue and must be preserved for correct color balance.
 
     Returns:
         Tuple of (image, final_exposure_ms)
@@ -2819,7 +2823,21 @@ def acquire_background_with_target_intensity(
         jai_props = JAICameraProperties(hardware.core)
         jai_props.disable_individual_exposure()
         jai_props.disable_individual_gain()
-        jai_props.set_rb_analog_gains(red=1.0, blue=1.0)
+        if preserve_analog_gains:
+            # Camera AWB mode: preserve AWB corrections in Gain_AnalogRed/Blue.
+            # These were set by one-shot AWB calibration and must remain active
+            # so backgrounds match the WB state of tissue tiles.
+            if logger:
+                try:
+                    cur_red = float(jai_props._get_property(jai_props.GAIN_ANALOG_RED))
+                    cur_blue = float(jai_props._get_property(jai_props.GAIN_ANALOG_BLUE))
+                    logger.info(
+                        f"Preserving AWB analog gains: R={cur_red:.3f}, B={cur_blue:.3f}"
+                    )
+                except Exception:
+                    logger.info("Preserving analog gains (could not read current values)")
+        else:
+            jai_props.set_rb_analog_gains(red=1.0, blue=1.0)
     except (ImportError, Exception):
         pass  # Not a JAI camera or module not available
 
@@ -3527,6 +3545,7 @@ def simple_background_collection(
                         initial_exposure_ms=initial_exposure_ms,
                         max_iterations=10,
                         logger=logger,
+                        preserve_analog_gains=True,  # Keep AWB corrections active
                     )
                     actual_intensity = float(np.median(image))
                     logger.info(
