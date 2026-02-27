@@ -3248,6 +3248,8 @@ def simple_background_collection(
     update_progress: Callable[[int, int], None],
     use_per_angle_wb: bool = False,
     wb_mode: str = None,
+    objective: str = None,
+    detector: str = None,
 ):
     """
     Simplified background collection for BackgroundCollectionWorkflow.
@@ -3271,6 +3273,10 @@ def simple_background_collection(
                          before acquiring each background image (legacy param)
         wb_mode: White balance mode string: "camera_awb", "simple", "per_angle", "off".
                  If None, derived from use_per_angle_wb for backward compatibility.
+        objective: Objective ID for calibration lookup (e.g., "LOCI_OBJECTIVE_OLYMPUS_20X_POL_001").
+                  Required for WB calibration data to be loaded from imageprocessing YAML.
+        detector: Detector ID for calibration lookup (e.g., "LOCI_DETECTOR_JAI_001").
+                 Required for WB calibration data to be loaded from imageprocessing YAML.
 
     Returns:
         Dict[float, float]: Dictionary mapping angles to final exposure times (ms)
@@ -3359,9 +3365,13 @@ def simple_background_collection(
         # All modes except "off" need Mode 3 calibration data for reference
         should_load_calibration = wb_mode != "off" and (is_jai_camera or use_per_angle_wb or wb_mode in ("camera_awb", "simple"))
 
-        # Resolve objective/detector for calibration lookup
-        objective = settings.get("objective_in_use") or settings.get("objective")
-        detector = settings.get("detector_in_use") or settings.get("detector")
+        # Resolve objective/detector for calibration lookup.
+        # Prefer explicitly passed values (from BGACQUIRE --objective/--detector flags),
+        # fall back to settings from config YAML (which may be null).
+        if not objective:
+            objective = settings.get("objective_in_use") or settings.get("objective")
+        if not detector:
+            detector = settings.get("detector_in_use") or settings.get("detector")
 
         if should_load_calibration:
             # Get objective and detector from settings or parse from output path

@@ -878,7 +878,7 @@ def handle_client(conn, addr):
 
                             # Split by known flags to avoid issues with spaces in paths
                             # Include --wb-mode as a valued flag
-                            flags = ["--yaml", "--output", "--modality", "--angles", "--exposures", "--wb-mode"]
+                            flags = ["--yaml", "--output", "--modality", "--angles", "--exposures", "--wb-mode", "--objective", "--detector"]
 
                             for i, flag in enumerate(flags):
                                 if flag in message:
@@ -915,6 +915,10 @@ def handle_client(conn, addr):
                                         params["exposures_str"] = value
                                     elif flag == "--wb-mode":
                                         params["wb_mode"] = value.lower()
+                                    elif flag == "--objective":
+                                        params["objective"] = value
+                                    elif flag == "--detector":
+                                        params["detector"] = value
 
                             # Resolve wb_mode: prefer explicit --wb-mode, fall back to boolean flag
                             if "wb_mode" in params:
@@ -980,6 +984,8 @@ def handle_client(conn, addr):
                                     update_progress=update_progress,
                                     use_per_angle_wb=params.get("use_per_angle_wb", False),
                                     wb_mode=params.get("wb_mode"),
+                                    objective=params.get("objective"),
+                                    detector=params.get("detector"),
                                 )
 
                                 # Format exposures as angle:exposure pairs
@@ -1423,6 +1429,7 @@ def handle_client(conn, addr):
                                         config_path=Path(params["yaml_file_path"]),
                                         result=result,
                                         calibration_type="simple",
+                                        angle_name="uncrossed",  # Simple WB calibrates at 90 deg (uncrossed)
                                         modality="ppm",
                                         objective=wb_objective,
                                         detector=wb_detector,
