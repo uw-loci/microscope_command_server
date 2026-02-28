@@ -3453,7 +3453,12 @@ def simple_background_collection(
             except (ImportError, Exception) as e:
                 logger.warning(f"Could not clear AWB corrections before {wb_mode} WB: {e}")
 
-        # Camera AWB mode: disable per-channel exposure/gain, neutral analog gains
+        # Camera AWB mode: disable per-channel exposure/gain, reset analog gains.
+        # AWB analog gains are calibrated at ONE polarizer angle (typically crossed/0deg)
+        # and cause channel saturation at other angles where optical transmission differs.
+        # Backgrounds are flat-field references -- they should be captured WITHOUT
+        # per-channel color corrections. AWB corrections are applied during tissue
+        # acquisition, not during background collection.
         camera_awb_gains = {}
         if wb_mode == "camera_awb" and is_jai_camera:
             try:
@@ -3461,9 +3466,8 @@ def simple_background_collection(
                 jai_props = JAICameraProperties(hardware.core)
                 jai_props.disable_individual_exposure()
                 jai_props.disable_individual_gain()
-                # NOTE: Do NOT reset analog gains here -- AWB corrections are stored in
-                # Gain_AnalogRed/Gain_AnalogBlue and must be preserved for camera_awb mode.
-                logger.info("Camera AWB: disabled per-channel exposure/gain for background collection (preserving AWB analog gains)")
+                jai_props.set_rb_analog_gains(red=1.0, blue=1.0)
+                logger.info("Camera AWB: disabled per-channel mode, reset analog gains to 1.0 for flat-field backgrounds")
             except (ImportError, Exception) as e:
                 logger.warning(f"Could not configure camera AWB mode: {e}")
             # Extract unified gains from Mode 3 calibration for brightness
@@ -3568,7 +3572,7 @@ def simple_background_collection(
                         initial_exposure_ms=initial_exposure_ms,
                         max_iterations=10,
                         logger=logger,
-                        preserve_analog_gains=True,  # Keep AWB corrections active
+                        preserve_analog_gains=False,  # Reset gains -- backgrounds are flat-field refs
                     )
                     actual_intensity = float(np.median(image))
                     logger.info(
@@ -3865,6 +3869,13 @@ def simple_background_collection(
 
             # Save background image using new format: angle.tif (not in subdirectory)
             background_path = output_path / f"{angle}.tif"
+            if image is not None and image.ndim == 3 and image.shape[2] >= 3:
+                ch_means = image.mean(axis=(0, 1))
+                logger.info(
+                    f"Background {angle} deg pre-save: shape={image.shape}, "
+                    f"R={ch_means[0]:.1f}, G={ch_means[1]:.1f}, B={ch_means[2]:.1f}, "
+                    f"median={float(np.median(image)):.1f}"
+                )
             TifWriterUtils.ome_writer(  # background -single
                 filename=str(background_path),
                 pixel_size_um=hardware.core.get_pixel_size_um(),
@@ -3887,12 +3898,7 @@ def simple_background_collection(
                 jai_props = JAICameraProperties(hardware.core)
                 jai_props.disable_individual_exposure()
                 jai_props.disable_individual_gain()
-                if wb_mode != "camera_awb":
-                    # For simple/per_angle: clear analog gains to neutral state
-                    jai_props.set_rb_analog_gains(red=1.0, blue=1.0)
-                else:
-                    # For camera_awb: preserve AWB corrections in analog gains
-                    logger.info("Camera AWB: preserving analog gain corrections through cleanup")
+                jai_props.set_rb_analog_gains(red=1.0, blue=1.0)
                 jai_props.set_unified_gain(1.0)
                 logger.info("Disabled per-channel mode and reset gains after background collection")
             except (ImportError, Exception) as e:
