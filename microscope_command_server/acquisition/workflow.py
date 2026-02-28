@@ -2277,6 +2277,10 @@ def _acquisition_workflow(
                 # Create birefringence image for this tile after all angles acquired
                 positive_angles = [a for a in angle_images.keys() if a > 0 and a != 90]
                 negative_angles = [a for a in angle_images.keys() if a < 0]
+                logger.debug(
+                    f"Biref check: angle_images keys={list(angle_images.keys())}, "
+                    f"positive={positive_angles}, negative={negative_angles}"
+                )
 
                 if positive_angles and negative_angles:
                     pos_angle = min(positive_angles)
@@ -2289,28 +2293,37 @@ def _acquisition_workflow(
                     # Create normalized birefringence image
                     # Uses [I(+) - I(-)]/[I(+) + I(-)] to suppress H&E staining variations
                     t_biref = time.perf_counter()
-                    TifWriterUtils.create_normalized_birefringence_tile(
-                        pos_image=angle_images[pos_angle],
-                        neg_image=angle_images[neg_angle],
-                        output_dir=biref_dir,
-                        filename=filename,
-                        pixel_size_um=hardware.core.get_pixel_size_um(),
-                        tile_config_source=tile_config_source,
-                        logger=logger,
+                    try:
+                        TifWriterUtils.create_normalized_birefringence_tile(
+                            pos_image=angle_images[pos_angle],
+                            neg_image=angle_images[neg_angle],
+                            output_dir=biref_dir,
+                            filename=filename,
+                            pixel_size_um=hardware.core.get_pixel_size_um(),
+                            tile_config_source=tile_config_source,
+                            logger=logger,
+                        )
+                        t_biref = log_timing(logger, f"Normalized birefringence calculation and save", t_biref)
+                    except Exception as e:
+                        logger.error(f"Failed to create birefringence tile {filename}: {e}", exc_info=True)
+                else:
+                    logger.warning(
+                        f"Skipping birefringence for tile {filename}: "
+                        f"need both positive (>0, !=90) and negative (<0) angles "
+                        f"but got angles={list(angle_images.keys())}"
                     )
-                    t_biref = log_timing(logger, f"Normalized birefringence calculation and save", t_biref)
 
-                    # # Create sum image alongside birefringence image
-                    # sum_dir = output_path / f"{pos_angle}.sum"
-                    # TifWriterUtils.create_sum_tile(
-                    #     pos_image=angle_images[pos_angle],
-                    #     neg_image=angle_images[neg_angle],
-                    #     output_dir=sum_dir,
-                    #     filename=filename,
-                    #     pixel_size_um=hardware.core.get_pixel_size_um(),
-                    #     tile_config_source=tile_config_source,
-                    #     logger=logger,
-                    # )
+                # # Create sum image alongside birefringence image
+                # sum_dir = output_path / f"{pos_angle}.sum"
+                # TifWriterUtils.create_sum_tile(
+                #     pos_image=angle_images[pos_angle],
+                #     neg_image=angle_images[neg_angle],
+                #     output_dir=sum_dir,
+                #     filename=filename,
+                #     pixel_size_um=hardware.core.get_pixel_size_um(),
+                #     tile_config_source=tile_config_source,
+                #     logger=logger,
+                # )
 
             else:
                 # Single image acquisition: no angles specified
