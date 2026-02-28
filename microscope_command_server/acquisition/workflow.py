@@ -3579,6 +3579,48 @@ def simple_background_collection(
                         f"Camera AWB background: shape={image.shape}, "
                         f"median={actual_intensity:.1f}, exposure={final_exposure:.1f}ms"
                     )
+
+                    # Post-convergence: ensure no channel is over-saturated.
+                    # The adaptive exposure converges on overall median (~green channel),
+                    # but the camera's native spectral response makes red 1.2-1.5x brighter.
+                    # Iteratively reduce exposure until brightest channel is under control.
+                    _CHANNEL_CEILING = 245.0
+                    _MAX_SAT_PCT = 5.0
+                    if image.ndim == 3 and image.shape[2] >= 3:
+                        for _sat_iter in range(4):
+                            ch_medians = np.median(image, axis=(0, 1))
+                            max_ch_med = float(np.max(ch_medians[:3]))
+                            total_px = image.shape[0] * image.shape[1]
+                            worst_sat = max(
+                                100.0 * int(np.sum(image[:, :, c] >= 250)) / total_px
+                                for c in range(min(3, image.shape[2]))
+                            )
+                            if max_ch_med <= _CHANNEL_CEILING and worst_sat <= _MAX_SAT_PCT:
+                                break
+                            # Heavily saturated channels have unknown true intensity;
+                            # use aggressive halving. Otherwise proportional reduction.
+                            if max_ch_med >= 254:
+                                scale = 0.5
+                            else:
+                                scale = _CHANNEL_CEILING / max_ch_med
+                            adj_exp = max(0.0001, final_exposure * scale)
+                            logger.info(
+                                f"  Camera AWB saturation fix #{_sat_iter + 1}: "
+                                f"max ch median={max_ch_med:.1f}, worst_sat={worst_sat:.1f}%, "
+                                f"exposure {final_exposure:.2f}ms -> {adj_exp:.2f}ms"
+                            )
+                            hardware.set_exposure(adj_exp)
+                            image, _ = hardware.snap_image()
+                            final_exposure = adj_exp
+                        # Log final per-channel state
+                        ch_medians = np.median(image, axis=(0, 1))
+                        actual_intensity = float(np.median(image))
+                        logger.info(
+                            f"  Camera AWB final: R={ch_medians[0]:.1f}, "
+                            f"G={ch_medians[1]:.1f}, B={ch_medians[2]:.1f}, "
+                            f"median={actual_intensity:.1f}"
+                        )
+
                     _check_saturation(image, f"AWB angle={angle}", logger)
                     final_exposures[angle] = final_exposure
                     achieved_intensities[angle] = actual_intensity
