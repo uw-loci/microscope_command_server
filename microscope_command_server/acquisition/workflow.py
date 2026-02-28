@@ -3468,12 +3468,12 @@ def simple_background_collection(
             except (ImportError, Exception) as e:
                 logger.warning(f"Could not clear AWB corrections before {wb_mode} WB: {e}")
 
-        # Camera AWB mode: disable per-channel exposure/gain, reset analog gains.
-        # AWB analog gains are calibrated at ONE polarizer angle (typically crossed/0deg)
-        # and cause channel saturation at other angles where optical transmission differs.
-        # Backgrounds are flat-field references -- they should be captured WITHOUT
-        # per-channel color corrections. AWB corrections are applied during tissue
-        # acquisition, not during background collection.
+        # Camera AWB mode: disable per-channel exposure/gain, PRESERVE analog gains.
+        # AWB one-shot calibration stores corrections in Gain_AnalogRed/Gain_AnalogBlue
+        # that balance the camera's native spectral response. These MUST be preserved
+        # so that all channels are roughly equal -- without them, red dominates heavily.
+        # Both backgrounds and tissue tiles must use the same AWB gains for flat-field
+        # correction to work correctly.
         camera_awb_gains = {}
         if wb_mode == "camera_awb" and is_jai_camera:
             try:
@@ -3481,8 +3481,21 @@ def simple_background_collection(
                 jai_props = JAICameraProperties(hardware.core)
                 jai_props.disable_individual_exposure()
                 jai_props.disable_individual_gain()
-                jai_props.set_rb_analog_gains(red=1.0, blue=1.0)
-                logger.info("Camera AWB: disabled per-channel mode, reset analog gains to 1.0 for flat-field backgrounds")
+                # Read and log current AWB analog gains (do NOT reset them)
+                try:
+                    cur_red = float(jai_props._get_property(jai_props.GAIN_ANALOG_RED))
+                    cur_blue = float(jai_props._get_property(jai_props.GAIN_ANALOG_BLUE))
+                    logger.info(
+                        f"Camera AWB: preserving analog gains: R={cur_red:.3f}, B={cur_blue:.3f}"
+                    )
+                    if abs(cur_red - 1.0) < 0.01 and abs(cur_blue - 1.0) < 0.01:
+                        logger.warning(
+                            "Camera AWB: analog gains are at 1.0 (uncalibrated). "
+                            "AWB one-shot may not have been run. "
+                            "Channels will NOT be balanced."
+                        )
+                except Exception:
+                    logger.info("Camera AWB: preserving analog gains (could not read current values)")
             except (ImportError, Exception) as e:
                 logger.warning(f"Could not configure camera AWB mode: {e}")
             # Extract unified gains from Mode 3 calibration for brightness
@@ -3587,33 +3600,8 @@ def simple_background_collection(
                         initial_exposure_ms=initial_exposure_ms,
                         max_iterations=10,
                         logger=logger,
-                        preserve_analog_gains=False,  # Reset gains -- backgrounds are flat-field refs
+                        preserve_analog_gains=True,  # Keep AWB corrections active
                     )
-                    actual_intensity = float(np.median(image))
-                    logger.info(
-                        f"Camera AWB background: shape={image.shape}, "
-                        f"median={actual_intensity:.1f}, exposure={final_exposure:.1f}ms"
-                    )
-
-                    # Post-convergence: ensure no channel is over-saturated.
-                    # The adaptive exposure converges on overall median (~green),
-                    # but the camera's native spectral response makes red brighter.
-                    # Halve exposure iteratively until per-channel saturation is
-                    # below threshold (same >= 250 test as _check_saturation).
-                    _SAT_THRESHOLD_PCT = 5.0
-                    for _sat_iter in range(4):
-                        worst_sat = _get_worst_channel_saturation(image)
-                        if worst_sat <= _SAT_THRESHOLD_PCT:
-                            break
-                        adj_exp = max(0.0001, final_exposure * 0.5)
-                        logger.info(
-                            f"  Camera AWB saturation fix #{_sat_iter + 1}: "
-                            f"worst channel {worst_sat:.1f}% saturated, "
-                            f"halving exposure {final_exposure:.2f}ms -> {adj_exp:.2f}ms"
-                        )
-                        hardware.set_exposure(adj_exp)
-                        image, _ = hardware.snap_image()
-                        final_exposure = adj_exp
                     actual_intensity = float(np.median(image))
 
                     _check_saturation(image, f"AWB angle={angle}", logger)
@@ -3935,9 +3923,15 @@ def simple_background_collection(
                 jai_props = JAICameraProperties(hardware.core)
                 jai_props.disable_individual_exposure()
                 jai_props.disable_individual_gain()
-                jai_props.set_rb_analog_gains(red=1.0, blue=1.0)
+                if wb_mode != "camera_awb":
+                    # For simple/per_angle: clear analog gains to neutral state
+                    jai_props.set_rb_analog_gains(red=1.0, blue=1.0)
+                else:
+                    # For camera_awb: preserve AWB analog gain corrections --
+                    # tissue acquisition needs the same gains for flat-field match
+                    logger.info("Camera AWB: preserving analog gain corrections through cleanup")
                 jai_props.set_unified_gain(1.0)
-                logger.info("Disabled per-channel mode and reset gains after background collection")
+                logger.info("Disabled per-channel mode and reset unified gain after background collection")
             except (ImportError, Exception) as e:
                 logger.warning(f"Could not reset per-channel mode: {e}")
 
