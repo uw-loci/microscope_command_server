@@ -3641,6 +3641,23 @@ def simple_background_collection(
         final_exposures = {}
         achieved_intensities = {}
 
+        # Load saved exposures from prior background collection (if available).
+        # These are much better starting points than the client's 10ms defaults,
+        # especially for 90-deg uncrossed which needs ~0.5ms at 20x.
+        saved_exposures = {}
+        try:
+            cal_targets = load_calibration_targets_from_yaml(Path(yaml_file_path))
+            if cal_targets:
+                bg_exp = cal_targets.get("background_exposures", {})
+                if bg_exp and "angles" in bg_exp:
+                    for aname, adata in bg_exp["angles"].items():
+                        if "angle_degrees" in adata and "exposure_ms" in adata:
+                            saved_exposures[adata["angle_degrees"]] = adata["exposure_ms"]
+                    if saved_exposures:
+                        logger.info(f"Loaded prior exposures: {saved_exposures}")
+        except Exception:
+            pass  # No saved data, will use client defaults
+
         # Track reference images for birefringence pair matching
         # When acquiring paired polarization angles (+7/-7 or +5/-5), the negative
         # angle should minimize birefringence against the positive angle's IMAGE,
@@ -3659,9 +3676,13 @@ def simple_background_collection(
                 )  # Each background is independent
                 logger.info(f"Set angle to {angle}")
 
-            # Get initial exposure from client
-            initial_exposure_ms = exposures[angle_idx] if angle_idx < len(exposures) else 100.0
-            logger.info(f"Initial exposure from client: {initial_exposure_ms:.2f}ms")
+            # Use saved exposure from prior run if available, else client default
+            if angle in saved_exposures:
+                initial_exposure_ms = saved_exposures[angle]
+                logger.info(f"Initial exposure from prior run: {initial_exposure_ms:.2f}ms")
+            else:
+                initial_exposure_ms = exposures[angle_idx] if angle_idx < len(exposures) else 100.0
+                logger.info(f"Initial exposure from client: {initial_exposure_ms:.2f}ms")
 
             # Choose acquisition method based on white balance mode
             image = None  # Will be set by whichever branch acquires
