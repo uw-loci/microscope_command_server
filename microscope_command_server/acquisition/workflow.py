@@ -3468,12 +3468,12 @@ def simple_background_collection(
             except (ImportError, Exception) as e:
                 logger.warning(f"Could not clear AWB corrections before {wb_mode} WB: {e}")
 
-        # Camera AWB mode: disable per-channel exposure/gain, PRESERVE analog gains.
-        # AWB one-shot calibration stores corrections in Gain_AnalogRed/Gain_AnalogBlue
-        # that balance the camera's native spectral response. These MUST be preserved
-        # so that all channels are roughly equal -- without them, red dominates heavily.
-        # Both backgrounds and tissue tiles must use the same AWB gains for flat-field
-        # correction to work correctly.
+        # Camera AWB mode: disable per-channel exposure/gain, use unified controls.
+        # The camera's built-in AWB applies corrections through an INTERNAL processing
+        # pipeline -- NOT through Gain_AnalogRed/Gain_AnalogBlue registers (those
+        # always read 1.0 regardless of AWB state). The AWB Continuous mode was run
+        # during calibration and the internal corrections persist after setting Off.
+        # Both backgrounds and tissue tiles see the same internal corrections.
         camera_awb_gains = {}
         if wb_mode == "camera_awb" and is_jai_camera:
             try:
@@ -3481,21 +3481,10 @@ def simple_background_collection(
                 jai_props = JAICameraProperties(hardware.core)
                 jai_props.disable_individual_exposure()
                 jai_props.disable_individual_gain()
-                # Read and log current AWB analog gains (do NOT reset them)
-                try:
-                    cur_red = float(jai_props._get_property(jai_props.GAIN_ANALOG_RED))
-                    cur_blue = float(jai_props._get_property(jai_props.GAIN_ANALOG_BLUE))
-                    logger.info(
-                        f"Camera AWB: preserving analog gains: R={cur_red:.3f}, B={cur_blue:.3f}"
-                    )
-                    if abs(cur_red - 1.0) < 0.01 and abs(cur_blue - 1.0) < 0.01:
-                        logger.warning(
-                            "Camera AWB: analog gains are at 1.0 (uncalibrated). "
-                            "AWB one-shot may not have been run. "
-                            "Channels will NOT be balanced."
-                        )
-                except Exception:
-                    logger.info("Camera AWB: preserving analog gains (could not read current values)")
+                logger.info(
+                    "Camera AWB: using unified exposure/gain. "
+                    "Internal AWB corrections applied via camera pipeline."
+                )
             except (ImportError, Exception) as e:
                 logger.warning(f"Could not configure camera AWB mode: {e}")
             # Extract unified gains from Mode 3 calibration for brightness

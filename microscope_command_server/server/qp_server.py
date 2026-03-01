@@ -3646,7 +3646,7 @@ def handle_client(conn, addr):
                     elif mode == 2:
                         jai_props.run_auto_white_balance()
                         awb_calibrated = True
-                        logger.info("Ran one-shot auto white balance (AWB calibrated)")
+                        logger.info("Ran AWB Continuous calibration (internal corrections active)")
                     else:
                         logger.warning(f"Unknown WB mode: {mode}")
 
