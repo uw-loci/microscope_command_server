@@ -3659,6 +3659,18 @@ def simple_background_collection(
 
                 # Use standard adaptive intensity matching (single unified exposure)
                 target_intensity = get_target_intensity_for_background(modality, angle)
+                # AWB equalizes all channels, so the target applies to EVERY
+                # channel equally. Without AWB, only the dominant channel
+                # (red, ~3.5x bias) reaches 245 while green/blue are much
+                # lower. With AWB, a target of 245 puts ALL channels at ~245
+                # leaving no headroom. Cap to keep channels well below clipping.
+                AWB_MAX_TARGET = 210.0
+                if target_intensity > AWB_MAX_TARGET:
+                    logger.info(
+                        f"  Camera AWB: capping target {target_intensity:.0f} "
+                        f"-> {AWB_MAX_TARGET:.0f} (AWB equalizes all channels)"
+                    )
+                    target_intensity = AWB_MAX_TARGET
                 logger.info(f"Camera AWB target intensity: {target_intensity:.1f}")
                 try:
                     image, final_exposure = acquire_background_with_target_intensity(
