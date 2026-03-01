@@ -1703,6 +1703,22 @@ def _acquisition_workflow(
                     except (ImportError, Exception) as e:
                         logger.warning(f"Could not reset per-channel mode: {e}")
 
+                    # The client exposure_90 was calibrated WITH unified_gain
+                    # (e.g., 0.49ms at gain=3.0). Since we just reset gains to
+                    # unity for autofocus, compensate the exposure to maintain
+                    # approximately the same image brightness.
+                    angle_name_90 = angle_to_name(90.0)
+                    cal_angles = jai_calibration.get("angles", {})
+                    if angle_name_90 in cal_angles:
+                        cal_gains = cal_angles[angle_name_90].get("gains", {})
+                        unified_gain = cal_gains.get("unified_gain", 1.0)
+                        if unified_gain > 1.0:
+                            exposure_90 *= unified_gain
+                            logger.info(
+                                f"Adjusted AF exposure by unified_gain={unified_gain:.1f}: "
+                                f"{exposure_90:.2f}ms"
+                            )
+
                 hardware.set_exposure(exposure_90)
                 logger.info(f"Set exposure to {exposure_90}ms for initial autofocus")
 
@@ -1866,6 +1882,15 @@ def _acquisition_workflow(
                             jai_props.set_rb_analog_gains(red=1.0, blue=1.0)
                         except (ImportError, Exception) as e:
                             logger.warning(f"Could not reset per-channel mode: {e}")
+
+                        # Compensate exposure for the gain reset (see initial AF block)
+                        angle_name_90 = angle_to_name(90.0)
+                        cal_angles = jai_calibration.get("angles", {})
+                        if angle_name_90 in cal_angles:
+                            cal_gains = cal_angles[angle_name_90].get("gains", {})
+                            unified_gain = cal_gains.get("unified_gain", 1.0)
+                            if unified_gain > 1.0:
+                                exposure_90 *= unified_gain
 
                     t_exp = time.perf_counter()
                     hardware.set_exposure(exposure_90)
