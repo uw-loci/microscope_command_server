@@ -2973,8 +2973,13 @@ def acquire_background_with_target_intensity(
         # Even if overall median is on target, a saturated channel means
         # the exposure is too high and must be reduced.
         if channel_saturated:
-            # Reduce exposure to bring the hottest channel below the limit
-            reduction = (CHANNEL_SAT_LIMIT * 0.90) / max_ch_median
+            if max_ch_median >= 254:
+                # Fully clipped -- no info about how far over, so halve.
+                # Gets from 10ms to 0.6ms in ~4 iterations.
+                reduction = 0.5
+            else:
+                # Partially saturated -- proportional reduction
+                reduction = (CHANNEL_SAT_LIMIT * 0.90) / max_ch_median
             new_exposure = max(current_exposure * reduction, MIN_EXPOSURE_MS)
             if logger:
                 logger.warning(
