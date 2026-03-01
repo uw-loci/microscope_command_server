@@ -1340,6 +1340,8 @@ def _acquisition_workflow(
                     logger.warning(f"Could not clear AWB corrections before simple WB: {e}")
             # Simple WB mode: load 90deg R:G:B ratios from Mode 3 calibration,
             # then load pre-computed simple_wb section if available
+            simple_wb_analog_red = 1.0
+            simple_wb_analog_blue = 1.0
             jai_calibration = load_jai_calibration_from_imageprocessing(
                 config_path=Path(params["yaml_file_path"]),
                 per_angle=True,
@@ -1350,6 +1352,21 @@ def _acquisition_workflow(
             )
             if jai_calibration:
                 logger.info("Simple WB: loaded per-angle calibration as base for ratio-scaling")
+                # Extract analog gains from uncrossed (90 deg) calibration.
+                # Phase 2 of calibration fine-tunes R/B analog gains to correct
+                # the camera's spectral bias. These must be applied during
+                # acquisition (same values used in background collection).
+                uncrossed_gains = (
+                    jai_calibration.get("angles", {})
+                    .get("uncrossed", {})
+                    .get("gains", {})
+                )
+                simple_wb_analog_red = uncrossed_gains.get("analog_red", 1.0)
+                simple_wb_analog_blue = uncrossed_gains.get("analog_blue", 1.0)
+                logger.info(
+                    f"Simple WB: analog gains from uncrossed calibration: "
+                    f"R={simple_wb_analog_red:.3f}, B={simple_wb_analog_blue:.3f}"
+                )
                 # Also load simple_wb section from YAML if it exists
                 simple_wb_data = load_simple_wb_from_imageprocessing(
                     config_path=Path(params["yaml_file_path"]),
@@ -2089,12 +2106,20 @@ def _acquisition_workflow(
                                     auto_enable=True,
                                 )
                                 jai_props.set_unified_gain(angle_sw.get("unified_gain", 1.0))
-                                jai_props.set_rb_analog_gains(red=1.0, blue=1.0)
+                                # Apply calibrated R/B analog gains from Phase 2.
+                                # These correct the camera's spectral bias and must
+                                # match what was used during background collection.
+                                jai_props.set_rb_analog_gains(
+                                    red=simple_wb_analog_red,
+                                    blue=simple_wb_analog_blue,
+                                )
                                 logger.info(
                                     f"  Simple WB: R={angle_sw['r']:.1f}ms, "
                                     f"G={angle_sw['g']:.1f}ms, B={angle_sw['b']:.1f}ms "
                                     f"(scale={angle_sw.get('scale', '?')}x, "
-                                    f"gain={angle_sw.get('unified_gain', 1.0):.2f})"
+                                    f"gain={angle_sw.get('unified_gain', 1.0):.2f}, "
+                                    f"analog R={simple_wb_analog_red:.3f}, "
+                                    f"B={simple_wb_analog_blue:.3f})"
                                 )
                             except (ImportError, Exception) as e:
                                 logger.warning(f"Simple WB failed for {angle_name}: {e}")
@@ -2882,6 +2907,11 @@ def acquire_background_with_target_intensity(
     last_image = None
     last_exposure = current_exposure
 
+    # Per-channel saturation limit: no channel median should exceed this.
+    # The JAI camera's ~3.5x red spectral bias means red can saturate while
+    # the overall median is well below target. This catches that case.
+    CHANNEL_SAT_LIMIT = 245
+
     for iteration in range(max_iterations):
         # Snap image (debayering auto-detected based on camera type)
         image, metadata = hardware.snap_image()
@@ -2892,17 +2922,54 @@ def acquire_background_with_target_intensity(
         # Calculate median intensity across all channels (more robust than mean)
         mean_intensity = float(np.median(image))
 
+        # Check per-channel medians for saturation (RGB image expected)
+        channel_saturated = False
+        max_ch_median = mean_intensity
+        max_ch_name = "all"
+        if image.ndim == 3 and image.shape[2] >= 3:
+            ch_names = ["R", "G", "B"]
+            ch_medians = [float(np.median(image[:, :, c])) for c in range(3)]
+            max_ch_idx = int(np.argmax(ch_medians))
+            max_ch_median = ch_medians[max_ch_idx]
+            max_ch_name = ch_names[max_ch_idx]
+            channel_saturated = max_ch_median >= CHANNEL_SAT_LIMIT
+
         # Store for potential use if we don't converge
         last_image = image
         last_exposure = current_exposure
 
         if logger:
+            ch_info = ""
+            if image.ndim == 3 and image.shape[2] >= 3:
+                ch_info = (
+                    f", channels=[R={ch_medians[0]:.0f}, "
+                    f"G={ch_medians[1]:.0f}, B={ch_medians[2]:.0f}]"
+                )
             logger.info(
                 f"  Iteration {iteration + 1}/{max_iterations}: "
                 f"median={mean_intensity:.1f}, exposure={current_exposure:.1f}ms"
+                f"{ch_info}"
             )
 
-        # Check convergence
+        # Per-channel saturation takes priority over convergence.
+        # Even if overall median is on target, a saturated channel means
+        # the exposure is too high and must be reduced.
+        if channel_saturated:
+            # Reduce exposure to bring the hottest channel below the limit
+            reduction = (CHANNEL_SAT_LIMIT * 0.90) / max_ch_median
+            new_exposure = max(current_exposure * reduction, MIN_EXPOSURE_MS)
+            if logger:
+                logger.warning(
+                    f"    {max_ch_name} channel saturated "
+                    f"(median={max_ch_median:.0f} >= {CHANNEL_SAT_LIMIT}), "
+                    f"reducing exposure {current_exposure:.1f}ms "
+                    f"-> {new_exposure:.1f}ms"
+                )
+            current_exposure = new_exposure
+            hardware.set_exposure(current_exposure)
+            continue
+
+        # Check convergence (only when no channel is saturated)
         intensity_error = abs(mean_intensity - target_intensity)
         if intensity_error <= tolerance:
             if logger:
@@ -2927,6 +2994,18 @@ def acquire_background_with_target_intensity(
             hardware.set_exposure(current_exposure)
         elif mean_intensity > 0:
             adjustment_ratio = target_intensity / mean_intensity
+            # Clamp adjustment to prevent overshooting into channel saturation.
+            # If max channel is already close to the limit, cap the increase.
+            if max_ch_median > 0 and adjustment_ratio > 1.0:
+                max_safe_ratio = CHANNEL_SAT_LIMIT / max_ch_median
+                if adjustment_ratio > max_safe_ratio:
+                    adjustment_ratio = max_safe_ratio * 0.90
+                    if logger:
+                        logger.info(
+                            f"    Capping exposure increase to avoid "
+                            f"{max_ch_name} saturation "
+                            f"(capped ratio={adjustment_ratio:.2f})"
+                        )
             new_exposure = current_exposure * adjustment_ratio
 
             # Clamp to bounds
