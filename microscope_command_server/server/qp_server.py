@@ -3635,7 +3635,10 @@ def handle_client(conn, addr):
                     jai_props = JAICameraProperties(hardware.core)
 
                     if mode == 0:
-                        jai_props.set_white_balance_mode("Off")
+                        # Use _set_property directly -- the retry wrapper
+                        # set_white_balance_mode("Off") fails for
+                        # Continuous->Off transitions (stale read-back).
+                        jai_props._set_property(jai_props.WHITE_BALANCE, "Off")
                         # Note: does NOT clear analog gain corrections.
                         # awb_calibrated stays True if AWB was previously run.
                         logger.info("Set white balance mode to Off")
