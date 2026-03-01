@@ -2898,11 +2898,29 @@ def acquire_background_with_target_intensity(
     current_exposure = max(MIN_EXPOSURE_MS, min(MAX_EXPOSURE_MS, initial_exposure_ms))
     hardware.set_exposure(current_exposure)
 
-    if logger:
-        logger.info(
-            f"Starting adaptive exposure: target={target_intensity:.1f}, "
-            f"tolerance={tolerance:.1f}, initial_exposure={current_exposure:.1f}ms"
+    # Verify exposure was accepted by reading it back
+    try:
+        readback_exp = float(
+            hardware.core.get_property("JAICamera", "Exposure")
         )
+        if logger:
+            logger.info(
+                f"Starting adaptive exposure: target={target_intensity:.1f}, "
+                f"tolerance={tolerance:.1f}, initial_exposure={current_exposure:.1f}ms "
+                f"(camera readback: {readback_exp:.1f}ms)"
+            )
+            if abs(readback_exp - current_exposure) > 1.0:
+                logger.error(
+                    f"EXPOSURE MISMATCH: set {current_exposure:.1f}ms "
+                    f"but camera reports {readback_exp:.1f}ms! "
+                    f"Exposure control may not be working."
+                )
+    except Exception:
+        if logger:
+            logger.info(
+                f"Starting adaptive exposure: target={target_intensity:.1f}, "
+                f"tolerance={tolerance:.1f}, initial_exposure={current_exposure:.1f}ms"
+            )
 
     last_image = None
     last_exposure = current_exposure
