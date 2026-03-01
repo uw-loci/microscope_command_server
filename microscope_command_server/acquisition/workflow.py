@@ -3625,7 +3625,18 @@ def simple_background_collection(
                         angle_cal = jai_calibration["angles"].get(angle_name, {})
                         unified_gain = angle_cal.get("gains", {}).get("unified_gain", 1.0)
                     jai_props.set_unified_gain(unified_gain)
-                    jai_props.set_rb_analog_gains(red=1.0, blue=1.0)  # neutral analog
+
+                    # Apply calibrated R/B analog gains from uncrossed calibration.
+                    # Phase 2 of calibration fine-tunes color balance via analog gains;
+                    # without these, per-channel exposures alone are insufficient and
+                    # the image appears yellow (red-dominant).
+                    wb_gains = simple_wb_base.get("gains", {})
+                    analog_red = wb_gains.get("analog_red", 1.0)
+                    analog_blue = wb_gains.get("analog_blue", 1.0)
+                    jai_props.set_rb_analog_gains(red=analog_red, blue=analog_blue)
+                    logger.info(
+                        f"  Simple WB: analog gains R={analog_red:.3f}, B={analog_blue:.3f}"
+                    )
 
                     # Start with base uncrossed R:G:B (scale=1.0)
                     base_r = simple_wb_base["r"]
