@@ -1331,11 +1331,15 @@ def _acquisition_workflow(
             # Clear any lingering AWB corrections before simple WB setup.
             # Simple mode sets explicit per-channel exposures + analog gains per tile;
             # residual AWB analog gain corrections would compound incorrectly.
+            # Also disable individual exposure/gain mode to ensure clean state.
             if is_jai_camera:
                 try:
                     from microscope_control.jai import JAICameraProperties
                     jai_props = JAICameraProperties(hardware.core)
                     jai_props.clear_awb_corrections()
+                    jai_props.disable_individual_exposure()
+                    jai_props.disable_individual_gain()
+                    logger.info("Simple WB: cleared AWB + disabled individual mode")
                 except (ImportError, Exception) as e:
                     logger.warning(f"Could not clear AWB corrections before simple WB: {e}")
             # Simple WB mode: load 90deg R:G:B ratios from Mode 3 calibration,
@@ -1389,11 +1393,17 @@ def _acquisition_workflow(
             # Clear any lingering AWB corrections before per-angle WB setup.
             # Per-angle mode sets explicit per-channel exposures + analog gains per tile;
             # residual AWB analog gain corrections would compound incorrectly.
+            # Also disable individual exposure/gain mode -- WBPPM calibration and
+            # the previous mode's acquisition leave individual mode enabled, which
+            # causes set_exposure() calls to be silently ignored.
             if is_jai_camera:
                 try:
                     from microscope_control.jai import JAICameraProperties
                     jai_props = JAICameraProperties(hardware.core)
                     jai_props.clear_awb_corrections()
+                    jai_props.disable_individual_exposure()
+                    jai_props.disable_individual_gain()
+                    logger.info("Per-angle WB: cleared AWB + disabled individual mode")
                 except (ImportError, Exception) as e:
                     logger.warning(f"Could not clear AWB corrections before per-angle WB: {e}")
             # Per-angle WB mode (Mode 3): existing behavior
@@ -1752,6 +1762,35 @@ def _acquisition_workflow(
                     else:
                         test_img = np.clip(test_img, 0, 255).astype(np.uint8)
 
+                # Brightness safety check: if the test image is very dim,
+                # the BG-reported exposure may be too low for tissue AF.
+                # This happens when per_angle BG returns the calibrated green
+                # exposure (tuned for WB at blank) which can be too short for
+                # tissue. Double the exposure until we get a usable image.
+                test_median = float(np.median(test_img))
+                AF_MIN_BRIGHTNESS = 15.0
+                af_brightness_attempts = 0
+                while test_median < AF_MIN_BRIGHTNESS and af_brightness_attempts < 4:
+                    exposure_90 *= 2.0
+                    hardware.set_exposure(exposure_90)
+                    logger.warning(
+                        f"AF test image too dim (median={test_median:.1f}), "
+                        f"doubling exposure to {exposure_90:.2f}ms"
+                    )
+                    test_img, _ = hardware.snap_image()
+                    if test_img.dtype in [np.float32, np.float64]:
+                        if test_img.max() <= 1.0 and test_img.min() >= 0.0:
+                            test_img = (test_img * 255).astype(np.uint8)
+                        else:
+                            test_img = np.clip(test_img, 0, 255).astype(np.uint8)
+                    test_median = float(np.median(test_img))
+                    af_brightness_attempts += 1
+                if af_brightness_attempts > 0:
+                    logger.info(
+                        f"AF exposure adjusted to {exposure_90:.2f}ms "
+                        f"(median now {test_median:.1f})"
+                    )
+
                 # Check for tissue
                 has_tissue, tissue_stats = AutofocusUtils.has_sufficient_tissue(
                     test_img,
@@ -1903,17 +1942,35 @@ def _acquisition_workflow(
 
                 # Ensure consistent format for tissue detection
                 if test_img.dtype in [np.float32, np.float64]:
-                    # Check if already normalized (0-1 range)
                     if test_img.max() <= 1.0 and test_img.min() >= 0.0:
-                        # Convert to uint8 to match expected format
                         test_img = (test_img * 255).astype(np.uint8)
-                        logger.info(
-                            "Converted normalized float image to uint8 for tissue detection"
-                        )
                     else:
-                        # Float but not normalized - clip and convert
                         test_img = np.clip(test_img, 0, 255).astype(np.uint8)
-                        logger.info("Converted float image to uint8 for tissue detection")
+
+                # Brightness safety check (same as initial AF block)
+                test_median = float(np.median(test_img))
+                AF_MIN_BRIGHTNESS = 15.0
+                af_brightness_attempts = 0
+                while test_median < AF_MIN_BRIGHTNESS and af_brightness_attempts < 4:
+                    exposure_90 *= 2.0
+                    hardware.set_exposure(exposure_90)
+                    logger.warning(
+                        f"AF test image too dim (median={test_median:.1f}), "
+                        f"doubling exposure to {exposure_90:.2f}ms"
+                    )
+                    test_img, _ = hardware.snap_image()
+                    if test_img.dtype in [np.float32, np.float64]:
+                        if test_img.max() <= 1.0 and test_img.min() >= 0.0:
+                            test_img = (test_img * 255).astype(np.uint8)
+                        else:
+                            test_img = np.clip(test_img, 0, 255).astype(np.uint8)
+                    test_median = float(np.median(test_img))
+                    af_brightness_attempts += 1
+                if af_brightness_attempts > 0:
+                    logger.info(
+                        f"AF exposure adjusted to {exposure_90:.2f}ms "
+                        f"(median now {test_median:.1f})"
+                    )
 
                 # Check if there's sufficient tissue for reliable autofocus
                 # Use thresholds from autofocus config (per-objective settings)
