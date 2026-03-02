@@ -1689,47 +1689,56 @@ def _acquisition_workflow(
             logger.info(f"Using diagonal autofocus position: X={first_af_pos.x}, Y={first_af_pos.y}")
 
             # For PPM, set rotation to 90deg for autofocus and tissue detection
-            exposure_90 = 2.0  # Default
             if "ppm" in modality.lower():
                 hardware.set_psg_ticks(90.0)
                 logger.info("Set rotation to 90 deg (uncrossed) for initial autofocus")
-                if 90.0 in params["angles"]:
-                    angle_idx = params["angles"].index(90.0)
-                    if angle_idx < len(params["exposures"]):
-                        exposure_90 = params["exposures"][angle_idx]
+
+                # Get 90-degree exposure from the current WB mode's calibration.
+                # Every WB mode (simple, per_angle, camera_awb) must have a
+                # calibrated 90-degree exposure -- do not guess a default.
+                if 90.0 not in params["angles"]:
+                    raise ValueError(
+                        "No 90-degree angle in WB calibration parameters. "
+                        "Cannot determine autofocus exposure. Re-run WB calibration."
+                    )
+                angle_idx = params["angles"].index(90.0)
+                if angle_idx >= len(params["exposures"]):
+                    raise ValueError(
+                        "90-degree angle found but no corresponding exposure value. "
+                        "Cannot determine autofocus exposure. Re-run WB calibration."
+                    )
+                exposure_90 = params["exposures"][angle_idx]
 
                 # Disable per-channel exposure/gain mode before autofocus.
-                # Camera may still have per-channel mode active from a previous
-                # acquisition, which causes set_exposure() to be ignored.
-                # Reset analog gains to 1.0/1.0 for a neutral camera state --
-                # the AF focus metric uses green channel only, which has gain 1.0
-                # in all WB modes, so analog gains are not needed.
-                if jai_calibration is not None:
+                # Camera may have per-channel mode active from calibration
+                # or a previous acquisition, which causes set_exposure() to
+                # be ignored. This must run for ALL WB modes.
+                # For simple/per_angle, also apply the uncrossed calibration
+                # analog gains so the AF sees a properly white-balanced image.
+                # For camera_AWB, gains are already set from AWB -- don't touch.
+                if is_jai_camera:
                     try:
                         from microscope_control.jai import JAICameraProperties
                         jai_props = JAICameraProperties(hardware.core)
                         jai_props.disable_individual_exposure()
                         jai_props.disable_individual_gain()
-                        jai_props.set_rb_analog_gains(red=1.0, blue=1.0)
-                        logger.info(
-                            "Disabled per-channel mode for pre-acquisition autofocus "
-                            "(analog gains reset to 1.0)"
-                        )
+                        if jai_calibration is not None:
+                            uncrossed_gains = (
+                                jai_calibration.get("angles", {})
+                                .get("uncrossed", {})
+                                .get("gains", {})
+                            )
+                            af_analog_red = uncrossed_gains.get("analog_red", 1.0)
+                            af_analog_blue = uncrossed_gains.get("analog_blue", 1.0)
+                            jai_props.set_rb_analog_gains(
+                                red=af_analog_red, blue=af_analog_blue
+                            )
+                            logger.info(
+                                "Applied uncrossed calibration analog gains for AF: "
+                                f"R={af_analog_red:.3f}, B={af_analog_blue:.3f}"
+                            )
                     except (ImportError, Exception) as e:
-                        logger.warning(f"Could not reset per-channel mode: {e}")
-
-                    # Ensure minimum AF exposure for reliable focus metric.
-                    # Per-angle calibration can produce low 90deg exposures
-                    # (e.g., 0.49ms) that give marginal signal for the
-                    # laplacian_variance focus metric. A floor of 0.6ms
-                    # ensures adequate contrast.
-                    MIN_AF_EXPOSURE_MS = 0.6
-                    if exposure_90 < MIN_AF_EXPOSURE_MS:
-                        logger.info(
-                            f"Boosting AF exposure from {exposure_90:.2f}ms "
-                            f"to minimum {MIN_AF_EXPOSURE_MS}ms"
-                        )
-                        exposure_90 = MIN_AF_EXPOSURE_MS
+                        logger.warning(f"Could not configure camera for AF: {e}")
 
                 hardware.set_exposure(exposure_90)
                 logger.info(f"Set exposure to {exposure_90}ms for initial autofocus")
@@ -1901,33 +1910,34 @@ def _acquisition_workflow(
                     hardware.set_psg_ticks(90.0)
                     t_rot = log_timing(logger, "Rotation to 90deg for autofocus", t_rot)
                     logger.info("Set rotation to 90 deg (uncrossed) for PPM autofocus")
-                    # CRITICAL: Set appropriate exposure for 90 deg before tissue detection
-                    # Find the 90 deg exposure from acquisition parameters
-                    exposure_90 = 2.0  # Default fallback
-
+                    # Use the 90-degree exposure from the current WB mode's
+                    # calibration (same value as the initial AF block).
+                    # exposure_90 was validated during pre-acquisition AF.
                     if 90.0 in params["angles"]:
                         angle_idx = params["angles"].index(90.0)
                         if angle_idx < len(params["exposures"]):
                             exposure_90 = params["exposures"][angle_idx]
 
-                    # Disable per-channel exposure/gain mode before autofocus.
-                    # The previous tile's acquisition may have left per-channel
-                    # mode active, which would cause set_exposure() to be ignored.
-                    # Reset analog gains to 1.0/1.0 (see initial AF block).
-                    if jai_calibration is not None:
+                    # Disable per-channel mode and apply analog gains
+                    # (see initial AF block for full rationale).
+                    if is_jai_camera:
                         try:
                             from microscope_control.jai import JAICameraProperties
                             jai_props = JAICameraProperties(hardware.core)
                             jai_props.disable_individual_exposure()
                             jai_props.disable_individual_gain()
-                            jai_props.set_rb_analog_gains(red=1.0, blue=1.0)
+                            if jai_calibration is not None:
+                                uncrossed_gains = (
+                                    jai_calibration.get("angles", {})
+                                    .get("uncrossed", {})
+                                    .get("gains", {})
+                                )
+                                jai_props.set_rb_analog_gains(
+                                    red=uncrossed_gains.get("analog_red", 1.0),
+                                    blue=uncrossed_gains.get("analog_blue", 1.0),
+                                )
                         except (ImportError, Exception) as e:
-                            logger.warning(f"Could not reset per-channel mode: {e}")
-
-                        # Ensure minimum AF exposure (see initial AF block)
-                        MIN_AF_EXPOSURE_MS = 0.6
-                        if exposure_90 < MIN_AF_EXPOSURE_MS:
-                            exposure_90 = MIN_AF_EXPOSURE_MS
+                            logger.warning(f"Could not configure camera for AF: {e}")
 
                     t_exp = time.perf_counter()
                     hardware.set_exposure(exposure_90)
