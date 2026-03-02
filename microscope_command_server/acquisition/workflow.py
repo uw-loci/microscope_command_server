@@ -1698,48 +1698,38 @@ def _acquisition_workflow(
                     if angle_idx < len(params["exposures"]):
                         exposure_90 = params["exposures"][angle_idx]
 
-                # Disable per-channel exposure/gain mode before autofocus
+                # Disable per-channel exposure/gain mode before autofocus.
                 # Camera may still have per-channel mode active from a previous
                 # acquisition, which causes set_exposure() to be ignored.
-                # Apply uncrossed calibration analog gains (not 1.0/1.0) so the
-                # AF images have the same signal the calibration determined is
-                # needed for the 90deg angle.
+                # Reset analog gains to 1.0/1.0 for a neutral camera state --
+                # the AF focus metric uses green channel only, which has gain 1.0
+                # in all WB modes, so analog gains are not needed.
                 if jai_calibration is not None:
-                    # Extract uncrossed calibration gains for AF
-                    angle_name_90 = angle_to_name(90.0)
-                    cal_angles = jai_calibration.get("angles", {})
-                    uncrossed_gains = {}
-                    if angle_name_90 in cal_angles:
-                        uncrossed_gains = cal_angles[angle_name_90].get("gains", {})
-                    af_analog_red = uncrossed_gains.get("analog_red", 1.0)
-                    af_analog_blue = uncrossed_gains.get("analog_blue", 1.0)
-                    unified_gain = uncrossed_gains.get("unified_gain", 1.0)
-
                     try:
                         from microscope_control.jai import JAICameraProperties
                         jai_props = JAICameraProperties(hardware.core)
                         jai_props.disable_individual_exposure()
                         jai_props.disable_individual_gain()
-                        jai_props.set_rb_analog_gains(
-                            red=af_analog_red, blue=af_analog_blue
-                        )
+                        jai_props.set_rb_analog_gains(red=1.0, blue=1.0)
                         logger.info(
-                            f"Disabled per-channel mode for pre-acquisition autofocus "
-                            f"(analog R={af_analog_red:.3f}, B={af_analog_blue:.3f})"
+                            "Disabled per-channel mode for pre-acquisition autofocus "
+                            "(analog gains reset to 1.0)"
                         )
                     except (ImportError, Exception) as e:
                         logger.warning(f"Could not reset per-channel mode: {e}")
 
-                    # The client exposure_90 was calibrated WITH unified_gain
-                    # (e.g., 0.49ms at gain=3.0). Since we reset unified gain
-                    # for autofocus, compensate the exposure to maintain
-                    # approximately the same image brightness.
-                    if unified_gain > 1.0:
-                        exposure_90 *= unified_gain
+                    # Ensure minimum AF exposure for reliable focus metric.
+                    # Per-angle calibration can produce low 90deg exposures
+                    # (e.g., 0.49ms) that give marginal signal for the
+                    # laplacian_variance focus metric. A floor of 0.6ms
+                    # ensures adequate contrast.
+                    MIN_AF_EXPOSURE_MS = 0.6
+                    if exposure_90 < MIN_AF_EXPOSURE_MS:
                         logger.info(
-                            f"Adjusted AF exposure by unified_gain={unified_gain:.1f}: "
-                            f"{exposure_90:.2f}ms"
+                            f"Boosting AF exposure from {exposure_90:.2f}ms "
+                            f"to minimum {MIN_AF_EXPOSURE_MS}ms"
                         )
+                        exposure_90 = MIN_AF_EXPOSURE_MS
 
                 hardware.set_exposure(exposure_90)
                 logger.info(f"Set exposure to {exposure_90}ms for initial autofocus")
@@ -1920,35 +1910,24 @@ def _acquisition_workflow(
                         if angle_idx < len(params["exposures"]):
                             exposure_90 = params["exposures"][angle_idx]
 
-                    # Disable per-channel exposure/gain mode before autofocus
-                    # The previous tile's acquisition may have left per-channel mode active,
-                    # which would cause set_exposure() to be ignored.
-                    # Apply uncrossed calibration analog gains (see initial AF block).
+                    # Disable per-channel exposure/gain mode before autofocus.
+                    # The previous tile's acquisition may have left per-channel
+                    # mode active, which would cause set_exposure() to be ignored.
+                    # Reset analog gains to 1.0/1.0 (see initial AF block).
                     if jai_calibration is not None:
-                        # Extract uncrossed calibration gains for AF
-                        angle_name_90 = angle_to_name(90.0)
-                        cal_angles = jai_calibration.get("angles", {})
-                        uncrossed_gains = {}
-                        if angle_name_90 in cal_angles:
-                            uncrossed_gains = cal_angles[angle_name_90].get("gains", {})
-                        af_analog_red = uncrossed_gains.get("analog_red", 1.0)
-                        af_analog_blue = uncrossed_gains.get("analog_blue", 1.0)
-                        unified_gain = uncrossed_gains.get("unified_gain", 1.0)
-
                         try:
                             from microscope_control.jai import JAICameraProperties
                             jai_props = JAICameraProperties(hardware.core)
                             jai_props.disable_individual_exposure()
                             jai_props.disable_individual_gain()
-                            jai_props.set_rb_analog_gains(
-                                red=af_analog_red, blue=af_analog_blue
-                            )
+                            jai_props.set_rb_analog_gains(red=1.0, blue=1.0)
                         except (ImportError, Exception) as e:
                             logger.warning(f"Could not reset per-channel mode: {e}")
 
-                        # Compensate exposure for the gain reset (see initial AF block)
-                        if unified_gain > 1.0:
-                            exposure_90 *= unified_gain
+                        # Ensure minimum AF exposure (see initial AF block)
+                        MIN_AF_EXPOSURE_MS = 0.6
+                        if exposure_90 < MIN_AF_EXPOSURE_MS:
+                            exposure_90 = MIN_AF_EXPOSURE_MS
 
                     t_exp = time.perf_counter()
                     hardware.set_exposure(exposure_90)
