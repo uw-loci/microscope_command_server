@@ -1454,7 +1454,7 @@ def handle_client(conn, addr):
                                         result=result,
                                         calibration_type="simple",
                                         angle_name="uncrossed",  # Simple WB calibrates at 90 deg (uncrossed)
-                                        modality=params["modality"],
+                                        modality=params.get("modality"),
                                         objective=wb_objective,
                                         detector=wb_detector,
                                     )
