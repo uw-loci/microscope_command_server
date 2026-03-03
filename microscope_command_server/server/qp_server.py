@@ -643,8 +643,10 @@ def handle_client(conn, addr):
                     x, y = struct.unpack("!ff", coords)
                     logger.info(f"Client {addr} requested move to: X={x}, Y={y}")
                     try:
+                        t0 = time.perf_counter()
                         hardware.move_to_position(Position(x, y))
-                        logger.info(f"Move completed to X={x}, Y={y}")
+                        t_ms = (time.perf_counter() - t0) * 1000
+                        logger.info(f"MOVE completed to X={x}, Y={y} in {t_ms:.0f}ms")
                     except Exception as e:
                         logger.error(f"Failed to move to XY position: {e}", exc_info=True)
                         # No response expected for movement commands, but log the error
