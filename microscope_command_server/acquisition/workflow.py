@@ -19,6 +19,7 @@ from microscope_control.hardware import Position
 from microscope_control.hardware.pycromanager import PycromanagerHardware
 from microscope_control.autofocus.core import AutofocusUtils
 from microscope_command_server.acquisition.tiles import TileConfigUtils
+from microscope_command_server.modality import get_config as get_modality_config
 from ppm_library.imaging.writer import TifWriterUtils
 from ppm_library.imaging.background import BackgroundCorrectionUtils
 import shlex
@@ -983,20 +984,31 @@ def parse_acquisition_message(message: str) -> dict:
     raise ValueError("Invalid acquisition message format - must use flag-based format with '--' parameters")
 
 
-def get_angles_wb_from_settings(settings: Dict[str, Any]) -> Dict[float, List[float]]:
-    """Extract white balance values for different angles from settings."""
+def get_angles_wb_from_settings(
+    settings: Dict[str, Any],
+    modality: Optional[str] = None,
+) -> Dict[float, List[float]]:
+    """Extract white balance values for different angles from settings.
+
+    Uses modality config to determine the WB settings key and angle mapping.
+    Falls back to neutral [1,1,1] if no WB settings are found.
+    """
+    mod_config = get_modality_config(modality)
     angles_wb = {}
 
-    # Try to find white balance settings
+    # Determine WB key from modality config or derive from modality name
     wb_settings = settings.get("white_balance", {})
-    ppm_wb = wb_settings.get("ppm", {})
+    wb_key = mod_config.wb_settings_key
+    if not wb_key and modality:
+        wb_key = modality.split("_")[0].lower()
+    modality_wb = wb_settings.get(wb_key, {}) if wb_key else {}
 
-    # Map standard angle names to numeric values
-    angle_mapping = {"crossed": 0.0, "uncrossed": 90.0, "positive": 7.0, "negative": -7.0}
+    # Use modality config angle names, or fall back to the modality_wb keys
+    angle_mapping = mod_config.name_to_angle if mod_config.name_to_angle else {}
 
     for angle_name, angle_value in angle_mapping.items():
-        if angle_name in ppm_wb:
-            wb_values = ppm_wb[angle_name]
+        if angle_name in modality_wb:
+            wb_values = modality_wb[angle_name]
             # Handle different formats
             if isinstance(wb_values, list):
                 if len(wb_values) > 0 and isinstance(wb_values[0], str):
@@ -1014,14 +1026,15 @@ def get_angles_wb_from_settings(settings: Dict[str, Any]) -> Dict[float, List[fl
     if not angles_wb:
         logger.warning(
             "No software white balance settings found in config "
-            "(settings['white_balance']['ppm']), using neutral [1,1,1] for all angles"
+            "(settings['white_balance']['%s']), using neutral [1,1,1] for all angles",
+            wb_key or "unknown",
         )
-        angles_wb = {
-            0.0: [1.0, 1.0, 1.0],  # crossed
-            90.0: [1.0, 1.0, 1.0],  # uncrossed
-            7.0: [1.0, 1.0, 1.0],  # positive
-            -7.0: [1.0, 1.0, 1.0],  # negative
-        }
+        # Build neutral entries for all configured angles
+        if angle_mapping:
+            angles_wb = {v: [1.0, 1.0, 1.0] for v in angle_mapping.values()}
+        else:
+            # Non-rotation modality: single neutral entry
+            angles_wb = {0.0: [1.0, 1.0, 1.0]}
 
     return angles_wb
 
@@ -1434,7 +1447,7 @@ def _acquisition_workflow(
 
         if white_balance_enabled:
             # Load software white balance settings from configuration (RGB multipliers)
-            angles_wb = get_angles_wb_from_settings(ppm_settings)
+            angles_wb = get_angles_wb_from_settings(ppm_settings, modality=modality)
 
             # If config had no WB settings (all neutral), use background-derived
             # coefficients as fallback. These are computed from the mean R/G/B of each
@@ -1688,23 +1701,25 @@ def _acquisition_workflow(
             logger.info(f"=== PRE-ACQUISITION AUTOFOCUS at position {first_af_idx} ===")
             logger.info(f"Using diagonal autofocus position: X={first_af_pos.x}, Y={first_af_pos.y}")
 
-            # For PPM, set rotation to 90deg for autofocus and tissue detection
-            if "ppm" in modality.lower():
-                hardware.set_psg_ticks(90.0)
-                logger.info("Set rotation to 90 deg (uncrossed) for initial autofocus")
+            # For rotation modalities, set rotation to autofocus angle
+            mod_config = get_modality_config(modality)
+            if mod_config.autofocus_angle is not None and hasattr(hardware, "set_psg_ticks"):
+                af_angle = mod_config.autofocus_angle
+                hardware.set_psg_ticks(af_angle)
+                logger.info("Set rotation to %.0f deg for initial autofocus", af_angle)
 
-                # Get 90-degree exposure from the current WB mode's calibration.
+                # Get autofocus-angle exposure from the current WB mode's calibration.
                 # Every WB mode (simple, per_angle, camera_awb) must have a
-                # calibrated 90-degree exposure -- do not guess a default.
-                if 90.0 not in params["angles"]:
+                # calibrated exposure for this angle -- do not guess a default.
+                if af_angle not in params["angles"]:
                     raise ValueError(
-                        "No 90-degree angle in WB calibration parameters. "
+                        f"No {af_angle}-degree angle in WB calibration parameters. "
                         "Cannot determine autofocus exposure. Re-run WB calibration."
                     )
-                angle_idx = params["angles"].index(90.0)
+                angle_idx = params["angles"].index(af_angle)
                 if angle_idx >= len(params["exposures"]):
                     raise ValueError(
-                        "90-degree angle found but no corresponding exposure value. "
+                        f"{af_angle}-degree angle found but no corresponding exposure value. "
                         "Cannot determine autofocus exposure. Re-run WB calibration."
                     )
                 exposure_90 = params["exposures"][angle_idx]
@@ -1903,18 +1918,19 @@ def _acquisition_workflow(
                     f"Checking for autofocus at position {pos_idx}: X={pos.x}, Y={pos.y}, Z={pos.z}"
                 )
 
-                # For PPM, always autofocus at 90 deg (uncrossed polarizers - brightest, fastest)
-                # This ensures consistent, fast autofocus regardless of angle sequence
-                if "ppm" in modality.lower():
+                # For rotation modalities, always autofocus at the configured angle
+                # (brightest orientation for consistent, fast autofocus)
+                if mod_config.autofocus_angle is not None and hasattr(hardware, "set_psg_ticks"):
+                    af_angle = mod_config.autofocus_angle
                     t_rot = time.perf_counter()
-                    hardware.set_psg_ticks(90.0)
-                    t_rot = log_timing(logger, "Rotation to 90deg for autofocus", t_rot)
-                    logger.info("Set rotation to 90 deg (uncrossed) for PPM autofocus")
-                    # Use the 90-degree exposure from the current WB mode's
+                    hardware.set_psg_ticks(af_angle)
+                    t_rot = log_timing(logger, "Rotation to %.0fdeg for autofocus" % af_angle, t_rot)
+                    logger.info("Set rotation to %.0f deg for autofocus", af_angle)
+                    # Use the autofocus-angle exposure from the current WB mode's
                     # calibration (same value as the initial AF block).
                     # exposure_90 was validated during pre-acquisition AF.
-                    if 90.0 in params["angles"]:
-                        angle_idx = params["angles"].index(90.0)
+                    if af_angle in params["angles"]:
+                        angle_idx = params["angles"].index(af_angle)
                         if angle_idx < len(params["exposures"]):
                             exposure_90 = params["exposures"][angle_idx]
 
@@ -2168,7 +2184,7 @@ def _acquisition_workflow(
                             exposure_ms = params["exposures"][angle_idx]
                             hardware.set_exposure(exposure_ms)
                         # Apply unified gain for brightness at dim angles
-                        angle_name = angle_to_name(angle)
+                        angle_name = angle_to_name(angle, modality=modality)
                         if camera_awb_gains and angle_name in camera_awb_gains:
                             try:
                                 from microscope_control.jai import JAICameraProperties
@@ -2182,7 +2198,7 @@ def _acquisition_workflow(
                     elif wb_mode == "simple" and simple_wb_data:
                         # Simple WB mode with pre-computed data: apply uncrossed R:G:B
                         # ratio uniformly scaled for this angle
-                        angle_name = angle_to_name(angle)
+                        angle_name = angle_to_name(angle, modality=modality)
                         sw_angles = simple_wb_data.get("angles", {})
                         if angle_name in sw_angles:
                             angle_sw = sw_angles[angle_name]
@@ -2528,17 +2544,9 @@ def write_position_metadata(metadata_txt_for_positions, raw_image_path, hardware
         f"(x,y,z) = ({pos_read.x},{pos_read.y},{round(pos_read.z, 3)}); "
     )
 
-    # TODO: modality is chosen on the config , but then overwrittebn by the message parameter
-    # here we should use the modality used for acquisition?
-    # if modality.lower.count("ppm") > 0:  # user-set value passed from acquisition parameters
-    # if hardware.settings.get("modality", "ppm") == "ppm":  # config set value from yaml
-
-    if "ppm" in modality.lower():
-        angle = (
-            hardware.get_psg_ticks()
-            if hardware.settings.get("ppm_optics", "ZCutQuartz") != "NA"
-            else "NA"
-        )
+    mod_config = get_modality_config(modality)
+    if mod_config.has_rotation and hasattr(hardware, "get_psg_ticks"):
+        angle = hardware.get_psg_ticks()
         line += f"r = {angle} ; "
 
     line += f"exposure (ms) = {hardware.core.get_exposure()}\n"
@@ -2547,71 +2555,55 @@ def write_position_metadata(metadata_txt_for_positions, raw_image_path, hardware
         f.write(line)
 
 
-def angle_to_name(angle: float) -> str:
-    """
-    Convert numeric angle to canonical name.
+def angle_to_name(angle: float, modality: Optional[str] = None) -> str:
+    """Convert numeric angle to canonical name using modality config.
+
+    Looks up the angle in the modality's angle_names mapping.
+    Falls back to fuzzy matching (within 2 degrees) and then a generic label.
 
     Args:
         angle: Rotation angle in degrees
+        modality: Modality identifier for config lookup (optional)
 
     Returns:
         Angle name (e.g., 'uncrossed', 'crossed', 'positive', 'negative')
     """
-    abs_angle = abs(angle)
+    mod_config = get_modality_config(modality)
 
-    if 88 <= abs_angle <= 92:
-        return "uncrossed"
-    elif abs_angle <= 3:
-        return "crossed"
-    elif 4 <= abs_angle <= 10:
-        return "positive" if angle > 0 else "negative"
-    else:
-        return f"angle_{angle}"
+    # Exact match first
+    if angle in mod_config.angle_names:
+        return mod_config.angle_names[angle]
+
+    # Fuzzy match: find closest named angle within 2 degrees
+    best_name = None
+    best_dist = float("inf")
+    for named_angle, name in mod_config.angle_names.items():
+        dist = abs(angle - named_angle)
+        if dist < best_dist and dist <= 2.0:
+            best_dist = dist
+            best_name = name
+
+    if best_name is not None:
+        return best_name
+
+    return f"angle_{angle}"
 
 
 def get_default_target_intensity(modality: str, angle: float) -> float:
-    """
-    Get hardcoded default target intensity for background acquisition.
+    """Get default target intensity for background acquisition.
 
-    These defaults are used when no YAML configuration is available.
-    The values are based on the optical properties of polarized light:
-    - Crossed polarizers (0 deg): Very dim -> 125
-    - Birefringence angles (5-7 deg): Moderate -> 160
-    - Uncrossed (90 deg): Very bright -> 245
-    - Intermediate: Standard -> 180
+    Uses the modality config's angle_intensity_targets for angle-specific
+    targets, falling back to the modality's default_target_intensity.
 
     Args:
         modality: Modality identifier (e.g., "ppm", "brightfield")
-        angle: Rotation angle in degrees (for PPM)
+        angle: Rotation angle in degrees
 
     Returns:
         Target grayscale intensity (0-255)
     """
-    modality_lower = modality.lower()
-
-    # Brightfield modality
-    if "brightfield" in modality_lower or "bf" in modality_lower:
-        return 250.0
-
-    # PPM modality - angle-specific targets
-    if "ppm" in modality_lower:
-        abs_angle = abs(angle)
-
-        if 88 <= abs_angle <= 92:
-            # Near-uncrossed region (around 90 deg) - brightest
-            return 245.0
-        elif 4 <= abs_angle <= 10:
-            # Birefringence angles (5-7 deg and their neighbors)
-            return 160.0
-        elif abs_angle <= 3:
-            # Near-crossed region (around 0 deg) - dimmest
-            return 125.0
-        else:
-            # Intermediate angles (10-88 deg)
-            return 180.0
-
-    # Default fallback
-    return 180.0
+    mod_config = get_modality_config(modality)
+    return mod_config.get_target_intensity(angle)
 
 
 def load_calibration_targets_from_yaml(config_path: Path) -> Optional[Dict[str, Any]]:
@@ -2657,13 +2649,12 @@ def get_target_intensity_for_angle(
     modality: str = "ppm",
     config_path: Optional[Path] = None,
 ) -> Tuple[float, str]:
-    """
-    Get target intensity for a specific angle with YAML priority logic.
+    """Get target intensity for a specific angle with YAML priority logic.
 
     Priority order:
     1. background_exposures.angles.{name}.achieved_intensity (from prior BG collection)
     2. calibration_targets.target_intensities.{name} (YAML configured)
-    3. Hardcoded defaults (based on optical properties)
+    3. Modality config defaults (based on optical properties)
 
     This ensures white balance calibration uses the same target intensity
     as background collection, so white-balanced images match backgrounds.
@@ -2677,7 +2668,7 @@ def get_target_intensity_for_angle(
         Tuple of (target_intensity, source) where source describes where
         the value came from (e.g., "background_exposures", "yaml_config", "default")
     """
-    angle_name = angle_to_name(angle)
+    angle_name = angle_to_name(angle, modality=modality)
 
     # Try YAML lookup if config_path provided
     if config_path is not None:
@@ -2792,7 +2783,7 @@ def save_background_exposures_to_yaml(
         # Build background_exposures data
         angles_data = {}
         for angle, exposure_ms in final_exposures.items():
-            angle_name = angle_to_name(angle)
+            angle_name = angle_to_name(angle, modality=modality)
             angles_data[angle_name] = {
                 "angle_degrees": angle,
                 "exposure_ms": round(exposure_ms, 2),
@@ -3780,7 +3771,7 @@ def simple_background_collection(
             if wb_mode == "camera_awb":
                 # Camera AWB mode: unified exposure only, adaptive intensity matching
                 # Apply unified gain for brightness at dim angles
-                angle_name = angle_to_name(angle)
+                angle_name = angle_to_name(angle, modality=modality)
                 if camera_awb_gains and angle_name in camera_awb_gains:
                     try:
                         from microscope_control.jai import JAICameraProperties
@@ -3828,7 +3819,7 @@ def simple_background_collection(
             elif wb_mode == "simple" and simple_wb_base is not None:
                 # Simple WB mode: ratio-preserving adaptive scaling
                 # Use uncrossed R:G:B ratios, uniformly scale per angle to hit target
-                angle_name = angle_to_name(angle)
+                angle_name = angle_to_name(angle, modality=modality)
                 try:
                     from microscope_control.jai import JAICameraProperties
                     jai_props = JAICameraProperties(hardware.core)

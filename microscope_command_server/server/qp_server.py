@@ -28,6 +28,7 @@ from datetime import datetime
 import numpy as np
 
 from microscope_control.config import ConfigManager
+from microscope_command_server.modality import get_config as get_modality_config
 
 
 def check_for_existing_server(host: str, port: int, timeout: float = 2.0) -> bool:
@@ -1166,11 +1167,11 @@ def handle_client(conn, addr):
                                 jai_props = JAICameraProperties(hardware.core)
                                 calibrator = JAIWhiteBalanceCalibrator(hardware, jai_props)
 
-                                # Set up PPM rotation callback if modality is PPM
-                                ppm_callback = None
-                                if params["modality"].lower() == "ppm":
-                                    if hasattr(hardware, "set_psg_ticks"):
-                                        ppm_callback = hardware.set_psg_ticks
+                                # Set up rotation callback if modality has rotation
+                                mod_config = get_modality_config(params["modality"])
+                                rotation_callback = None
+                                if mod_config.has_rotation and hasattr(hardware, "set_psg_ticks"):
+                                    rotation_callback = hardware.set_psg_ticks
 
                                 # Set up defocus callback if configured
                                 defocus_callback = None
@@ -1196,7 +1197,7 @@ def handle_client(conn, addr):
                                 result = calibrator.calibrate(
                                     config=wb_config,
                                     output_path=output_path,
-                                    ppm_rotation_callback=ppm_callback,
+                                    rotation_callback=rotation_callback,
                                     defocus_callback=defocus_callback,
                                 )
 
@@ -1451,7 +1452,7 @@ def handle_client(conn, addr):
                                         result=result,
                                         calibration_type="simple",
                                         angle_name="uncrossed",  # Simple WB calibrates at 90 deg (uncrossed)
-                                        modality="ppm",
+                                        modality=params["modality"],
                                         objective=wb_objective,
                                         detector=wb_detector,
                                     )
@@ -1581,7 +1582,7 @@ def handle_client(conn, addr):
 
                 # Track calibration results so the finally block can apply them
                 # to the camera for live view (using uncrossed angle settings).
-                _wb_ppm_results = None
+                _wb_rotation_results = None
 
                 # Read the message
                 message_parts = []
@@ -1794,7 +1795,7 @@ def handle_client(conn, addr):
                                                 angle_deg = params[f"{angle_name}_angle"]
                                                 target_val, source = get_target_intensity_for_angle(
                                                     angle=angle_deg,
-                                                    modality="ppm",
+                                                    modality=params.get("modality", "ppm"),
                                                     config_path=Path(params["yaml_file_path"]),
                                                 )
                                                 per_angle_targets[angle_name] = target_val
@@ -1815,19 +1816,19 @@ def handle_client(conn, addr):
                                 jai_props = JAICameraProperties(hardware.core)
                                 calibrator = JAIWhiteBalanceCalibrator(hardware, jai_props)
 
-                                # Set up PPM rotation callback
-                                ppm_callback = None
+                                # Set up rotation callback
+                                rotation_callback = None
                                 if hasattr(hardware, "set_psg_ticks"):
-                                    ppm_callback = hardware.set_psg_ticks
+                                    rotation_callback = hardware.set_psg_ticks
 
-                                # Run PPM calibration using the new method
+                                # Run per-angle calibration
                                 output_path = Path(params["output_folder_path"])
                                 results = calibrator.calibrate_ppm(
                                     angle_exposures=angle_exposures,
                                     target=params.get("target_intensity", 180.0),
                                     tolerance=params.get("tolerance", 5.0),
                                     output_path=output_path,
-                                    ppm_rotation_callback=ppm_callback,
+                                    rotation_callback=rotation_callback,
                                     per_angle_targets=per_angle_targets if per_angle_targets else None,
                                     max_gain_db=params.get("max_gain_db"),
                                     gain_threshold_ratio=params.get("gain_threshold"),
@@ -1849,13 +1850,14 @@ def handle_client(conn, addr):
                                             wb_detector = wb_detector or hardware.settings.get("detector_in_use") or hardware.settings.get("detector")
                                     logger.info(f"WB calibration: saving to imaging_profiles with objective={wb_objective}, detector={wb_detector}")
 
+                                    wb_modality = params.get("modality", "ppm")
                                     for angle_name, result in results.items():
                                         calibrator.update_imageprocessing_config(
                                             config_path=Path(params["yaml_file_path"]),
                                             result=result,
-                                            calibration_type="ppm",
+                                            calibration_type="per_angle",
                                             angle_name=angle_name,
-                                            modality="ppm",
+                                            modality=wb_modality,
                                             objective=wb_objective,
                                             detector=wb_detector,
                                         )
@@ -1883,7 +1885,7 @@ def handle_client(conn, addr):
                                 response = "|".join(response_parts)
                                 conn.sendall(response.encode())
                                 logger.info(f"WBPPM completed: all_converged={all_converged}")
-                                _wb_ppm_results = results
+                                _wb_rotation_results = results
 
                             except ImportError as e:
                                 error_msg = f"JAI calibration module not available: {e}"
@@ -1921,8 +1923,8 @@ def handle_client(conn, addr):
                         # Use uncrossed (90 deg) result for live view -- it is
                         # the brightest angle and most natural for visual QC.
                         uncrossed = (
-                            _wb_ppm_results.get("uncrossed")
-                            if _wb_ppm_results else None
+                            _wb_rotation_results.get("uncrossed")
+                            if _wb_rotation_results else None
                         )
                         if uncrossed is not None and uncrossed.converged:
                             jai_props.set_channel_exposures(
@@ -2102,10 +2104,13 @@ def handle_client(conn, addr):
                                                 wb_detector = wb_detector or hardware.settings.get("detector_in_use") or hardware.settings.get("detector")
 
                                         if wb_objective and wb_detector:
+                                            # Derive modality from YAML config path
+                                            # (e.g. config_PPM.yml -> "PPM")
+                                            snap_modality = params.get("modality", "ppm")
                                             jai_cal = load_jai_calibration_from_imageprocessing(
                                                 config_path=Path(yaml_path),
                                                 per_angle=True,
-                                                modality="ppm",
+                                                modality=snap_modality,
                                                 objective=wb_objective,
                                                 detector=wb_detector,
                                                 logger=logger,
@@ -2891,18 +2896,13 @@ def handle_client(conn, addr):
                                 conn.sendall(ack_response)
                                 logger.info("Sent STARTED acknowledgment for PPM sensitivity test")
 
-                                # Run PPM sensitivity test using programmatic interface
-                                from ppm_library.ppm.sensitivity_test import run_ppm_sensitivity_test
+                                # Delegate to PPM modality handler
+                                from microscope_command_server.modality.ppm import handle_sensitivity_test
 
-                                result_dir = run_ppm_sensitivity_test(
-                                    config_yaml=params["yaml_file_path"],
-                                    output_dir=params["output_folder_path"],
-                                    host="127.0.0.1",  # Connect back to ourselves
+                                result_dir = handle_sensitivity_test(
+                                    params=params,
                                     port=PORT,
-                                    test_type=params["test_type"],
-                                    base_angle=params["base_angle"],
-                                    n_repeats=params["n_repeats"],
-                                    keep_images=True,
+                                    _logger=logger,
                                 )
 
                                 if result_dir:
@@ -3072,22 +3072,15 @@ def handle_client(conn, addr):
                                         logger.error(f"Stage move callback failed: {e}")
                                         return False
 
-                                # Run PPM birefringence test using programmatic interface
-                                from ppm_library.ppm.birefringence_test import run_birefringence_maximization_test
+                                # Delegate to PPM modality handler
+                                from microscope_command_server.modality.ppm import handle_birefringence_test
 
-                                result_dir = run_birefringence_maximization_test(
-                                    config_yaml=params["yaml_file_path"],
-                                    output_dir=params["output_folder_path"],
-                                    host="127.0.0.1",  # Connect back to ourselves
+                                result_dir = handle_birefringence_test(
+                                    params=params,
                                     port=PORT,
-                                    angle_range=(params["min_angle"], params["max_angle"]),
-                                    angle_step=params["angle_step"],
-                                    exposure_mode=params["exposure_mode"],
-                                    fixed_exposure_ms=params.get("fixed_exposure_ms"),
-                                    keep_images=True,
-                                    target_intensity=params["target_intensity"],
                                     progress_callback=send_progress,
-                                    stage_move_callback=stage_move_callback if params["exposure_mode"] == "calibrate" else None,
+                                    stage_move_callback=stage_move_callback,
+                                    _logger=logger,
                                 )
 
                                 if result_dir:
@@ -3204,6 +3197,7 @@ def handle_client(conn, addr):
                                         params["center_x"] = int(value)
 
                             # Set defaults
+                            # Sunburst calibration is currently PPM-specific
                             params.setdefault("modality", "ppm_20x")
                             params.setdefault("expected_spokes", 16)
                             params.setdefault("saturation_threshold", 0.1)
