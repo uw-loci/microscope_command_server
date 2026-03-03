@@ -3631,13 +3631,18 @@ def handle_client(conn, addr):
                     jai_props = JAICameraProperties(hardware.core)
 
                     if mode == 0:
-                        # Use _set_property directly -- the retry wrapper
-                        # set_white_balance_mode("Off") fails for
-                        # Continuous->Off transitions (stale read-back).
-                        jai_props._set_property(jai_props.WHITE_BALANCE, "Off")
+                        # Set Off WITHOUT wait_for_device (wait=False).
+                        # The JAI camera's wait_for_device clears internal AWB
+                        # corrections accumulated during Continuous mode.
+                        # MicroManager's GUI does not call wait_for_device,
+                        # which is why AWB corrections persist via MM but not
+                        # via our code. Using wait=False preserves corrections.
+                        jai_props._set_property(
+                            jai_props.WHITE_BALANCE, "Off", wait=False
+                        )
                         # Note: does NOT clear analog gain corrections.
                         # awb_calibrated stays True if AWB was previously run.
-                        logger.info("Set white balance mode to Off")
+                        logger.info("Set white balance mode to Off (AWB corrections preserved)")
                     elif mode == 1:
                         jai_props.set_white_balance_mode("Continuous")
                         awb_calibrated = True
