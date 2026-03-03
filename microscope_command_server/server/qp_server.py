@@ -3648,6 +3648,21 @@ def handle_client(conn, addr):
                         awb_calibrated = True
                         logger.info("Set white balance mode to Continuous (AWB active)")
                     elif mode == 2:
+                        # Set the camera's native "Once" mode directly.
+                        # The camera runs a single AWB calibration and then
+                        # auto-returns to Off. This is the simple property set
+                        # used by the Camera Control UI.
+                        # NOTE: run_auto_white_balance() (mode 3) is a separate
+                        # full calibration routine used by automated workflows.
+                        jai_props._set_property(
+                            jai_props.WHITE_BALANCE, "Once", wait=False
+                        )
+                        awb_calibrated = True
+                        logger.info("Set white balance mode to Once (native one-shot AWB)")
+                    elif mode == 3:
+                        # Full AWB calibration routine: starts streaming, sets
+                        # Continuous, drains buffer for 3s, then sets Off.
+                        # Used by automated workflows (WB Comparison Test).
                         jai_props.run_auto_white_balance()
                         awb_calibrated = True
                         logger.info("Ran AWB Continuous calibration (internal corrections active)")
