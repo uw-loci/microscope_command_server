@@ -1320,8 +1320,8 @@ def handle_client(conn, addr):
                             params = {}
 
                             # Parse flags: --yaml, --objective, --detector, --output,
-                            #              --camera, --exposure, --target, --tolerance,
-                            #              --max_gain_db, --gain_threshold,
+                            #              --modality, --camera, --exposure, --target,
+                            #              --tolerance, --max_gain_db, --gain_threshold,
                             #              --max_iterations, --calibrate_black_level,
                             #              --base_gain, --exposure_soft_cap_ms, --boosted_max_gain_db
                             flags = [
@@ -1329,6 +1329,7 @@ def handle_client(conn, addr):
                                 "--objective",
                                 "--detector",
                                 "--output",
+                                "--modality",
                                 "--camera",
                                 "--exposure",
                                 "--target",
@@ -1374,6 +1375,8 @@ def handle_client(conn, addr):
                                         params["detector"] = value
                                     elif flag == "--output":
                                         params["output_folder_path"] = value
+                                    elif flag == "--modality":
+                                        params["modality"] = value
                                     elif flag == "--camera":
                                         params["camera"] = value
                                     elif flag == "--exposure":
