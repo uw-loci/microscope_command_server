@@ -1545,7 +1545,7 @@ def _acquisition_workflow(
         af_score_metric_name = "laplacian_variance"  # default
         af_texture_threshold = 0.005  # default - tissue detection sensitivity
         af_tissue_area_threshold = 0.2  # default - minimum tissue coverage
-        af_rgb_brightness_threshold = 225.0  # default - maximum RGB brightness for tissue (blank rejection)
+        af_rgb_brightness_threshold = 240.0  # default - maximum RGB brightness for tissue (blank rejection)
         # Adaptive autofocus parameters
         af_adaptive_initial_step = 10.0  # default
         af_adaptive_min_step = 2.0  # default
@@ -2361,7 +2361,7 @@ def _acquisition_workflow(
                         _check_saturation(image, f"post-correction tile {filename} at {angle}deg", logger)
                     elif background_correction_enabled and angle in background_disabled_angles:
                         logger.info(
-                            f"  Background correction SKIPPED for {angle} deg (validation failed - exposure mismatch or missing background)"
+                            f"  Background correction SKIPPED for {angle} deg (disabled by acquisition parameters - exposure mismatch or missing background)"
                         )
                     elif background_correction_enabled and angle not in background_images:
                         logger.info(
