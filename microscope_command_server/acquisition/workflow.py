@@ -1050,7 +1050,6 @@ def _acquisition_workflow(
     is_cancelled: Callable[[], bool],
     request_manual_focus: Optional[Callable[[], None]] = None,
     connection_config_path: Optional[str] = None,
-    awb_calibrated: bool = False,
 ):
     """Execute the main image acquisition workflow with progress and cancellation.
 
@@ -1068,8 +1067,6 @@ def _acquisition_workflow(
                              raise exceptions as before.
         connection_config_path: Optional path to config from initial CONFIG command,
                                used to warn if ACQUIRE uses different config.
-        awb_calibrated: Whether Camera AWB has been calibrated this session.
-                       Used to warn if camera_awb mode is selected without prior calibration.
     """
 
     logger.info(f"=== ACQUISITION WORKFLOW STARTED for client {client_addr} ===")
@@ -1297,12 +1294,13 @@ def _acquisition_workflow(
         base_modality = params["scan_type"].split("_")[0].lower()
 
         if wb_mode == "camera_awb":
-            # Warn if AWB hasn't been calibrated this session
-            if not awb_calibrated:
-                logger.warning(
-                    "Camera AWB mode selected but no AWB calibration detected this session. "
-                    "Colors may be incorrect. Run 'Camera AWB Calibration' first."
-                )
+            # Camera AWB must be set manually in MicroManager's Device Property
+            # Browser BEFORE acquisition. Cannot be controlled programmatically.
+            # To clear AWB: restart MicroManager and wait ~30 seconds.
+            logger.info(
+                "Camera AWB mode: ensure AWB was configured in MicroManager's "
+                "Device Property Browser before starting acquisition."
+            )
             # Camera AWB mode: no per-channel calibration needed.
             # Camera handles color internally. Load per-angle unified gains
             # from Mode 3 data for brightness boosting at dim angles.

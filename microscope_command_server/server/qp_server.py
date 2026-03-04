@@ -195,11 +195,6 @@ active_connection_addr = None  # Track single active client connection (blocks o
 active_connection_config_path = None  # Path to config file provided by active connection
 connection_state_lock = Lock()  # Protect connection state from race conditions
 
-# AWB state tracking -- True when Camera AWB corrections are present in analog gains.
-# Set True when SETWBMD mode=1 (Continuous) or mode=2 (Once) completes.
-# Remains True when mode=0 (Off) -- Off doesn't clear analog gain registers.
-# Reset to False only when analog gains are explicitly cleared (e.g., by simple/per_angle mode setup).
-awb_calibrated = False
 
 
 def init_pycromanager_with_logger():
@@ -403,7 +398,6 @@ def acquisitionWorkflow(message, client_addr):
         is_cancelled=_is_cancelled,
         request_manual_focus=_request_manual_focus,
         connection_config_path=active_connection_config_path,
-        awb_calibrated=awb_calibrated,
     )
 
 
@@ -3603,83 +3597,9 @@ def handle_client(conn, addr):
                     conn.sendall(b"ERR_GAIN")
                 continue
 
-            # ==================== White Balance Mode Control ====================
-
-            # SETWBMD - Set camera white balance mode (0=Off, 1=Continuous, 2=Once)
-            # JAI-SPECIFIC: Controls the camera's built-in hardware auto white
-            # balance feature. This is SEPARATE from the calibration commands
-            # (WBSIMPLE/WBPPM) which manually compute and apply per-channel
-            # exposure/gain values.
-            #
-            # WARNING: Hardware auto-WB (Continuous/Once) adjusts internal
-            # camera parameters that are NOT saved or reproducible. For
-            # reproducible scientific imaging, use WBSIMPLE/WBPPM calibration
-            # instead and keep hardware WB mode set to Off.
-            #
-            # Protocol: 8-byte command + 1 byte mode value.
-            #   0 = Off (disable auto WB)
-            #   1 = Continuous (camera auto-adjusts WB every frame)
-            #   2 = Once (camera runs single auto-WB then stops)
-            #
-            # Response: "ACK_____", "ERR_NJAI", or "ERR_WBMD".
-            if data == ExtendedCommand.SETWBMD:
-                logger.debug(f"Client {addr} requested to set WB mode")
-                try:
-                    mode_byte = conn.recv(1)
-                    mode = mode_byte[0]
-                    logger.info(f"Setting WB mode: {mode}")
-
-                    global awb_calibrated
-                    from microscope_control.jai import JAICameraProperties
-                    jai_props = JAICameraProperties(hardware.core)
-
-                    if mode == 0:
-                        # Set Off WITHOUT wait_for_device (wait=False).
-                        # The JAI camera's wait_for_device clears internal AWB
-                        # corrections accumulated during Continuous mode.
-                        # MicroManager's GUI does not call wait_for_device,
-                        # which is why AWB corrections persist via MM but not
-                        # via our code. Using wait=False preserves corrections.
-                        jai_props._set_property(
-                            jai_props.WHITE_BALANCE, "Off", wait=False
-                        )
-                        # Note: does NOT clear analog gain corrections.
-                        # awb_calibrated stays True if AWB was previously run.
-                        logger.info("Set white balance mode to Off (AWB corrections preserved)")
-                    elif mode == 1:
-                        jai_props.set_white_balance_mode("Continuous")
-                        awb_calibrated = True
-                        logger.info("Set white balance mode to Continuous (AWB active)")
-                    elif mode == 2:
-                        # Set the camera's native "Once" mode directly.
-                        # The camera runs a single AWB calibration and then
-                        # auto-returns to Off. This is the simple property set
-                        # used by the Camera Control UI.
-                        # NOTE: run_auto_white_balance() (mode 3) is a separate
-                        # full calibration routine used by automated workflows.
-                        jai_props._set_property(
-                            jai_props.WHITE_BALANCE, "Once", wait=False
-                        )
-                        awb_calibrated = True
-                        logger.info("Set white balance mode to Once (native one-shot AWB)")
-                    elif mode == 3:
-                        # Full AWB calibration routine: starts streaming, sets
-                        # Continuous, drains buffer for 3s, then sets Off.
-                        # Used by automated workflows (WB Comparison Test).
-                        jai_props.run_auto_white_balance()
-                        awb_calibrated = True
-                        logger.info("Ran AWB Continuous calibration (internal corrections active)")
-                    else:
-                        logger.warning(f"Unknown WB mode: {mode}")
-
-                    conn.sendall(b"ACK_____")
-                except ImportError:
-                    conn.sendall(b"ERR_NJAI")
-                    logger.error("JAI module not available for WB mode control")
-                except Exception as e:
-                    logger.error(f"Failed to set WB mode: {e}")
-                    conn.sendall(b"ERR_WBMD")
-                continue
+            # NOTE: SETWBMD handler was removed -- JAI hardware AWB cannot be
+            # reliably controlled through Pycromanager. Camera AWB must be set
+            # manually in MicroManager's Device Property Browser.
 
             # ==================== Live Mode Control Commands ====================
 

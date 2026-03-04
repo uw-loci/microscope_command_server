@@ -84,11 +84,9 @@ class ExtendedCommand:
     GETGAIN = b"getgain_"  # Get gain values (unified or JAI per-channel RGB)
     SETGAIN = b"setgain_"  # Set gain (count=1: JAI unified, count>=3: JAI per-channel)
 
-    # ---- JAI-Specific: White Balance Mode Control ----
-    # Controls the camera's built-in auto white balance hardware feature.
-    # NOTE: Hardware auto-WB (Continuous/Once) is NOT reproducible across
-    # sessions. For reproducible results, use WBSIMPLE/WBPPM calibration.
-    SETWBMD = b"setwbmd_"  # Set camera WB mode (0=Off, 1=Continuous, 2=Once)
+    # NOTE: SETWBMD (camera WB mode control) was removed -- JAI hardware AWB
+    # cannot be reliably controlled through Pycromanager. Set AWB manually in
+    # MicroManager's Device Property Browser.
 
     # Live Mode Control Commands
     GETLIVE = b"getlive_"  # Check if live mode is currently running
