@@ -1475,6 +1475,10 @@ def _acquisition_workflow(
                 for angle in params.get("angles", []):
                     angles_wb[angle] = uncrossed_profile
 
+        # Save starting position before any tile loading or acquisition so
+        # the finally block can always return the stage to where it started.
+        starting_position = hardware.get_current_position()
+
         # Set up output paths
         project_path = Path(params["projects_folder_path"]) / params["sample_label"]
         output_path = project_path / params["scan_type"] / params["region_name"]
@@ -1488,7 +1492,7 @@ def _acquisition_workflow(
 
         if not positions:
             logger.error(f"No positions found in {tile_config_path}")
-            set_state("FAILED")
+            set_state("FAILED", f"No tile positions found in {tile_config_path}")
             return
 
         xy_positions = [(pos.x, pos.y) for pos, filename in positions]
@@ -1516,8 +1520,6 @@ def _acquisition_workflow(
         #    logger.error(
         #        f"Total rotation steps {total_rotation} exceed Micro-Manager limit of 536870. Acquisition aborted."
         #    )
-
-        starting_position = hardware.get_current_position()
 
         update_progress(0, total_images)
         logger.info(
@@ -2530,9 +2532,14 @@ def _acquisition_workflow(
         logger.error(f"Error: {str(e)}", exc_info=True)
         set_state("FAILED", str(e))
     finally:
-        # Return to starting position
-        logger.info("Returning to starting position")
-        hardware.move_to_position(starting_position)
+        # Return to starting position if it was captured
+        try:
+            logger.info("Returning to starting position")
+            hardware.move_to_position(starting_position)
+        except NameError:
+            logger.warning("Could not return to starting position (position was not captured)")
+        except Exception as e:
+            logger.warning(f"Failed to return to starting position: {e}")
 
 
 def write_position_metadata(metadata_txt_for_positions, raw_image_path, hardware, modality):

@@ -681,7 +681,7 @@ def handle_client(conn, addr):
                     # If state is FAILED and we have an error message, send it
                     if state == AcquisitionState.FAILED and addr in acquisition_failure_messages:
                         # Send "FAILED: <message>" format (truncated to fit in response)
-                        error_msg = acquisition_failure_messages[addr]
+                        error_msg = acquisition_failure_messages.get(addr) or "Unknown error"
                         # Java client expects to parse this format
                         state_str = f"FAILED: {error_msg}"[:250]  # Reasonable limit for error message
                         # Pad to 16 bytes minimum for compatibility, but can be longer
