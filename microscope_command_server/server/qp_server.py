@@ -3320,11 +3320,18 @@ def handle_client(conn, addr):
                     jai_props = JAICameraProperties(hardware.core)
 
                     if jai_props.validate_camera():
-                        exp_individual = jai_props.is_individual_exposure_enabled()
-                        # Gain is always unified in new model
-                        mode_str = f"JAI_EXP:{1 if exp_individual else 0}_GAIN:0"
-                        conn.sendall(mode_str.encode("utf-8").ljust(16, b"\x00"))
-                        logger.info(f"Sent JAI mode flags: exp_ind={exp_individual}, gain_ind=false")
+                        if not jai_props.supports_individual_exposure():
+                            # JAI camera but ExposureIsIndividual property not available
+                            # (e.g. MM adapter without PR #781 support)
+                            mode_str = "JAI_EXP:U_GAIN:0"
+                            conn.sendall(mode_str.encode("utf-8").ljust(16, b"\x00"))
+                            logger.info("JAI camera without individual exposure support - sent EXP:U")
+                        else:
+                            exp_individual = jai_props.is_individual_exposure_enabled()
+                            # Gain is always unified in new model
+                            mode_str = f"JAI_EXP:{1 if exp_individual else 0}_GAIN:0"
+                            conn.sendall(mode_str.encode("utf-8").ljust(16, b"\x00"))
+                            logger.info(f"Sent JAI mode flags: exp_ind={exp_individual}, gain_ind=false")
                     else:
                         conn.sendall(b"UNIFIED_________")
                         logger.info("Non-JAI camera - sent UNIFIED mode")
@@ -3346,7 +3353,8 @@ def handle_client(conn, addr):
             #   exp_mode:  1 = individual (R,G,B separate), 0 = unified
             #   gain_mode: ignored (always unified), logged if True requested
             #
-            # Response: "ACK_____" on success, "ERR_NJAI" if not JAI, "ERR_MODE" on failure.
+            # Response: "ACK_____" on success, "ERR_NJAI" if not JAI,
+            #   "ERR_NSUP" if individual mode not supported, "ERR_MODE" on failure.
             if data == ExtendedCommand.SETMODE:
                 logger.debug(f"Client {addr} requested to set camera mode")
                 try:
@@ -3392,6 +3400,15 @@ def handle_client(conn, addr):
 
                     if not jai_props.validate_camera():
                         raise RuntimeError("JAI camera not active - cannot set individual mode")
+
+                    if exp_individual and not jai_props.supports_individual_exposure():
+                        conn.sendall(b"ERR_NSUP")
+                        logger.error(
+                            "Individual exposure mode requested but ExposureIsIndividual "
+                            "property not available. Check MicroManager device adapter "
+                            "version (requires PR #781)."
+                        )
+                        continue
 
                     if exp_individual:
                         jai_props.enable_individual_exposure()
@@ -3486,13 +3503,22 @@ def handle_client(conn, addr):
                         # Per-channel exposures (R, G, B)
                         from microscope_control.jai import JAICameraProperties
                         jai_props = JAICameraProperties(hardware.core)
-                        jai_props.set_channel_exposures(
-                            red=exposures[0],
-                            green=exposures[1],
-                            blue=exposures[2],
-                            auto_enable=True
-                        )
-                        logger.info(f"Set per-channel exposures: R={exposures[0]}, G={exposures[1]}, B={exposures[2]}")
+                        if not jai_props.supports_individual_exposure():
+                            # Fall back to unified using green channel value
+                            hardware.set_exposure(exposures[1])
+                            logger.warning(
+                                "Per-channel exposures requested but individual mode not "
+                                "supported - using green channel value (%.2f ms) as unified",
+                                exposures[1]
+                            )
+                        else:
+                            jai_props.set_channel_exposures(
+                                red=exposures[0],
+                                green=exposures[1],
+                                blue=exposures[2],
+                                auto_enable=True
+                            )
+                            logger.info(f"Set per-channel exposures: R={exposures[0]}, G={exposures[1]}, B={exposures[2]}")
 
                     conn.sendall(b"ACK_____")
                 except ImportError:
