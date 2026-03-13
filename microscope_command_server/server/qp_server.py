@@ -78,7 +78,7 @@ from microscope_control.hardware.pycromanager import (
 )
 from microscope_command_server.server.protocol import ExtendedCommand, TCP_PORT, END_MARKER
 from microscope_command_server.acquisition.workflow import _acquisition_workflow
-from microscope_command_server.version_info import format_log_header
+from microscope_command_server.version_info import collect_versions, format_log_header
 
 
 # Configure logging - boot/pre-connection logging goes to console + fallback file
@@ -519,8 +519,11 @@ def handle_client(conn, addr):
                     # Start session logging to <config_dir>/logs/
                     _start_session_logging(config_path)
 
-                    # Send success response
-                    conn.sendall(b"CFG___OK")
+                    # Send success response with version info payload
+                    import json
+                    version_json = json.dumps(collect_versions()).encode("utf-8")
+                    version_length = struct.pack("!I", len(version_json))
+                    conn.sendall(b"CFG___OK" + version_length + version_json)
 
                 except FileNotFoundError as e:
                     error_msg = f"Config file not found: {config_path}"
