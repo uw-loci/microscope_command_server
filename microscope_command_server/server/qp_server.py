@@ -78,6 +78,7 @@ from microscope_control.hardware.pycromanager import (
 )
 from microscope_command_server.server.protocol import ExtendedCommand, TCP_PORT, END_MARKER
 from microscope_command_server.acquisition.workflow import _acquisition_workflow
+from microscope_command_server.version_info import format_log_header
 
 
 # Configure logging - boot/pre-connection logging goes to console + fallback file
@@ -134,6 +135,7 @@ def _start_session_logging(config_path: str) -> None:
         _session_log_handler = handler
 
         logger.info(f"Session logging started: {session_log_file}")
+        logger.info(format_log_header())
     except Exception as e:
         logger.error(f"Failed to start session logging: {e}", exc_info=True)
 
@@ -4125,6 +4127,7 @@ def main():
     logger.info("=" * 60)
     logger.info("Microscope Command Server")
     logger.info("=" * 60)
+    logger.info(format_log_header())
 
     # Check for existing server instance BEFORE attempting to bind
     logger.info("Checking for existing server instance...")

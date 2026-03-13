@@ -26,7 +26,11 @@ x, y = get_stageXY()
 move_stageXY(x + 1000, y + 1000)
 """
 
-__version__ = "1.0.0"
+try:
+    from importlib.metadata import version as _get_version
+    __version__ = _get_version("microscope-command-server")
+except Exception:
+    __version__ = "0.0.0.dev"
 __author__ = "Mike Nelson, Bin Li, Jenu Chacko"
 
 # Note: We use 'microscope_server' as the package name internally
