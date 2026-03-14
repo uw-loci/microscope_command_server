@@ -55,18 +55,218 @@ def _check_saturation(image, angle_name, log, threshold_pct=1.0):
         angle_name: Label for the image (e.g., angle or "background")
         log: Logger instance
         threshold_pct: Saturation warning threshold as percentage (default 1.0%)
+
+    Returns:
+        Dict with per-channel saturation percentages {'R': float, 'G': float, 'B': float},
+        or None if the image is invalid.
     """
     if image is None or image.ndim != 3 or image.shape[2] < 3:
-        return
+        return None
     total_px = image.shape[0] * image.shape[1]
+    result = {}
     for i, ch in enumerate(["R", "G", "B"]):
         sat_count = int(np.sum(image[:, :, i] >= 250))
         sat_pct = 100.0 * sat_count / total_px
+        result[ch] = sat_pct
         if sat_pct > threshold_pct:
             log.warning(
                 f"SATURATION WARNING [{angle_name}]: {ch} channel has "
                 f"{sat_pct:.1f}% saturated pixels ({sat_count}/{total_px})"
             )
+    return result
+
+
+class SaturationMonitor:
+    """Tracks per-angle saturation across tiles and enforces limits.
+
+    Birefringence angles (small off-crossed angles like +/-7 deg) should have
+    zero saturation -- saturated tissue images cannot be corrected and produce
+    tiling artifacts. If saturation is detected on the initial tiles, the
+    acquisition should abort early rather than waste hours producing unusable data.
+
+    The uncrossed angle (90 deg) inherently has high brightness and some
+    background saturation is acceptable. Warnings at this angle are rate-limited
+    to avoid flooding the log.
+    """
+
+    # Angles within this range of 90 are considered uncrossed
+    UNCROSSED_TOLERANCE = 2.0
+    # Default: abort if worst channel exceeds this on birefringence angles
+    BIREF_ABORT_THRESHOLD_PCT = 5.0
+    # Number of initial tiles to monitor before deciding to abort
+    MONITORING_WINDOW = 3
+    # For uncrossed angle, only log every Nth saturated tile
+    UNCROSSED_LOG_INTERVAL = 50
+
+    def __init__(self, angles, logger=None,
+                 biref_abort_threshold_pct=None,
+                 monitoring_window=None):
+        """Initialize the saturation monitor.
+
+        Args:
+            angles: List of acquisition angles in degrees
+            logger: Logger instance
+            biref_abort_threshold_pct: Override default abort threshold for
+                birefringence angles (percentage of pixels saturated)
+            monitoring_window: Override default number of initial tiles to check
+        """
+        self._log = logger or logging.getLogger(__name__)
+        self._angles = list(angles)
+
+        self._biref_threshold = (
+            biref_abort_threshold_pct
+            if biref_abort_threshold_pct is not None
+            else self.BIREF_ABORT_THRESHOLD_PCT
+        )
+        self._window = (
+            monitoring_window
+            if monitoring_window is not None
+            else self.MONITORING_WINDOW
+        )
+
+        # Per-angle tracking
+        self._tile_count = {a: 0 for a in self._angles}
+        self._saturated_tile_count = {a: 0 for a in self._angles}
+        self._worst_seen = {a: 0.0 for a in self._angles}
+        self._total_warnings_suppressed = {a: 0 for a in self._angles}
+        self._aborted = False
+        self._abort_reason = ""
+
+    def _is_uncrossed(self, angle: float) -> bool:
+        """Check if angle is the uncrossed position (near 90 deg)."""
+        return abs(abs(angle) - 90.0) < self.UNCROSSED_TOLERANCE
+
+    def check_tile(self, sat_result, angle, tile_idx, filename):
+        """Record saturation for a tile and determine if acquisition should abort.
+
+        Args:
+            sat_result: Dict from _check_saturation ({'R': pct, 'G': pct, 'B': pct})
+                       or None if image was invalid
+            angle: Acquisition angle in degrees
+            tile_idx: Position index (0-based)
+            filename: Tile filename for logging
+
+        Returns:
+            True if acquisition should abort due to excessive saturation,
+            False to continue.
+        """
+        if sat_result is None or self._aborted:
+            return self._aborted
+
+        worst = max(sat_result.values())
+        self._tile_count[angle] = self._tile_count.get(angle, 0) + 1
+        if worst > 1.0:
+            self._saturated_tile_count[angle] = (
+                self._saturated_tile_count.get(angle, 0) + 1
+            )
+        self._worst_seen[angle] = max(self._worst_seen.get(angle, 0.0), worst)
+
+        if self._is_uncrossed(angle):
+            return self._handle_uncrossed(sat_result, angle, tile_idx, filename)
+        else:
+            return self._handle_birefringence(sat_result, angle, tile_idx, filename)
+
+    def _handle_birefringence(self, sat_result, angle, tile_idx, filename):
+        """Handle saturation for birefringence angles -- abort on excessive saturation."""
+        worst = max(sat_result.values())
+        tile_num = self._tile_count[angle]
+
+        if worst > self._biref_threshold and tile_num <= self._window:
+            self._log.error(
+                f"SATURATION ABORT: tile {filename} at {angle} deg has "
+                f"{worst:.1f}% saturation (threshold: {self._biref_threshold:.1f}%). "
+                f"Tile {tile_num}/{self._window} in monitoring window. "
+                f"Per-channel: R={sat_result['R']:.1f}%, "
+                f"G={sat_result['G']:.1f}%, B={sat_result['B']:.1f}%"
+            )
+            # Check if ALL tiles in the window so far have exceeded threshold
+            if self._saturated_tile_count[angle] >= tile_num:
+                if tile_num >= self._window:
+                    self._aborted = True
+                    self._abort_reason = (
+                        f"All {self._window} initial tiles at {angle} deg exceeded "
+                        f"{self._biref_threshold:.1f}% saturation. "
+                        f"Worst: {self._worst_seen[angle]:.1f}%. "
+                        f"The calibration (gain/exposure) for this angle is too high "
+                        f"for the tissue being imaged. Recalibrate before re-acquiring."
+                    )
+                    self._log.error(f"=== ACQUISITION ABORTED: {self._abort_reason} ===")
+                    return True
+                else:
+                    self._log.warning(
+                        f"Saturation at {angle} deg: {tile_num}/{self._window} "
+                        f"monitoring tiles saturated -- will abort if all "
+                        f"{self._window} initial tiles are saturated"
+                    )
+        return False
+
+    def _handle_uncrossed(self, sat_result, angle, tile_idx, filename):
+        """Handle saturation for uncrossed angle -- rate-limit warnings."""
+        worst = max(sat_result.values())
+        if worst <= 1.0:
+            return False
+
+        count = self._saturated_tile_count[angle]
+        # Log first occurrence, then every Nth
+        if count == 1:
+            self._log.info(
+                f"Saturation at {angle} deg (uncrossed) is expected for bright "
+                f"backgrounds. Further warnings will be logged every "
+                f"{self.UNCROSSED_LOG_INTERVAL} tiles."
+            )
+        elif count % self.UNCROSSED_LOG_INTERVAL != 0:
+            self._total_warnings_suppressed[angle] = (
+                self._total_warnings_suppressed.get(angle, 0) + 1
+            )
+            return False
+        # Log periodic update
+        self._log.warning(
+            f"Saturation at {angle} deg (uncrossed): {count} of "
+            f"{self._tile_count[angle]} tiles saturated so far "
+            f"(worst: {self._worst_seen[angle]:.1f}%, "
+            f"current: R={sat_result['R']:.1f}%, "
+            f"G={sat_result['G']:.1f}%, B={sat_result['B']:.1f}%)"
+        )
+        return False
+
+    def log_summary(self):
+        """Log a final summary of saturation across all angles."""
+        any_saturation = False
+        for angle in self._angles:
+            total = self._tile_count.get(angle, 0)
+            saturated = self._saturated_tile_count.get(angle, 0)
+            if saturated > 0:
+                any_saturation = True
+                suppressed = self._total_warnings_suppressed.get(angle, 0)
+                label = "uncrossed" if self._is_uncrossed(angle) else "birefringence"
+                msg = (
+                    f"Saturation summary for {angle} deg ({label}): "
+                    f"{saturated}/{total} tiles had saturation >1%, "
+                    f"worst channel: {self._worst_seen[angle]:.1f}%"
+                )
+                if suppressed > 0:
+                    msg += f" ({suppressed} warnings suppressed)"
+                self._log.info(msg)
+        if not any_saturation:
+            self._log.info("Saturation summary: no saturation detected at any angle")
+
+    def should_suppress_warnings(self, angle: float) -> bool:
+        """Return True if per-tile SATURATION WARNING logs should be suppressed.
+
+        For uncrossed angles: suppress after the first tile (monitor handles
+        rate-limited logging instead). For birefringence angles: never suppress.
+        """
+        if not self._is_uncrossed(angle):
+            return False
+        return self._tile_count.get(angle, 0) >= 1
+
+    @property
+    def aborted(self) -> bool:
+        return self._aborted
+
+    @property
+    def abort_reason(self) -> str:
+        return self._abort_reason
 
 
 def load_jai_calibration_from_imageprocessing(
@@ -1653,17 +1853,17 @@ def _acquisition_workflow(
         # Include all information needed for accurate time estimation:
         # - timing_window_size: how many tiles to use for rolling average
         # - af_n_tiles: number of adaptive autofocus positions per annotation
-        # - total_tiles: total number of tile positions in this annotation
+        # - total_tiles: total number of images (positions * angles) to match Java progress counter units
         # - af_n_steps: number of Z-steps per autofocus operation (for reference)
         timing_metadata_path = output_path / "acquisition_metadata.txt"
         with open(timing_metadata_path, "w") as f:
             f.write(f"timing_window_size={timing_window_size}\n")
             f.write(f"af_n_tiles={af_n_tiles}\n")
-            f.write(f"total_tiles={len(positions)}\n")
+            f.write(f"total_tiles={total_images}\n")
             f.write(f"af_n_steps={af_n_steps}\n")
             f.write(f"objective={current_objective}\n")
         logger.info(f"Wrote timing metadata to {timing_metadata_path}: "
-                    f"window={timing_window_size}, af_positions={af_n_tiles}, tiles={len(positions)}")
+                    f"window={timing_window_size}, af_positions={af_n_tiles}, tiles={total_images}")
 
         af_positions, af_min_distance = AutofocusUtils.get_autofocus_positions(
             fov, xy_positions, n_tiles=af_n_tiles
@@ -1889,6 +2089,12 @@ def _acquisition_workflow(
                     return
 
             logger.info(f"=== Starting main acquisition loop ===")
+
+        # Initialize saturation monitor for adaptive abort/rate-limiting
+        sat_monitor = SaturationMonitor(
+            angles=params.get("angles", []),
+            logger=logger,
+        )
 
         # Main acquisition loop
         for pos_idx, (pos, filename) in enumerate(positions):
@@ -2307,7 +2513,24 @@ def _acquisition_workflow(
                     img_mean = image.mean((0,1))
                     t_stats = log_timing(logger, f"Calculate image stats at {angle}deg", t_stats)
                     logger.info(f"  Image shape: {image.shape}, mean: {img_mean}")
-                    _check_saturation(image, f"tile {filename} at {angle}deg", logger)
+                    # For uncrossed angles, suppress per-tile SATURATION WARNING
+                    # after the first occurrence -- the monitor handles rate-limiting
+                    sat_warn_threshold = (
+                        101.0 if sat_monitor.should_suppress_warnings(angle) else 1.0
+                    )
+                    sat_result = _check_saturation(
+                        image, f"tile {filename} at {angle}deg", logger,
+                        threshold_pct=sat_warn_threshold,
+                    )
+                    if sat_monitor.check_tile(sat_result, angle, pos_idx, filename):
+                        # Saturation abort triggered -- save what we have and stop
+                        logger.error(
+                            f"Stopping acquisition at position {pos_idx + 1}/"
+                            f"{len(positions)} due to saturation abort"
+                        )
+                        sat_monitor.log_summary()
+                        set_state("FAILED", sat_monitor.abort_reason)
+                        return
 
                     # Save raw (unprocessed) image for comparison
                     raw_output_path = output_path.parent / "Raw" / output_path.name
@@ -2358,7 +2581,10 @@ def _acquisition_workflow(
                             f"    Correction applied with method: {background_correction_method}"
                         )
                         logger.info(f"    Post-correction RGB means: {image.mean(axis=(0,1))}")
-                        _check_saturation(image, f"post-correction tile {filename} at {angle}deg", logger)
+                        # Use higher threshold for post-correction to reduce noise;
+                        # the raw check + monitor already handles abort decisions
+                        if not sat_monitor._is_uncrossed(angle):
+                            _check_saturation(image, f"post-correction tile {filename} at {angle}deg", logger)
                     elif background_correction_enabled and angle in background_disabled_angles:
                         logger.info(
                             f"  Background correction SKIPPED for {angle} deg (disabled by acquisition parameters - exposure mismatch or missing background)"
@@ -2514,6 +2740,7 @@ def _acquisition_workflow(
         final_z = hardware.get_current_position().z
         set_state("COMPLETED", final_z=final_z)
         logger.info("=== ACQUISITION COMPLETED SUCCESSFULLY ===")
+        sat_monitor.log_summary()
         logger.info(f"Final Z position: {final_z:.2f} um")
         logger.info(f"Total images saved: {image_count}/{total_images}")
         logger.info(f"Output directory: {output_path}")
