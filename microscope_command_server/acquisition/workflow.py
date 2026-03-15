@@ -1943,13 +1943,19 @@ def _acquisition_workflow(
                                 .get("uncrossed", {})
                                 .get("gains", {})
                             )
+                            # Reset unified gain to uncrossed value (typically 1.0).
+                            # Previous angle may have set gain to 2.0x+ which persists
+                            # after disable_individual_gain(), causing saturation.
+                            af_unified_gain = uncrossed_gains.get("unified_gain", 1.0)
+                            jai_props.set_unified_gain(af_unified_gain)
                             af_analog_red = uncrossed_gains.get("analog_red", 1.0)
                             af_analog_blue = uncrossed_gains.get("analog_blue", 1.0)
                             jai_props.set_rb_analog_gains(
                                 red=af_analog_red, blue=af_analog_blue
                             )
                             logger.info(
-                                "Applied uncrossed calibration analog gains for AF: "
+                                "Applied uncrossed calibration for AF: "
+                                f"gain={af_unified_gain:.2f}x, "
                                 f"R={af_analog_red:.3f}, B={af_analog_blue:.3f}"
                             )
                     except (ImportError, Exception) as e:
@@ -2154,6 +2160,10 @@ def _acquisition_workflow(
                                     .get("uncrossed", {})
                                     .get("gains", {})
                                 )
+                                # Reset unified gain to uncrossed value (typically 1.0).
+                                # Previous angle leaves gain at 2.0x+, causing saturation.
+                                af_unified_gain = uncrossed_gains.get("unified_gain", 1.0)
+                                jai_props.set_unified_gain(af_unified_gain)
                                 jai_props.set_rb_analog_gains(
                                     red=uncrossed_gains.get("analog_red", 1.0),
                                     blue=uncrossed_gains.get("analog_blue", 1.0),
