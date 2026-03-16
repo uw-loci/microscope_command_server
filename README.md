@@ -232,4 +232,8 @@ See the `microscope_control` and `ppm_library` documentation for details on thes
 
 ## License
 
-MIT License
+MIT License - see [LICENSE](LICENSE) for details.
+
+## AI-Assisted Development
+
+This project was developed with assistance from [Claude](https://claude.ai) (Anthropic). Claude was used as a development tool for code generation, architecture design, debugging, and documentation throughout the project.
