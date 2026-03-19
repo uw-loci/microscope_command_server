@@ -103,3 +103,7 @@ class ExtendedCommand:
     GETFRAME = b"getframe"  # Get latest frame from MM circular buffer
     STRTSEQ = b"strtseq_"  # Start continuous sequence acquisition (core-level)
     STOPSEQ = b"stopseq_"  # Stop continuous sequence acquisition (core-level)
+
+    # Sweep Focus Commands
+    MOVZNW = b"movznw__"  # Move Z non-blocking (no wait_for_device) - for sweep focus
+    GETZF = b"getzf___"  # Get Z position only (fast, no X/Y read) - for sweep focus

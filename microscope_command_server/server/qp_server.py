@@ -664,6 +664,25 @@ def handle_client(conn, addr):
                     logger.error(f"Failed to move to Z position: {e}", exc_info=True)
                 continue
 
+            if data == ExtendedCommand.MOVZNW:
+                z = conn.recv(4)
+                z_position = struct.unpack("!f", z)[0]
+                logger.debug(f"Client {addr} non-blocking Z move to {z_position}")
+                try:
+                    hardware.set_z_no_wait(z_position)
+                except Exception as e:
+                    logger.error(f"Failed non-blocking Z move: {e}", exc_info=True)
+                continue
+
+            if data == ExtendedCommand.GETZF:
+                try:
+                    z = hardware.get_z_position()
+                    conn.sendall(struct.pack("!f", z))
+                except Exception as e:
+                    logger.error(f"Failed fast Z read: {e}", exc_info=True)
+                    conn.sendall(struct.pack("!f", 0.0))
+                continue
+
             if data == ExtendedCommand.MOVER:
                 coords = conn.recv(4)
                 angle = struct.unpack("!f", coords)[0]
