@@ -24,6 +24,7 @@ from ppm_library.imaging.writer import TifWriterUtils
 from ppm_library.imaging.background import BackgroundCorrectionUtils
 import shlex
 import skimage.filters
+from concurrent.futures import ThreadPoolExecutor, Future
 
 logger = logging.getLogger(__name__)
 
@@ -879,6 +880,67 @@ def load_and_apply_white_balance_settings(
         if logger:
             logger.warning(f"Failed to load white balance settings: {e}")
         return False
+
+
+class _TileWritePool:
+    """Bounded background thread pool for overlapping TIFF writes with hardware ops.
+
+    Pending writes are drained at each autofocus check position, which runs every
+    N tiles (N >= 1, enforced by af_n_tiles validation). This bounds the write
+    queue to at most N tiles worth of images between drain points.
+
+    During autofocus (1-5s of in-memory hardware ops), pending writes execute in
+    parallel with full disk bandwidth, so drain() after AF is usually instant.
+    """
+
+    def __init__(self, max_workers: int = 2):
+        self._executor = ThreadPoolExecutor(
+            max_workers=max_workers, thread_name_prefix="tile_io"
+        )
+        self._pending: List[Future] = []
+        self._failed_count = 0
+
+    def submit(self, fn, *args, **kwargs):
+        """Submit a write operation to the background pool."""
+        future = self._executor.submit(fn, *args, **kwargs)
+        self._pending.append(future)
+
+    def drain(self, timeout_per_write: float = 30.0):
+        """Wait for all pending writes to complete. Log errors but don't raise.
+
+        Args:
+            timeout_per_write: Seconds to wait per individual write before warning.
+
+        Returns:
+            Number of failed writes since last drain.
+        """
+        failed = 0
+        for future in self._pending:
+            try:
+                future.result(timeout=timeout_per_write)
+            except Exception as e:
+                failed += 1
+                self._failed_count += 1
+                logger.error(f"Background TIFF write failed: {e}")
+        self._pending.clear()
+        return failed
+
+    @property
+    def pending_count(self) -> int:
+        return len(self._pending)
+
+    @property
+    def total_failed(self) -> int:
+        return self._failed_count
+
+    def shutdown(self):
+        """Drain remaining writes and shut down the pool."""
+        if self._pending:
+            logger.info(
+                f"Shutting down write pool, draining {len(self._pending)} pending writes..."
+            )
+            self.drain(timeout_per_write=60.0)
+        self._executor.shutdown(wait=True)
 
 
 def log_timing(logger, operation_name, start_time):
@@ -1835,6 +1897,17 @@ def _acquisition_workflow(
             set_state("FAILED", error_msg)
             return
 
+        # Validate af_n_tiles >= 1.
+        # This invariant is required by the overlapped I/O system: pending TIFF
+        # writes are drained at each autofocus check position, so there must
+        # always be at least one AF position per acquisition.
+        if af_n_tiles < 1:
+            logger.warning(
+                f"af_n_tiles={af_n_tiles} is below minimum (1), clamping to 1. "
+                f"At least 1 AF position is required for overlapped I/O drain."
+            )
+            af_n_tiles = max(1, af_n_tiles)
+
         # Map score metric name to function
         score_metric_map = {
             "laplacian_variance": AutofocusUtils.autofocus_profile_laplacian_variance,
@@ -2107,6 +2180,12 @@ def _acquisition_workflow(
             logger=logger,
         )
 
+        # Initialize background write pool for overlapped I/O.
+        # TIFF writes are submitted here and execute in parallel with hardware ops.
+        # Pending writes are drained at each autofocus check (every af_n_tiles tiles),
+        # which runs in-memory (no disk I/O), giving writes full disk bandwidth.
+        write_pool = _TileWritePool(max_workers=2)
+
         # Main acquisition loop
         for pos_idx, (pos, filename) in enumerate(positions):
             # Check for cancellation
@@ -2336,6 +2415,15 @@ def _acquisition_workflow(
                     else:
                         logger.warning(f"Could not find suitable position to defer autofocus to")
 
+                # Drain pending background TIFF writes. Autofocus runs entirely
+                # in memory (snap + focus score), so pending writes had full disk
+                # bandwidth during the 1-5s AF operation. Drain is usually instant.
+                if write_pool.pending_count > 0:
+                    t_drain = time.perf_counter()
+                    n_drained = write_pool.pending_count
+                    failed = write_pool.drain()
+                    t_drain = log_timing(logger, f"Drain {n_drained} pending writes ({failed} failed)", t_drain)
+
                 # Restore per-channel exposure/gain mode after autofocus.
                 # Autofocus disabled per-channel mode to use unified exposure.
                 # Re-enable now and apply first angle's calibration to ensure the camera
@@ -2558,19 +2646,23 @@ def _acquisition_workflow(
                         t_mkdir = log_timing(logger, f"Create directories at {angle}deg", t_mkdir)
 
                         try:
-                            t_save_raw = time.perf_counter()
-                            TifWriterUtils.ome_writer(  # raw
-                                filename=str(raw_image_path),
-                                pixel_size_um=hardware.core.get_pixel_size_um(),
-                                data=image,
-                            )
-                            t_save_raw = log_timing(logger, f"Save raw image at {angle}deg (OME-TIFF write)", t_save_raw)
-                            logger.info(f"  Saved raw image: {raw_image_path}")
+                            # Write position metadata synchronously (reads hardware state)
                             write_position_metadata(
                                 metadata_txt_for_positions, raw_image_path, hardware, modality
                             )
+                            # Submit raw TIFF write to background pool.
+                            # Safe: apply_flat_field_correction creates a NEW array,
+                            # so the raw `image` array is never modified after this point.
+                            raw_pixel_size = hardware.core.get_pixel_size_um()
+                            write_pool.submit(
+                                TifWriterUtils.ome_writer,
+                                filename=str(raw_image_path),
+                                pixel_size_um=raw_pixel_size,
+                                data=image,
+                            )
+                            logger.info(f"  Queued raw image write: {raw_image_path}")
                         except Exception as e:
-                            logger.warning(f"  Failed to save raw image: {e}")
+                            logger.warning(f"  Failed to queue raw image: {e}")
 
                     # ======= APPLY BACKGROUND CORRECTION (STEP 1) =======
                     # Check if background correction is enabled, background exists, and angle is not disabled
@@ -2639,21 +2731,26 @@ def _acquisition_workflow(
                             f"  Software WB skipped (hardware WB active for {angle} deg, mode={wb_mode})"
                         )
 
-                    # Save processed image
+                    # Save processed image (background write)
                     image_path = output_path / str(angle) / filename
 
                     if image_path.parent.exists():
-                        t_save_proc = time.perf_counter()
-                        TifWriterUtils.ome_writer(  # processed
+                        # Submit processed TIFF write to background pool.
+                        # Safe: `image` is a new array from background correction / white
+                        # balance (both return new arrays). The next angle's snap_image()
+                        # creates yet another new array, so no mutation risk.
+                        proc_pixel_size = hardware.core.get_pixel_size_um()
+                        write_pool.submit(
+                            TifWriterUtils.ome_writer,
                             filename=str(image_path),
-                            pixel_size_um=hardware.core.get_pixel_size_um(),
+                            pixel_size_um=proc_pixel_size,
                             data=image,
                         )
-                        t_save_proc = log_timing(logger, f"Save processed image at {angle}deg", t_save_proc)
                         image_count += 1
                         update_progress(image_count, total_images)
 
-                        # Store image for birefringence calculation
+                        # Store image for birefringence calculation.
+                        # Concurrent read by biref + TIFF writer is safe (both read-only).
                         angle_images[angle] = image
 
                         # Log total time for this angle
@@ -2678,22 +2775,22 @@ def _acquisition_workflow(
                     biref_dir = output_path / f"{pos_angle}.biref"
                     tile_config_source = output_path / str(pos_angle) / "TileConfiguration.txt"
 
-                    # Create normalized birefringence image
-                    # Uses [I(+) - I(-)]/[I(+) + I(-)] to suppress H&E staining variations
-                    t_biref = time.perf_counter()
-                    try:
-                        TifWriterUtils.create_normalized_birefringence_tile(
-                            pos_image=angle_images[pos_angle],
-                            neg_image=angle_images[neg_angle],
-                            output_dir=biref_dir,
-                            filename=filename,
-                            pixel_size_um=hardware.core.get_pixel_size_um(),
-                            tile_config_source=tile_config_source,
-                            logger=logger,
-                        )
-                        t_biref = log_timing(logger, f"Normalized birefringence calculation and save", t_biref)
-                    except Exception as e:
-                        logger.error(f"Failed to create birefringence tile {filename}: {e}", exc_info=True)
+                    # Submit birefringence compute+save to background pool.
+                    # Reads angle_images arrays concurrently with pending processed
+                    # writes -- both are read-only, so this is safe.
+                    biref_pixel_size = hardware.core.get_pixel_size_um()
+                    biref_pos_img = angle_images[pos_angle]
+                    biref_neg_img = angle_images[neg_angle]
+                    write_pool.submit(
+                        TifWriterUtils.create_normalized_birefringence_tile,
+                        pos_image=biref_pos_img,
+                        neg_image=biref_neg_img,
+                        output_dir=biref_dir,
+                        filename=filename,
+                        pixel_size_um=biref_pixel_size,
+                        tile_config_source=tile_config_source,
+                        logger=logger,
+                    )
                 else:
                     logger.warning(
                         f"Skipping birefringence for tile {filename}: "
@@ -2719,9 +2816,12 @@ def _acquisition_workflow(
                 image_path = output_path / filename
 
                 if image_path.parent.exists():
-                    TifWriterUtils.ome_writer(  # brightfield
+                    # Submit brightfield TIFF write to background pool
+                    bf_pixel_size = hardware.core.get_pixel_size_um()
+                    write_pool.submit(
+                        TifWriterUtils.ome_writer,
                         filename=str(image_path),
-                        pixel_size_um=hardware.core.get_pixel_size_um(),
+                        pixel_size_um=bf_pixel_size,
                         data=image,
                     )
                     image_count += 1
@@ -2739,6 +2839,16 @@ def _acquisition_workflow(
             # Log total time for this tile/position
             tile_elapsed_ms = (time.perf_counter() - tile_start) * 1000
             logger.info(f"[TIMING] === TOTAL TILE TIME: {tile_elapsed_ms:.1f}ms ({tile_elapsed_ms/1000:.2f}s) ===")
+
+        # Drain any remaining background writes before finalizing
+        if write_pool.pending_count > 0:
+            t_drain = time.perf_counter()
+            n_remaining = write_pool.pending_count
+            logger.info(f"Draining {n_remaining} remaining background writes...")
+            failed = write_pool.drain()
+            t_drain = log_timing(logger, f"Final drain of {n_remaining} writes ({failed} failed)", t_drain)
+        if write_pool.total_failed > 0:
+            logger.warning(f"Total background write failures during acquisition: {write_pool.total_failed}")
 
         # Save device properties
         current_props = hardware.get_device_properties()
@@ -2775,6 +2885,14 @@ def _acquisition_workflow(
         logger.error(f"Error: {str(e)}", exc_info=True)
         set_state("FAILED", str(e))
     finally:
+        # Shut down background write pool (drains any remaining writes)
+        try:
+            write_pool.shutdown()
+        except NameError:
+            pass  # write_pool was never created (early failure)
+        except Exception as e:
+            logger.warning(f"Error shutting down write pool: {e}")
+
         # Return to starting position if it was captured
         try:
             logger.info("Returning to starting position")
