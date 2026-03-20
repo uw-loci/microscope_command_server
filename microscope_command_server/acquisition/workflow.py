@@ -1140,6 +1140,9 @@ def parse_acquisition_message(message: str) -> dict:
             elif parts[i] == "--af-range" and i + 1 < len(parts):
                 params["autofocus_range"] = float(parts[i + 1])
                 i += 2
+            elif parts[i] == "--save-raw" and i + 1 < len(parts):
+                params["save_raw"] = parts[i + 1].lower() == "true"
+                i += 2
             elif parts[i] == "--processing" and i + 1 < len(parts):
                 params["processing_pipeline"] = parts[i + 1]
                 i += 2
@@ -1365,6 +1368,8 @@ def _acquisition_workflow(
         background_correction_method = params.get("background_correction_method", "divide")
         background_disabled_angles = params.get("background_disabled_angles", [])
         white_balance_enabled = params.get("white_balance_enabled", True)
+        save_raw_tiles = params.get("save_raw", False)
+        logger.info(f"Save raw tiles: {save_raw_tiles}")
 
         # Log background correction configuration
         if background_correction_enabled:
@@ -2542,29 +2547,30 @@ def _acquisition_workflow(
                         set_state("FAILED", sat_monitor.abort_reason)
                         return
 
-                    # Save raw (unprocessed) image for comparison
-                    raw_output_path = output_path.parent / "Raw" / output_path.name
-                    raw_image_path = raw_output_path / str(angle) / filename
+                    # Save raw (unprocessed) image for comparison (only if enabled)
+                    if save_raw_tiles:
+                        raw_output_path = output_path.parent / "Raw" / output_path.name
+                        raw_image_path = raw_output_path / str(angle) / filename
 
-                    t_mkdir = time.perf_counter()
-                    if not raw_image_path.parent.exists():
-                        raw_image_path.parent.mkdir(parents=True, exist_ok=True)
-                    t_mkdir = log_timing(logger, f"Create directories at {angle}deg", t_mkdir)
+                        t_mkdir = time.perf_counter()
+                        if not raw_image_path.parent.exists():
+                            raw_image_path.parent.mkdir(parents=True, exist_ok=True)
+                        t_mkdir = log_timing(logger, f"Create directories at {angle}deg", t_mkdir)
 
-                    try:
-                        t_save_raw = time.perf_counter()
-                        TifWriterUtils.ome_writer(  # raw
-                            filename=str(raw_image_path),
-                            pixel_size_um=hardware.core.get_pixel_size_um(),
-                            data=image,
-                        )
-                        t_save_raw = log_timing(logger, f"Save raw image at {angle}deg (OME-TIFF write)", t_save_raw)
-                        logger.info(f"  Saved raw image: {raw_image_path}")
-                        write_position_metadata(
-                            metadata_txt_for_positions, raw_image_path, hardware, modality
-                        )
-                    except Exception as e:
-                        logger.warning(f"  Failed to save raw image: {e}")
+                        try:
+                            t_save_raw = time.perf_counter()
+                            TifWriterUtils.ome_writer(  # raw
+                                filename=str(raw_image_path),
+                                pixel_size_um=hardware.core.get_pixel_size_um(),
+                                data=image,
+                            )
+                            t_save_raw = log_timing(logger, f"Save raw image at {angle}deg (OME-TIFF write)", t_save_raw)
+                            logger.info(f"  Saved raw image: {raw_image_path}")
+                            write_position_metadata(
+                                metadata_txt_for_positions, raw_image_path, hardware, modality
+                            )
+                        except Exception as e:
+                            logger.warning(f"  Failed to save raw image: {e}")
 
                     # ======= APPLY BACKGROUND CORRECTION (STEP 1) =======
                     # Check if background correction is enabled, background exists, and angle is not disabled

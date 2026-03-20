@@ -123,8 +123,15 @@ def _start_session_logging(config_path: str) -> None:
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         session_log_file = session_log_dir / f"server_session_{timestamp}.log"
 
-        # Create a handler that flushes immediately via a custom emit override
-        handler = logging.FileHandler(session_log_file, encoding="utf-8")
+        # Create a handler that flushes after every log record.
+        # Without this, Python buffers log output and an 18-hour acquisition
+        # can lose all diagnostic data if the server crashes.
+        class FlushingFileHandler(logging.FileHandler):
+            def emit(self, record):
+                super().emit(record)
+                self.flush()
+
+        handler = FlushingFileHandler(session_log_file, encoding="utf-8")
         handler.setLevel(logging.DEBUG)
         handler.setFormatter(logging.Formatter(
             "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
