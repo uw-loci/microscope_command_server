@@ -261,6 +261,30 @@ class SaturationMonitor:
             return False
         return self._tile_count.get(angle, 0) >= 1
 
+    def get_summary_string(self) -> str:
+        """Return a compact saturation summary for protocol transmission.
+
+        Format: semicolon-separated entries per angle:
+          angle:saturated/total:worst_pct;angle:saturated/total:worst_pct
+        Example: "7.0:3/2404:21.6;-7.0:108/2404:49.6;90.0:0/2404:0.0"
+
+        Returns empty string if no saturation data available.
+        """
+        if not self._angles:
+            return ""
+        parts = []
+        for angle in self._angles:
+            total = self._tile_count.get(angle, 0)
+            saturated = self._saturated_tile_count.get(angle, 0)
+            worst = self._worst_seen.get(angle, 0.0)
+            parts.append(f"{angle}:{saturated}/{total}:{worst:.1f}")
+        return ";".join(parts)
+
+    @property
+    def has_saturation(self) -> bool:
+        """Return True if any angle had saturation >1%."""
+        return any(self._saturated_tile_count.get(a, 0) > 0 for a in self._angles)
+
     @property
     def aborted(self) -> bool:
         return self._aborted
@@ -2903,7 +2927,8 @@ def _acquisition_workflow(
 
         # Get final Z position for tilt correction model
         final_z = hardware.get_current_position().z
-        set_state("COMPLETED", final_z=final_z)
+        sat_summary = sat_monitor.get_summary_string()
+        set_state("COMPLETED", final_z=final_z, saturation_summary=sat_summary)
         logger.info("=== ACQUISITION COMPLETED SUCCESSFULLY ===")
         sat_monitor.log_summary()
         logger.info(f"Final Z position: {final_z:.2f} um")
