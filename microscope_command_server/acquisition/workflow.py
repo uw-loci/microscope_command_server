@@ -133,11 +133,15 @@ class SaturationMonitor:
         self._aborted = False
         self._abort_reason = ""
 
+        # Per-tile detail records for saturated tiles
+        # Each entry: {filename, angle, pos_idx, r_pct, g_pct, b_pct, stage_x, stage_y}
+        self._saturated_tiles = []
+
     def _is_uncrossed(self, angle: float) -> bool:
         """Check if angle is the uncrossed position (near 90 deg)."""
         return abs(abs(angle) - 90.0) < self.UNCROSSED_TOLERANCE
 
-    def check_tile(self, sat_result, angle, tile_idx, filename):
+    def check_tile(self, sat_result, angle, tile_idx, filename, stage_x=None, stage_y=None):
         """Record saturation for a tile and determine if acquisition should abort.
 
         Args:
@@ -146,6 +150,8 @@ class SaturationMonitor:
             angle: Acquisition angle in degrees
             tile_idx: Position index (0-based)
             filename: Tile filename for logging
+            stage_x: Optional stage X position in microns (for saturation report)
+            stage_y: Optional stage Y position in microns (for saturation report)
 
         Returns:
             True if acquisition should abort due to excessive saturation,
@@ -160,6 +166,18 @@ class SaturationMonitor:
             self._saturated_tile_count[angle] = (
                 self._saturated_tile_count.get(angle, 0) + 1
             )
+            # Record detail for saturated tile
+            self._saturated_tiles.append({
+                "filename": filename,
+                "angle": angle,
+                "pos_idx": tile_idx,
+                "r_pct": round(sat_result.get("R", 0.0), 1),
+                "g_pct": round(sat_result.get("G", 0.0), 1),
+                "b_pct": round(sat_result.get("B", 0.0), 1),
+                "worst_pct": round(worst, 1),
+                "stage_x": round(stage_x, 2) if stage_x is not None else None,
+                "stage_y": round(stage_y, 2) if stage_y is not None else None,
+            })
         self._worst_seen[angle] = max(self._worst_seen.get(angle, 0.0), worst)
 
         if self._is_uncrossed(angle):
@@ -260,6 +278,48 @@ class SaturationMonitor:
         if not self._is_uncrossed(angle):
             return False
         return self._tile_count.get(angle, 0) >= 1
+
+    def write_saturation_report(self, output_path) -> str:
+        """Write per-tile saturation details to a JSON file.
+
+        Args:
+            output_path: Acquisition output directory (Path or str)
+
+        Returns:
+            Path to the written report file, or None if no saturated tiles
+        """
+        import json
+
+        if not self._saturated_tiles:
+            return None
+
+        output_path = Path(output_path) if isinstance(output_path, str) else output_path
+        report_path = output_path / "saturation_report.json"
+
+        report = {
+            "summary": {
+                angle: {
+                    "total_tiles": self._tile_count.get(angle, 0),
+                    "saturated_tiles": self._saturated_tile_count.get(angle, 0),
+                    "worst_pct": round(self._worst_seen.get(angle, 0.0), 1),
+                    "is_uncrossed": self._is_uncrossed(angle),
+                }
+                for angle in self._angles
+            },
+            "saturated_tiles": self._saturated_tiles,
+        }
+
+        try:
+            with open(report_path, "w") as f:
+                json.dump(report, f, indent=2)
+            self._log.info(
+                f"Wrote saturation report with {len(self._saturated_tiles)} "
+                f"saturated tile entries to {report_path}"
+            )
+            return str(report_path)
+        except Exception as e:
+            self._log.error(f"Failed to write saturation report: {e}")
+            return None
 
     def get_summary_string(self) -> str:
         """Return a compact saturation summary for protocol transmission.
@@ -2688,7 +2748,10 @@ def _acquisition_workflow(
                         image, f"tile {filename} at {angle}deg", logger,
                         threshold_pct=sat_warn_threshold,
                     )
-                    if sat_monitor.check_tile(sat_result, angle, pos_idx, filename):
+                    if sat_monitor.check_tile(
+                        sat_result, angle, pos_idx, filename,
+                        stage_x=current_stage_pos.x, stage_y=current_stage_pos.y
+                    ):
                         # Saturation abort triggered -- save what we have and stop
                         logger.error(
                             f"Stopping acquisition at position {pos_idx + 1}/"
@@ -2924,6 +2987,9 @@ def _acquisition_workflow(
         # Write TileConfiguration with stage coordinates including Z
         if stage_positions_collected:
             TileConfigUtils.write_tileconfig_stage(output_path, stage_positions_collected)
+
+        # Write saturation report file (per-tile details for Java UI)
+        sat_monitor.write_saturation_report(output_path)
 
         # Get final Z position for tilt correction model
         final_z = hardware.get_current_position().z
