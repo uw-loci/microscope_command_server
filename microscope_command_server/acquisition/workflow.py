@@ -1455,14 +1455,22 @@ def _acquisition_workflow(
             z_end = params.get("z_end")
             z_step = params.get("z_step")
             z_pixel_size = params.get("z_pixel_size_um")
-            logger.info(
-                f"Z-stack parameters received: start={z_start}, end={z_end}, "
-                f"step={z_step}, pixel_size_z={z_pixel_size} um"
-            )
-            logger.warning(
-                "Z-stack acquisition is not yet implemented. "
-                "Parameters are parsed but the acquisition loop will run in 2D mode."
-            )
+            if z_start is None or z_end is None or z_step is None:
+                logger.warning(
+                    f"Z-stack enabled but incomplete parameters: "
+                    f"start={z_start}, end={z_end}, step={z_step}. "
+                    f"Ignoring z-stack and continuing in 2D mode."
+                )
+                z_stack_enabled = False
+            else:
+                logger.info(
+                    f"Z-stack parameters received: start={z_start}, end={z_end}, "
+                    f"step={z_step}, pixel_size_z={z_pixel_size} um"
+                )
+                logger.warning(
+                    "Z-stack acquisition is not yet implemented. "
+                    "Parameters are parsed but the acquisition loop will run in 2D mode."
+                )
 
         # Log background correction configuration
         if background_correction_enabled:
