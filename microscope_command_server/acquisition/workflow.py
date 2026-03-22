@@ -1211,6 +1211,21 @@ def parse_acquisition_message(message: str) -> dict:
             elif parts[i] == "--hint-z" and i + 1 < len(parts):
                 params["hint_z"] = float(parts[i + 1])
                 i += 2
+            elif parts[i] == "--z-stack":
+                params["z_stack"] = True
+                i += 1
+            elif parts[i] == "--z-start" and i + 1 < len(parts):
+                params["z_start"] = float(parts[i + 1])
+                i += 2
+            elif parts[i] == "--z-end" and i + 1 < len(parts):
+                params["z_end"] = float(parts[i + 1])
+                i += 2
+            elif parts[i] == "--z-step" and i + 1 < len(parts):
+                params["z_step"] = float(parts[i + 1])
+                i += 2
+            elif parts[i] == "--z-pixel-size" and i + 1 < len(parts):
+                params["z_pixel_size_um"] = float(parts[i + 1])
+                i += 2
             else:
                 i += 1
 
@@ -1432,6 +1447,22 @@ def _acquisition_workflow(
         white_balance_enabled = params.get("white_balance_enabled", True)
         save_raw_tiles = params.get("save_raw", False)
         logger.info(f"Save raw tiles: {save_raw_tiles}")
+
+        # Z-stack parameters (infrastructure only -- acquisition loop not yet implemented)
+        z_stack_enabled = params.get("z_stack", False)
+        if z_stack_enabled:
+            z_start = params.get("z_start")
+            z_end = params.get("z_end")
+            z_step = params.get("z_step")
+            z_pixel_size = params.get("z_pixel_size_um")
+            logger.info(
+                f"Z-stack parameters received: start={z_start}, end={z_end}, "
+                f"step={z_step}, pixel_size_z={z_pixel_size} um"
+            )
+            logger.warning(
+                "Z-stack acquisition is not yet implemented. "
+                "Parameters are parsed but the acquisition loop will run in 2D mode."
+            )
 
         # Log background correction configuration
         if background_correction_enabled:

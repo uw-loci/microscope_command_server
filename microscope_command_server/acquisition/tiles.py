@@ -86,6 +86,8 @@ class TileConfigUtils:
         id1: int = 0,
         suffix_length: int = 3,
         tileconfig_path: Optional[str] = None,
+        z_positions: Optional[list] = None,
+        pixel_size_z_um: Optional[float] = None,
     ):
         """
         Write a TileConfiguration.txt file.
@@ -94,10 +96,13 @@ class TileConfigUtils:
             target_foldername: Folder to create file in
             positions: List of (x, y) positions in micrometers
             filename: Name of output file (default: TileConfiguration.txt)
-            pixel_size_um: Pixel size in micrometers for scaling coordinates
+            pixel_size_um: XY pixel size in micrometers for scaling coordinates
             id1: Starting index for tile numbering
             suffix_length: Number of digits for tile index
             tileconfig_path: Direct path to output file (overrides target_foldername/filename)
+            z_positions: Optional list of Z positions (um) per tile. When provided, writes dim=3.
+            pixel_size_z_um: Optional Z pixel size for scaling Z coordinates. When None, Z values
+                are written in micrometers (unscaled).
         """
         # If direct path provided, use it; otherwise construct from folder + filename
         if tileconfig_path is None and target_foldername is not None:
@@ -111,16 +116,27 @@ class TileConfigUtils:
             min_suffix_length = len(str(last_tile_index))
             actual_suffix_length = max(suffix_length, min_suffix_length)
 
+            has_z = z_positions is not None and len(z_positions) == num_tiles
+            dim = 3 if has_z else 2
+            z_scale = pixel_size_z_um if pixel_size_z_um else 1.0
+
             with open(tileconfig_path, "w") as text_file:
-                print("dim = {}".format(2), file=text_file)
+                print(f"dim = {dim}", file=text_file)
                 for ix, pos in enumerate(positions):
                     tile_index = id1 + ix
                     file_id = f"tile_{tile_index:0{actual_suffix_length}d}"
                     x, y = pos
-                    print(
-                        f"{file_id}.tif; ; ({x / pixel_size_um:.1f}, {y / pixel_size_um:.1f})",
-                        file=text_file,
-                    )
+                    if has_z:
+                        z = z_positions[ix]
+                        print(
+                            f"{file_id}.tif; ; ({x / pixel_size_um:.1f}, {y / pixel_size_um:.1f}, {z / z_scale:.1f})",
+                            file=text_file,
+                        )
+                    else:
+                        print(
+                            f"{file_id}.tif; ; ({x / pixel_size_um:.1f}, {y / pixel_size_um:.1f})",
+                            file=text_file,
+                        )
 
     @staticmethod
     def write_tileconfig_stage(

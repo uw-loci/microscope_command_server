@@ -585,6 +585,30 @@ def handle_client(conn, addr):
                     conn.sendall(error_msg.encode("utf-8"))
                 continue
 
+            if data == ExtendedCommand.GETXYZ:
+                logger.debug(f"Client {addr} requested XYZ position")
+                try:
+                    pos = hardware.get_current_position()
+                    response = struct.pack("!fff", pos.x, pos.y, pos.z)
+                    conn.sendall(response)
+                    logger.debug(f"Sent XYZ to {addr}: ({pos.x}, {pos.y}, {pos.z})")
+                except Exception as e:
+                    logger.error(f"Failed to get XYZ position: {e}", exc_info=True)
+                    error_response = struct.pack("!fff", 0.0, 0.0, 0.0)
+                    conn.sendall(error_response)
+                continue
+
+            if data == ExtendedCommand.MOVEXYZ:
+                xyz_data = conn.recv(12)  # 3 floats x 4 bytes
+                x, y, z = struct.unpack("!fff", xyz_data)
+                logger.info(f"Client {addr} requested move to XYZ=({x}, {y}, {z})")
+                try:
+                    hardware.move_to_position(Position(x, y, z))
+                    logger.info(f"Successfully moved to XYZ: ({x}, {y}, {z})")
+                except Exception as e:
+                    logger.error(f"Failed to move to XYZ ({x}, {y}, {z}): {e}", exc_info=True)
+                continue
+
             if data == ExtendedCommand.GETFOV:
                 logger.debug(f"Client {addr} requested Field of View")
 
