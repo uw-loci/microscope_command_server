@@ -2325,14 +2325,23 @@ def _acquisition_workflow(
             # Ensure Z is current autofocus value
             pos.z = hardware.get_current_position().z
 
-            # Move to position
+            # Move to position -- use non-blocking XY when no autofocus is
+            # needed so the first angle's rotation+exposure can overlap.
+            needs_af = pos_idx in dynamic_af_positions
             logger.info(f"Moving to position: X={pos.x}, Y={pos.y}, Z={pos.z}")
             t0 = time.perf_counter()
-            hardware.move_to_position(pos)
+            if needs_af:
+                # Blocking move -- AF needs the stage settled first
+                hardware.move_to_position(pos)
+            else:
+                # Non-blocking XY -- we'll wait before the first snap
+                hardware.move_xy_no_wait(pos.x, pos.y)
+                # Z is already at the correct focus position
+            xy_move_pending = not needs_af
             t0 = log_timing(logger, "Stage XY movement command", t0)
 
             # Perform autofocus if needed (with tissue detection)
-            if pos_idx in dynamic_af_positions:
+            if needs_af:
                 logger.info(
                     f"Checking for autofocus at position {pos_idx}: X={pos.x}, Y={pos.y}, Z={pos.z}"
                 )
@@ -2467,44 +2476,17 @@ def _acquisition_workflow(
                         # Get Z position before adaptive autofocus for drift detection
                         z_before_adaptive = hardware.get_current_position().z
 
-                        logger.info(f"  Subsequent tissue position - using ADAPTIVE autofocus for speed")
+                        logger.info(f"  Subsequent tissue position - using SWEEP drift check for speed")
                         t_af = time.perf_counter()
-                        new_z = hardware.autofocus_adaptive_search(
-                            initial_step_size=af_adaptive_initial_step,
-                            min_step_size=af_adaptive_min_step,
-                            focus_threshold=af_adaptive_focus_threshold,
-                            max_total_steps=af_adaptive_max_steps,
+                        new_z = hardware.autofocus_sweep_drift_check(
+                            range_um=af_adaptive_initial_step * 2,
+                            n_steps=10,
                             score_metric=af_score_metric,
-                            pop_a_plot=False,
-                            move_stage_to_estimate=True,
                         )
-                        t_af = log_timing(logger, "ADAPTIVE autofocus", t_af)
+                        t_af = log_timing(logger, "SWEEP drift check", t_af)
 
-                        # Check for large drift and fall back to STANDARD autofocus if needed
-                        drift = abs(new_z - z_before_adaptive)
-                        logger.info(f"  Adaptive autofocus :: New Z {new_z} (drift: {new_z - z_before_adaptive:+.2f} um)")
-
-                        if drift > af_large_drift_threshold:
-                            logger.warning(
-                                f"  Large drift detected ({drift:.2f} um > {af_large_drift_threshold:.2f} um threshold)!"
-                            )
-                            logger.warning(f"  Falling back to STANDARD autofocus to re-establish baseline...")
-
-                            t_af_recovery = time.perf_counter()
-                            new_z = autofocus_with_manual_fallback(
-                                hardware=hardware,
-                                logger=logger,
-                                request_manual_focus=request_manual_focus,
-                                max_retries=3,
-                                move_stage_to_estimate=True,
-                                n_steps=af_n_steps,
-                                search_range=af_search_range,
-                                interp_strength=af_interp_strength,
-                                interp_kind=af_interp_kind,
-                                score_metric=af_score_metric,
-                            )
-                            t_af_recovery = log_timing(logger, "STANDARD autofocus (drift recovery)", t_af_recovery)
-                            logger.info(f"  STANDARD autofocus (drift recovery) :: New Z {new_z}")
+                        drift = new_z - z_before_adaptive
+                        logger.info(f"  Sweep drift check :: New Z {new_z} (drift: {drift:+.2f} um)")
                 else:
                     reason = "blank tile (RGB)" if tissue_stats.get('brightness_rejected') else "insufficient texture/area"
                     logger.warning(
@@ -2589,24 +2571,13 @@ def _acquisition_workflow(
                     # Start timing for this angle
                     angle_start = time.perf_counter()
 
-                    # Set rotation angle
-                    # First angle of each position should reset to "a" polarization state
-                    # is_sequence_start = angle_idx == 0
+                    # Start rotation (non-blocking) -- the stage begins moving
+                    # immediately while we set camera exposure in parallel.
                     t_rot = time.perf_counter()
-                    hardware.set_psg_ticks(angle)  # , is_sequence_start=is_sequence_start)
-                    t_rot = log_timing(logger, f"Rotation to {angle}deg", t_rot)
+                    hardware.set_psg_ticks_no_wait(angle)
 
-                    # Backup check of angle - seem to be having hardware issues sometimes
-                    # actual_angle = hardware.get_psg_ticks()
-                    # angle_diff = min(abs(actual_angle - angle), 360 - abs(actual_angle - angle))
-                    # if angle_diff > 5.0:
-                    #     logger.warning(f"  Angle mismatch: requested {angle:.1f} deg, got {actual_angle:.1f} deg, retrying...")
-                    #     hardware.set_psg_ticks(angle, is_sequence_start=False)
-                    #     time.sleep(0.15)
-                    #     actual_angle = hardware.get_psg_ticks()
-                    # logger.info(f"  Angle set to {hardware.get_psg_ticks():.1f}")
-
-                    # Set exposure time based on wb_mode
+                    # Set exposure time based on wb_mode.
+                    # This runs IN PARALLEL with the rotation stage movement.
                     t_exp = time.perf_counter()
 
                     if wb_mode == "camera_awb":
@@ -2723,7 +2694,18 @@ def _acquisition_workflow(
                         exposure_ms = params["exposures"][angle_idx]
                         hardware.set_exposure(exposure_ms)
                     t_exp = log_timing(logger, f"Set exposure for angle {angle}deg", t_exp)
-                    logger.info(f"  Exposure set to {hardware.core.get_exposure()}")
+
+                    # Wait for rotation to complete before snapping.
+                    # If exposure setting took longer than the rotation (~1s vs
+                    # ~700ms), this wait returns immediately (0ms).
+                    hardware.wait_for_rotation()
+                    t_rot = log_timing(logger, f"Rotation to {angle}deg", t_rot)
+
+                    # If XY move is still pending (non-blocking move for non-AF
+                    # tiles), wait for it now before the first snap.
+                    if xy_move_pending:
+                        hardware.wait_for_xy()
+                        xy_move_pending = False
 
                     # Acquire image
                     t_snap = time.perf_counter()
