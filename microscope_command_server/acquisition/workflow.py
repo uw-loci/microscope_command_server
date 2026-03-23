@@ -2480,8 +2480,7 @@ def _acquisition_workflow(
                         t_af = time.perf_counter()
                         new_z = hardware.autofocus_sweep_drift_check(
                             range_um=af_adaptive_initial_step * 2,
-                            n_steps=10,
-                            score_metric=af_score_metric,
+                            n_steps=5,
                         )
                         t_af = log_timing(logger, "SWEEP drift check", t_af)
 
