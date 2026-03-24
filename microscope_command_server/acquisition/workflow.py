@@ -2052,25 +2052,27 @@ def _acquisition_workflow(
 
         # Write timing window to file for Java progress dialog
         # Include all information needed for accurate time estimation:
-        # - timing_window_size: how many tiles to use for rolling average
-        # - af_n_tiles: number of adaptive autofocus positions per annotation
-        # - total_tiles: total number of images (positions * angles) to match Java progress counter units
-        # - af_n_steps: number of Z-steps per autofocus operation (for reference)
-        timing_metadata_path = output_path / "acquisition_metadata.txt"
-        with open(timing_metadata_path, "w") as f:
-            f.write(f"timing_window_size={timing_window_size}\n")
-            f.write(f"af_n_tiles={af_n_tiles}\n")
-            f.write(f"total_tiles={total_images}\n")
-            f.write(f"af_n_steps={af_n_steps}\n")
-            f.write(f"objective={current_objective}\n")
-        logger.info(f"Wrote timing metadata to {timing_metadata_path}: "
-                    f"window={timing_window_size}, af_positions={af_n_tiles}, tiles={total_images}")
-
         af_positions, af_min_distance = AutofocusUtils.get_autofocus_positions(
             fov, xy_positions, n_tiles=af_n_tiles
         )
 
         logger.info(f"Autofocus positions: {af_positions}")
+
+        # Write timing metadata AFTER computing AF positions so we can
+        # include the actual count (not just the interval).
+        # - timing_window_size: how many tiles to use for rolling average
+        # - af_n_tiles: actual number of AF positions in this annotation
+        #   (NOT the interval -- Java uses this to estimate remaining AF ops)
+        # - total_tiles: total number of images (positions * angles)
+        timing_metadata_path = output_path / "acquisition_metadata.txt"
+        with open(timing_metadata_path, "w") as f:
+            f.write(f"timing_window_size={timing_window_size}\n")
+            f.write(f"af_n_tiles={len(af_positions)}\n")
+            f.write(f"total_tiles={total_images}\n")
+            f.write(f"af_n_steps={af_n_steps}\n")
+            f.write(f"objective={current_objective}\n")
+        logger.info(f"Wrote timing metadata to {timing_metadata_path}: "
+                    f"window={timing_window_size}, af_positions={len(af_positions)}, tiles={total_images}")
 
         # Create dynamic autofocus positions set (can be modified during acquisition)
         dynamic_af_positions = set(af_positions)
