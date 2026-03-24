@@ -99,6 +99,9 @@ logger = logging.getLogger(__name__)
 _session_log_handler = None
 
 
+_session_log_config_path = None  # Track which config started the current session
+
+
 def _start_session_logging(config_path: str) -> None:
     """
     Start session-based file logging in the config file's parent directory.
@@ -107,13 +110,23 @@ def _start_session_logging(config_path: str) -> None:
     The handler is added to the root logger so all module loggers are captured.
     The handler flushes immediately on each log record (no buffered data lost on crash).
 
+    If a session log is already active for the same config path, keeps the
+    existing log file rather than creating a new one (prevents log splitting
+    when QuPath sends multiple CONFIG commands during a single session).
+
     Args:
         config_path: Path to the YAML config file sent by QuPath via CONFIG command
     """
-    global _session_log_handler
+    global _session_log_handler, _session_log_config_path
 
-    # Remove any existing session handler first
+    # If already logging for the same config, keep existing log
+    if _session_log_handler is not None and _session_log_config_path == config_path:
+        logger.info("Session logging already active for this config, continuing in same log")
+        return
+
+    # Different config or no active handler -- start fresh
     _stop_session_logging()
+    _session_log_config_path = config_path
 
     try:
         config_dir = pathlib.Path(config_path).resolve().parent
@@ -153,7 +166,7 @@ def _stop_session_logging() -> None:
 
     Flushes and closes the session log handler, then removes it from the root logger.
     """
-    global _session_log_handler
+    global _session_log_handler, _session_log_config_path
 
     if _session_log_handler is not None:
         try:
@@ -165,6 +178,7 @@ def _stop_session_logging() -> None:
             logger.debug(f"Error closing session log handler: {e}")
         finally:
             _session_log_handler = None
+            _session_log_config_path = None
 
 
 # Server configuration
