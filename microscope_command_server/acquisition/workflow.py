@@ -1932,16 +1932,13 @@ def _acquisition_workflow(
         af_n_steps = 11  # default
         af_interp_strength = 100  # default
         af_interp_kind = "quadratic"  # default
-        af_score_metric_name = "laplacian_variance"  # default
+        af_score_metric_name = "normalized_variance"  # default
         af_texture_threshold = 0.005  # default - tissue detection sensitivity
         af_tissue_area_threshold = 0.2  # default - minimum tissue coverage
         af_rgb_brightness_threshold = 240.0  # default - maximum RGB brightness for tissue (blank rejection)
-        # Adaptive autofocus parameters
-        af_adaptive_initial_step = 10.0  # default
-        af_adaptive_min_step = 2.0  # default
-        af_adaptive_max_steps = 25  # default
-        af_adaptive_focus_threshold = 0.95  # default
-        af_large_drift_threshold = 4.0  # default - um drift that triggers STANDARD autofocus fallback
+        # Sweep drift check parameters
+        af_sweep_range_um = 10.0  # default - total Z range for sweep (+/-5um)
+        af_sweep_n_steps = 5  # default - number of Z positions to sample
 
         # Get objective from acquisition parameters (passed via command line)
         current_objective = params.get("objective", "")
@@ -1983,11 +1980,11 @@ def _acquisition_workflow(
                     af_texture_threshold = af_setting.get("texture_threshold", af_texture_threshold)
                     af_tissue_area_threshold = af_setting.get("tissue_area_threshold", af_tissue_area_threshold)
                     af_rgb_brightness_threshold = af_setting.get("rgb_brightness_threshold", af_rgb_brightness_threshold)
-                    af_adaptive_initial_step = af_setting.get("adaptive_initial_step_um", af_adaptive_initial_step)
-                    af_adaptive_min_step = af_setting.get("adaptive_min_step_um", af_adaptive_min_step)
-                    af_adaptive_max_steps = af_setting.get("adaptive_max_steps", af_adaptive_max_steps)
-                    af_adaptive_focus_threshold = af_setting.get("adaptive_focus_threshold", af_adaptive_focus_threshold)
-                    af_large_drift_threshold = af_setting.get("large_drift_threshold_um", af_large_drift_threshold)
+                    af_sweep_range_um = af_setting.get("sweep_range_um", af_sweep_range_um)
+                    af_sweep_n_steps = af_setting.get("sweep_n_steps", af_sweep_n_steps)
+                    # Legacy support: old adaptive_initial_step_um -> sweep_range_um
+                    if "adaptive_initial_step_um" in af_setting and "sweep_range_um" not in af_setting:
+                        af_sweep_range_um = af_setting["adaptive_initial_step_um"] * 2
                     logger.info(
                         f"Loaded autofocus settings for {current_objective}: "
                         f"n_steps={af_n_steps}, search_range={af_search_range}um, n_tiles={af_n_tiles}, "
@@ -1995,8 +1992,7 @@ def _acquisition_workflow(
                         f"score_metric={af_score_metric_name}, "
                         f"texture_threshold={af_texture_threshold}, tissue_area_threshold={af_tissue_area_threshold}, "
                         f"rgb_brightness_threshold={af_rgb_brightness_threshold}, "
-                        f"adaptive: initial_step={af_adaptive_initial_step}um, min_step={af_adaptive_min_step}um, "
-                        f"max_steps={af_adaptive_max_steps}, focus_threshold={af_adaptive_focus_threshold}"
+                        f"sweep: range={af_sweep_range_um}um, n_steps={af_sweep_n_steps}"
                     )
                     af_settings_found = True
                     break
@@ -2481,8 +2477,9 @@ def _acquisition_workflow(
                         logger.info(f"  Subsequent tissue position - using SWEEP drift check for speed")
                         t_af = time.perf_counter()
                         new_z = hardware.autofocus_sweep_drift_check(
-                            range_um=af_adaptive_initial_step * 2,
-                            n_steps=5,
+                            range_um=af_sweep_range_um,
+                            n_steps=af_sweep_n_steps,
+                            score_metric=af_score_metric_name,
                         )
                         t_af = log_timing(logger, "SWEEP drift check", t_af)
 
