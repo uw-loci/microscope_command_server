@@ -55,6 +55,8 @@ class ExtendedCommand:
     REQMANF = b"reqmanf_"  # Check if manual focus is requested
     ACKMF = b"ackmf___"  # Acknowledge manual focus - retry autofocus
     SKIPAF = b"skipaf__"  # Skip autofocus retry - use current focus
+    REQHWER = b"reqhwer_"  # Check if hardware error recovery is requested
+    ACKHWER = b"ackhwer_"  # Acknowledge hardware error - retry/skip/cancel
     AFBENCH = b"afbench_"  # Run autofocus parameter benchmark
     SNAP = b"snap____"  # Simple snap with fixed exposure (no adaptive)
 

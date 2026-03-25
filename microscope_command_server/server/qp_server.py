@@ -211,6 +211,10 @@ manual_focus_request_events = {}  # addr -> Event (set when manual focus needed)
 manual_focus_complete_events = {}  # addr -> Event (set when user acknowledges)
 manual_focus_user_choice = {}  # addr -> str ("retry", "skip", "cancel")
 manual_focus_retries_remaining = {}  # addr -> int (number of retries remaining)
+hardware_error_request_events = {}  # addr -> Event (set when hardware error needs user decision)
+hardware_error_complete_events = {}  # addr -> Event (set when user acknowledges hardware error)
+hardware_error_user_choice = {}  # addr -> str ("retry", "skip", "cancel")
+hardware_error_message = {}  # addr -> str (error message string per client)
 
 # Server configuration state - CRITICAL FOR SAFETY
 # NEVER allow hardware operations with generic config - could damage microscope!
@@ -415,6 +419,30 @@ def acquisitionWorkflow(message, client_addr):
         logger.info(f"Manual focus acknowledged, user chose: {user_choice}")
         return user_choice
 
+    def _request_hardware_error_recovery(error_message: str) -> str:
+        """Signal hardware error and wait for user to choose retry/skip/cancel.
+
+        Args:
+            error_message: Detailed error message to show to user
+
+        Returns:
+            str: User's choice - "retry", "skip", or "cancel"
+        """
+        logger.info(f"Hardware error recovery requested for {client_addr}")
+        hardware_error_message[client_addr] = error_message
+        hardware_error_request_events[client_addr].set()
+        hardware_error_user_choice[client_addr] = None
+        logger.info("Waiting for user to resolve hardware error...")
+        hardware_error_complete_events[client_addr].wait()
+        user_choice = hardware_error_user_choice[client_addr] or "cancel"
+        # Clear events
+        hardware_error_request_events[client_addr].clear()
+        hardware_error_complete_events[client_addr].clear()
+        hardware_error_user_choice[client_addr] = None
+        hardware_error_message[client_addr] = ""
+        logger.info(f"Hardware error resolved, user chose: {user_choice}")
+        return user_choice
+
     return _acquisition_workflow(
         message=message,
         client_addr=client_addr,
@@ -425,6 +453,7 @@ def acquisitionWorkflow(message, client_addr):
         set_state=_set_state,
         is_cancelled=_is_cancelled,
         request_manual_focus=_request_manual_focus,
+        request_hardware_error_recovery=_request_hardware_error_recovery,
         connection_config_path=active_connection_config_path,
     )
 
@@ -445,6 +474,10 @@ def handle_client(conn, addr):
     manual_focus_complete_events[addr] = threading.Event()
     manual_focus_user_choice[addr] = None
     manual_focus_retries_remaining[addr] = 0
+    hardware_error_request_events[addr] = threading.Event()
+    hardware_error_complete_events[addr] = threading.Event()
+    hardware_error_user_choice[addr] = None
+    hardware_error_message[addr] = ""
 
     acquisition_thread = None
 
@@ -835,6 +868,35 @@ def handle_client(conn, addr):
                 manual_focus_complete_events[addr].set()
                 conn.sendall(b"ACK")
                 logger.info(f"Manual focus acknowledged by client {addr} - using current focus")
+                continue
+
+            # ============ HARDWARE ERROR RECOVERY REQUEST/ACKNOWLEDGMENT ============
+
+            # Check if hardware error recovery is requested
+            if data == ExtendedCommand.REQHWER:
+                if hardware_error_request_events[addr].is_set():
+                    # Hardware error - send error message
+                    err_msg = hardware_error_message.get(addr, "Unknown hardware error")
+                    # Encode as: 8-byte status + 4-byte length (big-endian) + message bytes
+                    msg_bytes = err_msg.encode('utf-8')
+                    length = len(msg_bytes)
+                    conn.sendall(b"HWERR___")  # 8-byte status: error present
+                    conn.sendall(length.to_bytes(4, 'big'))
+                    conn.sendall(msg_bytes)
+                    logger.debug(f"Sent hardware error to {addr}: {err_msg[:100]}")
+                else:
+                    conn.sendall(b"IDLE____")  # 8 bytes: no error
+                continue
+
+            # Hardware error acknowledgment - user chose retry/skip/cancel
+            if data == ExtendedCommand.ACKHWER:
+                # Read 8 bytes: user choice (padded to 8 with underscores)
+                choice_data = conn.recv(8)
+                choice = choice_data.decode('utf-8').strip().rstrip('_')
+                hardware_error_user_choice[addr] = choice
+                hardware_error_complete_events[addr].set()
+                conn.sendall(b"ACK")
+                logger.info(f"Hardware error acknowledged by {addr}: {choice}")
                 continue
 
             # ============ ACQUISITION COMMAND ============

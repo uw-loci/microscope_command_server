@@ -1413,6 +1413,7 @@ def _acquisition_workflow(
     set_state: Callable[[str], None],
     is_cancelled: Callable[[], bool],
     request_manual_focus: Optional[Callable[[], None]] = None,
+    request_hardware_error_recovery: Optional[Callable[[str], str]] = None,
     connection_config_path: Optional[str] = None,
 ):
     """Execute the main image acquisition workflow with progress and cancellation.
@@ -1429,6 +1430,10 @@ def _acquisition_workflow(
         request_manual_focus: Optional callback to request manual focus from user
                              when autofocus fails. If None, autofocus failures will
                              raise exceptions as before.
+        request_hardware_error_recovery: Optional callback to request hardware error
+                             recovery from user. Receives error message string and
+                             returns user choice: "retry", "skip", or "cancel".
+                             If None, hardware errors will fail the acquisition.
         connection_config_path: Optional path to config from initial CONFIG command,
                                used to warn if ACQUIRE uses different config.
     """
@@ -2345,6 +2350,7 @@ def _acquisition_workflow(
             # Stage move with retry on serial errors. Retries twice (2s delay),
             # then pauses acquisition for user intervention if still failing.
             move_succeeded = False
+            last_move_error = None
             for move_attempt in range(3):
                 try:
                     if needs_af:
@@ -2354,6 +2360,7 @@ def _acquisition_workflow(
                     move_succeeded = True
                     break
                 except Exception as move_err:
+                    last_move_error = move_err
                     if move_attempt < 2:
                         logger.warning(
                             f"Stage move failed (attempt {move_attempt + 1}/3): {move_err} "
@@ -2366,9 +2373,10 @@ def _acquisition_workflow(
 
             if not move_succeeded:
                 # All retries exhausted -- pause for user to fix hardware
-                if request_manual_focus is not None:
+                if request_hardware_error_recovery is not None:
+                    error_detail = str(last_move_error) if last_move_error else "Stage move failed after 3 attempts"
                     logger.info("Pausing acquisition for user to resolve stage error")
-                    user_choice = request_manual_focus(0)
+                    user_choice = request_hardware_error_recovery(error_detail)
                     if user_choice == "cancel":
                         logger.warning("User cancelled acquisition during stage error recovery")
                         set_state("CANCELLED")
@@ -2387,7 +2395,7 @@ def _acquisition_workflow(
                         set_state("FAILED", str(final_err))
                         return
                 else:
-                    # No manual focus callback -- fail acquisition
+                    # No hardware error recovery callback -- fail acquisition
                     set_state("FAILED", f"Stage move failed after 3 attempts")
                     return
 
