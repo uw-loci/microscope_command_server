@@ -2282,6 +2282,7 @@ def _acquisition_workflow(
 
                 logger.info(f"Initial autofocus completed: Z={initial_z:.2f} um")
                 first_tissue_autofocus_done = True
+                last_af_pos_idx = first_af_idx
 
                 # Remove this position from dynamic_af_positions since we already did it
                 dynamic_af_positions.discard(first_af_idx)
@@ -2307,6 +2308,9 @@ def _acquisition_workflow(
         # which runs in-memory (no disk I/O), giving writes full disk bandwidth.
         write_pool = _TileWritePool(max_workers=2)
 
+        # Track last position index where AF was performed (for gap detection)
+        last_af_pos_idx = -1
+
         # Main acquisition loop
         for pos_idx, (pos, filename) in enumerate(positions):
             # Check for cancellation
@@ -2326,6 +2330,15 @@ def _acquisition_workflow(
             # Move to position -- use non-blocking XY when no autofocus is
             # needed so the first angle's rotation+exposure can overlap.
             needs_af = pos_idx in dynamic_af_positions
+
+            # Force AF if gap since last AF exceeds n_tiles threshold
+            # (e.g., tissue separated by blank region)
+            if not needs_af and last_af_pos_idx >= 0:
+                gap = pos_idx - last_af_pos_idx
+                if gap > af_n_tiles:
+                    needs_af = True
+                    logger.info(f"  Forcing AF: gap of {gap} positions since last AF "
+                                f"(threshold: {af_n_tiles})")
             logger.info(f"Moving to position: X={pos.x}, Y={pos.y}, Z={pos.z}")
             t0 = time.perf_counter()
             if needs_af:
@@ -2485,6 +2498,9 @@ def _acquisition_workflow(
 
                         drift = new_z - z_before_adaptive
                         logger.info(f"  Sweep drift check :: New Z {new_z} (drift: {drift:+.2f} um)")
+
+                    # Track this position as the last AF position (for gap detection)
+                    last_af_pos_idx = pos_idx
                 else:
                     reason = "blank tile (RGB)" if tissue_stats.get('brightness_rejected') else "insufficient texture/area"
                     logger.warning(
