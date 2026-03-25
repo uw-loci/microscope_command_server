@@ -2341,13 +2341,56 @@ def _acquisition_workflow(
                                 f"(threshold: {af_n_tiles})")
             logger.info(f"Moving to position: X={pos.x}, Y={pos.y}, Z={pos.z}")
             t0 = time.perf_counter()
-            if needs_af:
-                # Blocking move -- AF needs the stage settled first
-                hardware.move_to_position(pos)
-            else:
-                # Non-blocking XY -- we'll wait before the first snap
-                hardware.move_xy_no_wait(pos.x, pos.y)
-                # Z is already at the correct focus position
+
+            # Stage move with retry on serial errors. Retries twice (2s delay),
+            # then pauses acquisition for user intervention if still failing.
+            move_succeeded = False
+            for move_attempt in range(3):
+                try:
+                    if needs_af:
+                        hardware.move_to_position(pos)
+                    else:
+                        hardware.move_xy_no_wait(pos.x, pos.y)
+                    move_succeeded = True
+                    break
+                except Exception as move_err:
+                    if move_attempt < 2:
+                        logger.warning(
+                            f"Stage move failed (attempt {move_attempt + 1}/3): {move_err} "
+                            f"-- retrying in 2s")
+                        time.sleep(2.0)
+                    else:
+                        logger.error(
+                            f"Stage move failed after 3 attempts: {move_err} "
+                            f"-- requesting user intervention")
+
+            if not move_succeeded:
+                # All retries exhausted -- pause for user to fix hardware
+                if request_manual_focus is not None:
+                    logger.info("Pausing acquisition for user to resolve stage error")
+                    user_choice = request_manual_focus(0)
+                    if user_choice == "cancel":
+                        logger.warning("User cancelled acquisition during stage error recovery")
+                        set_state("CANCELLED")
+                        return
+                    elif user_choice == "skip":
+                        logger.info(f"User chose to skip position {pos_idx}")
+                        continue  # Skip this tile entirely
+                    # "retry" -- try one more time after user intervention
+                    try:
+                        if needs_af:
+                            hardware.move_to_position(pos)
+                        else:
+                            hardware.move_xy_no_wait(pos.x, pos.y)
+                    except Exception as final_err:
+                        logger.error(f"Stage move still failing after user intervention: {final_err}")
+                        set_state("FAILED", str(final_err))
+                        return
+                else:
+                    # No manual focus callback -- fail acquisition
+                    set_state("FAILED", f"Stage move failed after 3 attempts")
+                    return
+
             xy_move_pending = not needs_af
             t0 = log_timing(logger, "Stage XY movement command", t0)
 
