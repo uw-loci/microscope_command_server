@@ -52,6 +52,7 @@ class ExtendedCommand:
     POLCAL = b"polcal__"  # Calibrate polarizer rotation stage
     TESTAF = b"testaf__"  # Test standard autofocus at current position
     TESTADAF = b"testadaf"  # Test adaptive autofocus at current position
+    TESTAFV = b"testafv_"  # Test autofocus validation (sweep + recovery from defocus)
     REQMANF = b"reqmanf_"  # Check if manual focus is requested
     ACKMF = b"ackmf___"  # Acknowledge manual focus - retry autofocus
     SKIPAF = b"skipaf__"  # Skip autofocus retry - use current focus

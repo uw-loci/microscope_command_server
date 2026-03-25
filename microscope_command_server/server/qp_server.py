@@ -2659,6 +2659,142 @@ def handle_client(conn, addr):
 
                 continue
 
+            if data == ExtendedCommand.TESTAFV:
+                logger.info(f"Client {addr} requested autofocus validation test")
+
+                # Read the message using the same pattern as TESTAF
+                message_parts = []
+                total_bytes = 0
+                start_time = time.time()
+
+                conn.settimeout(5.0)
+
+                try:
+                    while True:
+                        chunk = conn.recv(1024)
+                        if not chunk:
+                            logger.error(
+                                "Connection closed while reading autofocus validation message"
+                            )
+                            conn.sendall(b"FAILED:Connection closed")
+                            break
+
+                        message_parts.append(chunk.decode("utf-8"))
+                        total_bytes += len(chunk)
+
+                        full_message = "".join(message_parts)
+
+                        if END_MARKER in full_message:
+                            message = full_message.replace(END_MARKER, "").strip()
+
+                            # Parse the message (same flags as TESTAF)
+                            params = {}
+
+                            flags = ["--yaml", "--output", "--objective"]
+
+                            for i, flag in enumerate(flags):
+                                if flag in message:
+                                    start_idx = message.index(flag) + len(flag)
+
+                                    end_idx = len(message)
+                                    for next_flag in flags[i + 1 :]:
+                                        if next_flag in message[start_idx:]:
+                                            next_pos = message.index(next_flag, start_idx)
+                                            if next_pos < end_idx:
+                                                end_idx = next_pos
+                                                break
+
+                                    value = message[start_idx:end_idx].strip()
+
+                                    if flag == "--yaml":
+                                        params["yaml_file_path"] = value
+                                    elif flag == "--output":
+                                        params["output_folder_path"] = value
+                                    elif flag == "--objective":
+                                        params["objective"] = value
+
+                            # Validate required parameters
+                            required = ["yaml_file_path", "output_folder_path", "objective"]
+                            missing = [key for key in required if key not in params]
+                            if missing:
+                                error_msg = f"Missing required parameters: {missing}"
+                                logger.error(error_msg)
+                                conn.sendall(f"FAILED:{error_msg}".encode())
+                                break
+
+                            # Send immediate acknowledgment
+                            try:
+                                ack_response = f"STARTED:{params['output_folder_path']}".encode()
+                                conn.sendall(ack_response)
+                                logger.info(
+                                    "Sent STARTED acknowledgment for autofocus validation test"
+                                )
+
+                                # Execute autofocus validation test
+                                from microscope_control.autofocus.test import (
+                                    test_autofocus_validation,
+                                )
+
+                                result = test_autofocus_validation(
+                                    hardware=hardware,
+                                    config_manager=config_manager,
+                                    yaml_file_path=params["yaml_file_path"],
+                                    output_folder_path=params["output_folder_path"],
+                                    objective=params["objective"],
+                                    logger=logger,
+                                )
+
+                                if result["success"]:
+                                    # Format: SUCCESS:JSON-encoded result
+                                    import json
+                                    result_json = json.dumps(result)
+                                    response = f"SUCCESS:{result_json}".encode()
+                                    conn.sendall(response)
+                                    logger.info(
+                                        f"Autofocus validation test completed: "
+                                        f"sweep_delta={result['sweep_delta_um']}um, "
+                                        f"recovery_delta={result['recovery_delta_um']}um"
+                                    )
+                                else:
+                                    response = f"FAILED:{result['message']}".encode()
+                                    conn.sendall(response)
+                                    logger.error(
+                                        f"Autofocus validation test failed: {result['message']}"
+                                    )
+
+                            except Exception as e:
+                                logger.error(
+                                    f"Autofocus validation test failed: {str(e)}", exc_info=True
+                                )
+                                response = f"FAILED:{str(e)}".encode()
+                                conn.sendall(response)
+
+                            break
+
+                        # Safety checks
+                        if total_bytes > 10000:
+                            logger.error(
+                                f"Autofocus validation message too large: {total_bytes} bytes"
+                            )
+                            conn.sendall(b"FAILED:Message too large")
+                            break
+
+                        if time.time() - start_time > 10:
+                            logger.error("Timeout reading autofocus validation message")
+                            conn.sendall(b"FAILED:Timeout waiting for complete message")
+                            break
+
+                except socket.timeout:
+                    logger.error(f"Timeout reading autofocus validation message from {addr}")
+                    conn.sendall(b"FAILED:Timeout reading message")
+                except Exception as e:
+                    logger.error(f"Error in autofocus validation test: {str(e)}", exc_info=True)
+                    conn.sendall(f"FAILED:{str(e)}".encode())
+                finally:
+                    conn.settimeout(None)
+
+                continue
+
             if data == ExtendedCommand.AFBENCH:
                 logger.info(f"Client {addr} requested autofocus benchmark")
 
