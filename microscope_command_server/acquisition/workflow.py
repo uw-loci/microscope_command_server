@@ -2971,6 +2971,23 @@ def _acquisition_workflow(
         if stage_positions_collected:
             TileConfigUtils.write_tileconfig_stage(output_path, stage_positions_collected)
 
+        # Write consolidated tile manifest (intended vs actual positions)
+        try:
+            manifest_path = output_path / "tile_manifest.csv"
+            with open(manifest_path, "w") as mf:
+                mf.write("filename,intended_x_um,intended_y_um,actual_x_um,actual_y_um,actual_z_um,dx_um,dy_um\n")
+                # Build lookup from intended positions
+                intended = {fn: (pos.x, pos.y) for pos, fn in positions}
+                for entry in stage_positions_collected:
+                    fn, ax, ay, az = entry
+                    ix, iy = intended.get(fn, (float('nan'), float('nan')))
+                    dx = ax - ix if ix == ix else float('nan')
+                    dy = ay - iy if iy == iy else float('nan')
+                    mf.write(f"{fn},{ix:.3f},{iy:.3f},{ax:.3f},{ay:.3f},{az:.3f},{dx:.3f},{dy:.3f}\n")
+            logger.info("Wrote tile manifest: %s (%d tiles)", manifest_path, len(stage_positions_collected))
+        except Exception as e:
+            logger.warning("Failed to write tile manifest: %s", e)
+
         # Write saturation report file (per-tile details for Java UI)
         sat_monitor.write_saturation_report(output_path)
 
