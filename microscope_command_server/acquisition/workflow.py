@@ -2057,7 +2057,17 @@ def _acquisition_workflow(
             fov, xy_positions, n_tiles=af_n_tiles
         )
 
-        logger.info(f"Autofocus positions: {af_positions}")
+        small_grid_override = (len(xy_positions) <= 9)
+        if small_grid_override:
+            logger.info(
+                f"Small grid override: {len(xy_positions)} tiles <= 9, "
+                f"autofocus at ALL positions: {af_positions} (min_distance={af_min_distance})"
+            )
+        else:
+            logger.info(
+                f"Autofocus positions ({len(af_positions)}/{len(xy_positions)} tiles): "
+                f"{af_positions} (min_distance={af_min_distance:.1f})"
+            )
 
         # Write timing metadata AFTER computing AF positions so we can
         # include the actual count (not just the interval).
