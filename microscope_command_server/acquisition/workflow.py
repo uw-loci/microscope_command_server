@@ -6,6 +6,7 @@ microscope hardware, separated from the socket server/transport logic.
 
 from __future__ import annotations
 
+import json
 import time
 from typing import Callable, List, Tuple, Optional, Dict, Any
 from pathlib import Path
@@ -2326,6 +2327,9 @@ def _acquisition_workflow(
         # Track last position index where AF was performed (for gap detection)
         last_af_pos_idx = -1
 
+        # Collect per-tile measurements for post-acquisition analysis
+        tile_measurements = []
+
         # Main acquisition loop
         for pos_idx, (pos, filename) in enumerate(positions):
             # Check for cancellation
@@ -2338,6 +2342,11 @@ def _acquisition_workflow(
 
             # Start timing for this tile
             tile_start = time.perf_counter()
+
+            # Per-tile measurement tracking (reset each iteration)
+            af_type_for_this_tile = "none"
+            drift_for_this_tile = 0.0
+            af_failed_for_this_tile = False
 
             # Ensure Z is current autofocus value
             pos.z = hardware.get_current_position().z
@@ -2543,6 +2552,7 @@ def _acquisition_workflow(
                         )
                         t_af = log_timing(logger, "STANDARD autofocus", t_af)
                         first_tissue_autofocus_done = True
+                        af_type_for_this_tile = "standard"
                         logger.info(f"  Standard autofocus :: New Z {new_z}")
                     else:
                         # Get Z position before adaptive autofocus for drift detection
@@ -2558,12 +2568,15 @@ def _acquisition_workflow(
                         t_af = log_timing(logger, "SWEEP drift check", t_af)
 
                         drift = new_z - z_before_adaptive
+                        af_type_for_this_tile = "sweep"
+                        drift_for_this_tile = drift
                         logger.info(f"  Sweep drift check :: New Z {new_z} (drift: {drift:+.2f} um)")
 
                     # Track this position as the last AF position (for gap detection)
                     last_af_pos_idx = pos_idx
                 else:
                     reason = "blank tile (RGB)" if tissue_stats.get('brightness_rejected') else "insufficient texture/area"
+                    af_failed_for_this_tile = True
                     logger.warning(
                         f"Insufficient tissue at position {pos_idx} ({reason}) - deferring autofocus"
                     )
@@ -3023,6 +3036,19 @@ def _acquisition_workflow(
             tile_elapsed_ms = (time.perf_counter() - tile_start) * 1000
             logger.info(f"[TIMING] === TOTAL TILE TIME: {tile_elapsed_ms:.1f}ms ({tile_elapsed_ms/1000:.2f}s) ===")
 
+            # Record per-tile measurement data
+            # Use current_stage_pos.z (captured after autofocus) for the actual Z
+            tile_measurements.append({
+                "position_index": pos_idx,
+                "filename": filename,
+                "z_um": round(current_stage_pos.z, 2),
+                "af_performed": needs_af,
+                "af_type": af_type_for_this_tile,
+                "af_drift_um": round(drift_for_this_tile, 2),
+                "af_failed": af_failed_for_this_tile,
+                "tile_time_ms": round(tile_elapsed_ms, 0),
+            })
+
         # Drain any remaining background writes before finalizing
         if write_pool.pending_count > 0:
             t_drain = time.perf_counter()
@@ -3064,6 +3090,18 @@ def _acquisition_workflow(
 
         # Write saturation report file (per-tile details for Java UI)
         sat_monitor.write_saturation_report(output_path)
+
+        # Write per-tile measurements JSON for Java-side analysis
+        try:
+            measurements_path = output_path / "tile_measurements.json"
+            with open(measurements_path, "w") as f:
+                json.dump(tile_measurements, f, indent=2)
+            logger.info(
+                "Wrote per-tile measurements to %s (%d tiles)",
+                measurements_path, len(tile_measurements)
+            )
+        except Exception as e:
+            logger.warning("Failed to write tile measurements: %s", e)
 
         # Get final Z position for tilt correction model
         final_z = hardware.get_current_position().z
