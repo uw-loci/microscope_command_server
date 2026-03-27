@@ -1561,10 +1561,9 @@ def handle_client(conn, addr):
                                 jai_props = JAICameraProperties(hardware.core)
                                 calibrator = JAIWhiteBalanceCalibrator(hardware, jai_props)
 
-                                # Run simple calibration using the new method
+                                # Run simple calibration at uncrossed (90 deg) first
                                 output_path = Path(params["output_folder_path"])
-                                result = calibrator.calibrate_simple(
-                                    initial_exposure_ms=params["initial_exposure_ms"],
+                                calib_kwargs = dict(
                                     target=params.get("target_intensity", 180.0),
                                     tolerance=params.get("tolerance", 5.0),
                                     output_path=output_path,
@@ -1577,25 +1576,108 @@ def handle_client(conn, addr):
                                     boosted_max_gain_db=params.get("boosted_max_gain_db"),
                                 )
 
-                                # Update imageprocessing config if yaml path provided
+                                # Rotate to uncrossed (90 deg) for first calibration
+                                if hasattr(hardware, "set_psg_ticks"):
+                                    hardware.set_psg_ticks(90)
+                                    logger.info("Simple WB: rotated to uncrossed (90 deg)")
+
+                                uncrossed_result = calibrator.calibrate_simple(
+                                    initial_exposure_ms=params["initial_exposure_ms"],
+                                    **calib_kwargs,
+                                )
+                                logger.info(
+                                    f"Simple WB uncrossed: R={uncrossed_result.exposures_ms['red']:.2f}ms, "
+                                    f"G={uncrossed_result.exposures_ms['green']:.2f}ms, "
+                                    f"B={uncrossed_result.exposures_ms['blue']:.2f}ms, "
+                                    f"converged={uncrossed_result.converged}"
+                                )
+
+                                # Collect all angle results (uncrossed + remaining angles)
+                                all_results = {"uncrossed": uncrossed_result}
+
+                                # Load remaining PPM rotation angles from config
+                                remaining_angles = []
+                                try:
+                                    modality_name = params.get("modality", "ppm")
+                                    modalities = hardware.settings.get("modalities", {})
+                                    mod_config = modalities.get(modality_name, {})
+                                    rotation_angles = mod_config.get("rotation_angles", [])
+                                    for ra in rotation_angles:
+                                        name = ra.get("name")
+                                        tick = ra.get("tick")
+                                        if name and tick is not None and name != "uncrossed":
+                                            remaining_angles.append((name, float(tick)))
+                                    logger.info(f"Simple WB: will calibrate {len(remaining_angles)} additional angles: "
+                                                f"{[a[0] for a in remaining_angles]}")
+                                except Exception as e:
+                                    logger.warning(f"Could not load rotation angles from config: {e}")
+
+                                # Calibrate remaining angles using uncrossed R:G:B as starting point
+                                from microscope_command_server.acquisition.workflow import (
+                                    get_target_intensity_for_angle,
+                                )
+                                for angle_name, angle_deg in remaining_angles:
+                                    logger.info(f"Simple WB: calibrating {angle_name} ({angle_deg} deg)...")
+                                    if hasattr(hardware, "set_psg_ticks"):
+                                        hardware.set_psg_ticks(angle_deg)
+
+                                    # Use green channel from uncrossed as starting exposure
+                                    # (will be scaled up by calibrator for dimmer angles)
+                                    start_exp = uncrossed_result.exposures_ms["green"]
+
+                                    # Get per-angle target intensity from YAML or defaults
+                                    angle_target = calib_kwargs["target"]
+                                    if "yaml_file_path" in params:
+                                        try:
+                                            val, src = get_target_intensity_for_angle(
+                                                angle=angle_deg,
+                                                modality=params.get("modality", "ppm"),
+                                                config_path=Path(params["yaml_file_path"]),
+                                            )
+                                            angle_target = val
+                                            logger.info(f"  Target for {angle_name}: {val:.1f} (from {src})")
+                                        except Exception:
+                                            pass
+
+                                    try:
+                                        angle_kwargs = dict(calib_kwargs)
+                                        angle_kwargs["target"] = angle_target
+                                        angle_result = calibrator.calibrate_simple(
+                                            initial_exposure_ms=start_exp,
+                                            **angle_kwargs,
+                                        )
+                                        all_results[angle_name] = angle_result
+                                        logger.info(
+                                            f"  {angle_name}: R={angle_result.exposures_ms['red']:.2f}ms, "
+                                            f"G={angle_result.exposures_ms['green']:.2f}ms, "
+                                            f"B={angle_result.exposures_ms['blue']:.2f}ms, "
+                                            f"converged={angle_result.converged}"
+                                        )
+                                    except Exception as e:
+                                        logger.error(f"  Failed to calibrate {angle_name}: {e}")
+
+                                # Save all angle results to imageprocessing config
                                 if "yaml_file_path" in params:
                                     wb_objective = params.get("objective")
                                     wb_detector = params.get("detector")
+                                    wb_modality = params.get("modality", "ppm")
                                     logger.info(
-                                        f"Simple WB: saving config with objective={wb_objective}, "
-                                        f"detector={wb_detector}"
+                                        f"Simple WB: saving {len(all_results)} angle(s) with "
+                                        f"objective={wb_objective}, detector={wb_detector}"
                                     )
-                                    calibrator.update_imageprocessing_config(
-                                        config_path=Path(params["yaml_file_path"]),
-                                        result=result,
-                                        calibration_type="simple",
-                                        angle_name="uncrossed",  # Simple WB calibrates at 90 deg (uncrossed)
-                                        modality=params.get("modality"),
-                                        objective=wb_objective,
-                                        detector=wb_detector,
-                                    )
+                                    for aname, aresult in all_results.items():
+                                        calibrator.update_imageprocessing_config(
+                                            config_path=Path(params["yaml_file_path"]),
+                                            result=aresult,
+                                            calibration_type="simple",
+                                            angle_name=aname,
+                                            modality=wb_modality,
+                                            objective=wb_objective,
+                                            detector=wb_detector,
+                                        )
 
-                                # Format response with new gain model
+                                # Format response: uncrossed result for backward compatibility
+                                result = uncrossed_result
                                 exp_str = (
                                     f"exp_r:{result.exposures_ms['red']:.2f},"
                                     f"exp_g:{result.exposures_ms['green']:.2f},"
@@ -1606,11 +1688,13 @@ def handle_client(conn, addr):
                                     f"analog_r:{result.analog_red:.3f},"
                                     f"analog_b:{result.analog_blue:.3f}"
                                 )
-                                status = "CONVERGED" if result.converged else "NOT_CONVERGED"
+                                all_converged = all(r.converged for r in all_results.values())
+                                status = "CONVERGED" if all_converged else "NOT_CONVERGED"
+                                n_angles = len(all_results)
 
-                                response = f"SUCCESS:{output_path}|{status}|{exp_str}|{gain_str}"
+                                response = f"SUCCESS:{output_path}|{status}|{exp_str}|{gain_str}|angles:{n_angles}"
 
-                                # Append noise stats if available
+                                # Append noise stats from uncrossed if available
                                 if result.noise_stats is not None:
                                     ns = result.noise_stats
                                     response += (
@@ -1620,7 +1704,7 @@ def handle_client(conn, addr):
                                     )
 
                                 conn.sendall(response.encode())
-                                logger.info(f"WBSIMPLE completed: {status}")
+                                logger.info(f"WBSIMPLE completed: {n_angles} angles, all_converged={all_converged}")
                                 _wb_calibration_result = result
 
                             except ImportError as e:
