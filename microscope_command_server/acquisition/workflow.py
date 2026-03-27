@@ -208,9 +208,9 @@ class SaturationMonitor:
                         f"{self._biref_threshold:.1f}% saturation. "
                         f"Worst: {self._worst_seen[angle]:.1f}%. "
                         f"The white balance target intensity is too high for this tissue. "
-                        f"To fix: open White Balance Calibration, lower the Target Intensity "
-                        f"(try 150-160 instead of 180), and recalibrate. "
-                        f"Then collect new background images before re-acquiring."
+                        f"To fix: open White Balance Calibration and lower the Target "
+                        f"Intensity setting, then recalibrate. "
+                        f"Collect new background images before re-acquiring."
                     )
                     self._log.error(f"=== ACQUISITION ABORTED: {self._abort_reason} ===")
                     return True
