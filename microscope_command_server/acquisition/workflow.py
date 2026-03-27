@@ -3504,6 +3504,9 @@ def save_simple_wb_to_yaml(
             "angles": simple_wb_results,
         }
 
+        # Update global WB timestamp -- ANY WB change invalidates all backgrounds
+        detector_profile["wb_last_modified"] = datetime.now().isoformat()
+
         with open(imageprocessing_path, "w") as f:
             yaml.dump(ip_data, f, default_flow_style=False, sort_keys=False)
 
