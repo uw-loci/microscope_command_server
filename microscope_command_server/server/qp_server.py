@@ -2473,6 +2473,194 @@ def handle_client(conn, addr):
 
                 continue
 
+            # ==================== ZSTACK: Z-Stack Acquisition ====================
+            if data == ExtendedCommand.ZSTACK:
+                logger.info(f"Client {addr} requested Z-stack acquisition")
+                message_parts = []
+                total_bytes = 0
+                start_time = time.time()
+                conn.settimeout(5.0)
+
+                try:
+                    while True:
+                        chunk = conn.recv(4096)
+                        if not chunk:
+                            conn.sendall(b"FAILED:Connection closed")
+                            break
+                        message_parts.append(chunk.decode("utf-8"))
+                        total_bytes += len(chunk)
+                        full_message = "".join(message_parts)
+
+                        if END_MARKER in full_message:
+                            message = full_message.replace(END_MARKER, "").strip()
+                            logger.info(f"ZSTACK message: {message}")
+
+                            # Parse parameters: --output --z-start --z-end --z-step
+                            #   --modality --angles --wb-mode --yaml --objective --detector
+                            params = {}
+                            parts = message.split()
+                            i = 0
+                            while i < len(parts):
+                                if parts[i] == "--output" and i + 1 < len(parts):
+                                    params["output"] = parts[i + 1]; i += 2
+                                elif parts[i] == "--z-start" and i + 1 < len(parts):
+                                    params["z_start"] = float(parts[i + 1]); i += 2
+                                elif parts[i] == "--z-end" and i + 1 < len(parts):
+                                    params["z_end"] = float(parts[i + 1]); i += 2
+                                elif parts[i] == "--z-step" and i + 1 < len(parts):
+                                    params["z_step"] = float(parts[i + 1]); i += 2
+                                elif parts[i] == "--modality" and i + 1 < len(parts):
+                                    params["modality"] = parts[i + 1]; i += 2
+                                elif parts[i] == "--angles" and i + 1 < len(parts):
+                                    params["angles"] = parts[i + 1]; i += 2
+                                elif parts[i] == "--wb-mode" and i + 1 < len(parts):
+                                    params["wb_mode"] = parts[i + 1]; i += 2
+                                elif parts[i] == "--yaml" and i + 1 < len(parts):
+                                    params["yaml"] = parts[i + 1]; i += 2
+                                elif parts[i] == "--objective" and i + 1 < len(parts):
+                                    params["objective"] = parts[i + 1]; i += 2
+                                elif parts[i] == "--detector" and i + 1 < len(parts):
+                                    params["detector"] = parts[i + 1]; i += 2
+                                else:
+                                    i += 1
+
+                            # Validate required params
+                            for req in ["output", "z_start", "z_end", "z_step"]:
+                                if req not in params:
+                                    conn.sendall(f"FAILED:Missing --{req.replace('_','-')}".encode())
+                                    break
+                            else:
+                                conn.sendall(f"STARTED:{params['output']}".encode())
+                                try:
+                                    from microscope_command_server.acquisition.stack_timelapse import acquire_z_stack
+                                    result = acquire_z_stack(
+                                        hardware=hardware,
+                                        output_folder=params["output"],
+                                        z_start=params["z_start"],
+                                        z_end=params["z_end"],
+                                        z_step=params["z_step"],
+                                        modality=params.get("modality", "brightfield"),
+                                        angles_str=params.get("angles", "(0)"),
+                                        config_manager=config_manager,
+                                        wb_mode=params.get("wb_mode", "off"),
+                                        objective=params.get("objective"),
+                                        detector=params.get("detector"),
+                                        yaml_file_path=params.get("yaml"),
+                                    )
+                                    response = (f"SUCCESS:{params['output']}|"
+                                                f"planes:{result['n_planes']}|"
+                                                f"files:{len(result['files'])}|"
+                                                f"elapsed:{result['elapsed_seconds']:.1f}s")
+                                    conn.sendall(response.encode())
+                                    logger.info(f"ZSTACK complete: {result['n_planes']} planes")
+                                except Exception as e:
+                                    logger.error(f"ZSTACK failed: {e}", exc_info=True)
+                                    conn.sendall(f"FAILED:{str(e)}".encode())
+                            break
+
+                        if total_bytes > 10000 or time.time() - start_time > 10:
+                            conn.sendall(b"FAILED:Message too large or timeout")
+                            break
+                except socket.timeout:
+                    conn.sendall(b"FAILED:Timeout reading message")
+                except Exception as e:
+                    conn.sendall(f"FAILED:{str(e)}".encode())
+                finally:
+                    conn.settimeout(None)
+                continue
+
+            # ==================== TLAPSE: Time-Lapse Acquisition ====================
+            if data == ExtendedCommand.TLAPSE:
+                logger.info(f"Client {addr} requested time-lapse acquisition")
+                message_parts = []
+                total_bytes = 0
+                start_time = time.time()
+                conn.settimeout(5.0)
+
+                try:
+                    while True:
+                        chunk = conn.recv(4096)
+                        if not chunk:
+                            conn.sendall(b"FAILED:Connection closed")
+                            break
+                        message_parts.append(chunk.decode("utf-8"))
+                        total_bytes += len(chunk)
+                        full_message = "".join(message_parts)
+
+                        if END_MARKER in full_message:
+                            message = full_message.replace(END_MARKER, "").strip()
+                            logger.info(f"TLAPSE message: {message}")
+
+                            # Parse parameters: --output --timepoints --interval
+                            #   --modality --angles --wb-mode --yaml --objective --detector
+                            params = {}
+                            parts = message.split()
+                            i = 0
+                            while i < len(parts):
+                                if parts[i] == "--output" and i + 1 < len(parts):
+                                    params["output"] = parts[i + 1]; i += 2
+                                elif parts[i] == "--timepoints" and i + 1 < len(parts):
+                                    params["timepoints"] = int(parts[i + 1]); i += 2
+                                elif parts[i] == "--interval" and i + 1 < len(parts):
+                                    params["interval"] = float(parts[i + 1]); i += 2
+                                elif parts[i] == "--modality" and i + 1 < len(parts):
+                                    params["modality"] = parts[i + 1]; i += 2
+                                elif parts[i] == "--angles" and i + 1 < len(parts):
+                                    params["angles"] = parts[i + 1]; i += 2
+                                elif parts[i] == "--wb-mode" and i + 1 < len(parts):
+                                    params["wb_mode"] = parts[i + 1]; i += 2
+                                elif parts[i] == "--yaml" and i + 1 < len(parts):
+                                    params["yaml"] = parts[i + 1]; i += 2
+                                elif parts[i] == "--objective" and i + 1 < len(parts):
+                                    params["objective"] = parts[i + 1]; i += 2
+                                elif parts[i] == "--detector" and i + 1 < len(parts):
+                                    params["detector"] = parts[i + 1]; i += 2
+                                else:
+                                    i += 1
+
+                            for req in ["output", "timepoints", "interval"]:
+                                if req not in params:
+                                    conn.sendall(f"FAILED:Missing --{req}".encode())
+                                    break
+                            else:
+                                conn.sendall(f"STARTED:{params['output']}".encode())
+                                try:
+                                    from microscope_command_server.acquisition.stack_timelapse import acquire_time_lapse
+                                    result = acquire_time_lapse(
+                                        hardware=hardware,
+                                        output_folder=params["output"],
+                                        n_timepoints=params["timepoints"],
+                                        interval_seconds=params["interval"],
+                                        modality=params.get("modality", "brightfield"),
+                                        angles_str=params.get("angles", "(0)"),
+                                        config_manager=config_manager,
+                                        wb_mode=params.get("wb_mode", "off"),
+                                        objective=params.get("objective"),
+                                        detector=params.get("detector"),
+                                        yaml_file_path=params.get("yaml"),
+                                    )
+                                    response = (f"SUCCESS:{params['output']}|"
+                                                f"timepoints:{result['n_timepoints']}|"
+                                                f"files:{len(result['files'])}|"
+                                                f"elapsed:{result['elapsed_seconds']:.1f}s")
+                                    conn.sendall(response.encode())
+                                    logger.info(f"TLAPSE complete: {result['n_timepoints']} timepoints")
+                                except Exception as e:
+                                    logger.error(f"TLAPSE failed: {e}", exc_info=True)
+                                    conn.sendall(f"FAILED:{str(e)}".encode())
+                            break
+
+                        if total_bytes > 10000 or time.time() - start_time > 10:
+                            conn.sendall(b"FAILED:Message too large or timeout")
+                            break
+                except socket.timeout:
+                    conn.sendall(b"FAILED:Timeout reading message")
+                except Exception as e:
+                    conn.sendall(f"FAILED:{str(e)}".encode())
+                finally:
+                    conn.settimeout(None)
+                continue
+
             if data == ExtendedCommand.TESTAF:
                 logger.info(f"Client {addr} requested autofocus test")
 

@@ -60,6 +60,8 @@ class ExtendedCommand:
     ACKHWER = b"ackhwer_"  # Acknowledge hardware error - retry/skip/cancel
     AFBENCH = b"afbench_"  # Run autofocus parameter benchmark
     SNAP = b"snap____"  # Simple snap with fixed exposure (no adaptive)
+    ZSTACK = b"zstack__"  # Z-stack acquisition at current XY (multi-Z, single tile)
+    TLAPSE = b"tlapse__"  # Time-lapse acquisition at current position (repeat over time)
 
     # PPM Testing Commands (for QPSC menu integration)
     PPMSENS = b"ppmsens_"  # PPM Rotation Sensitivity Test
