@@ -2496,7 +2496,7 @@ def handle_client(conn, addr):
                             logger.info(f"SIFTAL message: {message}")
 
                             # Parse: --wsi-region <path> --micro-px <um> --wsi-px <um>
-                            #        --flip-x --flip-y
+                            #        --min-px <um> --flip-x --flip-y
                             params = {}
                             parts = message.split()
                             i = 0
@@ -2507,6 +2507,8 @@ def handle_client(conn, addr):
                                     params["micro_px"] = float(parts[i + 1]); i += 2
                                 elif parts[i] == "--wsi-px" and i + 1 < len(parts):
                                     params["wsi_px"] = float(parts[i + 1]); i += 2
+                                elif parts[i] == "--min-px" and i + 1 < len(parts):
+                                    params["min_px"] = float(parts[i + 1]); i += 2
                                 elif parts[i] == "--flip-x":
                                     params["flip_x"] = True; i += 1
                                 elif parts[i] == "--flip-y":
@@ -2543,11 +2545,12 @@ def handle_client(conn, addr):
 
                                 micro_px = params.get("micro_px", 0.173)
                                 wsi_px = params.get("wsi_px", 0.25)
+                                min_px = params.get("min_px", 1.0)
                                 flip_x = params.get("flip_x", False)
                                 flip_y = params.get("flip_y", False)
 
                                 logger.info(f"SIFT: micro_px={micro_px}, wsi_px={wsi_px}, "
-                                            f"flip_x={flip_x}, flip_y={flip_y}")
+                                            f"min_px={min_px}, flip_x={flip_x}, flip_y={flip_y}")
 
                                 result = match_sift(
                                     microscope_image=micro_bgr,
@@ -2556,6 +2559,7 @@ def handle_client(conn, addr):
                                     wsi_pixel_size_um=wsi_px,
                                     flip_x=flip_x,
                                     flip_y=flip_y,
+                                    min_pixel_size_um=min_px,
                                 )
 
                                 if result is None:
