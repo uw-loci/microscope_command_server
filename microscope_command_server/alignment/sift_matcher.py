@@ -23,6 +23,7 @@ def match_sift(
     flip_y: bool = False,
     min_match_count: int = 10,
     ratio_threshold: float = 0.7,
+    min_pixel_size_um: float = 1.0,
 ) -> Optional[Tuple[float, float, int, float]]:
     """
     Match a microscope snapshot to a WSI region using SIFT features.
@@ -37,6 +38,12 @@ def match_sift(
         flip_y: Whether the WSI is flipped in Y relative to the microscope
         min_match_count: Minimum SIFT matches required for a valid result
         ratio_threshold: Lowe's ratio test threshold (lower = stricter)
+        min_pixel_size_um: Minimum target pixel size in um. Both images are
+            downsampled to at least this resolution. This speeds up matching
+            and suppresses JPEG compression artifacts (8x8 block boundaries),
+            sensor noise, and other high-frequency artifacts that create
+            spurious keypoints. Default 1.0 um/px is sufficient for
+            tissue-level structural features.
 
     Returns:
         Tuple of (offset_x_um, offset_y_um, n_inliers, confidence) or None if matching failed.
@@ -55,34 +62,37 @@ def match_sift(
     elif flip_y:
         gray_wsi = cv2.flip(gray_wsi, 0)  # Vertical
 
-    # Rescale to the LOWER resolution (larger pixel size) to avoid upscaling.
-    # Downscaling preserves real features; upscaling invents fake detail.
-    # Use INTER_AREA for downscaling (best quality for decimation).
-    target_pixel_size = max(microscope_pixel_size_um, wsi_pixel_size_um)
+    # Downsample both images to a common resolution.
+    # Target = max of (lower resolution image, min_pixel_size_um).
+    # This ensures:
+    #   1. No upscaling (never invent fake detail)
+    #   2. Always at least min_pixel_size_um to suppress JPEG block artifacts,
+    #      sensor noise, and speed up matching
+    target_pixel_size = max(microscope_pixel_size_um, wsi_pixel_size_um, min_pixel_size_um)
 
     micro_scale = microscope_pixel_size_um / target_pixel_size
     wsi_scale = wsi_pixel_size_um / target_pixel_size
 
-    if abs(micro_scale - 1.0) > 0.01:
-        new_w = int(gray_micro.shape[1] * micro_scale)
-        new_h = int(gray_micro.shape[0] * micro_scale)
+    if micro_scale < 0.99:
+        new_w = max(1, int(gray_micro.shape[1] * micro_scale))
+        new_h = max(1, int(gray_micro.shape[0] * micro_scale))
         gray_micro = cv2.resize(gray_micro, (new_w, new_h), interpolation=cv2.INTER_AREA)
         logger.info(
             f"Downscaled microscope image to {new_w}x{new_h} "
             f"(scale={micro_scale:.3f}, {microscope_pixel_size_um:.4f} -> {target_pixel_size:.4f} um/px)"
         )
 
-    if abs(wsi_scale - 1.0) > 0.01:
-        new_w = int(gray_wsi.shape[1] * wsi_scale)
-        new_h = int(gray_wsi.shape[0] * wsi_scale)
+    if wsi_scale < 0.99:
+        new_w = max(1, int(gray_wsi.shape[1] * wsi_scale))
+        new_h = max(1, int(gray_wsi.shape[0] * wsi_scale))
         gray_wsi = cv2.resize(gray_wsi, (new_w, new_h), interpolation=cv2.INTER_AREA)
         logger.info(
             f"Downscaled WSI region to {new_w}x{new_h} "
             f"(scale={wsi_scale:.3f}, {wsi_pixel_size_um:.4f} -> {target_pixel_size:.4f} um/px)"
         )
 
-    if abs(micro_scale - 1.0) <= 0.01 and abs(wsi_scale - 1.0) <= 0.01:
-        logger.info("Pixel sizes match, no rescaling needed")
+    if micro_scale >= 0.99 and wsi_scale >= 0.99:
+        logger.info(f"Both images already at or below target resolution ({target_pixel_size:.4f} um/px)")
 
     # Both images now at target_pixel_size um/px
     gray_wsi_scaled = gray_wsi
