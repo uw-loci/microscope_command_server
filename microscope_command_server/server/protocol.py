@@ -62,6 +62,7 @@ class ExtendedCommand:
     SNAP = b"snap____"  # Simple snap with fixed exposure (no adaptive)
     ZSTACK = b"zstack__"  # Z-stack acquisition at current XY (multi-Z, single tile)
     TLAPSE = b"tlapse__"  # Time-lapse acquisition at current position (repeat over time)
+    SIFTAL = b"siftal__"  # SIFT auto-alignment: snap + match against WSI region file
 
     # PPM Testing Commands (for QPSC menu integration)
     PPMSENS = b"ppmsens_"  # PPM Rotation Sensitivity Test

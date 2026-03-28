@@ -2473,6 +2473,119 @@ def handle_client(conn, addr):
 
                 continue
 
+            # ==================== SIFTAL: SIFT Auto-Alignment ====================
+            if data == ExtendedCommand.SIFTAL:
+                logger.info(f"Client {addr} requested SIFT auto-alignment")
+                message_parts = []
+                total_bytes = 0
+                start_time = time.time()
+                conn.settimeout(5.0)
+
+                try:
+                    while True:
+                        chunk = conn.recv(4096)
+                        if not chunk:
+                            conn.sendall(b"FAILED:Connection closed")
+                            break
+                        message_parts.append(chunk.decode("utf-8"))
+                        total_bytes += len(chunk)
+                        full_message = "".join(message_parts)
+
+                        if END_MARKER in full_message:
+                            message = full_message.replace(END_MARKER, "").strip()
+                            logger.info(f"SIFTAL message: {message}")
+
+                            # Parse: --wsi-region <path> --micro-px <um> --wsi-px <um>
+                            #        --flip-x --flip-y
+                            params = {}
+                            parts = message.split()
+                            i = 0
+                            while i < len(parts):
+                                if parts[i] == "--wsi-region" and i + 1 < len(parts):
+                                    params["wsi_region_path"] = parts[i + 1]; i += 2
+                                elif parts[i] == "--micro-px" and i + 1 < len(parts):
+                                    params["micro_px"] = float(parts[i + 1]); i += 2
+                                elif parts[i] == "--wsi-px" and i + 1 < len(parts):
+                                    params["wsi_px"] = float(parts[i + 1]); i += 2
+                                elif parts[i] == "--flip-x":
+                                    params["flip_x"] = True; i += 1
+                                elif parts[i] == "--flip-y":
+                                    params["flip_y"] = True; i += 1
+                                else:
+                                    i += 1
+
+                            if "wsi_region_path" not in params:
+                                conn.sendall(b"FAILED:Missing --wsi-region")
+                                break
+
+                            try:
+                                import cv2
+                                from microscope_command_server.alignment.sift_matcher import match_sift
+
+                                # Read WSI region from file
+                                wsi_path = params["wsi_region_path"]
+                                wsi_region = cv2.imread(wsi_path)
+                                if wsi_region is None:
+                                    conn.sendall(f"FAILED:Could not read WSI region: {wsi_path}".encode())
+                                    break
+
+                                # Snap microscope image
+                                image, metadata = hardware.snap_image()
+                                if image is None:
+                                    conn.sendall(b"FAILED:Could not snap microscope image")
+                                    break
+
+                                # Convert RGB to BGR for OpenCV if needed
+                                if image.ndim == 3 and image.shape[2] == 3:
+                                    micro_bgr = cv2.cvtColor(image, cv2.COLOR_RGB2BGR)
+                                else:
+                                    micro_bgr = image
+
+                                micro_px = params.get("micro_px", 0.173)
+                                wsi_px = params.get("wsi_px", 0.25)
+                                flip_x = params.get("flip_x", False)
+                                flip_y = params.get("flip_y", False)
+
+                                logger.info(f"SIFT: micro_px={micro_px}, wsi_px={wsi_px}, "
+                                            f"flip_x={flip_x}, flip_y={flip_y}")
+
+                                result = match_sift(
+                                    microscope_image=micro_bgr,
+                                    wsi_region=wsi_region,
+                                    microscope_pixel_size_um=micro_px,
+                                    wsi_pixel_size_um=wsi_px,
+                                    flip_x=flip_x,
+                                    flip_y=flip_y,
+                                )
+
+                                if result is None:
+                                    conn.sendall(b"FAILED:SIFT matching failed - insufficient features or matches")
+                                else:
+                                    offset_x, offset_y, n_inliers, confidence = result
+                                    response = (f"SUCCESS:{offset_x:.2f},{offset_y:.2f}|"
+                                                f"inliers:{n_inliers}|confidence:{confidence:.3f}")
+                                    conn.sendall(response.encode())
+                                    logger.info(f"SIFTAL complete: offset=({offset_x:.1f}, {offset_y:.1f}) um, "
+                                                f"inliers={n_inliers}, confidence={confidence:.2f}")
+
+                            except ImportError as e:
+                                conn.sendall(f"FAILED:OpenCV not available: {e}".encode())
+                            except Exception as e:
+                                logger.error(f"SIFTAL failed: {e}", exc_info=True)
+                                conn.sendall(f"FAILED:{str(e)}".encode())
+                            break
+
+                        if total_bytes > 10000 or time.time() - start_time > 10:
+                            conn.sendall(b"FAILED:Message too large or timeout")
+                            break
+                except socket.timeout:
+                    conn.sendall(b"FAILED:Timeout reading message")
+                except Exception as e:
+                    conn.sendall(f"FAILED:{str(e)}".encode())
+                finally:
+                    conn.settimeout(None)
+                continue
+
             # ==================== ZSTACK: Z-Stack Acquisition ====================
             if data == ExtendedCommand.ZSTACK:
                 logger.info(f"Client {addr} requested Z-stack acquisition")
