@@ -55,26 +55,42 @@ def match_sift(
     elif flip_y:
         gray_wsi = cv2.flip(gray_wsi, 0)  # Vertical
 
-    # Rescale to match pixel sizes
-    # If microscope has 0.17 um/px and WSI has 0.25 um/px, WSI pixels are larger
-    # Scale WSI to match microscope pixel size
-    scale_factor = wsi_pixel_size_um / microscope_pixel_size_um
-    if abs(scale_factor - 1.0) > 0.01:
-        new_w = int(gray_wsi.shape[1] * scale_factor)
-        new_h = int(gray_wsi.shape[0] * scale_factor)
-        gray_wsi_scaled = cv2.resize(gray_wsi, (new_w, new_h), interpolation=cv2.INTER_LINEAR)
+    # Rescale to the LOWER resolution (larger pixel size) to avoid upscaling.
+    # Downscaling preserves real features; upscaling invents fake detail.
+    # Use INTER_AREA for downscaling (best quality for decimation).
+    target_pixel_size = max(microscope_pixel_size_um, wsi_pixel_size_um)
+
+    micro_scale = microscope_pixel_size_um / target_pixel_size
+    wsi_scale = wsi_pixel_size_um / target_pixel_size
+
+    if abs(micro_scale - 1.0) > 0.01:
+        new_w = int(gray_micro.shape[1] * micro_scale)
+        new_h = int(gray_micro.shape[0] * micro_scale)
+        gray_micro = cv2.resize(gray_micro, (new_w, new_h), interpolation=cv2.INTER_AREA)
         logger.info(
-            f"Rescaled WSI region from {gray_wsi.shape[1]}x{gray_wsi.shape[0]} "
-            f"to {new_w}x{new_h} (scale={scale_factor:.3f}, "
-            f"micro={microscope_pixel_size_um:.4f} um/px, wsi={wsi_pixel_size_um:.4f} um/px)"
+            f"Downscaled microscope image to {new_w}x{new_h} "
+            f"(scale={micro_scale:.3f}, {microscope_pixel_size_um:.4f} -> {target_pixel_size:.4f} um/px)"
         )
-    else:
-        gray_wsi_scaled = gray_wsi
+
+    if abs(wsi_scale - 1.0) > 0.01:
+        new_w = int(gray_wsi.shape[1] * wsi_scale)
+        new_h = int(gray_wsi.shape[0] * wsi_scale)
+        gray_wsi = cv2.resize(gray_wsi, (new_w, new_h), interpolation=cv2.INTER_AREA)
+        logger.info(
+            f"Downscaled WSI region to {new_w}x{new_h} "
+            f"(scale={wsi_scale:.3f}, {wsi_pixel_size_um:.4f} -> {target_pixel_size:.4f} um/px)"
+        )
+
+    if abs(micro_scale - 1.0) <= 0.01 and abs(wsi_scale - 1.0) <= 0.01:
         logger.info("Pixel sizes match, no rescaling needed")
+
+    # Both images now at target_pixel_size um/px
+    gray_wsi_scaled = gray_wsi
 
     logger.info(
         f"SIFT matching: microscope {gray_micro.shape[1]}x{gray_micro.shape[0]} "
-        f"vs WSI {gray_wsi_scaled.shape[1]}x{gray_wsi_scaled.shape[0]}"
+        f"vs WSI {gray_wsi_scaled.shape[1]}x{gray_wsi_scaled.shape[0]} "
+        f"(both at {target_pixel_size:.4f} um/px)"
     )
 
     # Run SIFT
@@ -137,13 +153,13 @@ def match_sift(
     wsi_scaled_center_x = gray_wsi_scaled.shape[1] / 2.0
     wsi_scaled_center_y = gray_wsi_scaled.shape[0] / 2.0
 
-    # Offset in scaled WSI pixels (= microscope pixels since we matched scale)
+    # Offset in matched-resolution pixels (both images at target_pixel_size)
     offset_px_x = wsi_center_in_scaled[0] - wsi_scaled_center_x
     offset_px_y = wsi_center_in_scaled[1] - wsi_scaled_center_y
 
-    # Convert to microns using microscope pixel size
-    offset_um_x = offset_px_x * microscope_pixel_size_um
-    offset_um_y = offset_px_y * microscope_pixel_size_um
+    # Convert to microns using the common target pixel size
+    offset_um_x = offset_px_x * target_pixel_size
+    offset_um_y = offset_px_y * target_pixel_size
 
     # Confidence: inlier ratio
     confidence = n_inliers / len(good_matches) if len(good_matches) > 0 else 0
