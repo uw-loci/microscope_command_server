@@ -1456,7 +1456,8 @@ def handle_client(conn, addr):
                             #              --modality, --camera, --exposure, --target,
                             #              --tolerance, --max_gain_db, --gain_threshold,
                             #              --max_iterations, --calibrate_black_level,
-                            #              --base_gain, --exposure_soft_cap_ms, --boosted_max_gain_db
+                            #              --base_gain, --exposure_soft_cap_ms, --boosted_max_gain_db,
+                            #              --target_positive, --target_negative, --target_crossed
                             flags = [
                                 "--yaml",
                                 "--objective",
@@ -1474,6 +1475,9 @@ def handle_client(conn, addr):
                                 "--base_gain",
                                 "--exposure_soft_cap_ms",
                                 "--boosted_max_gain_db",
+                                "--target_positive",
+                                "--target_negative",
+                                "--target_crossed",
                             ]
 
                             # Helper to find a flag as a complete word (followed by space)
@@ -1532,6 +1536,12 @@ def handle_client(conn, addr):
                                         params["exposure_soft_cap_ms"] = float(value)
                                     elif flag == "--boosted_max_gain_db":
                                         params["boosted_max_gain_db"] = float(value)
+                                    elif flag == "--target_positive":
+                                        params["target_positive"] = float(value)
+                                    elif flag == "--target_negative":
+                                        params["target_negative"] = float(value)
+                                    elif flag == "--target_crossed":
+                                        params["target_crossed"] = float(value)
 
                             # Validate required parameters
                             required = ["output_folder_path", "initial_exposure_ms"]
@@ -1625,9 +1635,16 @@ def handle_client(conn, addr):
                                     # (will be scaled up by calibrator for dimmer angles)
                                     start_exp = uncrossed_result.exposures_ms["green"]
 
-                                    # Get per-angle target intensity from YAML or defaults
-                                    angle_target = calib_kwargs["target"]
-                                    if "yaml_file_path" in params:
+                                    # Get per-angle target intensity.
+                                    # Priority: 1) client-provided per-angle target (from GUI spinners)
+                                    #           2) YAML config targets
+                                    #           3) default from global target
+                                    client_target_key = f"target_{angle_name}"
+                                    if client_target_key in params:
+                                        angle_target = params[client_target_key]
+                                        logger.info(f"  Target for {angle_name}: {angle_target:.1f} (from client)")
+                                    elif "yaml_file_path" in params:
+                                        angle_target = calib_kwargs["target"]
                                         try:
                                             val, src = get_target_intensity_for_angle(
                                                 angle=angle_deg,
@@ -1638,6 +1655,8 @@ def handle_client(conn, addr):
                                             logger.info(f"  Target for {angle_name}: {val:.1f} (from {src})")
                                         except Exception:
                                             pass
+                                    else:
+                                        angle_target = calib_kwargs["target"]
 
                                     try:
                                         angle_kwargs = dict(calib_kwargs)
