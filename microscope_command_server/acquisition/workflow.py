@@ -1091,10 +1091,24 @@ def autofocus_with_manual_fallback(
             # Success!
             return result
         elif isinstance(result, dict) and result.get('success') == False:
-            # Autofocus failed
+            # Autofocus failed with primary metric
             logger.warning(f"Autofocus failed (attempt {attempt + 1}/{max_retries}): {result['message']}")
             logger.warning(f"  Quality score: {result['quality_score']:.2f}, "
                           f"Prominence: {result['peak_prominence']:.2f}")
+
+            # Fallback: if primary metric found flat scores (no texture), try p98_p2
+            # which measures intensity range and works even on blank/featureless areas
+            primary_metric = autofocus_kwargs.get("score_metric", "normalized_variance")
+            if "flat" in result.get("message", "") and primary_metric != "p98_p2":
+                logger.info("Primary metric found flat scores -- retrying with p98_p2 (histogram range)")
+                fallback_kwargs = dict(autofocus_kwargs)
+                fallback_kwargs["score_metric"] = "p98_p2"
+                fallback_result = hardware.autofocus(**fallback_kwargs)
+                if isinstance(fallback_result, float):
+                    logger.info(f"p98_p2 fallback succeeded: Z={fallback_result:.2f} um")
+                    return fallback_result
+                else:
+                    logger.warning(f"p98_p2 fallback also failed: {fallback_result.get('message', '?')}")
 
             if request_manual_focus is not None:
                 # Always show dialog, even on last attempt
