@@ -3507,8 +3507,11 @@ def save_simple_wb_to_yaml(
             "angles": simple_wb_results,
         }
 
-        # Update global WB timestamp -- ANY WB change invalidates all backgrounds
-        detector_profile["wb_last_modified"] = datetime.now().isoformat()
+        # NOTE: Do NOT write wb_last_modified here. This function is called both
+        # during WB calibration AND during background collection. Writing it during
+        # BG collection would make the timestamp newer than the backgrounds, causing
+        # the Java validator to report them as stale. wb_last_modified is written
+        # by update_imageprocessing_config() in calibration.py during actual WB calibration.
 
         with open(imageprocessing_path, "w") as f:
             yaml.dump(ip_data, f, default_flow_style=False, sort_keys=False)
