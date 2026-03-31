@@ -93,8 +93,9 @@ class SaturationMonitor:
 
     # Angles within this range of 90 are considered uncrossed
     UNCROSSED_TOLERANCE = 2.0
-    # Default: abort if worst channel exceeds this on birefringence angles
-    BIREF_ABORT_THRESHOLD_PCT = 5.0
+    # Default: abort if worst channel exceeds this on birefringence angles.
+    # Configurable via acquisition_settings.saturation_abort_threshold_pct in YAML.
+    BIREF_ABORT_THRESHOLD_PCT = 10.0
     # Number of initial tiles to monitor before deciding to abort
     MONITORING_WINDOW = 3
     # For uncrossed angle, only log every Nth saturated tile
@@ -2318,9 +2319,20 @@ def _acquisition_workflow(
             logger.info(f"=== Starting main acquisition loop ===")
 
         # Initialize saturation monitor for adaptive abort/rate-limiting
+        # Read threshold from config YAML if available, otherwise use default (5%)
+        sat_threshold = None
+        try:
+            sat_threshold = config_manager.get(
+                "acquisition_settings", "saturation_abort_threshold_pct")
+            if sat_threshold is not None:
+                sat_threshold = float(sat_threshold)
+                logger.info(f"Saturation abort threshold from config: {sat_threshold}%")
+        except Exception:
+            pass
         sat_monitor = SaturationMonitor(
             angles=params.get("angles", []),
             logger=logger,
+            biref_abort_threshold_pct=sat_threshold,
         )
 
         # Initialize background write pool for overlapped I/O.
