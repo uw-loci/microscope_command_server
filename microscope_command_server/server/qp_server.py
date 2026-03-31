@@ -1622,23 +1622,24 @@ def handle_client(conn, addr):
                                 except Exception as e:
                                     logger.warning(f"Could not load rotation angles from config: {e}")
 
-                                # Calibrate remaining angles using uncrossed R:G:B as starting point
+                                # Calibrate remaining angles using UNIFIED exposure mode.
+                                # Keep analog R/B gains from uncrossed calibration for color balance.
+                                # Only adjust a single exposure time to reach target average intensity.
+                                # This prevents the per-channel exposure * analog gain compounding
+                                # that causes blue saturation at small angles.
                                 from microscope_command_server.acquisition.workflow import (
                                     get_target_intensity_for_angle,
                                 )
+                                from microscope_control.jai.calibration import WhiteBalanceResult
+                                import numpy as np
+
                                 for angle_name, angle_deg in remaining_angles:
-                                    logger.info(f"Simple WB: calibrating {angle_name} ({angle_deg} deg)...")
+                                    logger.info(f"Simple WB: calibrating {angle_name} ({angle_deg} deg) "
+                                                "with unified exposure...")
                                     if hasattr(hardware, "set_psg_ticks"):
                                         hardware.set_psg_ticks(angle_deg)
 
-                                    # Use green channel from uncrossed as starting exposure
-                                    # (will be scaled up by calibrator for dimmer angles)
-                                    start_exp = uncrossed_result.exposures_ms["green"]
-
-                                    # Get per-angle target intensity.
-                                    # Priority: 1) client-provided per-angle target (from GUI spinners)
-                                    #           2) YAML config targets
-                                    #           3) default from global target
+                                    # Get per-angle target intensity
                                     client_target_key = f"target_{angle_name}"
                                     if client_target_key in params:
                                         angle_target = params[client_target_key]
@@ -1659,11 +1660,53 @@ def handle_client(conn, addr):
                                         angle_target = calib_kwargs["target"]
 
                                     try:
-                                        angle_kwargs = dict(calib_kwargs)
-                                        angle_kwargs["target"] = angle_target
-                                        angle_result = calibrator.calibrate_simple(
-                                            initial_exposure_ms=start_exp,
-                                            **angle_kwargs,
+                                        # Switch to unified exposure mode (single exposure for all channels)
+                                        # Keep analog gains from uncrossed calibration for color balance
+                                        jai_props.disable_individual_exposure()
+                                        jai_props.set_unified_gain(uncrossed_result.unified_gain)
+                                        jai_props.set_rb_analog_gains(
+                                            red=uncrossed_result.analog_red,
+                                            blue=uncrossed_result.analog_blue)
+                                        logger.info(f"  Unified mode: gain={uncrossed_result.unified_gain:.2f}, "
+                                                    f"aR={uncrossed_result.analog_red:.3f}, "
+                                                    f"aB={uncrossed_result.analog_blue:.3f}")
+
+                                        # Start with uncrossed green exposure as initial guess
+                                        exposure_ms = uncrossed_result.exposures_ms["green"]
+                                        tolerance = calib_kwargs.get("tolerance", 5.0)
+                                        converged = False
+                                        max_iter = 15
+
+                                        for iteration in range(max_iter):
+                                            hardware.set_exposure(exposure_ms)
+                                            image, metadata = hardware.snap_image()
+                                            if image is None:
+                                                raise RuntimeError("Failed to snap image")
+                                            measured = float(np.mean(image))
+                                            logger.info(f"  Iter {iteration}: exp={exposure_ms:.2f}ms, "
+                                                        f"mean={measured:.1f} (target={angle_target:.1f})")
+                                            if abs(measured - angle_target) <= tolerance:
+                                                converged = True
+                                                logger.info(f"  Converged at iteration {iteration}")
+                                                break
+                                            if measured < 1.0:
+                                                exposure_ms *= 5.0
+                                            else:
+                                                exposure_ms *= angle_target / measured
+
+                                        # Build result with unified exposure for all channels
+                                        # (R/G/B all get the same exposure in unified mode)
+                                        angle_result = WhiteBalanceResult(
+                                            exposures_ms={"red": exposure_ms, "green": exposure_ms, "blue": exposure_ms},
+                                            black_levels={"red": 0, "green": 0, "blue": 0},
+                                            final_means={"red": measured, "green": measured, "blue": measured},
+                                            target_value=angle_target,
+                                            unified_gain=uncrossed_result.unified_gain,
+                                            analog_red=uncrossed_result.analog_red,
+                                            analog_blue=uncrossed_result.analog_blue,
+                                            wb_method="manual_simple",
+                                            converged=converged,
+                                            iterations=iteration + 1,
                                         )
                                         all_results[angle_name] = angle_result
                                         logger.info(
