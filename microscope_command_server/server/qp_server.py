@@ -1631,7 +1631,6 @@ def handle_client(conn, addr):
                                     get_target_intensity_for_angle,
                                 )
                                 from microscope_control.jai.calibration import WhiteBalanceResult
-                                import numpy as np
 
                                 for angle_name, angle_deg in remaining_angles:
                                     logger.info(f"Simple WB: calibrating {angle_name} ({angle_deg} deg) "
