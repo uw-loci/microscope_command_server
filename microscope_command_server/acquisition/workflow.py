@@ -2704,9 +2704,9 @@ def _acquisition_workflow(
                                 logger.debug(f"Could not set unified gain: {e}")
 
                     elif wb_mode == "simple" and simple_wb_data:
-                        # Simple WB mode: use exposures_ms from imaging profile (source of truth).
-                        # The simple_wb.angles section may have stale per-channel values from
-                        # old calibrations. The exposures_ms section is always up to date.
+                        # Simple WB mode: use simple_wb.angles (written during WBSIMPLE calibration).
+                        # These values are the source of truth for Simple WB acquisition and are
+                        # NOT overwritten by PPM WB or background collection.
                         # For small angles, all channels have the same exposure (unified mode).
                         angle_name = angle_to_name(angle, modality=modality)
                         sw_angles = simple_wb_data.get("angles", {})
@@ -4528,16 +4528,10 @@ def simple_background_collection(
                     final_exposures[angle] = exp_g  # Store green as reference
                     achieved_intensities[angle] = actual_intensity
 
-                    # Store the simple_wb data for this angle
-                    if not hasattr(simple_background_collection, '_simple_wb_results'):
-                        simple_background_collection._simple_wb_results = {}
-                    simple_background_collection._simple_wb_results[angle_name] = {
-                        "scale": round(scale, 3),
-                        "unified_gain": unified_gain,
-                        "r": round(exp_r, 2),
-                        "g": round(exp_g, 2),
-                        "b": round(exp_b, 2),
-                    }
+                    # NOTE: simple_wb.angles is now written during WB calibration
+                    # (WBSIMPLE handler), NOT during background collection.
+                    # BG collection uses per-channel scaling for flat-field acquisition,
+                    # but the acquisition itself uses unified values from calibration.
 
                     logger.info(
                         f"Simple WB background: shape={image.shape}, "
@@ -4813,25 +4807,10 @@ def simple_background_collection(
             logger.warning(f"Failed to save background exposures to YAML: {e}")
             # Non-fatal - continue returning the exposures
 
-        # Save simple_wb section to imageprocessing YAML for Mode 2
-        if wb_mode == "simple" and hasattr(simple_background_collection, '_simple_wb_results'):
-            try:
-                save_simple_wb_to_yaml(
-                    config_path=Path(yaml_file_path),
-                    simple_wb_results=simple_background_collection._simple_wb_results,
-                    base_exposures=simple_wb_base,
-                    modality=modality,
-                    objective=objective,
-                    detector=detector,
-                    logger=logger,
-                )
-                logger.info("Simple WB per-angle data saved to imageprocessing YAML")
-                # Clean up the function attribute
-                del simple_background_collection._simple_wb_results
-            except Exception as e:
-                logger.warning(f"Failed to save simple_wb data to YAML: {e}")
-                if hasattr(simple_background_collection, '_simple_wb_results'):
-                    del simple_background_collection._simple_wb_results
+        # NOTE: simple_wb.angles is now written during WB calibration (WBSIMPLE),
+        # not during background collection. This ensures the acquisition uses the
+        # correct unified exposure values from calibration, even if PPM WB later
+        # overwrites the shared exposures_ms section.
 
         # Return final exposures for metadata writing
         return final_exposures

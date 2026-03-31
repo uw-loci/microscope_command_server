@@ -1737,6 +1737,50 @@ def handle_client(conn, addr):
                                             detector=wb_detector,
                                         )
 
+                                    # Also save simple_wb section with calibration values.
+                                    # This is the source of truth for Simple WB acquisition.
+                                    # Background collection does NOT overwrite these values,
+                                    # so they remain correct even if PPM WB later overwrites
+                                    # the shared exposures_ms section.
+                                    from microscope_command_server.acquisition.workflow import (
+                                        save_simple_wb_to_yaml,
+                                    )
+                                    uncrossed_for_base = all_results.get("uncrossed")
+                                    if uncrossed_for_base:
+                                        simple_wb_cal_results = {}
+                                        uncrossed_g = uncrossed_for_base.exposures_ms["green"]
+                                        for aname, aresult in all_results.items():
+                                            scale = (aresult.exposures_ms["green"] / uncrossed_g
+                                                     if uncrossed_g > 0 else 1.0)
+                                            simple_wb_cal_results[aname] = {
+                                                "scale": round(scale, 3),
+                                                "unified_gain": round(aresult.unified_gain, 3),
+                                                "r": round(aresult.exposures_ms["red"], 2),
+                                                "g": round(aresult.exposures_ms["green"], 2),
+                                                "b": round(aresult.exposures_ms["blue"], 2),
+                                            }
+                                        base_exp = {
+                                            "r": round(uncrossed_for_base.exposures_ms["red"], 2),
+                                            "g": round(uncrossed_for_base.exposures_ms["green"], 2),
+                                            "b": round(uncrossed_for_base.exposures_ms["blue"], 2),
+                                            "gains": {
+                                                "unified_gain": round(uncrossed_for_base.unified_gain, 3),
+                                                "analog_red": round(uncrossed_for_base.analog_red, 3),
+                                                "analog_blue": round(uncrossed_for_base.analog_blue, 3),
+                                                "wb_method": uncrossed_for_base.wb_method,
+                                            },
+                                        }
+                                        save_simple_wb_to_yaml(
+                                            config_path=Path(params["yaml_file_path"]),
+                                            simple_wb_results=simple_wb_cal_results,
+                                            base_exposures=base_exp,
+                                            modality=wb_modality,
+                                            objective=wb_objective,
+                                            detector=wb_detector,
+                                            logger=logger,
+                                        )
+                                        logger.info("Simple WB: saved calibration values to simple_wb section")
+
                                 # Format response: uncrossed result for backward compatibility
                                 result = uncrossed_result
                                 exp_str = (
