@@ -1302,6 +1302,9 @@ def parse_acquisition_message(message: str) -> dict:
             elif parts[i] == "--hint-z" and i + 1 < len(parts):
                 params["hint_z"] = float(parts[i + 1])
                 i += 2
+            elif parts[i] == "--preferred-af-tile" and i + 1 < len(parts):
+                params["preferred_af_tile"] = int(parts[i + 1])
+                i += 2
             elif parts[i] == "--z-stack":
                 params["z_stack"] = True
                 i += 1
@@ -2060,8 +2063,10 @@ def _acquisition_workflow(
 
         # Write timing window to file for Java progress dialog
         # Include all information needed for accurate time estimation:
+        preferred_af_tile = params.get("preferred_af_tile")
         af_positions, af_min_distance = AutofocusUtils.get_autofocus_positions(
-            fov, xy_positions, n_tiles=af_n_tiles
+            fov, xy_positions, n_tiles=af_n_tiles,
+            preferred_first_af=preferred_af_tile,
         )
 
         small_grid_override = (len(xy_positions) <= 9)
@@ -2071,9 +2076,10 @@ def _acquisition_workflow(
                 f"autofocus at ALL positions: {af_positions} (min_distance={af_min_distance})"
             )
         else:
+            pref_msg = f" (preferred tile {preferred_af_tile} from WSI)" if preferred_af_tile is not None else ""
             logger.info(
                 f"Autofocus positions ({len(af_positions)}/{len(xy_positions)} tiles): "
-                f"{af_positions} (min_distance={af_min_distance:.1f})"
+                f"{af_positions} (min_distance={af_min_distance:.1f}){pref_msg}"
             )
 
         # Write timing metadata AFTER computing AF positions so we can
