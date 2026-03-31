@@ -2704,8 +2704,10 @@ def _acquisition_workflow(
                                 logger.debug(f"Could not set unified gain: {e}")
 
                     elif wb_mode == "simple" and simple_wb_data:
-                        # Simple WB mode with pre-computed data: apply uncrossed R:G:B
-                        # ratio uniformly scaled for this angle
+                        # Simple WB mode: use exposures_ms from imaging profile (source of truth).
+                        # The simple_wb.angles section may have stale per-channel values from
+                        # old calibrations. The exposures_ms section is always up to date.
+                        # For small angles, all channels have the same exposure (unified mode).
                         angle_name = angle_to_name(angle, modality=modality)
                         sw_angles = simple_wb_data.get("angles", {})
                         if angle_name in sw_angles:
@@ -2713,12 +2715,22 @@ def _acquisition_workflow(
                             try:
                                 from microscope_control.jai import JAICameraProperties
                                 jai_props = JAICameraProperties(hardware.core)
-                                jai_props.set_channel_exposures(
-                                    red=angle_sw["r"],
-                                    green=angle_sw["g"],
-                                    blue=angle_sw["b"],
-                                    auto_enable=True,
-                                )
+
+                                # Check if all channels have the same exposure (unified calibration)
+                                exp_r = angle_sw["r"]
+                                exp_g = angle_sw["g"]
+                                exp_b = angle_sw["b"]
+                                is_unified = abs(exp_r - exp_g) < 0.01 and abs(exp_g - exp_b) < 0.01
+
+                                if is_unified:
+                                    # Unified mode: set single exposure, analog gains handle color balance
+                                    jai_props.disable_individual_exposure()
+                                    hardware.set_exposure(exp_g)
+                                else:
+                                    # Legacy per-channel mode (old calibration data)
+                                    jai_props.set_channel_exposures(
+                                        red=exp_r, green=exp_g, blue=exp_b, auto_enable=True,
+                                    )
                                 jai_props.set_unified_gain(angle_sw.get("unified_gain", 1.0))
                                 # Apply calibrated R/B analog gains from Phase 2.
                                 # These correct the camera's spectral bias and must
