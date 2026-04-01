@@ -765,12 +765,12 @@ def apply_jai_calibration_for_angle(
                         'scale_applied' (the scale factor used, or 1.0 if none).
                         None if application failed.
     """
-    # Only applies to JAI camera
+    # Only applies to cameras with per-channel exposure control (e.g. JAI 3-CCD)
     try:
-        camera_name = hardware.core.get_property("Core", "Camera")
-        if "JAI" not in camera_name.upper():
+        camera_name = hardware.get_camera_name()
+        if not hardware.camera.supports_per_channel_exposure():
             if logger:
-                logger.debug(f"JAI calibration skipped - camera is {camera_name}")
+                logger.debug(f"Per-channel calibration skipped - camera is {camera_name}")
             return False, None
     except Exception:
         return False, None
@@ -806,7 +806,7 @@ def apply_jai_calibration_for_angle(
 
         if not exposures:
             if logger:
-                logger.warning("No exposure data in JAI calibration")
+                logger.debug("No exposure data in JAI calibration")
             return False, None
 
         # Get base per-channel exposures from calibration
@@ -926,12 +926,11 @@ def load_and_apply_white_balance_settings(
     # would match hypothetical "JAI_Fusion" etc.), this function uses an
     # exact match because the white_balance_settings.yml file format is
     # tightly coupled to JAICameraProperties.apply_white_balance_settings()
-    # and its specific property names. A different JAI model would likely
-    # need a different settings loader.
-    camera_name = hardware.core.get_property("Core", "Camera")
-    if camera_name != "JAICamera":
+    # Only applies to cameras with per-channel exposure (e.g. JAI 3-CCD).
+    camera_name = hardware.get_camera_name()
+    if not hardware.camera.supports_per_channel_exposure():
         if logger:
-            logger.debug(f"White balance loading skipped - camera is {camera_name}, not JAI")
+            logger.debug(f"White balance loading skipped - camera {camera_name} has no per-channel exposure")
         return False
 
     try:
@@ -1043,7 +1042,7 @@ def log_timing(logger, operation_name, start_time):
         Current time for use as next start_time
     """
     elapsed_ms = (time.perf_counter() - start_time) * 1000
-    logger.info(f"  [TIMING] {operation_name}: {elapsed_ms:.1f}ms")
+    logger.debug(f"  [TIMING] {operation_name}: {elapsed_ms:.1f}ms")
     return time.perf_counter()
 
 
@@ -1453,12 +1452,8 @@ def _acquisition_workflow(
     try:
         # Stop live mode if running - JAI camera properties cannot be changed during live streaming
         try:
-            if hardware.core.is_sequence_running():
-                hardware.core.stop_sequence_acquisition()
-                logger.info("Stopped core sequence acquisition before acquisition")
-            if hardware.studio is not None and hardware.studio.live().is_live_mode_on():
-                hardware.studio.live().set_live_mode(False)
-                logger.info("Stopped studio live mode before acquisition")
+            hardware.camera.stop_if_streaming()
+            logger.info("Ensured camera not streaming before acquisition")
         except Exception as e:
             logger.warning(f"Could not stop live/sequence mode: {e}")
 
@@ -1640,9 +1635,6 @@ def _acquisition_workflow(
 
                 if background_images:
                     logger.info(f"Loaded {len(background_images)} background images")
-                    # Check loaded backgrounds for saturation issues
-                    for bg_angle, bg_img in background_images.items():
-                        _check_saturation(bg_img, f"loaded background at {bg_angle}deg", logger)
                 else:
                     logger.warning("No background images found - disabling background correction")
                     background_correction_enabled = False
@@ -1685,10 +1677,10 @@ def _acquisition_workflow(
         # Note: get_property(camera_device, "Description") does NOT work reliably
         is_jai_camera = False
         try:
-            camera_name = hardware.core.get_property("Core", "Camera")
-            is_jai_camera = "JAI" in camera_name.upper()
+            camera_name = hardware.get_camera_name()
+            is_jai_camera = hardware.camera.supports_per_channel_exposure()
             if is_jai_camera:
-                logger.info(f"JAI camera detected: {camera_name}")
+                logger.info(f"Per-channel camera detected: {camera_name}")
         except Exception as e:
             logger.debug(f"Could not detect camera type: {e}")
 
@@ -2095,8 +2087,8 @@ def _acquisition_workflow(
             f.write(f"total_tiles={total_images}\n")
             f.write(f"af_n_steps={af_n_steps}\n")
             f.write(f"objective={current_objective}\n")
-        logger.info(f"Wrote timing metadata to {timing_metadata_path}: "
-                    f"window={timing_window_size}, af_positions={len(af_positions)}, tiles={total_images}")
+        logger.debug(f"Wrote timing metadata to {timing_metadata_path}: "
+                     f"window={timing_window_size}, af_positions={len(af_positions)}, tiles={total_images}")
 
         # Create dynamic autofocus positions set (can be modified during acquisition)
         dynamic_af_positions = set(af_positions)
@@ -2386,7 +2378,7 @@ def _acquisition_workflow(
                     needs_af = True
                     logger.info(f"  Forcing AF: gap of {gap} positions since last AF "
                                 f"(threshold: {af_n_tiles})")
-            logger.info(f"Moving to position: X={pos.x}, Y={pos.y}, Z={pos.z}")
+            logger.debug(f"Moving to position: X={pos.x}, Y={pos.y}, Z={pos.z}")
             t0 = time.perf_counter()
 
             # Stage move with retry on serial errors. Retries twice (2s delay),
@@ -2655,7 +2647,7 @@ def _acquisition_workflow(
                         logger=logger,
                     )
                     if not applied:
-                        logger.warning("Failed to restore per-channel mode after autofocus")
+                        logger.debug("Could not restore per-channel mode after autofocus")
 
             # Collect stage position for this tile (after autofocus, before acquiring angles)
             # This captures the actual XYZ used for acquisition
@@ -2745,7 +2737,7 @@ def _acquisition_workflow(
                                     red=simple_wb_analog_red,
                                     blue=simple_wb_analog_blue,
                                 )
-                                logger.info(
+                                logger.debug(
                                     f"  Simple WB: R={angle_sw['r']:.1f}ms, "
                                     f"G={angle_sw['g']:.1f}ms, B={angle_sw['b']:.1f}ms "
                                     f"(scale={angle_sw.get('scale', '?')}x, "
@@ -2843,7 +2835,7 @@ def _acquisition_workflow(
                     t_stats = time.perf_counter()
                     img_mean = image.mean((0,1))
                     t_stats = log_timing(logger, f"Calculate image stats at {angle}deg", t_stats)
-                    logger.info(f"  Image shape: {image.shape}, mean: {img_mean}")
+                    logger.debug(f"  Image shape: {image.shape}, mean: {img_mean}")
                     # For uncrossed angles, suppress per-tile SATURATION WARNING
                     # after the first occurrence -- the monitor handles rate-limiting
                     sat_warn_threshold = (
@@ -2884,7 +2876,7 @@ def _acquisition_workflow(
                             # Submit raw TIFF write to background pool.
                             # Safe: apply_flat_field_correction creates a NEW array,
                             # so the raw `image` array is never modified after this point.
-                            raw_pixel_size = hardware.core.get_pixel_size_um()
+                            raw_pixel_size = hardware.get_pixel_size_um()
                             write_pool.submit(
                                 TifWriterUtils.ome_writer,
                                 filename=str(raw_image_path),
@@ -2903,8 +2895,8 @@ def _acquisition_workflow(
                         and angle not in background_disabled_angles
                     ):
                         bg_img = background_images[angle]
-                        logger.info(f"  Applying background correction for {angle} degrees")
-                        logger.info(
+                        logger.debug(f"  Applying background correction for {angle} degrees")
+                        logger.debug(
                             f"    Background stats: mean={bg_img.mean():.1f}, std={bg_img.std():.1f}"
                         )
 
@@ -2916,10 +2908,10 @@ def _acquisition_workflow(
                             method=background_correction_method,
                         )
                         t_bg = log_timing(logger, f"Background correction at {angle}deg", t_bg)
-                        logger.info(
+                        logger.debug(
                             f"    Correction applied with method: {background_correction_method}"
                         )
-                        logger.info(f"    Post-correction RGB means: {image.mean(axis=(0,1))}")
+                        logger.debug(f"    Post-correction RGB means: {image.mean(axis=(0,1))}")
                         # Use higher threshold for post-correction to reduce noise;
                         # the raw check + monitor already handles abort decisions
                         if not sat_monitor._is_uncrossed(angle):
@@ -2958,7 +2950,7 @@ def _acquisition_workflow(
                             f"  Applied software white balance: R={wb_profile[0]:.2f}, G={wb_profile[1]:.2f}, B={wb_profile[2]:.2f}"
                         )
                     elif white_balance_enabled and (jai_calibration is not None or wb_mode in ("camera_awb", "simple")):
-                        logger.info(
+                        logger.debug(
                             f"  Software WB skipped (hardware WB active for {angle} deg, mode={wb_mode})"
                         )
 
@@ -2970,7 +2962,7 @@ def _acquisition_workflow(
                         # Safe: `image` is a new array from background correction / white
                         # balance (both return new arrays). The next angle's snap_image()
                         # creates yet another new array, so no mutation risk.
-                        proc_pixel_size = hardware.core.get_pixel_size_um()
+                        proc_pixel_size = hardware.get_pixel_size_um()
                         write_pool.submit(
                             TifWriterUtils.ome_writer,
                             filename=str(image_path),
@@ -2986,7 +2978,7 @@ def _acquisition_workflow(
 
                         # Log total time for this angle
                         angle_elapsed_ms = (time.perf_counter() - angle_start) * 1000
-                        logger.info(f"  [TIMING] Total for angle {angle}deg: {angle_elapsed_ms:.1f}ms")
+                        logger.debug(f"  [TIMING] Total for angle {angle}deg: {angle_elapsed_ms:.1f}ms")
                     else:
                         logger.error(f"Failed to save {image_path} - parent directory missing")
 
@@ -3009,7 +3001,7 @@ def _acquisition_workflow(
                     # Submit birefringence compute+save to background pool.
                     # Reads angle_images arrays concurrently with pending processed
                     # writes -- both are read-only, so this is safe.
-                    biref_pixel_size = hardware.core.get_pixel_size_um()
+                    biref_pixel_size = hardware.get_pixel_size_um()
                     biref_pos_img = angle_images[pos_angle]
                     biref_neg_img = angle_images[neg_angle]
                     write_pool.submit(
@@ -3036,7 +3028,7 @@ def _acquisition_workflow(
                 #     neg_image=angle_images[neg_angle],
                 #     output_dir=sum_dir,
                 #     filename=filename,
-                #     pixel_size_um=hardware.core.get_pixel_size_um(),
+                #     pixel_size_um=hardware.get_pixel_size_um(),
                 #     tile_config_source=tile_config_source,
                 #     logger=logger,
                 # )
@@ -3048,7 +3040,7 @@ def _acquisition_workflow(
 
                 if image_path.parent.exists():
                     # Submit brightfield TIFF write to background pool
-                    bf_pixel_size = hardware.core.get_pixel_size_um()
+                    bf_pixel_size = hardware.get_pixel_size_um()
                     write_pool.submit(
                         TifWriterUtils.ome_writer,
                         filename=str(image_path),
@@ -3069,7 +3061,7 @@ def _acquisition_workflow(
 
             # Log total time for this tile/position
             tile_elapsed_ms = (time.perf_counter() - tile_start) * 1000
-            logger.info(f"[TIMING] === TOTAL TILE TIME: {tile_elapsed_ms:.1f}ms ({tile_elapsed_ms/1000:.2f}s) ===")
+            logger.debug(f"[TIMING] === TOTAL TILE TIME: {tile_elapsed_ms:.1f}ms ({tile_elapsed_ms/1000:.2f}s) ===")
 
             # Record per-tile measurement data
             # Use current_stage_pos.z (captured after autofocus) for the actual Z
@@ -3170,10 +3162,14 @@ def _acquisition_workflow(
         except Exception as e:
             logger.warning(f"Error shutting down write pool: {e}")
 
-        # Return to starting position if it was captured
+        # Return XY to starting position (preserve Z from last autofocus so the
+        # next annotation's Z-hint starts near the actual focal plane rather than
+        # resetting to the user's initial Z).
         try:
-            logger.info("Returning to starting position")
-            hardware.move_to_position(starting_position)
+            logger.info("Returning to starting XY position (preserving Z)")
+            hardware.move_to_position(
+                Position(x=starting_position.x, y=starting_position.y)
+            )
         except NameError:
             logger.warning("Could not return to starting position (position was not captured)")
         except Exception as e:
@@ -3192,7 +3188,7 @@ def write_position_metadata(metadata_txt_for_positions, raw_image_path, hardware
         angle = hardware.get_psg_ticks()
         line += f"r = {angle} ; "
 
-    line += f"exposure (ms) = {hardware.core.get_exposure()}\n"
+    line += f"exposure (ms) = {hardware.get_exposure()}\n"
 
     with open(metadata_txt_for_positions, "a") as f:
         f.write(line)
@@ -3630,9 +3626,7 @@ def acquire_background_with_target_intensity(
 
     # Verify exposure was accepted by reading it back
     try:
-        readback_exp = float(
-            hardware.core.get_property("JAICamera", "Exposure")
-        )
+        readback_exp = float(hardware.get_exposure())
         if logger:
             logger.info(
                 f"Starting adaptive exposure: target={target_intensity:.1f}, "
@@ -4162,12 +4156,8 @@ def simple_background_collection(
         # Stop live mode if running - JAI camera properties cannot be changed during live streaming
         # This is the same pattern used in calibration.py
         try:
-            if hardware.core.is_sequence_running():
-                hardware.core.stop_sequence_acquisition()
-                logger.info("Stopped core sequence acquisition before background collection")
-            if hardware.studio is not None and hardware.studio.live().is_live_mode_on():
-                hardware.studio.live().set_live_mode(False)
-                logger.info("Stopped studio live mode before background collection")
+            hardware.camera.stop_if_streaming()
+            logger.info("Ensured camera not streaming before background collection")
         except Exception as e:
             logger.warning(f"Could not stop live/sequence mode: {e}")
 
@@ -4213,11 +4203,9 @@ def simple_background_collection(
         jai_calibration = None
         is_jai_camera = False
         try:
-            # Use "Core.Camera" property - this reliably contains "JAI" for JAI cameras
-            # Note: get_property(camera_device, "Description") does NOT work reliably
-            camera_name = hardware.core.get_property("Core", "Camera")
-            is_jai_camera = "JAI" in camera_name.upper()
-            logger.info(f"Camera detected: {camera_name} (JAI={is_jai_camera})")
+            camera_name = hardware.get_camera_name()
+            is_jai_camera = hardware.camera.supports_per_channel_exposure()
+            logger.info(f"Camera detected: {camera_name} (per_channel={is_jai_camera})")
         except Exception as e:
             logger.debug(f"Could not detect camera type: {e}")
 
@@ -4762,7 +4750,7 @@ def simple_background_collection(
                 )
             TifWriterUtils.ome_writer(  # background -single
                 filename=str(background_path),
-                pixel_size_um=hardware.core.get_pixel_size_um(),
+                pixel_size_um=hardware.get_pixel_size_um(),
                 data=image,
             )
 
@@ -5009,7 +4997,7 @@ def background_acquisition_workflow(
             background_path = angle_dir / "background.tif"
             TifWriterUtils.ome_writer(  # background 2 with bkg-workflow
                 filename=str(background_path),
-                pixel_size_um=hardware.core.get_pixel_size_um(),
+                pixel_size_um=hardware.get_pixel_size_um(),
                 data=image,
             )
 
