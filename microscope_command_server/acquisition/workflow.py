@@ -2634,11 +2634,14 @@ def _acquisition_workflow(
 
                 # Restore per-channel exposure/gain mode after autofocus.
                 # Autofocus disabled per-channel mode to use unified exposure.
-                # Re-enable now and apply first angle's calibration to ensure the camera
-                # is in a known-good state before the angle loop starts.
-                if jai_calibration is not None and params["angles"]:
+                # Only needed for per_angle WB mode (PPM WB), which uses per-channel
+                # JAI calibration. Simple WB and camera_awb modes set exposures
+                # differently in the angle loop -- no restore needed.
+                if (wb_mode == "per_angle"
+                        and jai_calibration is not None
+                        and params["angles"]):
                     first_angle = params["angles"][0]
-                    logger.info(f"Restoring per-channel WB mode after autofocus (first angle: {first_angle})")
+                    logger.debug(f"Restoring per-channel WB mode after autofocus (first angle: {first_angle})")
                     applied, _ = apply_jai_calibration_for_angle(
                         hardware=hardware,
                         jai_calibration=jai_calibration,
@@ -2647,7 +2650,7 @@ def _acquisition_workflow(
                         logger=logger,
                     )
                     if not applied:
-                        logger.debug("Could not restore per-channel mode after autofocus")
+                        logger.warning("Failed to restore per-channel mode after autofocus")
 
             # Collect stage position for this tile (after autofocus, before acquiring angles)
             # This captures the actual XYZ used for acquisition
