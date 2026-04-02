@@ -3195,7 +3195,6 @@ def handle_client(conn, addr):
                                     hardware=hardware,
                                     config_manager=config_manager,
                                     yaml_file_path=params["yaml_file_path"],
-                                    output_folder_path=params["output_folder_path"],
                                     objective=params["objective"],
                                     logger=logger,
                                 )
