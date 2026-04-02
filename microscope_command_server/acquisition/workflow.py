@@ -1051,6 +1051,7 @@ def autofocus_with_manual_fallback(
     logger,
     request_manual_focus: Optional[Callable[[int], str]] = None,
     max_retries: int = 3,
+    fallback_z: Optional[float] = None,
     **autofocus_kwargs
 ):
     """
@@ -1070,6 +1071,8 @@ def autofocus_with_manual_fallback(
                              user choice: "retry", "skip", or "cancel".
                              If None, will raise exception on autofocus failure.
         max_retries: Maximum number of retry attempts after manual focus
+        fallback_z: Z position to use when user skips (e.g., the Z-hint from
+                    the tilt model). If None, uses the failed AF's attempted_z.
         **autofocus_kwargs: Arguments to pass to hardware.autofocus()
 
     Returns:
@@ -1106,16 +1109,26 @@ def autofocus_with_manual_fallback(
                 user_choice = request_manual_focus(retries_remaining)  # Pass retries info
 
                 if user_choice == "skip":
-                    # User chose to use current focus - restore XY and return
+                    # User chose to skip -- use fallback_z (hint from tilt model)
+                    # if available, otherwise use the failed AF's attempted_z.
+                    # The tilt model hint is usually much more accurate than a
+                    # failed autofocus result.
+                    if fallback_z is not None:
+                        skip_z = fallback_z
+                        logger.info(f"Using fallback Z (hint): {skip_z:.2f} um "
+                                   f"(failed AF attempted: {result['attempted_z']:.2f} um)")
+                        hardware.move_to_position(Position(z=skip_z))
+                    else:
+                        skip_z = result['attempted_z']
+                        logger.info(f"Using failed AF position: {skip_z:.2f} um (no fallback hint)")
                     current_pos = hardware.get_current_position()
                     if abs(current_pos.x - original_x) > 1.0 or abs(current_pos.y - original_y) > 1.0:
                         logger.info(f"Restoring XY position after manual focus: "
                                    f"({current_pos.x:.1f}, {current_pos.y:.1f}) -> ({original_x:.1f}, {original_y:.1f})")
-                        # Position already imported at top of file (line 18)
-                        restore_pos = Position(original_x, original_y, current_pos.z)
+                        restore_pos = Position(original_x, original_y, skip_z)
                         hardware.move_to_position(restore_pos)
-                    logger.info("User chose to use current focus position")
-                    return result['attempted_z']
+                    logger.info("User chose to skip autofocus")
+                    return skip_z
                 elif user_choice == "cancel":
                     # User chose to cancel acquisition
                     logger.warning("User cancelled acquisition during manual focus")
@@ -1144,12 +1157,12 @@ def autofocus_with_manual_fallback(
                             continue
                     else:
                         # No retries left - shouldn't happen since button should be disabled
-                        logger.warning("User chose retry but no retries remaining - using current focus")
-                        return result['attempted_z']
+                        logger.warning("User chose retry but no retries remaining - using fallback Z")
+                        return fallback_z if fallback_z is not None else result['attempted_z']
                 else:
                     # Unknown choice - default to skip
-                    logger.warning(f"Unknown user choice '{user_choice}' - using current focus")
-                    return result['attempted_z']
+                    logger.warning(f"Unknown user choice '{user_choice}' - using fallback Z")
+                    return fallback_z if fallback_z is not None else result['attempted_z']
             else:
                 # No callback provided, raise exception
                 raise RuntimeError(
@@ -2278,6 +2291,7 @@ def _acquisition_workflow(
                         hardware=hardware,
                         request_manual_focus=request_manual_focus,
                         max_retries=3,
+                        fallback_z=hint_z,
                         n_steps=af_n_steps,
                         search_range=af_search_range,
                         score_metric=af_score_metric,
@@ -2294,6 +2308,7 @@ def _acquisition_workflow(
                         hardware=hardware,
                         request_manual_focus=request_manual_focus,
                         max_retries=0,  # No retries - go straight to manual if AF fails
+                        fallback_z=hint_z,
                         n_steps=af_n_steps,
                         search_range=af_search_range,
                         score_metric=af_score_metric,
@@ -2557,6 +2572,7 @@ def _acquisition_workflow(
                             logger=logger,
                             request_manual_focus=request_manual_focus,
                             max_retries=3,
+                            fallback_z=hint_z,
                             move_stage_to_estimate=True,
                             n_steps=af_n_steps,
                             search_range=af_search_range,
