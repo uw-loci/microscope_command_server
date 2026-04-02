@@ -1,0 +1,304 @@
+"""System and alignment command handlers.
+
+Handles connection management, configuration, and alignment commands:
+CONFIG, DISCONNECT, SHUTDOWN, SIFTAL
+"""
+
+import struct
+import socket
+import time
+import logging
+
+from microscope_command_server.server.protocol import END_MARKER
+from microscope_command_server.server.handlers.utils import read_message_string
+
+logger = logging.getLogger(__name__)
+
+
+def handle_disconnect(conn, client, hardware, settings, **kwargs):
+    """Handle client disconnect request.
+
+    Returns 'DISCONNECT' sentinel so the caller can break the
+    command loop.
+
+    Returns:
+        str: 'DISCONNECT' to signal the caller to close the connection.
+    """
+    addr = kwargs.get("addr", client if isinstance(client, tuple) else getattr(client, "addr", client))
+    logger.info("Client %s requested to disconnect", addr)
+    return "DISCONNECT"
+
+
+def handle_shutdown(conn, client, hardware, settings, **kwargs):
+    """Handle server shutdown request.
+
+    Sets the shutdown_event so the main server loop exits after
+    all clients disconnect.
+
+    Returns 'SHUTDOWN' sentinel so the caller can break the command loop.
+
+    Required kwargs:
+        shutdown_event: threading.Event to signal shutdown.
+
+    Returns:
+        str: 'SHUTDOWN' to signal the caller to close the connection.
+    """
+    addr = kwargs.get("addr", client if isinstance(client, tuple) else getattr(client, "addr", client))
+    shutdown_event = kwargs.get("shutdown_event")
+    logger.warning("Client %s requested server shutdown", addr)
+    if shutdown_event is not None:
+        shutdown_event.set()
+    return "SHUTDOWN"
+
+
+def handle_config(conn, client, hardware, settings, **kwargs):
+    """Handle CONFIG command -- connection setup and config loading.
+
+    This is the most complex system command. It:
+    1. Reads the config file path from the socket
+    2. Validates connection locking (single active client)
+    3. Loads and validates the YAML config
+    4. Reinitializes hardware components from the new config
+    5. Starts session logging
+    6. Sends version info back to the client
+
+    Modifies global server state via kwargs:
+        server_configured, active_connection_addr, active_connection_config_path
+
+    Required kwargs:
+        addr: Client address tuple
+        config_manager: ConfigManager instance
+        connection_state_lock: Lock protecting connection state
+        server_configured: bool (current state, returned modified)
+        active_connection_addr: tuple or None (current, returned modified)
+        active_connection_config_path: str or None (current, returned modified)
+        start_session_logging: callable(config_path)
+
+    Returns:
+        dict with updated global state keys:
+            server_configured, active_connection_addr, active_connection_config_path
+        or None if the command was handled without state changes (e.g., blocked).
+    """
+    addr = kwargs["addr"]
+    config_manager = kwargs["config_manager"]
+    connection_state_lock = kwargs["connection_state_lock"]
+    current_server_configured = kwargs.get("server_configured", False)
+    current_active_addr = kwargs.get("active_connection_addr")
+    current_active_config_path = kwargs.get("active_connection_config_path")
+    start_session_logging = kwargs.get("start_session_logging")
+
+    logger.info("Client %s sent CONFIG command", addr)
+
+    try:
+        # Read config file path: 4 bytes length + path string
+        path_length_bytes = conn.recv(4)
+        if not path_length_bytes:
+            logger.error("CONFIG: No path length received")
+            conn.sendall(b"CFG_FAIL")
+            return None
+
+        path_length = struct.unpack("!I", path_length_bytes)[0]
+        logger.debug("CONFIG: Expecting config path of %d bytes", path_length)
+
+        config_path_bytes = conn.recv(path_length)
+        config_path = config_path_bytes.decode("utf-8")
+        logger.info("CONFIG: Received config path: %s", config_path)
+
+        # Check connection locking
+        with connection_state_lock:
+            if current_active_addr is not None and current_active_addr != addr:
+                # Another connection exists - check if same IP (likely reconnect)
+                # addr is (ip, port) tuple - compare IP only
+                active_ip = current_active_addr[0]
+                new_ip = addr[0]
+
+                if active_ip == new_ip:
+                    # Same IP reconnecting - allow takeover (previous connection likely crashed)
+                    logger.warning("CONFIG: Same IP reconnecting - taking over from %s", current_active_addr)
+                    logger.warning("CONFIG: Previous connection may have been improperly closed")
+                    # Clear the old connection state (will be set to new addr below)
+                    current_active_addr = None
+                    current_active_config_path = None
+                else:
+                    # Different IP - reject this CONFIG
+                    logger.warning("CONFIG: Rejected - connection %s already active", current_active_addr)
+                    error_msg = f"BLOCKED: Active connection from {current_active_addr}".encode("utf-8")
+                    error_length = struct.pack("!I", len(error_msg))
+                    conn.sendall(b"CFG_BLCK" + error_length + error_msg)
+                    return None
+
+        # Load the config file
+        new_settings = config_manager.load_config_file(config_path)
+
+        # Validate essential config sections exist
+        # Note: id_detector specs come from resources file, not main config
+        # Main config has hardware.detectors which lists detector IDs
+        required_sections = ["microscope", "stage"]
+        missing = [s for s in required_sections if s not in new_settings or not new_settings[s]]
+        if missing:
+            error_msg = f"Config missing required sections: {', '.join(missing)}"
+            logger.error("CONFIG: %s", error_msg)
+            error_bytes = error_msg.encode("utf-8")
+            error_length = struct.pack("!I", len(error_bytes))
+            conn.sendall(b"CFG_FAIL" + error_length + error_bytes)
+            return None
+
+        # Update hardware with new configuration.
+        # Rebuild all composed components (camera registry,
+        # stage, rotation stage) from the new settings.
+        hardware.settings = new_settings
+        hardware._camera_name = hardware._detect_camera_name()
+        hardware._camera_registry = hardware._build_camera_registry()
+        hardware._active_detector_id = hardware._find_detector_id(hardware._camera_name)
+        hardware._stage = hardware._create_stage()
+        hardware._rotation_stage = hardware._create_rotation_stage()
+
+        # Build updated state to return
+        updated_state = {
+            "server_configured": True,
+            "active_connection_addr": addr,
+            "active_connection_config_path": config_path,
+        }
+
+        microscope_name = new_settings.get("microscope", {}).get("name", "Unknown")
+        logger.info("CONFIG: Successfully loaded config for microscope: %s", microscope_name)
+        logger.info("CONFIG: Server now configured and ready for operations")
+
+        # Start session logging to <config_dir>/logs/
+        if start_session_logging:
+            start_session_logging(config_path)
+
+        # Send success response with version info payload
+        import json
+        from microscope_command_server.version_info import collect_versions
+        version_json = json.dumps(collect_versions()).encode("utf-8")
+        version_length = struct.pack("!I", len(version_json))
+        conn.sendall(b"CFG___OK" + version_length + version_json)
+
+        return updated_state
+
+    except FileNotFoundError:
+        error_msg = f"Config file not found: {config_path}"
+        logger.error("CONFIG: %s", error_msg)
+        error_bytes = error_msg.encode("utf-8")
+        error_length = struct.pack("!I", len(error_bytes))
+        conn.sendall(b"CFG_FAIL" + error_length + error_bytes)
+        return None
+    except Exception as e:
+        error_msg = f"Failed to load config: {str(e)}"
+        logger.error("CONFIG: %s", error_msg, exc_info=True)
+        error_bytes = error_msg.encode("utf-8")
+        error_length = struct.pack("!I", len(error_bytes))
+        conn.sendall(b"CFG_FAIL" + error_length + error_bytes)
+        return None
+
+
+def handle_siftal(conn, client, hardware, settings, **kwargs):
+    """SIFT auto-alignment: snap microscope image and match against WSI region.
+
+    Reads --wsi-region, --micro-px, --wsi-px, --min-px, --flip-x,
+    --flip-y flags. Snaps a microscope image, runs SIFT feature
+    matching against the provided WSI region file, and returns
+    the offset in micrometers.
+
+    Response: SUCCESS:<offset_x>,<offset_y>|inliers:<n>|confidence:<f>
+              or FAILED:<reason>
+    """
+    addr = kwargs.get("addr", client if isinstance(client, tuple) else getattr(client, "addr", client))
+    logger.info("Client %s requested SIFT auto-alignment", addr)
+
+    try:
+        message = read_message_string(conn, chunk_size=4096)
+    except (socket.timeout, ConnectionError, ValueError) as e:
+        logger.error("Failed to read SIFTAL message from %s: %s", addr, e)
+        conn.sendall(f"FAILED:{str(e)}".encode())
+        return
+
+    logger.info("SIFTAL message: %s", message)
+
+    # Parse: --wsi-region <path> --micro-px <um> --wsi-px <um>
+    #        --min-px <um> --flip-x --flip-y
+    params = {}
+    parts = message.split()
+    i = 0
+    while i < len(parts):
+        if parts[i] == "--wsi-region" and i + 1 < len(parts):
+            params["wsi_region_path"] = parts[i + 1]; i += 2
+        elif parts[i] == "--micro-px" and i + 1 < len(parts):
+            params["micro_px"] = float(parts[i + 1]); i += 2
+        elif parts[i] == "--wsi-px" and i + 1 < len(parts):
+            params["wsi_px"] = float(parts[i + 1]); i += 2
+        elif parts[i] == "--min-px" and i + 1 < len(parts):
+            params["min_px"] = float(parts[i + 1]); i += 2
+        elif parts[i] == "--flip-x":
+            params["flip_x"] = True; i += 1
+        elif parts[i] == "--flip-y":
+            params["flip_y"] = True; i += 1
+        else:
+            i += 1
+
+    if "wsi_region_path" not in params:
+        conn.sendall(b"FAILED:Missing --wsi-region")
+        return
+
+    try:
+        import cv2
+        from microscope_command_server.alignment.sift_matcher import match_sift
+
+        # Read WSI region from file
+        wsi_path = params["wsi_region_path"]
+        wsi_region = cv2.imread(wsi_path)
+        if wsi_region is None:
+            conn.sendall(f"FAILED:Could not read WSI region: {wsi_path}".encode())
+            return
+
+        # Snap microscope image
+        image, metadata = hardware.snap_image()
+        if image is None:
+            conn.sendall(b"FAILED:Could not snap microscope image")
+            return
+
+        # Convert RGB to BGR for OpenCV if needed
+        if image.ndim == 3 and image.shape[2] == 3:
+            micro_bgr = cv2.cvtColor(image, cv2.COLOR_RGB2BGR)
+        else:
+            micro_bgr = image
+
+        micro_px = params.get("micro_px", 0.173)
+        wsi_px = params.get("wsi_px", 0.25)
+        min_px = params.get("min_px", 1.0)
+        flip_x = params.get("flip_x", False)
+        flip_y = params.get("flip_y", False)
+
+        logger.info(
+            "SIFT: micro_px=%s, wsi_px=%s, min_px=%s, flip_x=%s, flip_y=%s",
+            micro_px, wsi_px, min_px, flip_x, flip_y,
+        )
+
+        result = match_sift(
+            microscope_image=micro_bgr,
+            wsi_region=wsi_region,
+            microscope_pixel_size_um=micro_px,
+            wsi_pixel_size_um=wsi_px,
+            flip_x=flip_x,
+            flip_y=flip_y,
+            min_pixel_size_um=min_px,
+        )
+
+        if result is None:
+            conn.sendall(b"FAILED:SIFT matching failed - insufficient features or matches")
+        else:
+            offset_x, offset_y, n_inliers, confidence = result
+            response = (f"SUCCESS:{offset_x:.2f},{offset_y:.2f}|"
+                        f"inliers:{n_inliers}|confidence:{confidence:.3f}")
+            conn.sendall(response.encode())
+            logger.info(
+                "SIFTAL complete: offset=(%.1f, %.1f) um, inliers=%d, confidence=%.2f",
+                offset_x, offset_y, n_inliers, confidence,
+            )
+
+    except ImportError as e:
+        conn.sendall(f"FAILED:OpenCV not available: {e}".encode())
+    except Exception as e:
+        logger.error("SIFTAL failed: %s", e, exc_info=True)
+        conn.sendall(f"FAILED:{str(e)}".encode())
