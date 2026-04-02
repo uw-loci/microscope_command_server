@@ -453,14 +453,26 @@ def handle_client(conn, addr):
     client = ClientState(addr)
     acquisition_thread = None
 
-    # Shared kwargs passed to every handler for access to global state
+    # Shared kwargs passed to every handler for access to global state.
+    # This dict contains everything any handler might need. Handlers
+    # pick what they need via kwargs["key"] or kwargs.get("key").
     handler_kwargs = {
+        # Identity
         "addr": addr,
+        # Server state
         "server_configured": server_configured,
         "shutdown_event": shutdown_event,
         "connection_state_lock": connection_state_lock,
         "active_connection_addr": active_connection_addr,
         "active_connection_config_path": active_connection_config_path,
+        # Config manager (for CONFIG handler to reload settings)
+        "config_manager": config_manager,
+        # AcquisitionState enum (handlers import-free access)
+        "AcquisitionState": AcquisitionState,
+        # Acquisition workflow function (for ACQUIRE handler)
+        "acquisitionWorkflow": acquisitionWorkflow,
+        # Session logging control (for CONFIG handler)
+        "start_session_logging": _start_session_logging,
         # Per-client state dicts (legacy -- handlers access by addr)
         "acquisition_states": acquisition_states,
         "acquisition_progress": acquisition_progress,
