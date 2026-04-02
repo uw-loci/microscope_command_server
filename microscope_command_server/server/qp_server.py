@@ -222,6 +222,9 @@ server_configured = False  # True only after CONFIG command received with valid 
 active_connection_addr = None  # Track single active client connection (blocks other connections)
 active_connection_config_path = None  # Path to config file provided by active connection
 connection_state_lock = Lock()  # Protect connection state from race conditions
+# Track all connected clients from the configured IP so we only unconfigure
+# when ALL connections from that IP disconnect (Java uses main + aux sockets).
+active_ip_connections = set()  # Set of (ip, port) tuples from the active IP
 
 
 
@@ -433,6 +436,10 @@ def handle_client(conn, addr):
 
     logger.info(f">>> New client connected from {addr}")
 
+    # Track this connection for disconnect cleanup
+    with connection_state_lock:
+        active_ip_connections.add(addr)
+
     # Initialize per-client state in global dicts
     # (legacy pattern -- will migrate to ClientState object)
     acquisition_locks[addr] = Lock()
@@ -568,18 +575,36 @@ def handle_client(conn, addr):
         if addr in acquisition_saturation_summary:
             del acquisition_saturation_summary[addr]
 
-        # Clear active connection if this was the active client
-        # NOTE: global statement removed - these are module-level variables accessed via 'connection_state_lock'
-        # global server_configured, active_connection_addr, active_connection_config_path
+        # Remove this connection from tracking and check if all connections from
+        # the active IP are gone before unconfiguring.  Java uses main + aux sockets,
+        # so we must NOT unconfigure when just one of them disconnects.
         with connection_state_lock:
+            active_ip_connections.discard(addr)
+
             if active_connection_addr == addr:
-                logger.info(f"Active connection {addr} disconnected - server now UNCONFIGURED")
-                logger.info("Next connection will need to provide CONFIG command")
-                # Stop session logging before clearing state
-                _stop_session_logging()
-                server_configured = False
-                active_connection_addr = None
-                active_connection_config_path = None
+                # The CONFIG-owning connection disconnected.  Check if any other
+                # connections from the same IP are still alive.
+                active_ip = addr[0]
+                remaining = [a for a in active_ip_connections if a[0] == active_ip]
+                if remaining:
+                    # Hand ownership to the remaining connection
+                    active_connection_addr = remaining[0]
+                    logger.info(
+                        f"Active connection {addr} disconnected - "
+                        f"handing ownership to {active_connection_addr} "
+                        f"({len(remaining)} connection(s) still active from same IP)"
+                    )
+                else:
+                    # No more connections from this IP -- truly unconfigure
+                    logger.info(f"All connections from {active_ip} disconnected - server now UNCONFIGURED")
+                    logger.info("Next connection will need to provide CONFIG command")
+                    _stop_session_logging()
+                    server_configured = False
+                    active_connection_addr = None
+                    active_connection_config_path = None
+            else:
+                # Not the active connection -- just remove from tracking
+                logger.debug(f"Non-active connection {addr} disconnected")
 
         conn.close()
         logger.info(f"<<< Client {addr} disconnected and cleaned up")
