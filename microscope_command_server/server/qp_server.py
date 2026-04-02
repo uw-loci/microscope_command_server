@@ -455,6 +455,7 @@ def handle_client(conn, addr):
 
     # Shared kwargs passed to every handler for access to global state
     handler_kwargs = {
+        "addr": addr,
         "server_configured": server_configured,
         "shutdown_event": shutdown_event,
         "connection_state_lock": connection_state_lock,
