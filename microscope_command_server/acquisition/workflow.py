@@ -1319,6 +1319,19 @@ def parse_acquisition_message(message: str) -> dict:
             elif parts[i] == "--z-pixel-size" and i + 1 < len(parts):
                 params["z_pixel_size_um"] = float(parts[i + 1])
                 i += 2
+            # LSM / multiphoton flags
+            elif parts[i] == "--laser-power" and i + 1 < len(parts):
+                params["laser_power"] = float(parts[i + 1])
+                i += 2
+            elif parts[i] == "--laser-wavelength" and i + 1 < len(parts):
+                params["laser_wavelength"] = int(parts[i + 1])
+                i += 2
+            elif parts[i] == "--dwell-time" and i + 1 < len(parts):
+                params["dwell_time"] = float(parts[i + 1])
+                i += 2
+            elif parts[i] == "--averaging" and i + 1 < len(parts):
+                params["averaging"] = int(parts[i + 1])
+                i += 2
             else:
                 i += 1
 

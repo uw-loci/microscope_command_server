@@ -16,9 +16,11 @@ Usage::
 from .config import ModalityConfig
 from .registry import get_config, register, registered_prefixes
 from .ppm import register_ppm
+from .shg import register_shg
 
 # Register built-in modalities on import
 register_ppm()
+register_shg()
 
 __all__ = [
     "ModalityConfig",
