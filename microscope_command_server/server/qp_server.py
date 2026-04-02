@@ -561,9 +561,26 @@ def handle_client(conn, addr):
                         conn.sendall(b"CFG_FAIL" + error_length + error_bytes)
                         continue
 
-                    # Update hardware with new configuration
+                    # Update hardware with new configuration.
+                    # Rebuild all composed components (camera registry,
+                    # stage, rotation stage) from the new settings.
                     hardware.settings = new_settings
-                    hardware._initialize_microscope_methods()
+                    hardware._camera_name = hardware._detect_camera_name()
+                    hardware._camera_registry = hardware._build_camera_registry()
+                    hardware._active_detector_id = hardware._find_detector_id(hardware._camera_name)
+                    hardware._stage = hardware._create_stage()
+                    hardware._rotation_stage = hardware._create_rotation_stage()
+
+                    # Legacy compat: update rotation_device attribute
+                    hardware.rotation_device = None
+                    if hardware._rotation_stage is not None:
+                        from microscope_control.hardware.rotation import (
+                            PIZRotationStage, ThorRotationStage,
+                        )
+                        if isinstance(hardware._rotation_stage, PIZRotationStage):
+                            hardware.rotation_device = hardware._rotation_stage._device
+                        elif isinstance(hardware._rotation_stage, ThorRotationStage):
+                            hardware.rotation_device = hardware._rotation_stage._device
 
                     # Mark server as configured and track active connection
                     with connection_state_lock:
