@@ -427,6 +427,7 @@ def handle_client(conn, addr):
     to the appropriate handler function. Per-client state is tracked in
     the global dicts (will migrate to ClientState in a future pass).
     """
+    global server_configured, active_connection_addr, active_connection_config_path, startup_settings
     from microscope_command_server.server.handlers import COMMAND_HANDLERS
     from microscope_command_server.server.client_state import ClientState
 
