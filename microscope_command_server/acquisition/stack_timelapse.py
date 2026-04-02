@@ -117,9 +117,9 @@ def acquire_z_stack(
             progress_callback(plane_idx, n_planes, f"Z={z_pos:.1f} um")
 
         # Move Z
-        hardware.core.set_position(z_pos)
-        hardware.core.wait_for_device(hardware.core.get_focus_device())
-        actual_z = hardware.core.get_position()
+        from microscope_control.hardware import Position
+        hardware.move_to_position(Position(z=z_pos))
+        actual_z = hardware.get_z_position()
         logger.info(f"Plane {plane_idx + 1}/{n_planes}: Z={actual_z:.2f} um (target={z_pos:.2f})")
 
         # Acquire at each angle

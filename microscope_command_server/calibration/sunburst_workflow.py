@@ -267,7 +267,7 @@ def _read_current_camera_settings(hardware, logger) -> Dict[str, str]:
     try:
         camera = None
         try:
-            camera = hardware.core.get_property("Core", "Camera")
+            camera = hardware.get_camera_name()
         except Exception:
             pass
 
@@ -294,10 +294,10 @@ def _read_current_camera_settings(hardware, logger) -> Dict[str, str]:
                 )
             except ImportError:
                 logger.debug("JAI module not available, reading unified exposure")
-                exposure_ms = hardware.core.get_exposure()
+                exposure_ms = hardware.get_exposure()
                 extra_info["Exposure"] = f"{exposure_ms:.1f} ms"
         else:
-            exposure_ms = hardware.core.get_exposure()
+            exposure_ms = hardware.get_exposure()
             extra_info["Exposure"] = f"{exposure_ms:.1f} ms"
             if camera:
                 extra_info["Camera"] = camera

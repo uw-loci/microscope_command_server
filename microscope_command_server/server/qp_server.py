@@ -694,7 +694,7 @@ def handle_client(conn, addr):
                     continue
 
                 try:
-                    pixel_size = hardware.core.get_pixel_size_um()
+                    pixel_size = hardware.get_pixel_size_um()
                     response = struct.pack("!f", float(pixel_size))
                     conn.sendall(response)
                     logger.debug(f"Sent pixel size to {addr}: {pixel_size} um/pixel")
@@ -1317,11 +1317,11 @@ def handle_client(conn, addr):
                                             original_z = current_pos.z
                                             new_z = original_z + offset_um
                                             hardware.move_to_position(
-                                                hardware.get_current_position()._replace(z=new_z)
+                                                Position(hardware.get_current_position().x, hardware.get_current_position().y, new_z)
                                             )
                                             def restore():
                                                 hardware.move_to_position(
-                                                    hardware.get_current_position()._replace(z=original_z)
+                                                    Position(hardware.get_current_position().x, hardware.get_current_position().y, original_z)
                                                 )
                                             return original_z, restore
                                         return defocus_fn
@@ -4067,7 +4067,7 @@ def handle_client(conn, addr):
             if data == ExtendedCommand.GETCAM:
                 logger.debug(f"Client {addr} requested camera name")
                 try:
-                    camera_name = hardware.core.get_property("Core", "Camera")
+                    camera_name = hardware.get_camera_name()
                     # Pad or truncate to 32 bytes
                     camera_name_bytes = camera_name.encode("utf-8")[:32].ljust(32, b"\x00")
                     conn.sendall(camera_name_bytes)
@@ -4211,7 +4211,7 @@ def handle_client(conn, addr):
                         # JAI with individual exposures - return 4 floats (all, R, G, B)
                         exposures = jai_props.get_channel_exposures()
                         # Get unified exposure as well for "all" value
-                        all_exp = hardware.core.get_exposure()
+                        all_exp = hardware.get_exposure()
                         response = struct.pack("!ffff",
                             float(all_exp),
                             float(exposures["red"]),
@@ -4221,13 +4221,13 @@ def handle_client(conn, addr):
                         logger.info(f"Sent per-channel exposures: all={all_exp}, R={exposures['red']}, G={exposures['green']}, B={exposures['blue']}")
                     else:
                         # Unified exposure - return 1 float
-                        exposure = hardware.core.get_exposure()
+                        exposure = hardware.get_exposure()
                         response = struct.pack("!f", float(exposure))
                         conn.sendall(response)
                         logger.info(f"Sent unified exposure: {exposure}")
                 except ImportError:
                     # JAI module not available - get unified exposure
-                    exposure = hardware.core.get_exposure()
+                    exposure = hardware.get_exposure()
                     response = struct.pack("!f", float(exposure))
                     conn.sendall(response)
                     logger.info(f"Sent unified exposure (no JAI): {exposure}")
