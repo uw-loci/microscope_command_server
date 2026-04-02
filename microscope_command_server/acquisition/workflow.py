@@ -776,8 +776,6 @@ def apply_jai_calibration_for_angle(
         return False, None
 
     try:
-        from microscope_control.jai import JAICameraProperties
-
         # Get calibration settings for this angle
         if per_angle:
             # Use interpolation-aware calibration lookup for PPM angles.
@@ -810,7 +808,6 @@ def apply_jai_calibration_for_angle(
             return False, None
 
         # Get base per-channel exposures from calibration
-        jai_props = JAICameraProperties(hardware.core)
         base_exp_r = exposures.get("r", 50.0)
         base_exp_g = exposures.get("g", 50.0)
         base_exp_b = exposures.get("b", 50.0)
@@ -825,7 +822,7 @@ def apply_jai_calibration_for_angle(
         exp_b = base_exp_b * scale_applied
 
         # Apply per-channel exposures
-        jai_props.set_channel_exposures(
+        hardware.camera.set_channel_exposures(
             red=exp_r,
             green=exp_g,
             blue=exp_b,
@@ -875,10 +872,10 @@ def apply_jai_calibration_for_angle(
         # during PPM acquisition the camera cycles through angles with different
         # gains. If angle N has gain=3.0 and angle N+1 has gain=1.0, skipping
         # the 1.0 set leaves the camera at 3.0 -> saturated image at angle N+1.
-        jai_props.set_unified_gain(unified_gain)
+        hardware.camera.set_unified_gain(unified_gain)
         exp_msg += f" | Unified gain: {unified_gain:.3f}"
 
-        jai_props.set_rb_analog_gains(red=analog_red, blue=analog_blue)
+        hardware.camera.set_rb_analog_gains(analog_red=analog_red, analog_blue=analog_blue)
         exp_msg += f" | Analog R={analog_red:.3f}, B={analog_blue:.3f}"
 
         if logger:
@@ -886,10 +883,6 @@ def apply_jai_calibration_for_angle(
 
         return True, exposure_info
 
-    except ImportError:
-        if logger:
-            logger.debug("JAI camera module not available - skipping calibration")
-        return False, None
     except Exception as e:
         if logger:
             logger.warning(f"Failed to apply JAI calibration: {e}")
@@ -934,8 +927,6 @@ def load_and_apply_white_balance_settings(
         return False
 
     try:
-        from microscope_control.jai import JAICameraProperties
-
         # Build path to settings file
         wb_settings_path = (
             Path(calibration_folder)
@@ -950,19 +941,14 @@ def load_and_apply_white_balance_settings(
                 logger.info(f"No white balance settings found at {wb_settings_path}")
             return False
 
-        # Load and apply settings
-        jai_props = JAICameraProperties(hardware.core)
-        success = jai_props.apply_white_balance_settings(str(wb_settings_path))
+        # Load and apply settings via camera properties
+        success = hardware.camera.properties.apply_white_balance_settings(str(wb_settings_path))
 
         if success and logger:
             logger.info(f"Applied white balance settings from {wb_settings_path}")
 
         return success
 
-    except ImportError:
-        if logger:
-            logger.warning("JAI calibration module not available - skipping white balance loading")
-        return False
     except Exception as e:
         if logger:
             logger.warning(f"Failed to load white balance settings: {e}")
@@ -1738,14 +1724,12 @@ def _acquisition_workflow(
             # Explicitly disable individual exposure/gain mode for camera AWB
             if is_jai_camera:
                 try:
-                    from microscope_control.jai import JAICameraProperties
-                    jai_props = JAICameraProperties(hardware.core)
-                    jai_props.disable_individual_exposure()
-                    jai_props.disable_individual_gain()
+                    hardware.camera.disable_individual_exposure()
+                    hardware.camera.disable_individual_gain()
                     # NOTE: Do NOT reset analog gains here -- AWB corrections are stored in
                     # Gain_AnalogRed/Gain_AnalogBlue and must be preserved for camera_awb mode.
                     logger.info("Camera AWB mode: disabled per-channel exposure/gain (preserving AWB analog gains)")
-                except (ImportError, Exception) as e:
+                except Exception as e:
                     logger.warning(f"Could not configure camera AWB mode: {e}")
             if jai_calibration:
                 logger.info(f"Camera AWB: loaded unified gains from calibration for brightness control")
@@ -1768,13 +1752,11 @@ def _acquisition_workflow(
             # Also disable individual exposure/gain mode to ensure clean state.
             if is_jai_camera:
                 try:
-                    from microscope_control.jai import JAICameraProperties
-                    jai_props = JAICameraProperties(hardware.core)
-                    jai_props.clear_awb_corrections()
-                    jai_props.disable_individual_exposure()
-                    jai_props.disable_individual_gain()
+                    hardware.camera.clear_awb_corrections()
+                    hardware.camera.disable_individual_exposure()
+                    hardware.camera.disable_individual_gain()
                     logger.info("Simple WB: cleared AWB + disabled individual mode")
-                except (ImportError, Exception) as e:
+                except Exception as e:
                     logger.warning(f"Could not clear AWB corrections before simple WB: {e}")
             # Simple WB mode: load 90deg R:G:B ratios from Mode 3 calibration,
             # then load pre-computed simple_wb section if available
@@ -1832,13 +1814,11 @@ def _acquisition_workflow(
             # causes set_exposure() calls to be silently ignored.
             if is_jai_camera:
                 try:
-                    from microscope_control.jai import JAICameraProperties
-                    jai_props = JAICameraProperties(hardware.core)
-                    jai_props.clear_awb_corrections()
-                    jai_props.disable_individual_exposure()
-                    jai_props.disable_individual_gain()
+                    hardware.camera.clear_awb_corrections()
+                    hardware.camera.disable_individual_exposure()
+                    hardware.camera.disable_individual_gain()
                     logger.info("Per-angle WB: cleared AWB + disabled individual mode")
-                except (ImportError, Exception) as e:
+                except Exception as e:
                     logger.warning(f"Could not clear AWB corrections before per-angle WB: {e}")
             # Per-angle WB mode (Mode 3): existing behavior
             jai_calibration = load_jai_calibration_from_imageprocessing(
@@ -2166,10 +2146,8 @@ def _acquisition_workflow(
                 # For camera_AWB, gains are already set from AWB -- don't touch.
                 if is_jai_camera:
                     try:
-                        from microscope_control.jai import JAICameraProperties
-                        jai_props = JAICameraProperties(hardware.core)
-                        jai_props.disable_individual_exposure()
-                        jai_props.disable_individual_gain()
+                        hardware.camera.disable_individual_exposure()
+                        hardware.camera.disable_individual_gain()
                         if jai_calibration is not None:
                             uncrossed_gains = (
                                 jai_calibration.get("angles", {})
@@ -2180,18 +2158,18 @@ def _acquisition_workflow(
                             # Previous angle may have set gain to 2.0x+ which persists
                             # after disable_individual_gain(), causing saturation.
                             af_unified_gain = uncrossed_gains.get("unified_gain", 1.0)
-                            jai_props.set_unified_gain(af_unified_gain)
+                            hardware.camera.set_unified_gain(af_unified_gain)
                             af_analog_red = uncrossed_gains.get("analog_red", 1.0)
                             af_analog_blue = uncrossed_gains.get("analog_blue", 1.0)
-                            jai_props.set_rb_analog_gains(
-                                red=af_analog_red, blue=af_analog_blue
+                            hardware.camera.set_rb_analog_gains(
+                                analog_red=af_analog_red, analog_blue=af_analog_blue
                             )
                             logger.info(
                                 "Applied uncrossed calibration for AF: "
                                 f"gain={af_unified_gain:.2f}x, "
                                 f"R={af_analog_red:.3f}, B={af_analog_blue:.3f}"
                             )
-                    except (ImportError, Exception) as e:
+                    except Exception as e:
                         logger.warning(f"Could not configure camera for AF: {e}")
 
                 hardware.set_exposure(exposure_90)
@@ -2478,10 +2456,8 @@ def _acquisition_workflow(
                     # (see initial AF block for full rationale).
                     if is_jai_camera:
                         try:
-                            from microscope_control.jai import JAICameraProperties
-                            jai_props = JAICameraProperties(hardware.core)
-                            jai_props.disable_individual_exposure()
-                            jai_props.disable_individual_gain()
+                            hardware.camera.disable_individual_exposure()
+                            hardware.camera.disable_individual_gain()
                             if jai_calibration is not None:
                                 uncrossed_gains = (
                                     jai_calibration.get("angles", {})
@@ -2491,12 +2467,12 @@ def _acquisition_workflow(
                                 # Reset unified gain to uncrossed value (typically 1.0).
                                 # Previous angle leaves gain at 2.0x+, causing saturation.
                                 af_unified_gain = uncrossed_gains.get("unified_gain", 1.0)
-                                jai_props.set_unified_gain(af_unified_gain)
-                                jai_props.set_rb_analog_gains(
-                                    red=uncrossed_gains.get("analog_red", 1.0),
-                                    blue=uncrossed_gains.get("analog_blue", 1.0),
+                                hardware.camera.set_unified_gain(af_unified_gain)
+                                hardware.camera.set_rb_analog_gains(
+                                    analog_red=uncrossed_gains.get("analog_red", 1.0),
+                                    analog_blue=uncrossed_gains.get("analog_blue", 1.0),
                                 )
-                        except (ImportError, Exception) as e:
+                        except Exception as e:
                             logger.warning(f"Could not configure camera for AF: {e}")
 
                     t_exp = time.perf_counter()
@@ -2713,12 +2689,10 @@ def _acquisition_workflow(
                         angle_name = angle_to_name(angle, modality=modality)
                         if camera_awb_gains and angle_name in camera_awb_gains:
                             try:
-                                from microscope_control.jai import JAICameraProperties
-                                jai_props = JAICameraProperties(hardware.core)
                                 gain_val = camera_awb_gains[angle_name]
-                                jai_props.set_unified_gain(gain_val)
+                                hardware.camera.set_unified_gain(gain_val)
                                 logger.info(f"  Camera AWB: unified gain={gain_val:.2f} for {angle_name}")
-                            except (ImportError, Exception) as e:
+                            except Exception as e:
                                 logger.debug(f"Could not set unified gain: {e}")
 
                     elif wb_mode == "simple" and simple_wb_data:
@@ -2731,9 +2705,6 @@ def _acquisition_workflow(
                         if angle_name in sw_angles:
                             angle_sw = sw_angles[angle_name]
                             try:
-                                from microscope_control.jai import JAICameraProperties
-                                jai_props = JAICameraProperties(hardware.core)
-
                                 # Check if all channels have the same exposure (unified calibration)
                                 exp_r = angle_sw["r"]
                                 exp_g = angle_sw["g"]
@@ -2742,20 +2713,20 @@ def _acquisition_workflow(
 
                                 if is_unified:
                                     # Unified mode: set single exposure, analog gains handle color balance
-                                    jai_props.disable_individual_exposure()
+                                    hardware.camera.disable_individual_exposure()
                                     hardware.set_exposure(exp_g)
                                 else:
                                     # Legacy per-channel mode (old calibration data)
-                                    jai_props.set_channel_exposures(
+                                    hardware.camera.set_channel_exposures(
                                         red=exp_r, green=exp_g, blue=exp_b, auto_enable=True,
                                     )
-                                jai_props.set_unified_gain(angle_sw.get("unified_gain", 1.0))
+                                hardware.camera.set_unified_gain(angle_sw.get("unified_gain", 1.0))
                                 # Apply calibrated R/B analog gains from Phase 2.
                                 # These correct the camera's spectral bias and must
                                 # match what was used during background collection.
-                                jai_props.set_rb_analog_gains(
-                                    red=simple_wb_analog_red,
-                                    blue=simple_wb_analog_blue,
+                                hardware.camera.set_rb_analog_gains(
+                                    analog_red=simple_wb_analog_red,
+                                    analog_blue=simple_wb_analog_blue,
                                 )
                                 logger.debug(
                                     f"  Simple WB: R={angle_sw['r']:.1f}ms, "
@@ -2765,7 +2736,7 @@ def _acquisition_workflow(
                                     f"analog R={simple_wb_analog_red:.3f}, "
                                     f"B={simple_wb_analog_blue:.3f})"
                                 )
-                            except (ImportError, Exception) as e:
+                            except Exception as e:
                                 logger.warning(f"Simple WB failed for {angle_name}: {e}")
                                 if angle_idx < len(params["exposures"]):
                                     hardware.set_exposure(params["exposures"][angle_idx])
@@ -2814,12 +2785,10 @@ def _acquisition_workflow(
                             # successful apply_jai_calibration_for_angle may have enabled it,
                             # which would cause this set_exposure() to be silently ignored.
                             try:
-                                from microscope_control.jai import JAICameraProperties
-                                jai_props = JAICameraProperties(hardware.core)
-                                jai_props.disable_individual_exposure()
-                                jai_props.disable_individual_gain()
-                                jai_props.set_rb_analog_gains(red=1.0, blue=1.0)
-                            except (ImportError, Exception):
+                                hardware.camera.disable_individual_exposure()
+                                hardware.camera.disable_individual_gain()
+                                hardware.camera.set_rb_analog_gains(analog_red=1.0, analog_blue=1.0)
+                            except Exception:
                                 pass
                             exposure_ms = params["exposures"][angle_idx]
                             hardware.set_exposure(exposure_ms)
@@ -3615,26 +3584,24 @@ def acquire_background_with_target_intensity(
     # If per-channel mode is active (from calibration or previous operations),
     # hardware.set_exposure() would be silently ignored.
     try:
-        from microscope_control.jai import JAICameraProperties
-        jai_props = JAICameraProperties(hardware.core)
-        jai_props.disable_individual_exposure()
-        jai_props.disable_individual_gain()
+        hardware.camera.disable_individual_exposure()
+        hardware.camera.disable_individual_gain()
         if preserve_analog_gains:
             # Camera AWB mode: preserve AWB corrections in Gain_AnalogRed/Blue.
             # These were set by one-shot AWB calibration and must remain active
             # so backgrounds match the WB state of tissue tiles.
             if logger:
                 try:
-                    cur_red = float(jai_props._get_property(jai_props.GAIN_ANALOG_RED))
-                    cur_blue = float(jai_props._get_property(jai_props.GAIN_ANALOG_BLUE))
+                    cur_gains = hardware.camera.get_rb_analog_gains()
                     logger.info(
-                        f"Preserving AWB analog gains: R={cur_red:.3f}, B={cur_blue:.3f}"
+                        f"Preserving AWB analog gains: "
+                        f"R={cur_gains['analog_red']:.3f}, B={cur_gains['analog_blue']:.3f}"
                     )
                 except Exception:
                     logger.info("Preserving analog gains (could not read current values)")
         else:
-            jai_props.set_rb_analog_gains(red=1.0, blue=1.0)
-    except (ImportError, Exception):
+            hardware.camera.set_rb_analog_gains(analog_red=1.0, analog_blue=1.0)
+    except Exception:
         pass  # Not a JAI camera or module not available
 
     # Set initial exposure
@@ -3845,12 +3812,10 @@ def acquire_background_with_biref_matching(
 
     # Ensure per-channel mode is disabled before using unified set_exposure()
     try:
-        from microscope_control.jai import JAICameraProperties
-        jai_props = JAICameraProperties(hardware.core)
-        jai_props.disable_individual_exposure()
-        jai_props.disable_individual_gain()
-        jai_props.set_rb_analog_gains(red=1.0, blue=1.0)
-    except (ImportError, Exception):
+        hardware.camera.disable_individual_exposure()
+        hardware.camera.disable_individual_gain()
+        hardware.camera.set_rb_analog_gains(analog_red=1.0, analog_blue=1.0)
+    except Exception:
         pass  # Not a JAI camera or module not available
 
     current_exposure = max(MIN_EXPOSURE_MS, min(MAX_EXPOSURE_MS, initial_exposure_ms))
@@ -3998,11 +3963,9 @@ def acquire_background_with_per_channel_adaptive(
     Raises:
         RuntimeError: If image acquisition fails
     """
-    try:
-        from microscope_control.jai import JAICameraProperties
-    except ImportError:
+    if not hardware.camera.supports_per_channel_exposure():
         if logger:
-            logger.warning("JAI camera module not available - falling back to single exposure")
+            logger.warning("Camera does not support per-channel exposure - falling back to single exposure")
         # Fall back to regular adaptive exposure
         image, final_exp = acquire_background_with_target_intensity(
             hardware=hardware,
@@ -4027,8 +3990,6 @@ def acquire_background_with_per_channel_adaptive(
     ratio_r = exp_r / exp_g
     ratio_b = exp_b / exp_g
 
-    jai_props = JAICameraProperties(hardware.core)
-
     if logger:
         logger.info(
             f"Starting per-channel adaptive exposure: target={target_intensity:.1f}, "
@@ -4037,7 +3998,7 @@ def acquire_background_with_per_channel_adaptive(
         logger.info(f"  Channel ratios (R:G:B) = {ratio_r:.3f}:1.000:{ratio_b:.3f}")
 
     # Apply initial per-channel exposures
-    jai_props.set_channel_exposures(red=exp_r, green=exp_g, blue=exp_b, auto_enable=True)
+    hardware.camera.set_channel_exposures(red=exp_r, green=exp_g, blue=exp_b, auto_enable=True)
 
     last_image = None
     last_exposures = {'r': exp_r, 'g': exp_g, 'b': exp_b}
@@ -4095,7 +4056,7 @@ def acquire_background_with_per_channel_adaptive(
             )
 
         # Apply scaled per-channel exposures
-        jai_props.set_channel_exposures(red=exp_r, green=exp_g, blue=exp_b, auto_enable=True)
+        hardware.camera.set_channel_exposures(red=exp_r, green=exp_g, blue=exp_b, auto_enable=True)
 
     # Max iterations reached
     if logger:
@@ -4299,10 +4260,8 @@ def simple_background_collection(
         # residual AWB analog gain corrections would compound incorrectly.
         if wb_mode in ("simple", "per_angle") and is_jai_camera:
             try:
-                from microscope_control.jai import JAICameraProperties
-                jai_props = JAICameraProperties(hardware.core)
-                jai_props.clear_awb_corrections()
-            except (ImportError, Exception) as e:
+                hardware.camera.clear_awb_corrections()
+            except Exception as e:
                 logger.warning(f"Could not clear AWB corrections before {wb_mode} WB: {e}")
 
         # Camera AWB mode: disable per-channel exposure/gain, use unified controls.
@@ -4314,15 +4273,13 @@ def simple_background_collection(
         camera_awb_gains = {}
         if wb_mode == "camera_awb" and is_jai_camera:
             try:
-                from microscope_control.jai import JAICameraProperties
-                jai_props = JAICameraProperties(hardware.core)
-                jai_props.disable_individual_exposure()
-                jai_props.disable_individual_gain()
+                hardware.camera.disable_individual_exposure()
+                hardware.camera.disable_individual_gain()
                 logger.info(
                     "Camera AWB: using unified exposure/gain. "
                     "Internal AWB corrections applied via camera pipeline."
                 )
-            except (ImportError, Exception) as e:
+            except Exception as e:
                 logger.warning(f"Could not configure camera AWB mode: {e}")
             # Extract unified gains from Mode 3 calibration for brightness
             if jai_calibration and "angles" in jai_calibration:
@@ -4428,12 +4385,10 @@ def simple_background_collection(
                 angle_name = angle_to_name(angle, modality=modality)
                 if camera_awb_gains and angle_name in camera_awb_gains:
                     try:
-                        from microscope_control.jai import JAICameraProperties
-                        jai_props = JAICameraProperties(hardware.core)
                         gain_val = camera_awb_gains[angle_name]
-                        jai_props.set_unified_gain(gain_val)
+                        hardware.camera.set_unified_gain(gain_val)
                         logger.info(f"  Camera AWB: unified gain={gain_val:.2f} for {angle_name}")
-                    except (ImportError, Exception) as e:
+                    except Exception as e:
                         logger.debug(f"Could not set unified gain: {e}")
 
                 # Use standard adaptive intensity matching (single unified exposure)
@@ -4475,15 +4430,12 @@ def simple_background_collection(
                 # Use uncrossed R:G:B ratios, uniformly scale per angle to hit target
                 angle_name = angle_to_name(angle, modality=modality)
                 try:
-                    from microscope_control.jai import JAICameraProperties
-                    jai_props = JAICameraProperties(hardware.core)
-
                     # Get unified gain from Mode 3 calibration for this angle
                     unified_gain = 1.0
                     if jai_calibration and "angles" in jai_calibration:
                         angle_cal = jai_calibration["angles"].get(angle_name, {})
                         unified_gain = angle_cal.get("gains", {}).get("unified_gain", 1.0)
-                    jai_props.set_unified_gain(unified_gain)
+                    hardware.camera.set_unified_gain(unified_gain)
 
                     # Apply calibrated R/B analog gains from uncrossed calibration.
                     # Phase 2 of calibration fine-tunes color balance via analog gains;
@@ -4492,7 +4444,7 @@ def simple_background_collection(
                     wb_gains = simple_wb_base.get("gains", {})
                     analog_red = wb_gains.get("analog_red", 1.0)
                     analog_blue = wb_gains.get("analog_blue", 1.0)
-                    jai_props.set_rb_analog_gains(red=analog_red, blue=analog_blue)
+                    hardware.camera.set_rb_analog_gains(analog_red=analog_red, analog_blue=analog_blue)
                     logger.info(
                         f"  Simple WB: analog gains R={analog_red:.3f}, B={analog_blue:.3f}"
                     )
@@ -4515,7 +4467,7 @@ def simple_background_collection(
                         exp_r = base_r * scale
                         exp_g = base_g * scale
                         exp_b = base_b * scale
-                        jai_props.set_channel_exposures(
+                        hardware.camera.set_channel_exposures(
                             red=exp_r, green=exp_g, blue=exp_b, auto_enable=True,
                         )
                         image, metadata = hardware.snap_image()
@@ -4553,11 +4505,6 @@ def simple_background_collection(
                     # Store reference for biref pair matching
                     if angle > 0 and angle != 90:
                         biref_pair_references[angle] = image.copy()
-                except ImportError:
-                    raise ImportError(
-                        "Simple WB mode requires the JAI camera module "
-                        "(microscope_control.jai) but it is not available."
-                    )
                 except RuntimeError as e:
                     logger.error(f"Failed to acquire simple WB background at angle {angle}: {e}")
                     continue
@@ -4584,11 +4531,8 @@ def simple_background_collection(
                         logger.info(f"  R={per_channel_exp.get('r', 50):.1f}ms, "
                                    f"G={per_channel_exp.get('g', 50):.1f}ms, B={per_channel_exp.get('b', 50):.1f}ms")
                         try:
-                            from microscope_control.jai import JAICameraProperties
-                            jai_props = JAICameraProperties(hardware.core)
-
                             # Apply the calibrated per-channel exposures
-                            jai_props.set_channel_exposures(
+                            hardware.camera.set_channel_exposures(
                                 red=per_channel_exp.get('r', 50.0),
                                 green=per_channel_exp.get('g', 50.0),
                                 blue=per_channel_exp.get('b', 50.0),
@@ -4606,9 +4550,9 @@ def simple_background_collection(
                             # During PPM acquisition the camera cycles through angles
                             # with different gains. Skipping unity-gain angles leaves
                             # the previous angle's gain active -> saturated images.
-                            jai_props.set_unified_gain(unified_gain)
-                            jai_props.set_rb_analog_gains(
-                                red=analog_red, blue=analog_blue
+                            hardware.camera.set_unified_gain(unified_gain)
+                            hardware.camera.set_rb_analog_gains(
+                                analog_red=analog_red, analog_blue=analog_blue
                             )
                             logger.info(
                                 f"  Applied gains: unified={unified_gain:.2f}x, "
@@ -4645,9 +4589,6 @@ def simple_background_collection(
                             if angle > 0 and angle != 90:
                                 biref_pair_references[angle] = image.copy()
                                 logger.info(f"Stored +{angle} image as reference for birefringence pair matching")
-                        except ImportError:
-                            logger.warning("JAI camera module not available, falling back to standard mode")
-                            jai_calibration = None
                         except RuntimeError as e:
                             logger.error(f"Failed to acquire background at angle {angle}: {e}")
                             continue
@@ -4783,20 +4724,18 @@ def simple_background_collection(
         # (e.g., autofocus) will be silently ignored.
         if wb_mode in ("per_angle", "simple", "camera_awb") or (jai_calibration and use_per_angle_wb):
             try:
-                from microscope_control.jai import JAICameraProperties
-                jai_props = JAICameraProperties(hardware.core)
-                jai_props.disable_individual_exposure()
-                jai_props.disable_individual_gain()
+                hardware.camera.disable_individual_exposure()
+                hardware.camera.disable_individual_gain()
                 if wb_mode != "camera_awb":
                     # For simple/per_angle: clear analog gains to neutral state
-                    jai_props.set_rb_analog_gains(red=1.0, blue=1.0)
+                    hardware.camera.set_rb_analog_gains(analog_red=1.0, analog_blue=1.0)
                 else:
                     # For camera_awb: preserve AWB analog gain corrections --
                     # tissue acquisition needs the same gains for flat-field match
                     logger.info("Camera AWB: preserving analog gain corrections through cleanup")
-                jai_props.set_unified_gain(1.0)
+                hardware.camera.set_unified_gain(1.0)
                 logger.info("Disabled per-channel mode and reset unified gain after background collection")
-            except (ImportError, Exception) as e:
+            except Exception as e:
                 logger.warning(f"Could not reset per-channel mode: {e}")
 
         logger.info("=== SIMPLE BACKGROUND COLLECTION COMPLETE ===")
