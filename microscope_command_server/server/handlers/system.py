@@ -158,6 +158,7 @@ def handle_config(conn, client, hardware, settings, **kwargs):
             "server_configured": True,
             "active_connection_addr": addr,
             "active_connection_config_path": config_path,
+            "settings": new_settings,
         }
 
         microscope_name = new_settings.get("microscope", {}).get("name", "Unknown")
