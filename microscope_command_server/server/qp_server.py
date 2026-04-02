@@ -270,36 +270,6 @@ def init_pycromanager_with_logger():
         sys.exit(1)
 
 
-# OPTION 3 HELPER (COMMENTED OUT): Auto-reconnect to MM on first command
-# Uncomment this function and use it in handle_client() if using Option 3 lazy connection mode
-# def ensure_micromanager_connected():
-#     """
-#     Attempt to connect to Micro-Manager if not already connected.
-#     Used with Option 3 (lazy connection mode).
-#
-#     Returns:
-#         bool: True if connected, False if connection failed
-#     """
-#     global core, studio, hardware
-#
-#     if core is not None and hardware is not None:
-#         return True  # Already connected
-#
-#     logger.info("Attempting to connect to Micro-Manager...")
-#     try:
-#         core, studio = init_pycromanager()
-#         if core:
-#             hardware = PycromanagerHardware(core, studio, startup_settings)
-#             logger.info("Successfully connected to Micro-Manager")
-#             return True
-#         else:
-#             logger.error("Failed to connect to Micro-Manager - core is None")
-#             return False
-#     except Exception as e:
-#         logger.error(f"Exception while connecting to Micro-Manager: {e}")
-#         return False
-
-
 # Initialize hardware connections
 logger.info("Loading generic startup configuration...")
 config_manager = ConfigManager()
@@ -350,14 +320,6 @@ core, studio = init_pycromanager_with_logger()
 hardware = PycromanagerHardware(core, studio, startup_settings)
 logger.info("Hardware initialized with generic config")
 logger.info("Server ready - microscope-specific config will be loaded from ACQUIRE --yaml parameter")
-
-# OPTION 3 (COMMENTED OUT): Allow server to start without MM, auto-reconnect on first command
-# Uncomment this section and comment out Option 1 above to enable lazy connection mode
-# logger.info("Micro-Manager connection will be attempted on first command")
-# core = None
-# studio = None
-# hardware = None
-# logger.warning("Server starting without Micro-Manager - commands will fail until MM connected")
 
 
 def acquisitionWorkflow(message, client_addr):
@@ -570,17 +532,6 @@ def handle_client(conn, addr):
                     hardware._active_detector_id = hardware._find_detector_id(hardware._camera_name)
                     hardware._stage = hardware._create_stage()
                     hardware._rotation_stage = hardware._create_rotation_stage()
-
-                    # Legacy compat: update rotation_device attribute
-                    hardware.rotation_device = None
-                    if hardware._rotation_stage is not None:
-                        from microscope_control.hardware.rotation import (
-                            PIZRotationStage, ThorRotationStage,
-                        )
-                        if isinstance(hardware._rotation_stage, PIZRotationStage):
-                            hardware.rotation_device = hardware._rotation_stage._device
-                        elif isinstance(hardware._rotation_stage, ThorRotationStage):
-                            hardware.rotation_device = hardware._rotation_stage._device
 
                     # Mark server as configured and track active connection
                     with connection_state_lock:
@@ -1594,13 +1545,10 @@ def handle_client(conn, addr):
                                     target=params.get("target_intensity", 180.0),
                                     tolerance=params.get("tolerance", 5.0),
                                     output_path=output_path,
-                                    max_gain_db=params.get("max_gain_db"),
                                     gain_threshold_ratio=params.get("gain_threshold"),
                                     max_iterations=params.get("max_iterations"),
                                     calibrate_black_level=params.get("calibrate_black_level"),
                                     base_gain=params.get("base_gain"),
-                                    exposure_soft_cap_ms=params.get("exposure_soft_cap_ms"),
-                                    boosted_max_gain_db=params.get("boosted_max_gain_db"),
                                 )
 
                                 # Rotate to uncrossed (90 deg) for first calibration
@@ -2174,13 +2122,10 @@ def handle_client(conn, addr):
                                     output_path=output_path,
                                     rotation_callback=rotation_callback,
                                     per_angle_targets=per_angle_targets if per_angle_targets else None,
-                                    max_gain_db=params.get("max_gain_db"),
                                     gain_threshold_ratio=params.get("gain_threshold"),
                                     max_iterations=params.get("max_iterations"),
                                     calibrate_black_level=params.get("calibrate_black_level"),
                                     base_gain=params.get("base_gain"),
-                                    exposure_soft_cap_ms=params.get("exposure_soft_cap_ms"),
-                                    boosted_max_gain_db=params.get("boosted_max_gain_db"),
                                 )
 
                                 # Update imageprocessing config for each angle

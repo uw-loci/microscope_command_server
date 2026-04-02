@@ -1906,9 +1906,6 @@ def _acquisition_workflow(
             return
 
         xy_positions = [(pos.x, pos.y) for pos, filename in positions]
-        # except Exception as e:
-        #   logger.warning("Falling back to older tileconfig reader: %s", e)
-        #   xy_positions = TileConfigUtils.read_TileConfiguration_coordinates(tile_config_path)
 
         # Create angle subdirectories
         if params["angles"]:
@@ -1921,15 +1918,6 @@ def _acquisition_workflow(
         total_images = (
             len(positions) * len(params["angles"]) if params["angles"] else len(positions)
         )
-
-        # check if total image is 720_psg_degs (should be 360, MSN tested 720) x number_of_tiles < MM2 limit
-        # for DDR25 limit is 536870.9 (thorlabs)degs or 268573 (ticks)
-        # that is 372 tiles
-        #total_rotation = 720 * len(positions)  #
-        #if total_rotation > 2**18:  # 262144
-        #    logger.error(
-        #        f"Total rotation steps {total_rotation} exceed Micro-Manager limit of 536870. Acquisition aborted."
-        #    )
 
         update_progress(0, total_images)
         logger.info(
@@ -3161,9 +3149,6 @@ def _acquisition_workflow(
             logger.info(
                 f"Autofocus deferred at {len(deferred_af_positions)} positions due to insufficient tissue: {sorted(deferred_af_positions)}"
             )
-        # else:
-        #    logger.info(
-        #    f"Autofocus completed at {len([p for p in af_positions if p not in deferred_af_positions])} positions")
 
     except Exception as e:
         logger.error("=== ACQUISITION FAILED ===")
@@ -5223,8 +5208,7 @@ def polarizer_calibration_workflow(
 
             f.write(f"Date: {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
             f.write(f"Configuration: {yaml_file_path}\n")
-            f.write(f"Position: X={current_pos.x:.1f}, Y={current_pos.y:.1f}, Z={current_pos.z:.1f}\n")
-            f.write(f"Rotation Device: {result['rotation_device']}\n\n")
+            f.write(f"Position: X={current_pos.x:.1f}, Y={current_pos.y:.1f}, Z={current_pos.z:.1f}\n\n")
 
             f.write("Parameters:\n")
             f.write(f"  Coarse: 0-360 deg in {step_size} deg steps\n")
