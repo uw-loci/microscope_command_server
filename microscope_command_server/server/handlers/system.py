@@ -217,8 +217,7 @@ def handle_siftal(conn, client, hardware, settings, **kwargs):
 
     logger.info("SIFTAL message: %s", message)
 
-    # Parse: --wsi-region <path> --micro-px <um> --wsi-px <um>
-    #        --min-px <um> --flip-x --flip-y
+    # Parse SIFT parameters from message
     params = {}
     parts = message.split()
     i = 0
@@ -231,6 +230,14 @@ def handle_siftal(conn, client, hardware, settings, **kwargs):
             params["wsi_px"] = float(parts[i + 1]); i += 2
         elif parts[i] == "--min-px" and i + 1 < len(parts):
             params["min_px"] = float(parts[i + 1]); i += 2
+        elif parts[i] == "--ratio" and i + 1 < len(parts):
+            params["ratio_threshold"] = float(parts[i + 1]); i += 2
+        elif parts[i] == "--min-matches" and i + 1 < len(parts):
+            params["min_match_count"] = int(parts[i + 1]); i += 2
+        elif parts[i] == "--contrast" and i + 1 < len(parts):
+            params["contrast_threshold"] = float(parts[i + 1]); i += 2
+        elif parts[i] == "--nfeatures" and i + 1 < len(parts):
+            params["nfeatures"] = int(parts[i + 1]); i += 2
         elif parts[i] == "--flip-x":
             params["flip_x"] = True; i += 1
         elif parts[i] == "--flip-y":
@@ -270,10 +277,16 @@ def handle_siftal(conn, client, hardware, settings, **kwargs):
         min_px = params.get("min_px", 1.0)
         flip_x = params.get("flip_x", False)
         flip_y = params.get("flip_y", False)
+        ratio_threshold = params.get("ratio_threshold", 0.7)
+        min_match_count = params.get("min_match_count", 10)
+        contrast_threshold = params.get("contrast_threshold", 0.04)
+        nfeatures = params.get("nfeatures", 0)
 
         logger.info(
-            "SIFT: micro_px=%s, wsi_px=%s, min_px=%s, flip_x=%s, flip_y=%s",
+            "SIFT: micro_px=%s, wsi_px=%s, min_px=%s, flip=(%s,%s), "
+            "ratio=%s, min_matches=%s, contrast=%s, nfeatures=%s",
             micro_px, wsi_px, min_px, flip_x, flip_y,
+            ratio_threshold, min_match_count, contrast_threshold, nfeatures,
         )
 
         result = match_sift(
@@ -283,7 +296,11 @@ def handle_siftal(conn, client, hardware, settings, **kwargs):
             wsi_pixel_size_um=wsi_px,
             flip_x=flip_x,
             flip_y=flip_y,
+            min_match_count=min_match_count,
+            ratio_threshold=ratio_threshold,
             min_pixel_size_um=min_px,
+            contrast_threshold=contrast_threshold,
+            nfeatures=nfeatures,
         )
 
         if result is None:

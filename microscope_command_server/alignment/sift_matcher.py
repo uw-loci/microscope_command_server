@@ -24,6 +24,8 @@ def match_sift(
     min_match_count: int = 10,
     ratio_threshold: float = 0.7,
     min_pixel_size_um: float = 1.0,
+    contrast_threshold: float = 0.04,
+    nfeatures: int = 0,
 ) -> Optional[Tuple[float, float, int, float]]:
     """
     Match a microscope snapshot to a WSI region using SIFT features.
@@ -103,8 +105,11 @@ def match_sift(
         f"(both at {target_pixel_size:.4f} um/px)"
     )
 
-    # Run SIFT
-    sift = cv2.SIFT_create()
+    # Run SIFT with configurable parameters
+    sift = cv2.SIFT_create(
+        nfeatures=nfeatures,
+        contrastThreshold=contrast_threshold,
+    )
     kp_micro, des_micro = sift.detectAndCompute(gray_micro, None)
     kp_wsi, des_wsi = sift.detectAndCompute(gray_wsi_scaled, None)
 
