@@ -1318,6 +1318,9 @@ def parse_acquisition_message(message: str) -> dict:
             elif parts[i] == "--z-pixel-size" and i + 1 < len(parts):
                 params["z_pixel_size_um"] = float(parts[i + 1])
                 i += 2
+            elif parts[i] == "--z-projection" and i + 1 < len(parts):
+                params["z_projection"] = parts[i + 1]
+                i += 2
             # LSM / multiphoton flags
             elif parts[i] == "--laser-power" and i + 1 < len(parts):
                 params["laser_power"] = float(parts[i + 1])
@@ -1554,28 +1557,52 @@ def _acquisition_workflow(
         save_raw_tiles = params.get("save_raw", False)
         logger.info(f"Save raw tiles: {save_raw_tiles}")
 
-        # Z-stack parameters (infrastructure only -- acquisition loop not yet implemented)
+        # Z-stack parameters
         z_stack_enabled = params.get("z_stack", False)
+        z_offsets = [0.0]  # Default: single plane (2D mode)
+        projection_fn = None
         if z_stack_enabled:
-            z_start = params.get("z_start")
-            z_end = params.get("z_end")
+            z_range = params.get("z_start")  # Reinterpret: z_start = total range
             z_step = params.get("z_step")
             z_pixel_size = params.get("z_pixel_size_um")
-            if z_start is None or z_end is None or z_step is None:
+            z_start_abs = params.get("z_start")
+            z_end_abs = params.get("z_end")
+
+            if z_start_abs is not None and z_end_abs is not None and z_step is not None:
+                # Compute range from absolute start/end
+                z_total_range = abs(z_end_abs - z_start_abs)
+            elif z_step is not None:
+                z_total_range = 0
+            else:
+                z_total_range = 0
+
+            if z_step is None or z_step <= 0:
                 logger.warning(
-                    f"Z-stack enabled but incomplete parameters: "
-                    f"start={z_start}, end={z_end}, step={z_step}. "
-                    f"Ignoring z-stack and continuing in 2D mode."
+                    "Z-stack enabled but z_step is missing or invalid (step=%s). "
+                    "Continuing in 2D mode.", z_step
+                )
+                z_stack_enabled = False
+            elif z_total_range <= 0:
+                logger.warning(
+                    "Z-stack range is zero or negative (start=%s, end=%s). "
+                    "Continuing in 2D mode.", z_start_abs, z_end_abs
                 )
                 z_stack_enabled = False
             else:
-                logger.info(
-                    f"Z-stack parameters received: start={z_start}, end={z_end}, "
-                    f"step={z_step}, pixel_size_z={z_pixel_size} um"
+                from microscope_command_server.acquisition.projections import (
+                    generate_z_offsets, get_projection,
                 )
-                logger.warning(
-                    "Z-stack acquisition is not yet implemented. "
-                    "Parameters are parsed but the acquisition loop will run in 2D mode."
+                z_offsets = generate_z_offsets(z_total_range, z_step)
+                projection_name = params.get("z_projection", "max")
+                try:
+                    projection_fn = get_projection(projection_name)
+                except KeyError as e:
+                    logger.error("Invalid z_projection: %s. Falling back to 'max'.", e)
+                    projection_fn = get_projection("max")
+                    projection_name = "max"
+                logger.info(
+                    "Z-stack: %d planes over +/-%.1f um (step=%.1f), projection=%s",
+                    len(z_offsets), z_total_range / 2, z_step, projection_name
                 )
 
         # Log background correction configuration
@@ -1908,14 +1935,14 @@ def _acquisition_workflow(
                 shutil.copy2(tile_config_path, angle_dir / "TileConfiguration.txt")
 
         # Calculate total images and update progress
-        total_images = (
-            len(positions) * len(params["angles"]) if params["angles"] else len(positions)
-        )
+        n_z_planes = len(z_offsets)
+        n_angles = len(params["angles"]) if params["angles"] else 1
+        total_images = len(positions) * n_z_planes * n_angles
 
         update_progress(0, total_images)
         logger.info(
             f"Starting acquisition of {total_images} total images "
-            f"({len(positions)} positions x {len(params['angles'])} angles)"
+            f"({len(positions)} positions x {n_z_planes} Z-planes x {n_angles} angles)"
         )
 
         image_count = 0
@@ -2656,320 +2683,373 @@ def _acquisition_workflow(
             ))
 
             if params["angles"]:
-                # Storage for birefringence image calculation
-                angle_images = {}
+                # Z-stack: record center Z from autofocus, generate absolute Z positions
+                center_z = current_stage_pos.z
+                z_stack_images = {}  # angle -> [z0_img, z1_img, ...] (only used when z_stack_enabled)
+                angle_images = {}  # For 2D: stores last plane's images; For Z-stack: stores projected images
 
-                # Multi-angle acquisition
-                for angle_idx, angle in enumerate(params["angles"]):
-                    # Check for cancellation
-                    if is_cancelled():
-                        logger.warning(f"Acquisition cancelled by client {client_addr}")
-                        set_state("CANCELLED")
-                        return
+                for z_idx, z_offset in enumerate(z_offsets):
+                    # Move Z if doing Z-stack (skip for single-plane 2D)
+                    if z_stack_enabled and z_offset != 0.0:
+                        target_z = center_z + z_offset
+                        hardware.move_to_position(Position(z=target_z))
+                        logger.debug(
+                            "Z-stack: plane %d/%d, Z=%.2f (offset=%+.1f)",
+                            z_idx + 1, len(z_offsets), target_z, z_offset,
+                        )
 
-                    # Start timing for this angle
-                    angle_start = time.perf_counter()
+                    # Multi-angle acquisition at this Z plane
+                    for angle_idx, angle in enumerate(params["angles"]):
+                        # Check for cancellation
+                        if is_cancelled():
+                            logger.warning(f"Acquisition cancelled by client {client_addr}")
+                            set_state("CANCELLED")
+                            return
 
-                    # Start rotation (non-blocking) -- the stage begins moving
-                    # immediately while we set camera exposure in parallel.
-                    t_rot = time.perf_counter()
-                    hardware.set_psg_ticks_no_wait(angle)
+                        # Start timing for this angle
+                        angle_start = time.perf_counter()
 
-                    # Set exposure time based on wb_mode.
-                    # This runs IN PARALLEL with the rotation stage movement.
-                    t_exp = time.perf_counter()
+                        # Start rotation (non-blocking) -- the stage begins moving
+                        # immediately while we set camera exposure in parallel.
+                        t_rot = time.perf_counter()
+                        hardware.set_psg_ticks_no_wait(angle)
 
-                    if wb_mode == "camera_awb":
-                        # Camera AWB mode: unified exposure only, no per-channel.
-                        # Camera handles color balance internally.
-                        if angle_idx < len(params["exposures"]):
-                            exposure_ms = params["exposures"][angle_idx]
-                            hardware.set_exposure(exposure_ms)
-                        # Apply unified gain for brightness at dim angles
-                        angle_name = angle_to_name(angle, modality=modality)
-                        if camera_awb_gains and angle_name in camera_awb_gains:
-                            try:
-                                gain_val = camera_awb_gains[angle_name]
-                                hardware.camera.set_unified_gain(gain_val)
-                                logger.info(f"  Camera AWB: unified gain={gain_val:.2f} for {angle_name}")
-                            except Exception as e:
-                                logger.debug(f"Could not set unified gain: {e}")
+                        # Set exposure time based on wb_mode.
+                        # This runs IN PARALLEL with the rotation stage movement.
+                        t_exp = time.perf_counter()
 
-                    elif wb_mode == "simple" and simple_wb_data:
-                        # Simple WB mode: use simple_wb.angles (written during WBSIMPLE calibration).
-                        # These values are the source of truth for Simple WB acquisition and are
-                        # NOT overwritten by PPM WB or background collection.
-                        # For small angles, all channels have the same exposure (unified mode).
-                        angle_name = angle_to_name(angle, modality=modality)
-                        sw_angles = simple_wb_data.get("angles", {})
-                        if angle_name in sw_angles:
-                            angle_sw = sw_angles[angle_name]
-                            try:
-                                # Check if all channels have the same exposure (unified calibration)
-                                exp_r = angle_sw["r"]
-                                exp_g = angle_sw["g"]
-                                exp_b = angle_sw["b"]
-                                is_unified = abs(exp_r - exp_g) < 0.01 and abs(exp_g - exp_b) < 0.01
+                        if wb_mode == "camera_awb":
+                            # Camera AWB mode: unified exposure only, no per-channel.
+                            # Camera handles color balance internally.
+                            if angle_idx < len(params["exposures"]):
+                                exposure_ms = params["exposures"][angle_idx]
+                                hardware.set_exposure(exposure_ms)
+                            # Apply unified gain for brightness at dim angles
+                            angle_name = angle_to_name(angle, modality=modality)
+                            if camera_awb_gains and angle_name in camera_awb_gains:
+                                try:
+                                    gain_val = camera_awb_gains[angle_name]
+                                    hardware.camera.set_unified_gain(gain_val)
+                                    logger.info(f"  Camera AWB: unified gain={gain_val:.2f} for {angle_name}")
+                                except Exception as e:
+                                    logger.debug(f"Could not set unified gain: {e}")
 
-                                if is_unified:
-                                    # Unified mode: set single exposure, analog gains handle color balance
-                                    hardware.camera.disable_individual_exposure()
-                                    hardware.set_exposure(exp_g)
-                                else:
-                                    # Legacy per-channel mode (old calibration data)
-                                    hardware.camera.set_channel_exposures(
-                                        red=exp_r, green=exp_g, blue=exp_b, auto_enable=True,
+                        elif wb_mode == "simple" and simple_wb_data:
+                            # Simple WB mode: use simple_wb.angles (written during WBSIMPLE calibration).
+                            # These values are the source of truth for Simple WB acquisition and are
+                            # NOT overwritten by PPM WB or background collection.
+                            # For small angles, all channels have the same exposure (unified mode).
+                            angle_name = angle_to_name(angle, modality=modality)
+                            sw_angles = simple_wb_data.get("angles", {})
+                            if angle_name in sw_angles:
+                                angle_sw = sw_angles[angle_name]
+                                try:
+                                    # Check if all channels have the same exposure (unified calibration)
+                                    exp_r = angle_sw["r"]
+                                    exp_g = angle_sw["g"]
+                                    exp_b = angle_sw["b"]
+                                    is_unified = abs(exp_r - exp_g) < 0.01 and abs(exp_g - exp_b) < 0.01
+
+                                    if is_unified:
+                                        # Unified mode: set single exposure, analog gains handle color balance
+                                        hardware.camera.disable_individual_exposure()
+                                        hardware.set_exposure(exp_g)
+                                    else:
+                                        # Legacy per-channel mode (old calibration data)
+                                        hardware.camera.set_channel_exposures(
+                                            red=exp_r, green=exp_g, blue=exp_b, auto_enable=True,
+                                        )
+                                    hardware.camera.set_unified_gain(angle_sw.get("unified_gain", 1.0))
+                                    # Apply calibrated R/B analog gains from Phase 2.
+                                    # These correct the camera's spectral bias and must
+                                    # match what was used during background collection.
+                                    hardware.camera.set_rb_analog_gains(
+                                        analog_red=simple_wb_analog_red,
+                                        analog_blue=simple_wb_analog_blue,
                                     )
-                                hardware.camera.set_unified_gain(angle_sw.get("unified_gain", 1.0))
-                                # Apply calibrated R/B analog gains from Phase 2.
-                                # These correct the camera's spectral bias and must
-                                # match what was used during background collection.
-                                hardware.camera.set_rb_analog_gains(
-                                    analog_red=simple_wb_analog_red,
-                                    analog_blue=simple_wb_analog_blue,
-                                )
-                                logger.debug(
-                                    f"  Simple WB: R={angle_sw['r']:.1f}ms, "
-                                    f"G={angle_sw['g']:.1f}ms, B={angle_sw['b']:.1f}ms "
-                                    f"(scale={angle_sw.get('scale', '?')}x, "
-                                    f"gain={angle_sw.get('unified_gain', 1.0):.2f}, "
-                                    f"analog R={simple_wb_analog_red:.3f}, "
-                                    f"B={simple_wb_analog_blue:.3f})"
-                                )
-                            except Exception as e:
-                                logger.warning(f"Simple WB failed for {angle_name}: {e}")
-                                if angle_idx < len(params["exposures"]):
+                                    logger.debug(
+                                        f"  Simple WB: R={angle_sw['r']:.1f}ms, "
+                                        f"G={angle_sw['g']:.1f}ms, B={angle_sw['b']:.1f}ms "
+                                        f"(scale={angle_sw.get('scale', '?')}x, "
+                                        f"gain={angle_sw.get('unified_gain', 1.0):.2f}, "
+                                        f"analog R={simple_wb_analog_red:.3f}, "
+                                        f"B={simple_wb_analog_blue:.3f})"
+                                    )
+                                except Exception as e:
+                                    logger.warning(f"Simple WB failed for {angle_name}: {e}")
+                                    if angle_idx < len(params["exposures"]):
+                                        hardware.set_exposure(params["exposures"][angle_idx])
+                            else:
+                                # Angle not in simple_wb data - fall back to base ratio
+                                # with exposure_scale from calibration
+                                logger.info(f"  Simple WB: no data for {angle_name}, using calibration with scale")
+                                if jai_calibration is not None:
+                                    applied, _ = apply_jai_calibration_for_angle(
+                                        hardware=hardware,
+                                        jai_calibration=jai_calibration,
+                                        angle=angle,
+                                        per_angle=False,
+                                        logger=logger,
+                                    )
+                                    if not applied and angle_idx < len(params["exposures"]):
+                                        hardware.set_exposure(params["exposures"][angle_idx])
+                                elif angle_idx < len(params["exposures"]):
                                     hardware.set_exposure(params["exposures"][angle_idx])
-                        else:
-                            # Angle not in simple_wb data - fall back to base ratio
-                            # with exposure_scale from calibration
-                            logger.info(f"  Simple WB: no data for {angle_name}, using calibration with scale")
-                            if jai_calibration is not None:
-                                applied, _ = apply_jai_calibration_for_angle(
-                                    hardware=hardware,
-                                    jai_calibration=jai_calibration,
-                                    angle=angle,
-                                    per_angle=False,
-                                    logger=logger,
-                                )
-                                if not applied and angle_idx < len(params["exposures"]):
-                                    hardware.set_exposure(params["exposures"][angle_idx])
-                            elif angle_idx < len(params["exposures"]):
+
+                        elif wb_mode == "simple" and jai_calibration is not None:
+                            # Simple WB mode without pre-computed data: use uncrossed
+                            # ratio from Mode 3 calibration with uniform scaling
+                            applied, _ = apply_jai_calibration_for_angle(
+                                hardware=hardware,
+                                jai_calibration=jai_calibration,
+                                angle=angle,
+                                per_angle=False,
+                                logger=logger,
+                            )
+                            if not applied and angle_idx < len(params["exposures"]):
                                 hardware.set_exposure(params["exposures"][angle_idx])
 
-                    elif wb_mode == "simple" and jai_calibration is not None:
-                        # Simple WB mode without pre-computed data: use uncrossed
-                        # ratio from Mode 3 calibration with uniform scaling
-                        applied, _ = apply_jai_calibration_for_angle(
-                            hardware=hardware,
-                            jai_calibration=jai_calibration,
-                            angle=angle,
-                            per_angle=False,
-                            logger=logger,
-                        )
-                        if not applied and angle_idx < len(params["exposures"]):
-                            hardware.set_exposure(params["exposures"][angle_idx])
-
-                    elif jai_calibration is not None:
-                        # Per-angle WB mode (Mode 3): apply full per-angle calibration
-                        applied, _ = apply_jai_calibration_for_angle(
-                            hardware=hardware,
-                            jai_calibration=jai_calibration,
-                            angle=angle,
-                            per_angle=white_balance_per_angle,
-                            logger=logger,
-                        )
-                        if not applied and angle_idx < len(params["exposures"]):
-                            # Fall back to single exposure if JAI calibration failed.
-                            # Must disable per-channel mode first - a previous angle's
-                            # successful apply_jai_calibration_for_angle may have enabled it,
-                            # which would cause this set_exposure() to be silently ignored.
-                            try:
-                                hardware.camera.disable_individual_exposure()
-                                hardware.camera.disable_individual_gain()
-                                hardware.camera.set_rb_analog_gains(analog_red=1.0, analog_blue=1.0)
-                            except Exception:
-                                pass
+                        elif jai_calibration is not None:
+                            # Per-angle WB mode (Mode 3): apply full per-angle calibration
+                            applied, _ = apply_jai_calibration_for_angle(
+                                hardware=hardware,
+                                jai_calibration=jai_calibration,
+                                angle=angle,
+                                per_angle=white_balance_per_angle,
+                                logger=logger,
+                            )
+                            if not applied and angle_idx < len(params["exposures"]):
+                                # Fall back to single exposure if JAI calibration failed.
+                                # Must disable per-channel mode first - a previous angle's
+                                # successful apply_jai_calibration_for_angle may have enabled it,
+                                # which would cause this set_exposure() to be silently ignored.
+                                try:
+                                    hardware.camera.disable_individual_exposure()
+                                    hardware.camera.disable_individual_gain()
+                                    hardware.camera.set_rb_analog_gains(analog_red=1.0, analog_blue=1.0)
+                                except Exception:
+                                    pass
+                                exposure_ms = params["exposures"][angle_idx]
+                                hardware.set_exposure(exposure_ms)
+                                logger.info(f"  JAI calibration failed, using single exposure: {exposure_ms}ms")
+                        elif angle_idx < len(params["exposures"]):
+                            # No JAI calibration - use single exposure from params
                             exposure_ms = params["exposures"][angle_idx]
                             hardware.set_exposure(exposure_ms)
-                            logger.info(f"  JAI calibration failed, using single exposure: {exposure_ms}ms")
-                    elif angle_idx < len(params["exposures"]):
-                        # No JAI calibration - use single exposure from params
-                        exposure_ms = params["exposures"][angle_idx]
-                        hardware.set_exposure(exposure_ms)
-                    t_exp = log_timing(logger, f"Set exposure for angle {angle}deg", t_exp)
+                        t_exp = log_timing(logger, f"Set exposure for angle {angle}deg", t_exp)
 
-                    # Wait for rotation to complete before snapping.
-                    # If exposure setting took longer than the rotation (~1s vs
-                    # ~700ms), this wait returns immediately (0ms).
-                    hardware.wait_for_rotation()
-                    t_rot = log_timing(logger, f"Rotation to {angle}deg", t_rot)
+                        # Wait for rotation to complete before snapping.
+                        # If exposure setting took longer than the rotation (~1s vs
+                        # ~700ms), this wait returns immediately (0ms).
+                        hardware.wait_for_rotation()
+                        t_rot = log_timing(logger, f"Rotation to {angle}deg", t_rot)
 
-                    # If XY move is still pending (non-blocking move for non-AF
-                    # tiles), wait for it now before the first snap.
-                    if xy_move_pending:
-                        hardware.wait_for_xy()
-                        xy_move_pending = False
+                        # If XY move is still pending (non-blocking move for non-AF
+                        # tiles), wait for it now before the first snap.
+                        if xy_move_pending:
+                            hardware.wait_for_xy()
+                            xy_move_pending = False
 
-                    # Acquire image
-                    t_snap = time.perf_counter()
-                    image, metadata = hardware.snap_image(debayering=False)
-                    t_snap = log_timing(logger, f"Snap image at {angle}deg (includes camera+USB+internal processing)", t_snap)
+                        # Acquire image
+                        t_snap = time.perf_counter()
+                        image, metadata = hardware.snap_image(debayering=False)
+                        t_snap = log_timing(logger, f"Snap image at {angle}deg (includes camera+USB+internal processing)", t_snap)
 
-                    if image is None:
-                        logger.error(f"Failed to acquire image at angle {angle}")
-                        continue
+                        if image is None:
+                            logger.error(f"Failed to acquire image at angle {angle}")
+                            continue
 
-                    # Calculate image stats (numpy operation)
-                    t_stats = time.perf_counter()
-                    img_mean = image.mean((0,1))
-                    t_stats = log_timing(logger, f"Calculate image stats at {angle}deg", t_stats)
-                    logger.debug(f"  Image shape: {image.shape}, mean: {img_mean}")
-                    # For uncrossed angles, suppress per-tile SATURATION WARNING
-                    # after the first occurrence -- the monitor handles rate-limiting
-                    sat_warn_threshold = (
-                        101.0 if sat_monitor.should_suppress_warnings(angle) else 1.0
-                    )
-                    sat_result = _check_saturation(
-                        image, f"tile {filename} at {angle}deg", logger,
-                        threshold_pct=sat_warn_threshold,
-                    )
-                    if sat_monitor.check_tile(
-                        sat_result, angle, pos_idx, filename,
-                        stage_x=current_stage_pos.x, stage_y=current_stage_pos.y
-                    ):
-                        # Saturation abort triggered -- save what we have and stop
-                        logger.error(
-                            f"Stopping acquisition at position {pos_idx + 1}/"
-                            f"{len(positions)} due to saturation abort"
+                        # Calculate image stats (numpy operation)
+                        t_stats = time.perf_counter()
+                        img_mean = image.mean((0,1))
+                        t_stats = log_timing(logger, f"Calculate image stats at {angle}deg", t_stats)
+                        logger.debug(f"  Image shape: {image.shape}, mean: {img_mean}")
+                        # For uncrossed angles, suppress per-tile SATURATION WARNING
+                        # after the first occurrence -- the monitor handles rate-limiting
+                        sat_warn_threshold = (
+                            101.0 if sat_monitor.should_suppress_warnings(angle) else 1.0
                         )
-                        sat_monitor.log_summary()
-                        set_state("FAILED", sat_monitor.abort_reason)
-                        return
-
-                    # Save raw (unprocessed) image for comparison (only if enabled)
-                    if save_raw_tiles:
-                        raw_output_path = output_path.parent / "Raw" / output_path.name
-                        raw_image_path = raw_output_path / str(angle) / filename
-
-                        t_mkdir = time.perf_counter()
-                        if not raw_image_path.parent.exists():
-                            raw_image_path.parent.mkdir(parents=True, exist_ok=True)
-                        t_mkdir = log_timing(logger, f"Create directories at {angle}deg", t_mkdir)
-
-                        try:
-                            # Write position metadata synchronously (reads hardware state)
-                            write_position_metadata(
-                                metadata_txt_for_positions, raw_image_path, hardware, modality
+                        sat_result = _check_saturation(
+                            image, f"tile {filename} at {angle}deg", logger,
+                            threshold_pct=sat_warn_threshold,
+                        )
+                        if sat_monitor.check_tile(
+                            sat_result, angle, pos_idx, filename,
+                            stage_x=current_stage_pos.x, stage_y=current_stage_pos.y
+                        ):
+                            # Saturation abort triggered -- save what we have and stop
+                            logger.error(
+                                f"Stopping acquisition at position {pos_idx + 1}/"
+                                f"{len(positions)} due to saturation abort"
                             )
-                            # Submit raw TIFF write to background pool.
-                            # Safe: apply_flat_field_correction creates a NEW array,
-                            # so the raw `image` array is never modified after this point.
-                            raw_pixel_size = hardware.get_pixel_size_um()
-                            write_pool.submit(
-                                TifWriterUtils.ome_writer,
-                                filename=str(raw_image_path),
-                                pixel_size_um=raw_pixel_size,
-                                data=image,
+                            sat_monitor.log_summary()
+                            set_state("FAILED", sat_monitor.abort_reason)
+                            return
+
+                        # Save raw (unprocessed) image for comparison (only if enabled)
+                        if save_raw_tiles:
+                            raw_output_path = output_path.parent / "Raw" / output_path.name
+                            raw_image_path = raw_output_path / str(angle) / filename
+
+                            t_mkdir = time.perf_counter()
+                            if not raw_image_path.parent.exists():
+                                raw_image_path.parent.mkdir(parents=True, exist_ok=True)
+                            t_mkdir = log_timing(logger, f"Create directories at {angle}deg", t_mkdir)
+
+                            try:
+                                # Write position metadata synchronously (reads hardware state)
+                                write_position_metadata(
+                                    metadata_txt_for_positions, raw_image_path, hardware, modality
+                                )
+                                # Submit raw TIFF write to background pool.
+                                # Safe: apply_flat_field_correction creates a NEW array,
+                                # so the raw `image` array is never modified after this point.
+                                raw_pixel_size = hardware.get_pixel_size_um()
+                                write_pool.submit(
+                                    TifWriterUtils.ome_writer,
+                                    filename=str(raw_image_path),
+                                    pixel_size_um=raw_pixel_size,
+                                    data=image,
+                                )
+                                logger.info(f"  Queued raw image write: {raw_image_path}")
+                            except Exception as e:
+                                logger.warning(f"  Failed to queue raw image: {e}")
+
+                        # ======= APPLY BACKGROUND CORRECTION (STEP 1) =======
+                        # Check if background correction is enabled, background exists, and angle is not disabled
+                        if (
+                            background_correction_enabled
+                            and angle in background_images
+                            and angle not in background_disabled_angles
+                        ):
+                            bg_img = background_images[angle]
+                            logger.debug(f"  Applying background correction for {angle} degrees")
+                            logger.debug(
+                                f"    Background stats: mean={bg_img.mean():.1f}, std={bg_img.std():.1f}"
                             )
-                            logger.info(f"  Queued raw image write: {raw_image_path}")
-                        except Exception as e:
-                            logger.warning(f"  Failed to queue raw image: {e}")
 
-                    # ======= APPLY BACKGROUND CORRECTION (STEP 1) =======
-                    # Check if background correction is enabled, background exists, and angle is not disabled
-                    if (
-                        background_correction_enabled
-                        and angle in background_images
-                        and angle not in background_disabled_angles
-                    ):
-                        bg_img = background_images[angle]
-                        logger.debug(f"  Applying background correction for {angle} degrees")
-                        logger.debug(
-                            f"    Background stats: mean={bg_img.mean():.1f}, std={bg_img.std():.1f}"
-                        )
+                            t_bg = time.perf_counter()
+                            image = BackgroundCorrectionUtils.apply_flat_field_correction(
+                                image,
+                                background_images[angle],
+                                background_scaling_factors[angle],
+                                method=background_correction_method,
+                            )
+                            t_bg = log_timing(logger, f"Background correction at {angle}deg", t_bg)
+                            logger.debug(
+                                f"    Correction applied with method: {background_correction_method}"
+                            )
+                            logger.debug(f"    Post-correction RGB means: {image.mean(axis=(0,1))}")
+                            # Use higher threshold for post-correction to reduce noise;
+                            # the raw check + monitor already handles abort decisions
+                            if not sat_monitor._is_uncrossed(angle):
+                                _check_saturation(image, f"post-correction tile {filename} at {angle}deg", logger)
+                        elif background_correction_enabled and angle in background_disabled_angles:
+                            logger.info(
+                                f"  Background correction SKIPPED for {angle} deg (disabled by acquisition parameters - exposure mismatch or missing background)"
+                            )
+                        elif background_correction_enabled and angle not in background_images:
+                            logger.info(
+                                f"  Background correction SKIPPED for {angle} deg (no background image available)"
+                            )
 
-                        t_bg = time.perf_counter()
-                        image = BackgroundCorrectionUtils.apply_flat_field_correction(
-                            image,
-                            background_images[angle],
-                            background_scaling_factors[angle],
-                            method=background_correction_method,
-                        )
-                        t_bg = log_timing(logger, f"Background correction at {angle}deg", t_bg)
-                        logger.debug(
-                            f"    Correction applied with method: {background_correction_method}"
-                        )
-                        logger.debug(f"    Post-correction RGB means: {image.mean(axis=(0,1))}")
-                        # Use higher threshold for post-correction to reduce noise;
-                        # the raw check + monitor already handles abort decisions
-                        if not sat_monitor._is_uncrossed(angle):
-                            _check_saturation(image, f"post-correction tile {filename} at {angle}deg", logger)
-                    elif background_correction_enabled and angle in background_disabled_angles:
-                        logger.info(
-                            f"  Background correction SKIPPED for {angle} deg (disabled by acquisition parameters - exposure mismatch or missing background)"
-                        )
-                    elif background_correction_enabled and angle not in background_images:
-                        logger.info(
-                            f"  Background correction SKIPPED for {angle} deg (no background image available)"
-                        )
+                        # ======= APPLY WHITE BALANCE (STEP 2) =======
+                        # Skip software WB when hardware WB (JAI per-channel exposures) is active.
+                        # Hardware WB already balances the channels via different exposure times;
+                        # applying software RGB multipliers on top would double-correct.
+                        if white_balance_enabled and jai_calibration is None and wb_mode not in ("camera_awb", "simple"):
+                            # Use pre-configured white balance values (software-only mode)
+                            if angle in angles_wb:
+                                wb_profile = angles_wb[angle]
+                            else:
+                                # Default neutral if angle not found
+                                wb_profile = [1.0, 1.0, 1.0]
+                                logger.warning(
+                                    f"    No white balance profile for {angle} deg, using neutral"
+                                )
 
-                    # ======= APPLY WHITE BALANCE (STEP 2) =======
-                    # Skip software WB when hardware WB (JAI per-channel exposures) is active.
-                    # Hardware WB already balances the channels via different exposure times;
-                    # applying software RGB multipliers on top would double-correct.
-                    if white_balance_enabled and jai_calibration is None and wb_mode not in ("camera_awb", "simple"):
-                        # Use pre-configured white balance values (software-only mode)
-                        if angle in angles_wb:
-                            wb_profile = angles_wb[angle]
+                            t_wb = time.perf_counter()
+                            gain = calculate_luminance_gain(*wb_profile)
+                            image = hardware.white_balance(
+                                image, white_balance_profile=wb_profile, gain=gain
+                            )
+                            t_wb = log_timing(logger, f"White balance at {angle}deg", t_wb)
+                            logger.info(
+                                f"  Applied software white balance: R={wb_profile[0]:.2f}, G={wb_profile[1]:.2f}, B={wb_profile[2]:.2f}"
+                            )
+                        elif white_balance_enabled and (jai_calibration is not None or wb_mode in ("camera_awb", "simple")):
+                            logger.debug(
+                                f"  Software WB skipped (hardware WB active for {angle} deg, mode={wb_mode})"
+                            )
+
+                        # Save or accumulate image depending on Z-stack mode
+                        if not z_stack_enabled:
+                            # 2D mode: save directly (existing behavior)
+                            image_path = output_path / str(angle) / filename
+
+                            if image_path.parent.exists():
+                                # Submit processed TIFF write to background pool.
+                                # Safe: `image` is a new array from background correction / white
+                                # balance (both return new arrays). The next angle's snap_image()
+                                # creates yet another new array, so no mutation risk.
+                                proc_pixel_size = hardware.get_pixel_size_um()
+                                write_pool.submit(
+                                    TifWriterUtils.ome_writer,
+                                    filename=str(image_path),
+                                    pixel_size_um=proc_pixel_size,
+                                    data=image,
+                                )
+
+                                # Store image for birefringence calculation.
+                                # Concurrent read by biref + TIFF writer is safe (both read-only).
+                                angle_images[angle] = image
+                            else:
+                                logger.error(f"Failed to save {image_path} - parent directory missing")
                         else:
-                            # Default neutral if angle not found
-                            wb_profile = [1.0, 1.0, 1.0]
-                            logger.warning(
-                                f"    No white balance profile for {angle} deg, using neutral"
-                            )
+                            # Z-stack mode: accumulate for projection
+                            z_stack_images.setdefault(angle, []).append(image)
+                            # Optionally save raw Z planes
+                            if save_raw_tiles:
+                                z_plane_path = output_path / str(angle) / f"z{z_idx:03d}" / filename
+                                z_plane_path.parent.mkdir(parents=True, exist_ok=True)
+                                write_pool.submit(
+                                    TifWriterUtils.ome_writer,
+                                    filename=str(z_plane_path),
+                                    pixel_size_um=hardware.get_pixel_size_um(),
+                                    data=image,
+                                )
 
-                        t_wb = time.perf_counter()
-                        gain = calculate_luminance_gain(*wb_profile)
-                        image = hardware.white_balance(
-                            image, white_balance_profile=wb_profile, gain=gain
-                        )
-                        t_wb = log_timing(logger, f"White balance at {angle}deg", t_wb)
-                        logger.info(
-                            f"  Applied software white balance: R={wb_profile[0]:.2f}, G={wb_profile[1]:.2f}, B={wb_profile[2]:.2f}"
-                        )
-                    elif white_balance_enabled and (jai_calibration is not None or wb_mode in ("camera_awb", "simple")):
-                        logger.debug(
-                            f"  Software WB skipped (hardware WB active for {angle} deg, mode={wb_mode})"
-                        )
-
-                    # Save processed image (background write)
-                    image_path = output_path / str(angle) / filename
-
-                    if image_path.parent.exists():
-                        # Submit processed TIFF write to background pool.
-                        # Safe: `image` is a new array from background correction / white
-                        # balance (both return new arrays). The next angle's snap_image()
-                        # creates yet another new array, so no mutation risk.
-                        proc_pixel_size = hardware.get_pixel_size_um()
-                        write_pool.submit(
-                            TifWriterUtils.ome_writer,
-                            filename=str(image_path),
-                            pixel_size_um=proc_pixel_size,
-                            data=image,
-                        )
                         image_count += 1
                         update_progress(image_count, total_images)
-
-                        # Store image for birefringence calculation.
-                        # Concurrent read by biref + TIFF writer is safe (both read-only).
-                        angle_images[angle] = image
 
                         # Log total time for this angle
                         angle_elapsed_ms = (time.perf_counter() - angle_start) * 1000
                         logger.debug(f"  [TIMING] Total for angle {angle}deg: {angle_elapsed_ms:.1f}ms")
-                    else:
-                        logger.error(f"Failed to save {image_path} - parent directory missing")
+
+                # -- end of z_offsets loop --
+
+                # Z-stack projection: reduce Z planes to single 2D image per angle
+                if z_stack_enabled and projection_fn is not None:
+                    for angle in params["angles"]:
+                        if angle in z_stack_images and len(z_stack_images[angle]) > 0:
+                            projected = projection_fn(z_stack_images[angle])
+                            angle_images[angle] = projected  # For birefringence
+                            # Save projected image as the tile for stitching
+                            image_path = output_path / str(angle) / filename
+                            if image_path.parent.exists():
+                                write_pool.submit(
+                                    TifWriterUtils.ome_writer,
+                                    filename=str(image_path),
+                                    pixel_size_um=hardware.get_pixel_size_um(),
+                                    data=projected,
+                                )
+                    logger.info(
+                        "Z-stack projection (%s) computed for %d angles at position %d",
+                        params.get("z_projection", "max"), len(z_stack_images), pos_idx + 1,
+                    )
+
+                    # Return Z to center position for next tile
+                    hardware.move_to_position(Position(z=center_z))
 
                 # Create birefringence image for this tile after all angles acquired
                 positive_angles = [a for a in angle_images.keys() if a > 0 and a != 90]
