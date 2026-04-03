@@ -271,31 +271,24 @@ def _read_current_camera_settings(hardware, logger) -> Dict[str, str]:
         except Exception:
             pass
 
-        if camera == "JAICamera":
-            try:
-                from microscope_control.jai import JAICameraProperties
-                jai_props = JAICameraProperties(hardware.core)
+        cam = hardware.camera
+        if cam.supports_per_channel_exposure():
+            exposures = cam.get_channel_exposures()
+            extra_info["Exposure R"] = f"{exposures['red']:.1f} ms"
+            extra_info["Exposure G"] = f"{exposures['green']:.1f} ms"
+            extra_info["Exposure B"] = f"{exposures['blue']:.1f} ms"
 
-                exposures = jai_props.get_channel_exposures()
-                extra_info["Exposure R"] = f"{exposures['red']:.1f} ms"
-                extra_info["Exposure G"] = f"{exposures['green']:.1f} ms"
-                extra_info["Exposure B"] = f"{exposures['blue']:.1f} ms"
+            gain = cam.get_unified_gain()
+            if gain > 1.0:
+                extra_info["Unified Gain"] = f"{gain:.2f}x"
 
-                gain = jai_props.get_unified_gain()
-                if gain > 1.0:
-                    extra_info["Unified Gain"] = f"{gain:.2f}x"
-
-                logger.info(
-                    f"Current camera settings: "
-                    f"R={exposures['red']:.1f}ms, "
-                    f"G={exposures['green']:.1f}ms, "
-                    f"B={exposures['blue']:.1f}ms, "
-                    f"gain={gain:.2f}x"
-                )
-            except ImportError:
-                logger.debug("JAI module not available, reading unified exposure")
-                exposure_ms = hardware.get_exposure()
-                extra_info["Exposure"] = f"{exposure_ms:.1f} ms"
+            logger.info(
+                f"Current camera settings: "
+                f"R={exposures['red']:.1f}ms, "
+                f"G={exposures['green']:.1f}ms, "
+                f"B={exposures['blue']:.1f}ms, "
+                f"gain={gain:.2f}x"
+            )
         else:
             exposure_ms = hardware.get_exposure()
             extra_info["Exposure"] = f"{exposure_ms:.1f} ms"

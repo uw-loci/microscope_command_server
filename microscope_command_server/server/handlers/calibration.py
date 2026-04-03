@@ -5,9 +5,12 @@ measurement commands:
 WBCALIBR, WBSIMPLE, WBPPM, POLCAL, PPMSENS, PPMBIREF, SBCALIB,
 GETNOISE, NOISCHAR
 
-NOTE: Many of these handlers are JAI-camera-specific and use
-JAICameraProperties directly. TODO: migrate to a camera-agnostic
-calibration interface when non-JAI cameras need calibration support.
+NOTE: Calibration handlers (WBCALIBR, WBSIMPLE, WBPPM, NOISCHAR) pass
+JAICameraProperties to external calibrator classes (JAIWhiteBalanceCalibrator,
+JAINoiseCharacterization) which require it as their API. All direct camera
+property manipulation (finally-block cleanup) uses the Camera ABC methods
+instead. The calibrator pass-throughs remain until those classes are migrated
+to accept the Camera interface directly.
 """
 
 import socket
@@ -237,13 +240,12 @@ def handle_wbcalibr(conn, client, hardware, settings, **kwargs):
         # Reset per-channel mode so subsequent operations (autofocus,
         # SNAP, acquisition) can use unified set_exposure() correctly
         try:
-            from microscope_control.jai import JAICameraProperties
-            jai_props = JAICameraProperties(hardware.core)
-            jai_props.disable_individual_exposure()
-            jai_props.disable_individual_gain()
-            jai_props.set_rb_analog_gains(red=1.0, blue=1.0)
+            cam = hardware.camera
+            cam.disable_individual_exposure()
+            cam.disable_individual_gain()
+            cam.set_rb_analog_gains(analog_red=1.0, analog_blue=1.0)
             logger.debug("Reset per-channel mode after WBCALIBR")
-        except (ImportError, Exception):
+        except Exception:
             pass
 
 
@@ -697,21 +699,20 @@ def handle_wbsimple(conn, client, hardware, settings, **kwargs):
         # Apply calibration result to camera so live view shows
         # the white-balanced image, or reset on failure.
         try:
-            from microscope_control.jai import JAICameraProperties
-            jai_props = JAICameraProperties(hardware.core)
+            cam = hardware.camera
             if (_wb_calibration_result is not None
                     and _wb_calibration_result.converged):
-                jai_props.set_channel_exposures(
+                cam.set_channel_exposures(
                     red=_wb_calibration_result.exposures_ms['red'],
                     green=_wb_calibration_result.exposures_ms['green'],
                     blue=_wb_calibration_result.exposures_ms['blue'],
                     auto_enable=True,
                 )
-                jai_props.set_unified_gain(
+                cam.set_unified_gain(
                     _wb_calibration_result.unified_gain)
-                jai_props.set_rb_analog_gains(
-                    red=_wb_calibration_result.analog_red,
-                    blue=_wb_calibration_result.analog_blue)
+                cam.set_rb_analog_gains(
+                    analog_red=_wb_calibration_result.analog_red,
+                    analog_blue=_wb_calibration_result.analog_blue)
                 logger.info(
                     "Applied calibration to camera for live view: "
                     "R=%.2f G=%.2f B=%.2f, "
@@ -725,12 +726,12 @@ def handle_wbsimple(conn, client, hardware, settings, **kwargs):
                 )
             else:
                 # Reset to clean state on failure
-                jai_props.set_rb_analog_gains(red=1.0, blue=1.0)
-                jai_props.set_unified_gain(1.0)
-                jai_props.disable_individual_exposure()
+                cam.set_rb_analog_gains(analog_red=1.0, analog_blue=1.0)
+                cam.set_unified_gain(1.0)
+                cam.disable_individual_exposure()
                 logger.debug("Reset camera state after WBSIMPLE "
                              "(calibration did not converge)")
-        except (ImportError, Exception):
+        except Exception:
             pass
 
 
@@ -1083,8 +1084,7 @@ def handle_wbppm(conn, client, hardware, settings, **kwargs):
         # Apply uncrossed calibration to camera so live view shows
         # the white-balanced image, or reset on failure.
         try:
-            from microscope_control.jai import JAICameraProperties
-            jai_props = JAICameraProperties(hardware.core)
+            cam = hardware.camera
             # Use uncrossed (90 deg) result for live view -- it is
             # the brightest angle and most natural for visual QC.
             uncrossed = (
@@ -1092,16 +1092,16 @@ def handle_wbppm(conn, client, hardware, settings, **kwargs):
                 if _wb_rotation_results else None
             )
             if uncrossed is not None and uncrossed.converged:
-                jai_props.set_channel_exposures(
+                cam.set_channel_exposures(
                     red=uncrossed.exposures_ms['red'],
                     green=uncrossed.exposures_ms['green'],
                     blue=uncrossed.exposures_ms['blue'],
                     auto_enable=True,
                 )
-                jai_props.set_unified_gain(uncrossed.unified_gain)
-                jai_props.set_rb_analog_gains(
-                    red=uncrossed.analog_red,
-                    blue=uncrossed.analog_blue)
+                cam.set_unified_gain(uncrossed.unified_gain)
+                cam.set_rb_analog_gains(
+                    analog_red=uncrossed.analog_red,
+                    analog_blue=uncrossed.analog_blue)
                 logger.info(
                     "Applied uncrossed calibration to camera for "
                     "live view: R=%.2f G=%.2f B=%.2f, "
@@ -1115,12 +1115,12 @@ def handle_wbppm(conn, client, hardware, settings, **kwargs):
                 )
             else:
                 # Reset to clean state on failure
-                jai_props.set_rb_analog_gains(red=1.0, blue=1.0)
-                jai_props.set_unified_gain(1.0)
-                jai_props.disable_individual_exposure()
+                cam.set_rb_analog_gains(analog_red=1.0, analog_blue=1.0)
+                cam.set_unified_gain(1.0)
+                cam.disable_individual_exposure()
                 logger.debug("Reset camera state after WBPPM "
                              "(no uncrossed result to apply)")
-        except (ImportError, Exception):
+        except Exception:
             pass
 
 
@@ -1952,12 +1952,10 @@ def handle_noischar(conn, client, hardware, settings, **kwargs):
         conn.settimeout(None)  # Reset to blocking mode
         # Reset camera to clean state after characterization
         try:
-            from microscope_control.jai import JAICameraProperties
-
-            jai_props = JAICameraProperties(hardware.core)
-            jai_props.set_rb_analog_gains(red=1.0, blue=1.0)
-            jai_props.set_unified_gain(1.0)
-            jai_props.disable_individual_exposure()
+            cam = hardware.camera
+            cam.set_rb_analog_gains(analog_red=1.0, analog_blue=1.0)
+            cam.set_unified_gain(1.0)
+            cam.disable_individual_exposure()
             logger.debug("Reset camera state after NOISCHAR")
-        except (ImportError, Exception):
+        except Exception:
             pass

@@ -276,29 +276,32 @@ def handle_snap(conn, client, hardware, settings, **kwargs):
                     # Priority 2: WB calibration lookup from YAML
                     # Priority 3: Unified exposure
                     wb_applied = False
+                    cam = hardware.camera
                     if exp_r is not None and exp_g is not None and exp_b is not None:
                         # Direct per-channel control - used for WB calibration loops
-                        # TODO: migrate to hardware.camera.properties
-                        try:
-                            from microscope_control.jai import JAICameraProperties
-                            jai_props = JAICameraProperties(hardware.core)
-                            jai_props.set_channel_exposures(
-                                red=exp_r,
-                                green=exp_g,
-                                blue=exp_b,
-                                auto_enable=True,
+                        if cam.supports_per_channel_exposure():
+                            try:
+                                cam.set_channel_exposures(
+                                    red=exp_r,
+                                    green=exp_g,
+                                    blue=exp_b,
+                                    auto_enable=True,
+                                )
+                                wb_applied = True
+                                logger.info(
+                                    "SNAP: Applied direct per-channel exposures: "
+                                    "R=%.2fms, G=%.2fms, B=%.2fms",
+                                    exp_r, exp_g, exp_b,
+                                )
+                            except Exception as e:
+                                logger.warning(
+                                    "SNAP: Failed to set per-channel exposures: %s", e
+                                )
+                        else:
+                            logger.debug(
+                                "SNAP: Per-channel exposures provided but camera "
+                                "does not support per-channel mode"
                             )
-                            wb_applied = True
-                            logger.info(
-                                "SNAP: Applied direct per-channel exposures: "
-                                "R=%.2fms, G=%.2fms, B=%.2fms",
-                                exp_r, exp_g, exp_b,
-                            )
-                        except (ImportError, Exception) as e:
-                            logger.warning(
-                                "SNAP: Failed to set per-channel exposures: %s", e
-                            )
-                            wb_applied = False
 
                     elif use_white_balance and yaml_path:
                         wb_applied = _apply_snap_white_balance(
@@ -308,15 +311,8 @@ def handle_snap(conn, client, hardware, settings, **kwargs):
                     # If white balance was not applied, use the default behavior:
                     # disable per-channel mode and use unified exposure
                     if not wb_applied:
-                        # TODO: migrate to hardware.camera.properties
-                        try:
-                            from microscope_control.jai import JAICameraProperties
-                            jai_props = JAICameraProperties(hardware.core)
-                            jai_props.disable_individual_exposure()
-                            jai_props.disable_individual_gain()
-                            # Don't reset analog gains - preserve WB color balance
-                        except (ImportError, Exception):
-                            pass  # Not a JAI camera or module not available
+                        cam.disable_individual_exposure()
+                        cam.disable_individual_gain()
 
                         # Set unified exposure (fixed - no adaptive adjustment!)
                         hardware.set_exposure(exposure_ms)

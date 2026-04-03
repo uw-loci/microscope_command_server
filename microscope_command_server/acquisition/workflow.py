@@ -1475,11 +1475,8 @@ def _acquisition_workflow(
         # Parse the acquisition parameters
         params = parse_acquisition_message(message)
 
-        modality = "_".join(params["scan_type"].split("_")[:2])
-
         logger.info("Acquisition parameters:")
         logger.info(f"  Client: {client_addr}")
-        logger.info(f"  Modality: {modality}")
         logger.info(f"  Sample label: {params['sample_label']}")
         logger.info(f"  Scan type: {params['scan_type']}")
         logger.info(f"  Region: {params['region_name']}")
@@ -1521,22 +1518,28 @@ def _acquisition_workflow(
             hardware._initialize_microscope_methods()
             logger.info("Re-initialized hardware methods with updated settings")
 
+        # Apply acquisition profile mode setup (MM ConfigGroup presets,
+        # illumination, camera switching, mode positions).
+        # The scan_type maps to a key in acquisition_profiles.
+        scan_type = params.get("scan_type", "")
+        if hasattr(hardware, "apply_mode_setup"):
+            hardware.apply_mode_setup(scan_type)
+
         # Try to load and apply JAI white balance settings if available
         # Settings are stored in calibration folder after running WBCALIBRATE command
         wb_calibration_folder = params.get("white_balance_calibration_folder")
         if wb_calibration_folder:
-            # Extract modality and objective from params for path construction
-            wb_modality = BackgroundCorrectionUtils.get_modality_from_scan_type(
-                params["scan_type"]
-            )
-            # Try to get objective from scan type (e.g., "ppm_20x" -> "20x")
-            scan_parts = params["scan_type"].split("_")
-            wb_objective = scan_parts[-1] if len(scan_parts) > 1 else "default"
+            # Use modality config for WB key, and explicit objective/detector
+            # from params (sent by Java extension) instead of parsing scan_type
+            mod_config = get_modality_config(params.get("scan_type", ""))
+            wb_modality = mod_config.wb_settings_key or params.get("scan_type", "").split("_")[0].lower()
+            wb_objective = params.get("objective", "default")
+            wb_detector = params.get("detector", "default")
 
             load_and_apply_white_balance_settings(
                 hardware=hardware,
                 calibration_folder=wb_calibration_folder,
-                detector="JAI",
+                detector=wb_detector,
                 modality=wb_modality,
                 objective=wb_objective,
                 logger=logger,
@@ -1706,6 +1709,18 @@ def _acquisition_workflow(
                 )
         logger.info(f"White balance mode: {wb_mode}")
 
+        # Check if the modality supports white balance. Monochrome modalities
+        # (SHG, 2P, brightfield with monochrome camera) have wb_settings_key=None
+        # and should not attempt RGB white balance on grayscale images.
+        _wb_mod_check = get_modality_config(params.get("scan_type", ""))
+        if wb_mode != "off" and _wb_mod_check.wb_settings_key is None:
+            logger.info(
+                "White balance mode '%s' requested but modality has no WB settings key "
+                "(monochrome or single-channel modality). Forcing wb_mode='off'.",
+                wb_mode,
+            )
+            wb_mode = "off"
+
         # Keep white_balance_enabled and white_balance_per_angle in sync for
         # downstream code that still references them (software WB, etc.)
         white_balance_enabled = wb_mode != "off"
@@ -1727,7 +1742,10 @@ def _acquisition_workflow(
         # This is separate from software white balance (RGB multipliers applied post-capture)
         jai_calibration = None
         simple_wb_data = None  # Mode 2 pre-computed per-angle scaled exposures
-        base_modality = params["scan_type"].split("_")[0].lower()
+        # Use modality config wb_settings_key (e.g. "ppm") for WB calibration
+        # lookup. Falls back to first part of scan_type for legacy configs.
+        _wb_mod_config = get_modality_config(params.get("scan_type", ""))
+        base_modality = _wb_mod_config.wb_settings_key or params["scan_type"].split("_")[0].lower()
 
         if wb_mode == "camera_awb":
             # Camera AWB must be set manually in MicroManager's Device Property
@@ -2033,6 +2051,28 @@ def _acquisition_workflow(
                     f"Available objectives in config: {available_objectives}\n"
                     f"Cannot proceed with acquisition - please add autofocus settings for '{current_objective}' "
                     f"or verify the objective name matches the configuration."
+                )
+                logger.error(error_msg)
+                set_state("FAILED", error_msg)
+                return
+
+            # Check that autofocus settings have been explicitly calibrated.
+            # The Setup Wizard generates settings with calibrated: false to
+            # prevent uncalibrated search ranges from damaging hardware.
+            af_calibrated = af_setting.get("calibrated", True)  # Legacy configs assumed calibrated
+            if af_calibrated is False:
+                error_msg = (
+                    f"Autofocus settings for objective '{current_objective}' have not been calibrated!\n"
+                    f"The autofocus configuration file was generated with default placeholder values "
+                    f"that may not be safe for your hardware.\n"
+                    f"\n"
+                    f"To fix this:\n"
+                    f"  1. Open {autofocus_file}\n"
+                    f"  2. Adjust search_range_um and n_steps for your objective\n"
+                    f"  3. Set 'calibrated: true' for this objective\n"
+                    f"  4. Or run the Autofocus Benchmark utility from the QP Scope menu\n"
+                    f"\n"
+                    f"CRITICAL: An incorrect search_range_um can crash the objective into the sample!"
                 )
                 logger.error(error_msg)
                 set_state("FAILED", error_msg)
