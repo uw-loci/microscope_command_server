@@ -1334,6 +1334,9 @@ def parse_acquisition_message(message: str) -> dict:
             elif parts[i] == "--averaging" and i + 1 < len(parts):
                 params["averaging"] = int(parts[i + 1])
                 i += 2
+            elif parts[i] == "--biref-min-intensity" and i + 1 < len(parts):
+                params["biref_min_intensity"] = int(parts[i + 1])
+                i += 2
             else:
                 i += 1
 
@@ -3123,6 +3126,7 @@ def _acquisition_workflow(
                         pixel_size_um=biref_pixel_size,
                         tile_config_source=tile_config_source,
                         logger=logger,
+                        min_intensity=params.get("biref_min_intensity", 0),
                     )
                 else:
                     logger.warning(
