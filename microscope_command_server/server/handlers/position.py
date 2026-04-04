@@ -83,12 +83,23 @@ def handle_getpxsz(conn, client, hardware, settings, **kwargs):
 
 
 def handle_getr(conn, client, hardware, settings, **kwargs):
-    """Return current rotation angle as one big-endian float (degrees)."""
+    """Return current rotation angle as one big-endian float (degrees).
+
+    Returns NaN if no rotation stage is configured (not an error condition).
+    """
     logger.debug("Client %s requested rotation angle", client.addr)
     try:
         angle = hardware.get_psg_ticks()
         conn.sendall(struct.pack("!f", angle))
         logger.debug("Sent rotation angle: %.1f deg", angle)
+    except RuntimeError as e:
+        if "No rotation stage" in str(e):
+            # Not an error -- microscope simply has no rotation hardware
+            conn.sendall(struct.pack("!f", float("nan")))
+            logger.debug("No rotation stage configured, returned NaN")
+        else:
+            logger.error("Failed to get rotation angle: %s", e, exc_info=True)
+            conn.sendall(b"HWERR")
     except Exception as e:
         logger.error("Failed to get rotation angle: %s", e, exc_info=True)
         conn.sendall(b"HWERR")
