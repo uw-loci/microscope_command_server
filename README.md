@@ -22,20 +22,24 @@ Socket-based command server for remote microscope control and QuPath integration
 - pip (Python package installer)
 - Git (for `pip install git+https://...` commands)
 
-⚠️ **Important**: This package depends on `microscope-control` and `ppm-library`.
+**Important**: This package depends on `microscope-imageprocessing` (required) and `microscope-control` (required).
+`ppm-library` is an **optional** dependency, only needed for PPM (polarized light) modality support.
 See the [QPSC Installation Guide](https://github.com/uw-loci/QPSC#automated-installation-windows) for complete setup instructions.
 
 ### Quick Install (from GitHub)
 
 **Install dependencies first:**
 ```bash
-# 1. Install ppm-library
-pip install git+https://github.com/uw-loci/ppm_library.git
+# 1. Install microscope-imageprocessing (required - background correction, OME-TIFF I/O)
+pip install git+https://github.com/uw-loci/microscope_imageprocessing.git
 
-# 2. Install microscope-control
+# 2. Install microscope-control (required - hardware abstraction)
 pip install git+https://github.com/uw-loci/microscope_control.git
 
-# 3. Then install microscope_command_server
+# 3. (Optional) Install ppm-library for PPM modality support
+pip install git+https://github.com/uw-loci/ppm_library.git
+
+# 4. Then install microscope_command_server
 pip install git+https://github.com/uw-loci/microscope_command_server.git
 ```
 
@@ -150,13 +154,18 @@ move_stageXY(x + 1000, y + 1000)
 The server coordinates between QuPath (Java) and the microscope hardware (Python/Micro-Manager):
 
 ```
-QuPath Extension → Socket Client → Microscope Server
-                                        ↓
-                              Microscope Control
-                                   +
-                               PPM Library
-                                        ↓
-                              Micro-Manager Hardware
+QuPath Extension -> Socket Client -> Microscope Server
+                                          |
+                          +---------------+---------------+
+                          |               |               |
+                  Microscope       Microscope        PPM Library
+                   Control       ImageProcessing     (optional)
+                      |               |                  |
+                      v               v                  v
+              Micro-Manager     Debayering,        PPM-specific
+                Hardware        Background,        analysis and
+                               OME-TIFF I/O,       calibration
+                              Z-stack projections
 ```
 
 ## Server Configuration
