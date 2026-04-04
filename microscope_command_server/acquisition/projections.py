@@ -7,14 +7,14 @@ image suitable for stitching. Each operator takes a list of numpy arrays
 The PositionHook ABC enables custom per-position logic during acquisition
 (e.g., conditional time-lapse, quality checks, adaptive protocols).
 
-Projection functions and registry are re-exported from microscope_imaging.
+Projection functions and registry are re-exported from microscope_imageprocessing.
 """
 
 import logging
 from abc import ABC, abstractmethod
 from typing import Dict, Any
 
-from microscope_imaging.zstack.projections import (
+from microscope_imageprocessing.zstack.projections import (
     max_intensity_projection,
     min_intensity_projection,
     sum_projection,

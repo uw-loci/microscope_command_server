@@ -21,8 +21,8 @@ from microscope_control.hardware.pycromanager import PycromanagerHardware
 from microscope_control.autofocus.core import AutofocusUtils
 from microscope_command_server.acquisition.tiles import TileConfigUtils
 from microscope_command_server.modality import get_config as get_modality_config
-from microscope_imaging.io.writer import ome_tiff_writer
-from microscope_imaging.correction.background import BackgroundCorrectionUtils
+from microscope_imageprocessing.io.writer import ome_tiff_writer
+from microscope_imageprocessing.correction.background import BackgroundCorrectionUtils
 import shlex
 import skimage.filters
 from concurrent.futures import ThreadPoolExecutor, Future
