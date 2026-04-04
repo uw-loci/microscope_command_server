@@ -12,10 +12,11 @@ authors = [
 ]
 dependencies = [
     "microscope-control>=1.0.0",
-    "ppm-library>=1.0.0",
+    "microscope-imaging>=0.1.0",
 ]
 
 [project.optional-dependencies]
+ppm = ["ppm-library>=1.0.0"]
 dev = [
     "pytest>=7.4.0",
     "pytest-cov>=4.1.0",

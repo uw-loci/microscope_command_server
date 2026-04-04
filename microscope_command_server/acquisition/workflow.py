@@ -21,8 +21,8 @@ from microscope_control.hardware.pycromanager import PycromanagerHardware
 from microscope_control.autofocus.core import AutofocusUtils
 from microscope_command_server.acquisition.tiles import TileConfigUtils
 from microscope_command_server.modality import get_config as get_modality_config
-from ppm_library.imaging.writer import TifWriterUtils
-from ppm_library.imaging.background import BackgroundCorrectionUtils
+from microscope_imaging.io.writer import ome_tiff_writer
+from microscope_imaging.correction.background import BackgroundCorrectionUtils
 import shlex
 import skimage.filters
 from concurrent.futures import ThreadPoolExecutor, Future
@@ -2946,7 +2946,7 @@ def _acquisition_workflow(
                                 # so the raw `image` array is never modified after this point.
                                 raw_pixel_size = hardware.get_pixel_size_um()
                                 write_pool.submit(
-                                    TifWriterUtils.ome_writer,
+                                    ome_tiff_writer,
                                     filename=str(raw_image_path),
                                     pixel_size_um=raw_pixel_size,
                                     data=image,
@@ -3034,7 +3034,7 @@ def _acquisition_workflow(
                                 # creates yet another new array, so no mutation risk.
                                 proc_pixel_size = hardware.get_pixel_size_um()
                                 write_pool.submit(
-                                    TifWriterUtils.ome_writer,
+                                    ome_tiff_writer,
                                     filename=str(image_path),
                                     pixel_size_um=proc_pixel_size,
                                     data=image,
@@ -3053,7 +3053,7 @@ def _acquisition_workflow(
                                 z_plane_path = output_path / str(angle) / f"z{z_idx:03d}" / filename
                                 z_plane_path.parent.mkdir(parents=True, exist_ok=True)
                                 write_pool.submit(
-                                    TifWriterUtils.ome_writer,
+                                    ome_tiff_writer,
                                     filename=str(z_plane_path),
                                     pixel_size_um=hardware.get_pixel_size_um(),
                                     data=image,
@@ -3078,7 +3078,7 @@ def _acquisition_workflow(
                             image_path = output_path / str(angle) / filename
                             if image_path.parent.exists():
                                 write_pool.submit(
-                                    TifWriterUtils.ome_writer,
+                                    ome_tiff_writer,
                                     filename=str(image_path),
                                     pixel_size_um=hardware.get_pixel_size_um(),
                                     data=projected,
@@ -3110,11 +3110,12 @@ def _acquisition_workflow(
                     # Submit birefringence compute+save to background pool.
                     # Reads angle_images arrays concurrently with pending processed
                     # writes -- both are read-only, so this is safe.
+                    from ppm_library.imaging.writer import TifWriterUtils as PpmWriterUtils
                     biref_pixel_size = hardware.get_pixel_size_um()
                     biref_pos_img = angle_images[pos_angle]
                     biref_neg_img = angle_images[neg_angle]
                     write_pool.submit(
-                        TifWriterUtils.create_normalized_birefringence_tile,
+                        PpmWriterUtils.create_normalized_birefringence_tile,
                         pos_image=biref_pos_img,
                         neg_image=biref_neg_img,
                         output_dir=biref_dir,
@@ -3132,7 +3133,7 @@ def _acquisition_workflow(
 
                 # # Create sum image alongside birefringence image
                 # sum_dir = output_path / f"{pos_angle}.sum"
-                # TifWriterUtils.create_sum_tile(
+                # PpmWriterUtils.create_sum_tile(
                 #     pos_image=angle_images[pos_angle],
                 #     neg_image=angle_images[neg_angle],
                 #     output_dir=sum_dir,
@@ -3151,7 +3152,7 @@ def _acquisition_workflow(
                     # Submit brightfield TIFF write to background pool
                     bf_pixel_size = hardware.get_pixel_size_um()
                     write_pool.submit(
-                        TifWriterUtils.ome_writer,
+                        ome_tiff_writer,
                         filename=str(image_path),
                         pixel_size_um=bf_pixel_size,
                         data=image,
@@ -4826,7 +4827,7 @@ def simple_background_collection(
                     f"R={ch_means[0]:.1f}, G={ch_means[1]:.1f}, B={ch_means[2]:.1f}, "
                     f"median={float(np.median(image)):.1f}"
                 )
-            TifWriterUtils.ome_writer(  # background -single
+            ome_tiff_writer(  # background -single
                 filename=str(background_path),
                 pixel_size_um=hardware.get_pixel_size_um(),
                 data=image,
@@ -5071,7 +5072,7 @@ def background_acquisition_workflow(
 
             # Save background image
             background_path = angle_dir / "background.tif"
-            TifWriterUtils.ome_writer(  # background 2 with bkg-workflow
+            ome_tiff_writer(  # background 2 with bkg-workflow
                 filename=str(background_path),
                 pixel_size_um=hardware.get_pixel_size_um(),
                 data=image,
