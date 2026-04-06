@@ -821,14 +821,6 @@ def apply_jai_calibration_for_angle(
         exp_g = base_exp_g * scale_applied
         exp_b = base_exp_b * scale_applied
 
-        # Apply per-channel exposures
-        hardware.camera.set_channel_exposures(
-            red=exp_r,
-            green=exp_g,
-            blue=exp_b,
-            auto_enable=True,  # Automatically enable individual exposure mode
-        )
-
         # Build exposure info for return value
         exposure_info = {
             "exposures_ms": {"r": exp_r, "g": exp_g, "b": exp_b},
@@ -836,18 +828,7 @@ def apply_jai_calibration_for_angle(
             "scale_applied": scale_applied,
         }
 
-        if scale_applied != 1.0:
-            exp_msg = (
-                f"Applied JAI calibration for angle {angle}: "
-                f"R={exp_r:.1f}ms, G={exp_g:.1f}ms, B={exp_b:.1f}ms "
-                f"(scale={scale_applied:.2f}x, base={base_exposure:.1f}ms)"
-            )
-        else:
-            exp_msg = f"Applied JAI calibration for angle {angle}: R={exp_r:.1f}ms, G={exp_g:.1f}ms, B={exp_b:.1f}ms"
-
-        # Apply gains using new model: unified gain + R/B analog corrections
-        # New format keys: unified_gain, analog_red, analog_blue
-        # Old format keys: unified_gain, r, g, b
+        # Extract gains (new format: unified_gain, analog_red, analog_blue)
         unified_gain = gains.get("unified_gain", 1.0)
         analog_red = gains.get("analog_red", None)
         analog_blue = gains.get("analog_blue", None)
@@ -856,30 +837,40 @@ def apply_jai_calibration_for_angle(
         if analog_red is None and "r" in gains:
             analog_red = gains.get("r", 1.0)
             analog_blue = gains.get("b", 1.0)
-            if logger:
-                logger.info(
-                    "Using old gain format (r/g/b) - "
-                    "mapped to analog_red/analog_blue"
-                )
 
         if analog_red is None:
             analog_red = 1.0
         if analog_blue is None:
             analog_blue = 1.0
 
-        # ALWAYS apply unified gain and R/B analog gains for every angle.
-        # Previous code only applied gains when they differed from 1.0, but
-        # during PPM acquisition the camera cycles through angles with different
-        # gains. If angle N has gain=3.0 and angle N+1 has gain=1.0, skipping
-        # the 1.0 set leaves the camera at 3.0 -> saturated image at angle N+1.
-        hardware.camera.set_unified_gain(unified_gain)
-        exp_msg += f" | Unified gain: {unified_gain:.3f}"
-
-        hardware.camera.set_rb_analog_gains(analog_red=analog_red, analog_blue=analog_blue)
-        exp_msg += f" | Analog R={analog_red:.3f}, B={analog_blue:.3f}"
+        # Apply mode + exposures + gains atomically via Camera.apply_settings().
+        # This stops streaming once (if needed), applies all settings, and avoids
+        # partial-state windows between individual set_*() calls.
+        hardware.camera.apply_settings(
+            exposures={"r": exp_r, "g": exp_g, "b": exp_b},
+            unified_gain=unified_gain,
+            analog_red=analog_red,
+            analog_blue=analog_blue,
+            individual_exposure=True,
+        )
 
         if logger:
-            logger.info(exp_msg)
+            if scale_applied != 1.0:
+                logger.info(
+                    "Applied JAI calibration for angle %s: "
+                    "R=%.1fms, G=%.1fms, B=%.1fms (scale=%.2fx) "
+                    "| Gain: %.3f, aR=%.3f, aB=%.3f",
+                    angle, exp_r, exp_g, exp_b, scale_applied,
+                    unified_gain, analog_red, analog_blue,
+                )
+            else:
+                logger.info(
+                    "Applied JAI calibration for angle %s: "
+                    "R=%.1fms, G=%.1fms, B=%.1fms "
+                    "| Gain: %.3f, aR=%.3f, aB=%.3f",
+                    angle, exp_r, exp_g, exp_b,
+                    unified_gain, analog_red, analog_blue,
+                )
 
         return True, exposure_info
 
@@ -2787,36 +2778,27 @@ def _acquisition_workflow(
                             if angle_name in sw_angles:
                                 angle_sw = sw_angles[angle_name]
                                 try:
-                                    # Check if all channels have the same exposure (unified calibration)
                                     exp_r = angle_sw["r"]
                                     exp_g = angle_sw["g"]
                                     exp_b = angle_sw["b"]
                                     is_unified = abs(exp_r - exp_g) < 0.01 and abs(exp_g - exp_b) < 0.01
+                                    sw_gain = angle_sw.get("unified_gain", 1.0)
 
-                                    if is_unified:
-                                        # Unified mode: set single exposure, analog gains handle color balance
-                                        hardware.camera.disable_individual_exposure()
-                                        hardware.set_exposure(exp_g)
-                                    else:
-                                        # Legacy per-channel mode (old calibration data)
-                                        hardware.camera.set_channel_exposures(
-                                            red=exp_r, green=exp_g, blue=exp_b, auto_enable=True,
-                                        )
-                                    hardware.camera.set_unified_gain(angle_sw.get("unified_gain", 1.0))
-                                    # Apply calibrated R/B analog gains from Phase 2.
-                                    # These correct the camera's spectral bias and must
-                                    # match what was used during background collection.
-                                    hardware.camera.set_rb_analog_gains(
+                                    # Apply all settings atomically
+                                    hardware.camera.apply_settings(
+                                        exposures=({"all": exp_g} if is_unified
+                                                   else {"r": exp_r, "g": exp_g, "b": exp_b}),
+                                        unified_gain=sw_gain,
                                         analog_red=simple_wb_analog_red,
                                         analog_blue=simple_wb_analog_blue,
+                                        individual_exposure=not is_unified,
                                     )
                                     logger.debug(
-                                        f"  Simple WB: R={angle_sw['r']:.1f}ms, "
-                                        f"G={angle_sw['g']:.1f}ms, B={angle_sw['b']:.1f}ms "
-                                        f"(scale={angle_sw.get('scale', '?')}x, "
-                                        f"gain={angle_sw.get('unified_gain', 1.0):.2f}, "
-                                        f"analog R={simple_wb_analog_red:.3f}, "
-                                        f"B={simple_wb_analog_blue:.3f})"
+                                        "  Simple WB: R=%.1fms, G=%.1fms, B=%.1fms "
+                                        "(scale=%sx, gain=%.2f, aR=%.3f, aB=%.3f)",
+                                        exp_r, exp_g, exp_b,
+                                        angle_sw.get("scale", "?"), sw_gain,
+                                        simple_wb_analog_red, simple_wb_analog_blue,
                                     )
                                 except Exception as e:
                                     logger.warning(f"Simple WB failed for {angle_name}: {e}")
