@@ -4476,11 +4476,9 @@ def simple_background_collection(
         for angle_idx, angle in enumerate(angles):
             logger.info(f"Acquiring background {angle_idx + 1}/{total_images} for angle {angle}")
 
-            # Set rotation angle if supported
-            if hasattr(hardware, "set_psg_ticks"):
-                hardware.set_psg_ticks(
-                    angle  # , is_sequence_start=True
-                )  # Each background is independent
+            # Set rotation angle if rotation stage is present
+            if hardware.rotation_stage is not None:
+                hardware.set_psg_ticks(angle)
                 logger.info(f"Set angle to {angle}")
 
             # Use saved exposure from prior run if available, else client default
@@ -4967,11 +4965,9 @@ def background_acquisition_workflow(
             angle_dir = output_path / str(angle)
             angle_dir.mkdir(exist_ok=True)
 
-            # Set rotation angle if PPM
-            if hasattr(hardware, "set_psg_ticks"):
-                hardware.set_psg_ticks(
-                    angle  # , is_sequence_start=True
-                )  # Each background is independent
+            # Set rotation angle if rotation stage is present
+            if hardware.rotation_stage is not None:
+                hardware.set_psg_ticks(angle)
                 logger.info(f"Set angle to {angle}")
 
             # Use exposure from client as initial value for adaptive exposure
@@ -5166,11 +5162,11 @@ def polarizer_calibration_workflow(
             hardware._initialize_microscope_methods()
             logger.info("Re-initialized hardware methods with updated settings")
 
-        # Verify PPM is available
-        if not hasattr(hardware, "set_psg_ticks"):
+        # Verify PPM rotation stage is available
+        if hardware.rotation_stage is None:
             raise RuntimeError(
-                "PPM rotation stage methods not available. "
-                "Check ppm_optics setting in configuration."
+                "No rotation stage configured. PPM calibration requires a "
+                "rotation stage. Check modality and ppm_optics settings."
             )
 
         # Import the calibration utility
