@@ -1,7 +1,7 @@
 """Camera control command handlers.
 
 Handles camera property queries and settings:
-GETCAM, GETMODE, SETMODE, GETEXP, SETEXP, GETGAIN, SETGAIN
+GETCAM, GETMODE, SETMODE, GETEXP, SETEXP, GETGAIN, SETGAIN, SETCAM
 
 These commands use the Camera ABC's per-channel capability methods.
 Cameras that support per-channel control (e.g. JAI 3-CCD) return True
@@ -321,3 +321,113 @@ def handle_setgain(conn, client, hardware, settings, **kwargs):
     except Exception as e:
         logger.error("Failed to set gain: %s", e)
         conn.sendall(b"ERR_GAIN")
+
+
+def handle_setcam(conn, client, hardware, settings, **kwargs):
+    """Set camera mode, exposures, and gains atomically in one command.
+
+    Replaces the sequence SETMODE -> SETEXP -> SETGAIN with a single
+    round-trip. Stops streaming once, applies all settings, responds once.
+
+    Protocol:
+        1 byte:  exp_mode (1=individual, 0=unified)
+        1 byte:  exposure_count (1=unified, 3=per-channel)
+        N*4 bytes: exposures (big-endian floats)
+        1 byte:  gain_count (1=unified only, 3=unified+analog_r+analog_b)
+        N*4 bytes: gains (big-endian floats)
+
+    Response: 'ACK_____' on success, 'ERR_SETC' on failure.
+    """
+    logger.debug("Client %s requested SETCAM (atomic camera settings)", client.addr)
+    try:
+        # Read header: exp_mode (1) + exp_count (1)
+        header = conn.recv(2)
+        if len(header) != 2:
+            raise ValueError("Expected 2-byte SETCAM header")
+
+        exp_individual = header[0] == 1
+        exp_count = header[1]
+
+        # Read exposures
+        exp_data = conn.recv(exp_count * 4)
+        if len(exp_data) != exp_count * 4:
+            raise ValueError(f"Expected {exp_count * 4} exposure bytes, got {len(exp_data)}")
+        exposures = struct.unpack(f"!{'f' * exp_count}", exp_data)
+
+        # Read gain count + gains
+        gain_count_byte = conn.recv(1)
+        gain_count = gain_count_byte[0]
+        gain_data = conn.recv(gain_count * 4)
+        if len(gain_data) != gain_count * 4:
+            raise ValueError(f"Expected {gain_count * 4} gain bytes, got {len(gain_data)}")
+        gains = struct.unpack(f"!{'f' * gain_count}", gain_data)
+
+        logger.info(
+            "SETCAM: mode=%s, exposures=%s, gains=%s",
+            "individual" if exp_individual else "unified",
+            exposures, gains,
+        )
+
+        cam = hardware.camera
+
+        # Stop streaming ONCE before all changes
+        stopped = False
+        try:
+            if hardware.core.is_sequence_running():
+                hardware.core.stop_sequence_acquisition()
+                stopped = True
+                time.sleep(0.1)
+        except Exception:
+            pass
+        try:
+            if hardware.studio is not None and hardware.studio.live().is_live_mode_on():
+                hardware.studio.live().set_live_mode(False)
+                stopped = True
+                time.sleep(0.1)
+        except Exception:
+            pass
+
+        # 1. Set mode
+        if exp_individual:
+            if not cam.supports_per_channel_exposure():
+                conn.sendall(b"ERR_NSUP")
+                logger.error("Individual exposure not supported by %s", cam.get_name())
+                return
+            cam.enable_individual_exposure()
+        else:
+            cam.disable_individual_exposure()
+        cam.disable_individual_gain()
+
+        # 2. Set exposures
+        if exp_count == 1:
+            hardware.set_exposure(exposures[0])
+            logger.info("SETCAM: unified exposure %.3fms", exposures[0])
+        elif exp_count >= 3:
+            if cam.supports_per_channel_exposure():
+                cam.set_channel_exposures(
+                    red=exposures[0], green=exposures[1], blue=exposures[2],
+                    auto_enable=False,
+                )
+                logger.info("SETCAM: per-channel R=%.3f G=%.3f B=%.3fms",
+                            exposures[0], exposures[1], exposures[2])
+            else:
+                hardware.set_exposure(exposures[1])
+                logger.info("SETCAM: fallback unified %.3fms (green)", exposures[1])
+
+        # 3. Set gains
+        if gain_count == 1:
+            cam.set_unified_gain(gains[0])
+            logger.info("SETCAM: unified gain %.2f", gains[0])
+        elif gain_count >= 3:
+            cam.set_unified_gain(gains[0])
+            cam.set_rb_analog_gains(red=gains[1], blue=gains[2])
+            logger.info("SETCAM: unified=%.2f, aR=%.3f, aB=%.3f",
+                        gains[0], gains[1], gains[2])
+
+        conn.sendall(b"ACK_____")
+        logger.info("SETCAM complete (streaming was %s)",
+                     "stopped" if stopped else "not running")
+
+    except Exception as e:
+        logger.error("SETCAM failed: %s", e)
+        conn.sendall(b"ERR_SETC")

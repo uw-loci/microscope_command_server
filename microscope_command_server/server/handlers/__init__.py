@@ -21,6 +21,7 @@ from microscope_command_server.server.handlers.position import (
 from microscope_command_server.server.handlers.camera import (
     handle_getcam, handle_getmode, handle_setmode,
     handle_getexp, handle_setexp, handle_getgain, handle_setgain,
+    handle_setcam,
 )
 from microscope_command_server.server.handlers.live import (
     handle_getlive, handle_setlive, handle_getframe,
@@ -71,6 +72,7 @@ COMMAND_HANDLERS = {
     ExtendedCommand.SETEXP: handle_setexp,
     ExtendedCommand.GETGAIN: handle_getgain,
     ExtendedCommand.SETGAIN: handle_setgain,
+    ExtendedCommand.SETCAM: handle_setcam,
 
     # Live mode & snapshot
     ExtendedCommand.GETLIVE: handle_getlive,

@@ -89,6 +89,7 @@ class ExtendedCommand:
     SETEXP = b"setexp__"  # Set exposure (count=1: generic, count>=3: JAI per-channel)
     GETGAIN = b"getgain_"  # Get gain values (unified or JAI per-channel RGB)
     SETGAIN = b"setgain_"  # Set gain (count=1: JAI unified, count>=3: JAI per-channel)
+    SETCAM = b"setcam__"   # Compound: set mode + exposures + gains atomically (1 round-trip)
 
     # NOTE: SETWBMD (camera WB mode control) was removed -- JAI hardware AWB
     # cannot be reliably controlled through Pycromanager. Set AWB manually in
