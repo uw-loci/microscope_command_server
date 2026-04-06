@@ -4267,6 +4267,14 @@ def simple_background_collection(
         # Parse angles and exposures from client
         # Use client's exposures as initial values for adaptive exposure
         angles, exposures = parse_angles_exposures(angles_str, exposures_str)
+
+        # Brightfield and other single-angle modalities send empty angles [].
+        # Treat this as a single background at angle 0 (no rotation).
+        if not angles:
+            angles = [0.0]
+            exposures = [exposures[0] if exposures else 50.0]
+            logger.info("No angles specified -- collecting single brightfield background (angle=0)")
+
         logger.info(f"Collecting backgrounds for angles: {angles} using adaptive exposure")
         logger.info(f"Initial exposures from client: {exposures}")
 
@@ -4277,9 +4285,9 @@ def simple_background_collection(
         # Load main configuration file
         settings = config_manager.load_config_file(yaml_file_path)
 
-        # Load and merge LOCI resources (same pattern as regular acquisition workflow)
+        # Load and merge LOCI resources (derive path from config file, not package)
         loci_rsc_file = str(
-            Path(__file__).parent / "configurations" / "resources" / "resources_LOCI.yml"
+            Path(yaml_file_path).parent / "resources" / "resources_LOCI.yml"
         )
         try:
             loci_resources = config_manager.load_config_file(loci_rsc_file)
