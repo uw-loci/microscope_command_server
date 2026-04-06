@@ -619,6 +619,8 @@ def handle_wbsimple(conn, client, hardware, settings, **kwargs):
                                 "r": round(uncrossed_for_base.exposures_ms["red"], 2),
                                 "g": round(uncrossed_for_base.exposures_ms["green"], 2),
                                 "b": round(uncrossed_for_base.exposures_ms["blue"], 2),
+                                "unified_exposure_ms": round(
+                                    uncrossed_for_base.exposures_ms["green"], 2),
                                 "gains": {
                                     "unified_gain": round(uncrossed_for_base.unified_gain, 3),
                                     "analog_red": round(uncrossed_for_base.analog_red, 3),
