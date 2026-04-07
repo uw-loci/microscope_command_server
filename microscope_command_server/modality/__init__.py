@@ -18,11 +18,13 @@ from .registry import get_config, register, registered_prefixes
 from .ppm import register_ppm
 from .shg import register_shg
 from .brightfield import register_brightfield
+from .widefield import register_widefield
 
 # Register built-in modalities on import
 register_ppm()
 register_shg()
 register_brightfield()
+register_widefield()
 
 __all__ = [
     "ModalityConfig",
