@@ -4272,6 +4272,7 @@ def simple_background_collection(
     wb_mode: str = None,
     objective: str = None,
     detector: str = None,
+    target_intensity_override: float = None,
 ):
     """
     Simplified background collection for BackgroundCollectionWorkflow.
@@ -4384,6 +4385,13 @@ def simple_background_collection(
             logger.info(f"Camera detected: {camera_name} (per_channel={is_jai_camera})")
         except Exception as e:
             logger.debug(f"Could not detect camera type: {e}")
+
+        # Use target intensity override from Java UI if provided (non-RGB cameras only)
+        if target_intensity_override is not None and target_intensity_override > 0:
+            logger.info(
+                "Using target intensity override from client: %.0f",
+                target_intensity_override,
+            )
 
         # Load calibration based on wb_mode
         # All modes except "off" need Mode 3 calibration data for reference
@@ -4588,7 +4596,9 @@ def simple_background_collection(
                         logger.debug(f"Could not set unified gain: {e}")
 
                 # Use standard adaptive intensity matching (single unified exposure)
-                target_intensity = get_target_intensity_for_background(modality, angle)
+                target_intensity = (target_intensity_override
+                                    if target_intensity_override and target_intensity_override > 0
+                                    else get_target_intensity_for_background(modality, angle))
                 # AWB equalizes all channels, so the target applies to EVERY
                 # channel equally. Without AWB, only the dominant channel
                 # (red, ~3.5x bias) reaches 245 while green/blue are much
@@ -4649,7 +4659,9 @@ def simple_background_collection(
                     base_r = simple_wb_base["r"]
                     base_g = simple_wb_base["g"]
                     base_b = simple_wb_base["b"]
-                    target_intensity = get_target_intensity_for_background(modality, angle)
+                    target_intensity = (target_intensity_override
+                                    if target_intensity_override and target_intensity_override > 0
+                                    else get_target_intensity_for_background(modality, angle))
                     logger.info(
                         f"Simple WB adaptive: base R={base_r:.1f}, G={base_g:.1f}, B={base_b:.1f}, "
                         f"gain={unified_gain:.2f}, target={target_intensity:.1f}"
@@ -4838,7 +4850,9 @@ def simple_background_collection(
                             f"For best results, acquire positive angles before negative. "
                             f"Falling back to intensity-based matching."
                         )
-                        target_intensity = get_target_intensity_for_background(modality, angle)
+                        target_intensity = (target_intensity_override
+                                    if target_intensity_override and target_intensity_override > 0
+                                    else get_target_intensity_for_background(modality, angle))
                         try:
                             image, final_exposure = acquire_background_with_target_intensity(
                                 hardware=hardware,
@@ -4862,7 +4876,9 @@ def simple_background_collection(
                             continue
                 else:
                     # Non-biref angles (0, 90, positive angles): use standard intensity matching
-                    target_intensity = get_target_intensity_for_background(modality, angle)
+                    target_intensity = (target_intensity_override
+                                    if target_intensity_override and target_intensity_override > 0
+                                    else get_target_intensity_for_background(modality, angle))
                     logger.info(f"Target intensity: {target_intensity:.1f}")
 
                     try:
@@ -5091,7 +5107,9 @@ def background_acquisition_workflow(
                         f"Biref pair matching: +{paired_positive} not yet acquired. "
                         f"Falling back to intensity-based matching."
                     )
-                    target_intensity = get_target_intensity_for_background(modality, angle)
+                    target_intensity = (target_intensity_override
+                                    if target_intensity_override and target_intensity_override > 0
+                                    else get_target_intensity_for_background(modality, angle))
                     try:
                         image, final_exposure = acquire_background_with_target_intensity(
                             hardware=hardware,
@@ -5113,7 +5131,9 @@ def background_acquisition_workflow(
                         continue
             else:
                 # Non-biref angles: use standard intensity matching
-                target_intensity = get_target_intensity_for_background(modality, angle)
+                target_intensity = (target_intensity_override
+                                    if target_intensity_override and target_intensity_override > 0
+                                    else get_target_intensity_for_background(modality, angle))
                 logger.info(f"Target intensity: {target_intensity:.1f}")
 
                 try:

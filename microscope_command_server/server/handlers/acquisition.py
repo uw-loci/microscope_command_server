@@ -212,7 +212,7 @@ def handle_bgacquire(conn, client, hardware, settings, **kwargs):
 
                 # Split by known flags to avoid issues with spaces in paths
                 # Include --wb-mode as a valued flag
-                flags = ["--yaml", "--output", "--modality", "--angles", "--exposures", "--wb-mode", "--objective", "--detector"]
+                flags = ["--yaml", "--output", "--modality", "--angles", "--exposures", "--wb-mode", "--objective", "--detector", "--target-intensity"]
 
                 for i, flag in enumerate(flags):
                     if flag in message:
@@ -253,6 +253,11 @@ def handle_bgacquire(conn, client, hardware, settings, **kwargs):
                             params["objective"] = value
                         elif flag == "--detector":
                             params["detector"] = value
+                        elif flag == "--target-intensity":
+                            try:
+                                params["target_intensity"] = float(value)
+                            except ValueError:
+                                logger.warning("Invalid --target-intensity value: %s", value)
 
                 # Resolve wb_mode: prefer explicit --wb-mode, fall back to boolean flag
                 if "wb_mode" in params:
@@ -321,6 +326,7 @@ def handle_bgacquire(conn, client, hardware, settings, **kwargs):
                         wb_mode=params.get("wb_mode"),
                         objective=params.get("objective"),
                         detector=params.get("detector"),
+                        target_intensity_override=params.get("target_intensity"),
                     )
 
                     # Format exposures as angle:exposure pairs
