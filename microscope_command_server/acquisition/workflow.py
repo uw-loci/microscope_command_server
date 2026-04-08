@@ -1466,6 +1466,11 @@ def _acquisition_workflow(
         except Exception as e:
             logger.warning(f"Could not stop live/sequence mode: {e}")
 
+        # Invalidate camera settings state so first apply_settings() writes
+        # all properties to hardware (defensive -- state may be stale from
+        # live mode or manual adjustments).
+        hardware.camera.invalidate_settings_state()
+
         # Parse the acquisition parameters
         params = parse_acquisition_message(message)
 
