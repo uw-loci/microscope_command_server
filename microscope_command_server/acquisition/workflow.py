@@ -2721,12 +2721,15 @@ def _acquisition_workflow(
                 current_stage_pos.z
             ))
 
+            # Worst saturation across all angles (must be initialized before
+            # the angles branch so it's available for tile_measurements later)
+            tile_worst_sat = {"R": 0.0, "G": 0.0, "B": 0.0}
+
             if params["angles"]:
                 # Z-stack: record center Z from autofocus, generate absolute Z positions
                 center_z = current_stage_pos.z
                 z_stack_images = {}  # angle -> [z0_img, z1_img, ...] (only used when z_stack_enabled)
                 angle_images = {}  # For 2D: stores last plane's images; For Z-stack: stores projected images
-                tile_worst_sat = {"R": 0.0, "G": 0.0, "B": 0.0}  # Worst saturation across all angles
 
                 for z_idx, z_offset in enumerate(z_offsets):
                     # Move Z if doing Z-stack (skip for single-plane 2D)
