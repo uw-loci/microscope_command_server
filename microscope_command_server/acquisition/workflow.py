@@ -3157,7 +3157,29 @@ def _acquisition_workflow(
 
             # Log total time for this tile/position
             tile_elapsed_ms = (time.perf_counter() - tile_start) * 1000
-            logger.debug(f"[TIMING] === TOTAL TILE TIME: {tile_elapsed_ms:.1f}ms ({tile_elapsed_ms/1000:.2f}s) ===")
+            logger.info(
+                "Tile %d/%d: %.1fs (%s)",
+                pos_idx + 1, len(positions), tile_elapsed_ms / 1000,
+                "AF" if needs_af else "no-AF",
+            )
+
+            # Periodic progress summary (every 100 tiles)
+            if (pos_idx + 1) % 100 == 0 and pos_idx > 0:
+                completed = pos_idx + 1
+                elapsed_total_s = sum(
+                    m["tile_time_ms"] for m in tile_measurements
+                ) / 1000 + tile_elapsed_ms / 1000
+                avg_s = elapsed_total_s / completed
+                remaining = len(positions) - completed
+                eta_s = remaining * avg_s
+                eta_h = eta_s / 3600
+                throughput = completed / (elapsed_total_s / 3600) if elapsed_total_s > 0 else 0
+                logger.info(
+                    "[PROGRESS] %d/%d (%.1f%%) | avg %.1fs/tile | ETA %.1fh | %.0f tiles/hr",
+                    completed, len(positions),
+                    100 * completed / len(positions),
+                    avg_s, eta_h, throughput,
+                )
 
             # Record per-tile measurement data
             # Use current_stage_pos.z (captured after autofocus) for the actual Z
@@ -3225,6 +3247,23 @@ def _acquisition_workflow(
             )
         except Exception as e:
             logger.warning("Failed to write tile measurements: %s", e)
+
+        # Post-acquisition timing report
+        if tile_measurements:
+            all_times = [m["tile_time_ms"] for m in tile_measurements]
+            af_tiles = [m for m in tile_measurements if m["af_performed"]]
+            non_af_tiles = [m for m in tile_measurements if not m["af_performed"]]
+            total_wall_s = sum(all_times) / 1000
+            avg_all = sum(all_times) / len(all_times)
+            avg_af = sum(m["tile_time_ms"] for m in af_tiles) / len(af_tiles) if af_tiles else 0
+            avg_non_af = sum(m["tile_time_ms"] for m in non_af_tiles) / len(non_af_tiles) if non_af_tiles else 0
+            throughput = len(all_times) / (total_wall_s / 3600) if total_wall_s > 0 else 0
+            logger.info("=== ACQUISITION TIMING REPORT ===")
+            logger.info("  Total tiles: %d, wall time: %.1fh", len(all_times), total_wall_s / 3600)
+            logger.info("  Average: %.1fms/tile (%.1fs)", avg_all, avg_all / 1000)
+            logger.info("  AF tiles: %d (avg %.1fms), non-AF: %d (avg %.1fms)",
+                        len(af_tiles), avg_af, len(non_af_tiles), avg_non_af)
+            logger.info("  Throughput: %.0f tiles/hr", throughput)
 
         # Get final Z position for tilt correction model
         final_z = hardware.get_current_position().z
