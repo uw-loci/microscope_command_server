@@ -3795,10 +3795,11 @@ def acquire_background_with_target_intensity(
     last_image = None
     last_exposure = current_exposure
 
-    # Per-channel saturation limit: no channel median should exceed this.
-    # The JAI camera's ~3.5x red spectral bias means red can saturate while
-    # the overall median is well below target. This catches that case.
-    CHANNEL_SAT_LIMIT = 245
+    # Saturation limits are derived from the first image's dtype to support
+    # both 8-bit (JAI, 0-255) and 16-bit (Hamamatsu, 0-65535) cameras.
+    # Initialized on first snap, then fixed for all subsequent iterations.
+    channel_sat_limit = None
+    overall_sat_limit = None
 
     for iteration in range(max_iterations):
         # Snap image (debayering auto-detected based on camera type)
@@ -3806,6 +3807,33 @@ def acquire_background_with_target_intensity(
 
         if image is None:
             raise RuntimeError(f"Failed to acquire image at iteration {iteration}")
+
+        # Derive saturation limits from image dtype on first iteration.
+        # Also scale target_intensity if it appears to be an 8-bit value on
+        # a 16-bit camera (e.g., target=200 on uint16 -> target=51200).
+        if channel_sat_limit is None:
+            if image.dtype == np.uint16:
+                channel_sat_limit = 64000
+                overall_sat_limit = 64000
+                if target_intensity <= 255:
+                    old_target = target_intensity
+                    target_intensity = target_intensity * 256.0
+                    tolerance = tolerance * 256.0
+                    if logger:
+                        logger.info(
+                            f"  16-bit camera detected: scaling target "
+                            f"{old_target:.0f} -> {target_intensity:.0f}, "
+                            f"tolerance -> {tolerance:.0f}"
+                        )
+            else:
+                channel_sat_limit = 245
+                overall_sat_limit = 254
+            if logger:
+                logger.info(
+                    f"  Image dtype: {image.dtype}, saturation limits: "
+                    f"channel={channel_sat_limit}, overall={overall_sat_limit}, "
+                    f"target={target_intensity:.0f}"
+                )
 
         # Calculate median intensity across all channels (more robust than mean)
         mean_intensity = float(np.median(image))
@@ -3820,7 +3848,7 @@ def acquire_background_with_target_intensity(
             max_ch_idx = int(np.argmax(ch_medians))
             max_ch_median = ch_medians[max_ch_idx]
             max_ch_name = ch_names[max_ch_idx]
-            channel_saturated = max_ch_median >= CHANNEL_SAT_LIMIT
+            channel_saturated = max_ch_median >= channel_sat_limit
 
         # Store for potential use if we don't converge
         last_image = image
@@ -3843,18 +3871,18 @@ def acquire_background_with_target_intensity(
         # Even if overall median is on target, a saturated channel means
         # the exposure is too high and must be reduced.
         if channel_saturated:
-            if max_ch_median >= 254:
+            if max_ch_median >= (overall_sat_limit * 0.99):
                 # Fully clipped -- no info about how far over, so halve.
                 # Gets from 10ms to 0.6ms in ~4 iterations.
                 reduction = 0.5
             else:
                 # Partially saturated -- proportional reduction
-                reduction = (CHANNEL_SAT_LIMIT * 0.90) / max_ch_median
+                reduction = (channel_sat_limit * 0.90) / max_ch_median
             new_exposure = max(current_exposure * reduction, MIN_EXPOSURE_MS)
             if logger:
                 logger.warning(
                     f"    {max_ch_name} channel saturated "
-                    f"(median={max_ch_median:.0f} >= {CHANNEL_SAT_LIMIT}), "
+                    f"(median={max_ch_median:.0f} >= {channel_sat_limit}), "
                     f"reducing exposure {current_exposure:.1f}ms "
                     f"-> {new_exposure:.1f}ms"
                 )
@@ -3875,7 +3903,7 @@ def acquire_background_with_target_intensity(
 
         # Calculate proportional adjustment
         # If image is too dark, increase exposure; if too bright, decrease
-        if mean_intensity >= 254.0:
+        if mean_intensity >= overall_sat_limit:
             # Image is saturated - decrease exposure aggressively
             # Proportional control alone is too slow when saturated
             new_exposure = max(current_exposure * 0.5, MIN_EXPOSURE_MS)
@@ -3890,7 +3918,7 @@ def acquire_background_with_target_intensity(
             # Clamp adjustment to prevent overshooting into channel saturation.
             # If max channel is already close to the limit, cap the increase.
             if max_ch_median > 0 and adjustment_ratio > 1.0:
-                max_safe_ratio = CHANNEL_SAT_LIMIT / max_ch_median
+                max_safe_ratio = channel_sat_limit / max_ch_median
                 if adjustment_ratio > max_safe_ratio:
                     adjustment_ratio = max_safe_ratio * 0.90
                     if logger:

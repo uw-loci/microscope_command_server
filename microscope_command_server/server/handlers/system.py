@@ -152,6 +152,8 @@ def handle_config(conn, client, hardware, settings, **kwargs):
         hardware._active_detector_id = hardware._find_detector_id(hardware._camera_name)
         hardware._stage = hardware._create_stage()
         hardware._rotation_stage = hardware._create_rotation_stage()
+        hardware._illumination = hardware._create_illumination()
+        hardware._detector = hardware._create_detector()
 
         # Build updated state to return
         updated_state = {
