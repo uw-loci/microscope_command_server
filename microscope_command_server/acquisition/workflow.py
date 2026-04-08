@@ -2721,6 +2721,7 @@ def _acquisition_workflow(
                 center_z = current_stage_pos.z
                 z_stack_images = {}  # angle -> [z0_img, z1_img, ...] (only used when z_stack_enabled)
                 angle_images = {}  # For 2D: stores last plane's images; For Z-stack: stores projected images
+                tile_worst_sat = {"R": 0.0, "G": 0.0, "B": 0.0}  # Worst saturation across all angles
 
                 for z_idx, z_offset in enumerate(z_offsets):
                     # Move Z if doing Z-stack (skip for single-plane 2D)
@@ -2898,6 +2899,12 @@ def _acquisition_workflow(
                             image, f"tile {filename} at {angle}deg", logger,
                             threshold_pct=sat_warn_threshold,
                         )
+                        # Track worst per-channel saturation across all angles for this tile
+                        if sat_result:
+                            for ch in ("R", "G", "B"):
+                                if sat_result.get(ch, 0) > tile_worst_sat[ch]:
+                                    tile_worst_sat[ch] = sat_result[ch]
+
                         if sat_monitor.check_tile(
                             sat_result, angle, pos_idx, filename,
                             stage_x=current_stage_pos.x, stage_y=current_stage_pos.y
@@ -3192,6 +3199,10 @@ def _acquisition_workflow(
                 "af_drift_um": round(drift_for_this_tile, 2),
                 "af_failed": af_failed_for_this_tile,
                 "tile_time_ms": round(tile_elapsed_ms, 0),
+                "saturation_R_pct": round(tile_worst_sat.get("R", 0), 1),
+                "saturation_G_pct": round(tile_worst_sat.get("G", 0), 1),
+                "saturation_B_pct": round(tile_worst_sat.get("B", 0), 1),
+                "saturation_worst_pct": round(max(tile_worst_sat.values()), 1),
             })
 
         # Drain any remaining background writes before finalizing
