@@ -116,6 +116,22 @@ def handle_config(conn, client, hardware, settings, **kwargs):
                     # Same IP reconnecting - allow takeover (previous connection likely crashed)
                     logger.warning("CONFIG: Same IP reconnecting - taking over from %s", current_active_addr)
                     logger.warning("CONFIG: Previous connection may have been improperly closed")
+                    # Stop any orphaned sequence acquisition left running by
+                    # the dead client. Without this the camera can stay
+                    # streaming into MM's circular buffer and eventually
+                    # hard-lock the Hamamatsu sCMOS driver + MicroManager
+                    # itself (observed on OWS3 2026-04-09).
+                    try:
+                        if hardware.core.is_sequence_running():
+                            logger.warning(
+                                "CONFIG: Stopping orphaned sequence acquisition from dead client"
+                            )
+                            hardware.core.stop_sequence_acquisition()
+                    except Exception as stop_err:
+                        logger.error(
+                            "CONFIG: Failed to stop orphaned sequence acquisition: %s",
+                            stop_err,
+                        )
                     # Clear the old addr (will be set to new addr below).
                     # KEEP current_active_config_path so the downstream
                     # path_changed check can skip rebuilding hardware when

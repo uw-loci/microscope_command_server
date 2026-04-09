@@ -598,6 +598,22 @@ def handle_client(conn, addr):
                     # No more connections from this IP -- truly unconfigure
                     logger.info(f"All connections from {active_ip} disconnected - server now UNCONFIGURED")
                     logger.info("Next connection will need to provide CONFIG command")
+                    # Stop any orphaned sequence acquisition left running by
+                    # the departed client. If the live viewer crashed or the
+                    # main connection timed out mid-stream, the camera keeps
+                    # streaming into MM's circular buffer indefinitely --
+                    # this can hard-lock the Hamamatsu sCMOS driver and
+                    # MicroManager itself (observed on OWS3 2026-04-09).
+                    try:
+                        if hardware is not None and hardware.core.is_sequence_running():
+                            logger.warning(
+                                "Stopping orphaned sequence acquisition left by disconnected client"
+                            )
+                            hardware.core.stop_sequence_acquisition()
+                    except Exception as stop_err:
+                        logger.error(
+                            "Failed to stop orphaned sequence acquisition: %s", stop_err
+                        )
                     _stop_session_logging()
                     server_configured = False
                     active_connection_addr = None
