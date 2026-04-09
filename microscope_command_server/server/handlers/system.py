@@ -116,9 +116,14 @@ def handle_config(conn, client, hardware, settings, **kwargs):
                     # Same IP reconnecting - allow takeover (previous connection likely crashed)
                     logger.warning("CONFIG: Same IP reconnecting - taking over from %s", current_active_addr)
                     logger.warning("CONFIG: Previous connection may have been improperly closed")
-                    # Clear the old connection state (will be set to new addr below)
+                    # Clear the old addr (will be set to new addr below).
+                    # KEEP current_active_config_path so the downstream
+                    # path_changed check can skip rebuilding hardware when
+                    # the reconnecting client is using the same config.
+                    # Rebuilding during live acquisition hangs on
+                    # _detect_camera_name() core calls (see OWS3 incident
+                    # 2026-04-09).
                     current_active_addr = None
-                    current_active_config_path = None
                 else:
                     # Different IP - reject this CONFIG
                     logger.warning("CONFIG: Rejected - connection %s already active", current_active_addr)
