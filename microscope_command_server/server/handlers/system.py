@@ -143,17 +143,33 @@ def handle_config(conn, client, hardware, settings, **kwargs):
             conn.sendall(b"CFG_FAIL" + error_length + error_bytes)
             return None
 
-        # Update hardware with new configuration.
-        # Rebuild all composed components (camera registry,
-        # stage, rotation stage) from the new settings.
+        # Update hardware with new configuration. Always refresh the
+        # settings dict (cheap). Only rebuild composed components when
+        # the config path actually changes -- aux connections re-send
+        # CONFIG on every reconnect with the same path, and
+        # re-enumerating all MM device properties via
+        # _detect_camera_name() while a sequence acquisition is running
+        # can exceed the client's 5s read timeout and corrupt both
+        # connections (see OWS3 incident 2026-04-09).
         hardware.settings = new_settings
-        hardware._camera_name = hardware._detect_camera_name()
-        hardware._camera_registry = hardware._build_camera_registry()
-        hardware._active_detector_id = hardware._find_detector_id(hardware._camera_name)
-        hardware._stage = hardware._create_stage()
-        hardware._rotation_stage = hardware._create_rotation_stage()
-        hardware._illumination = hardware._create_illumination()
-        hardware._detector = hardware._create_detector()
+        path_changed = (current_active_config_path != config_path)
+        if path_changed:
+            logger.info(
+                "CONFIG: Config path changed (%s -> %s), rebuilding hardware",
+                current_active_config_path, config_path,
+            )
+            hardware._camera_name = hardware._detect_camera_name()
+            hardware._camera_registry = hardware._build_camera_registry()
+            hardware._active_detector_id = hardware._find_detector_id(hardware._camera_name)
+            hardware._stage = hardware._create_stage()
+            hardware._rotation_stage = hardware._create_rotation_stage()
+            hardware._illumination = hardware._create_illumination()
+            hardware._detector = hardware._create_detector()
+        else:
+            logger.debug(
+                "CONFIG: Same config path (%s), skipping hardware rebuild",
+                config_path,
+            )
 
         # Build updated state to return
         updated_state = {
