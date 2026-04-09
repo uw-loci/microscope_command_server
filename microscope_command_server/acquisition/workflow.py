@@ -4416,6 +4416,32 @@ def simple_background_collection(
         except Exception as e:
             logger.warning(f"Could not stop live/sequence mode: {e}")
 
+        # Align lamp intensity with the acquisition profile before collecting
+        # backgrounds. Without this, background collection uses whatever lamp
+        # level the user left in the hardware (e.g. from the Live Viewer
+        # Camera tab), while the subsequent tiled acquisition calls
+        # apply_mode_setup() and overwrites the lamp with the profile's
+        # illumination_intensity -- producing flat-fields that silently
+        # correct for the wrong illumination pattern.
+        #
+        # This only touches lamp intensity -- it does NOT move stages,
+        # switch detectors, or apply MM presets, so the user's manually
+        # positioned blank area is preserved.
+        try:
+            applied_intensity = hardware.apply_profile_illumination(modality)
+            if applied_intensity is not None:
+                logger.info(
+                    f"Background collection aligned to profile '{modality}' "
+                    f"illumination intensity: {applied_intensity}"
+                )
+            else:
+                logger.info(
+                    f"Background collection: no profile illumination applied for '{modality}' "
+                    "(profile missing, no illumination_intensity, or no active illumination device)"
+                )
+        except Exception as e:
+            logger.warning(f"Could not apply profile illumination for background collection: {e}")
+
         # Parse angles and exposures from client
         # Use client's exposures as initial values for adaptive exposure
         angles, exposures = parse_angles_exposures(angles_str, exposures_str)
