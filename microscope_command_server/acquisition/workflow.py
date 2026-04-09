@@ -1707,9 +1707,16 @@ def _acquisition_workflow(
             # Load background images if directory is valid
             if background_dir and background_dir.exists():
                 logger.info(f"Loading background images from: {background_dir}")
+                # Non-rotation modalities (brightfield, fluorescence, monochrome)
+                # send angles=[] but still need to load a single background image.
+                # Pass [0.0] as a sentinel so the loader searches the directory --
+                # it will find either background.tif (new name) or 0.0.tif (legacy).
+                # The sentinel key 0.0 matches what the acquisition loop uses at
+                # the non-rotation branch (see bg_key = 0.0 below).
+                bg_load_angles = params["angles"] if params["angles"] else [0.0]
                 background_images, background_scaling_factors, background_wb_coeffs = (
                     BackgroundCorrectionUtils.load_background_images(
-                        background_dir, params["angles"], logger
+                        background_dir, bg_load_angles, logger
                     )
                 )
 
@@ -4415,6 +4422,11 @@ def simple_background_collection(
 
         # Brightfield and other single-angle modalities send empty angles [].
         # Treat this as a single background at angle 0 (no rotation).
+        # Track whether this was a non-rotation collection so we can save the
+        # output file as background.tif instead of 0.0.tif -- the 0.0 is a
+        # placeholder, not a real polarization angle, and saving it as a
+        # numeric filename is confusing for monochrome / brightfield users.
+        is_non_rotation_background = not angles
         if not angles:
             angles = [0.0]
             exposures = [exposures[0] if exposures else 50.0]
@@ -4988,8 +5000,15 @@ def simple_background_collection(
                     except RuntimeError as e:
                         logger.error(f"Failed to acquire background at angle {angle}: {e}")
 
-            # Save background image using new format: angle.tif (not in subdirectory)
-            background_path = output_path / f"{angle}.tif"
+            # Save background image.
+            # Rotation modalities (PPM): save as {angle}.tif (e.g. 7.0.tif).
+            # Non-rotation modalities (brightfield, fluorescence, monochrome):
+            # save as background.tif -- a numeric 0.0.tif name is confusing
+            # when there is no real polarization angle.
+            if is_non_rotation_background:
+                background_path = output_path / "background.tif"
+            else:
+                background_path = output_path / f"{angle}.tif"
             if image is not None and image.ndim == 3 and image.shape[2] >= 3:
                 ch_means = image.mean(axis=(0, 1))
                 logger.info(
