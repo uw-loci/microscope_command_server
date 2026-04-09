@@ -30,51 +30,90 @@ from concurrent.futures import ThreadPoolExecutor, Future
 logger = logging.getLogger(__name__)
 
 
-def _get_worst_channel_saturation(image) -> float:
-    """Return the worst per-channel saturation percentage (pixels >= 250).
+def _saturation_threshold(image) -> int:
+    """Derive near-saturation threshold from image dtype.
 
-    Returns 0.0 for non-RGB images or None images.
+    Returns a value just below the dtype maximum to catch near-saturation
+    where the channel mean is pulled down by a few non-clipped pixels.
     """
-    if image is None or image.ndim != 3 or image.shape[2] < 3:
+    if image.dtype == np.uint16:
+        return 64000
+    return 250  # uint8
+
+
+def _get_worst_channel_saturation(image) -> float:
+    """Return the worst per-channel saturation percentage.
+
+    Works for both RGB (H,W,3) and monochrome (H,W) images.
+    Uses dtype-aware saturation threshold.
+    Returns 0.0 for None images.
+    """
+    if image is None:
         return 0.0
+    sat_thresh = _saturation_threshold(image)
     total_px = image.shape[0] * image.shape[1]
     worst = 0.0
-    for c in range(min(3, image.shape[2])):
-        sat_pct = 100.0 * int(np.sum(image[:, :, c] >= 250)) / total_px
-        worst = max(worst, sat_pct)
+    if image.ndim == 2:
+        # Monochrome
+        sat_pct = 100.0 * int(np.sum(image >= sat_thresh)) / total_px
+        worst = sat_pct
+    elif image.ndim == 3 and image.shape[2] >= 3:
+        # RGB
+        for c in range(min(3, image.shape[2])):
+            sat_pct = 100.0 * int(np.sum(image[:, :, c] >= sat_thresh)) / total_px
+            worst = max(worst, sat_pct)
     return worst
 
 
 def _check_saturation(image, angle_name, log, threshold_pct=1.0):
     """Check per-channel saturation and warn if above threshold.
 
-    Uses >= 250 threshold to catch near-saturation where the channel mean
-    is pulled down by a small fraction of non-clipped pixels (e.g., mean
-    254.99 indicates virtually all pixels at 255).
+    Supports both RGB (H,W,3) and monochrome (H,W) images with
+    dtype-aware saturation thresholds (250 for uint8, 64000 for uint16).
 
     Args:
-        image: RGB image array (H, W, 3) or None
+        image: Image array (H,W) for monochrome or (H,W,3) for RGB, or None
         angle_name: Label for the image (e.g., angle or "background")
         log: Logger instance
         threshold_pct: Saturation warning threshold as percentage (default 1.0%)
 
     Returns:
-        Dict with per-channel saturation percentages {'R': float, 'G': float, 'B': float},
-        or None if the image is invalid.
+        Dict with per-channel saturation percentages.
+        RGB: {'R': float, 'G': float, 'B': float}
+        Mono: {'Gray': float}
+        None if the image is invalid.
     """
-    if image is None or image.ndim != 3 or image.shape[2] < 3:
+    if image is None:
         return None
+    sat_thresh = _saturation_threshold(image)
     total_px = image.shape[0] * image.shape[1]
     result = {}
-    for i, ch in enumerate(["R", "G", "B"]):
-        sat_count = int(np.sum(image[:, :, i] >= 250))
+
+    if image.ndim == 2:
+        # Monochrome image
+        sat_count = int(np.sum(image >= sat_thresh))
         sat_pct = 100.0 * sat_count / total_px
-        result[ch] = sat_pct
+        result["Gray"] = sat_pct
         if sat_pct > threshold_pct:
             log.warning(
-                f"SATURATION WARNING [{angle_name}]: {ch} channel has "
-                f"{sat_pct:.1f}% saturated pixels ({sat_count}/{total_px})"
+                f"SATURATION WARNING [{angle_name}]: {sat_pct:.1f}% saturated "
+                f"pixels ({sat_count}/{total_px}, threshold >= {sat_thresh})"
             )
+    elif image.ndim == 3 and image.shape[2] >= 3:
+        # RGB image
+        for i, ch in enumerate(["R", "G", "B"]):
+            sat_count = int(np.sum(image[:, :, i] >= sat_thresh))
+            sat_pct = 100.0 * sat_count / total_px
+            result[ch] = sat_pct
+            if sat_pct > threshold_pct:
+                log.warning(
+                    f"SATURATION WARNING [{angle_name}]: {ch} channel has "
+                    f"{sat_pct:.1f}% saturated pixels ({sat_count}/{total_px}, "
+                    f"threshold >= {sat_thresh})"
+                )
+    else:
+        return None
+
     return result
 
 
@@ -3145,12 +3184,34 @@ def _acquisition_workflow(
                 # )
 
             else:
-                # Single image acquisition: no angles specified
+                # Single image acquisition: no rotation angles (BF, fluorescence, etc.)
                 image, metadata = hardware.snap_image()
+
+                # Background correction (flat-field division)
+                if background_correction_enabled and background_images:
+                    bg_key = 0.0  # Non-rotation uses angle key 0.0
+                    if bg_key in background_images:
+                        try:
+                            image = BackgroundCorrectionUtils.apply_flat_field_correction(
+                                image, background_images[bg_key],
+                                method=background_correction_method)
+                            logger.info(
+                                "  Applied %s background correction (median=%.0f)",
+                                background_correction_method, float(np.median(image)),
+                            )
+                        except Exception as e:
+                            logger.warning("  Background correction failed: %s", e)
+
+                # Saturation check (works for both mono and RGB)
+                sat_result = _check_saturation(image, "tile", logger)
+                if sat_result:
+                    for ch_key, pct in sat_result.items():
+                        if pct > tile_worst_sat.get(ch_key, 0):
+                            tile_worst_sat[ch_key] = pct
+
                 image_path = output_path / filename
 
                 if image_path.parent.exists():
-                    # Submit brightfield TIFF write to background pool
                     bf_pixel_size = hardware.get_pixel_size_um()
                     write_pool.submit(
                         ome_tiff_writer,
@@ -3207,9 +3268,9 @@ def _acquisition_workflow(
                 "af_drift_um": round(drift_for_this_tile, 2),
                 "af_failed": af_failed_for_this_tile,
                 "tile_time_ms": round(tile_elapsed_ms, 0),
-                "saturation_R_pct": round(tile_worst_sat.get("R", 0), 1),
-                "saturation_G_pct": round(tile_worst_sat.get("G", 0), 1),
-                "saturation_B_pct": round(tile_worst_sat.get("B", 0), 1),
+                "saturation_R_pct": round(tile_worst_sat.get("R", tile_worst_sat.get("Gray", 0)), 1),
+                "saturation_G_pct": round(tile_worst_sat.get("G", tile_worst_sat.get("Gray", 0)), 1),
+                "saturation_B_pct": round(tile_worst_sat.get("B", tile_worst_sat.get("Gray", 0)), 1),
                 "saturation_worst_pct": round(max(tile_worst_sat.values()), 1),
             })
 
