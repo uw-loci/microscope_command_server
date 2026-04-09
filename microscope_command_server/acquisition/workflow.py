@@ -3185,6 +3185,16 @@ def _acquisition_workflow(
 
             else:
                 # Single image acquisition: no rotation angles (BF, fluorescence, etc.)
+                # Set the exposure explicitly from params. Without this, the
+                # camera keeps whatever residual exposure was left by the last
+                # operation (autofocus, background collection, WB calibration),
+                # which is typically much shorter than what the user configured
+                # and produces severely underexposed tiles (OWS3 2026-04-09).
+                if params.get("exposures"):
+                    exposure_ms = float(params["exposures"][0])
+                    hardware.set_exposure(exposure_ms)
+                    logger.debug("Single-image path: set exposure to %.2f ms", exposure_ms)
+
                 image, metadata = hardware.snap_image()
 
                 # Background correction (flat-field division)
@@ -3192,8 +3202,13 @@ def _acquisition_workflow(
                     bg_key = 0.0  # Non-rotation uses angle key 0.0
                     if bg_key in background_images:
                         try:
+                            # apply_flat_field_correction requires scaling_factor;
+                            # use 1.0 for single-image (no cross-tile scaling).
+                            bg_scale = background_scaling_factors.get(bg_key, 1.0) \
+                                if background_scaling_factors else 1.0
                             image = BackgroundCorrectionUtils.apply_flat_field_correction(
                                 image, background_images[bg_key],
+                                scaling_factor=bg_scale,
                                 method=background_correction_method)
                             logger.info(
                                 "  Applied %s background correction (median=%.0f)",
