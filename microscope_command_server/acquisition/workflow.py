@@ -15,6 +15,7 @@ import logging
 import yaml
 
 import numpy as np
+from scipy.spatial.distance import cdist as _cdist_scipy
 
 from microscope_control.hardware import Position
 from microscope_control.hardware.pycromanager import PycromanagerHardware
@@ -2409,6 +2410,8 @@ def _acquisition_workflow(
                 logger.info(f"Initial autofocus completed: Z={initial_z:.2f} um")
                 first_tissue_autofocus_done = True
                 last_af_pos_idx = first_af_idx
+                # Record initial AF result for nearest-spatial Z propagation
+                completed_af_positions.append((first_af_pos.x, first_af_pos.y, initial_z))
 
                 # Remove this position from dynamic_af_positions since we already did it
                 dynamic_af_positions.discard(first_af_idx)
@@ -2448,6 +2451,13 @@ def _acquisition_workflow(
         # Track last position index where AF was performed (for gap detection)
         last_af_pos_idx = -1
 
+        # Track all completed AF positions as (x, y, z) for nearest-spatial
+        # Z propagation.  Non-AF tiles use the Z from the spatially-closest
+        # AF rather than the most-recent AF in scan order.  This eliminates
+        # horizontal Z bands in serpentine scans where the scan reversal
+        # makes the most-recent AF far away in X.
+        completed_af_positions = []
+
         # Collect per-tile measurements for post-acquisition analysis
         tile_measurements = []
 
@@ -2469,11 +2479,11 @@ def _acquisition_workflow(
             drift_for_this_tile = 0.0
             af_failed_for_this_tile = False
 
-            # Ensure Z is current autofocus value
-            pos.z = hardware.get_current_position().z
-
-            # Move to position -- use non-blocking XY when no autofocus is
-            # needed so the first angle's rotation+exposure can overlap.
+            # Determine the best Z for this tile position.
+            # AF tiles will autofocus after moving, so just use current Z.
+            # Non-AF tiles use the Z from the spatially NEAREST completed
+            # AF position (not just the most recent in scan order) to avoid
+            # horizontal Z bands in serpentine scans.
             needs_af = pos_idx in dynamic_af_positions
 
             # Force AF if gap since last AF exceeds n_tiles threshold
@@ -2484,6 +2494,32 @@ def _acquisition_workflow(
                     needs_af = True
                     logger.info(f"  Forcing AF: gap of {gap} positions since last AF "
                                 f"(threshold: {af_n_tiles})")
+
+            # For non-AF tiles, move Z to the spatially nearest AF's Z.
+            # Without this, non-AF tiles inherit the LAST AF's Z (most-recent
+            # in scan order), which in a serpentine scan may be on the opposite
+            # side of the tissue -- producing horizontal Z bands in the focus
+            # map and degraded image quality.
+            if not needs_af and completed_af_positions:
+                tile_xy = np.array([[pos.x, pos.y]])
+                af_xy = np.array([(ax, ay) for ax, ay, _ in completed_af_positions])
+                nearest_idx = int(np.argmin(_cdist_scipy(tile_xy, af_xy)[0]))
+                nearest_z = completed_af_positions[nearest_idx][2]
+                current_z = hardware.get_current_position().z
+                if abs(nearest_z - current_z) > 0.1:
+                    hardware.move_to_position(Position(z=nearest_z))
+                    logger.debug(
+                        "  Nearest-AF Z correction: %.2f -> %.2f um "
+                        "(nearest AF at X=%.0f, Y=%.0f, dist=%.0f um)",
+                        current_z, nearest_z,
+                        completed_af_positions[nearest_idx][0],
+                        completed_af_positions[nearest_idx][1],
+                        float(_cdist_scipy(tile_xy, [af_xy[nearest_idx]])[0][0]),
+                    )
+                pos.z = nearest_z
+            else:
+                pos.z = hardware.get_current_position().z
+
             logger.debug(f"Moving to position: X={pos.x}, Y={pos.y}, Z={pos.z}")
             t0 = time.perf_counter()
 
@@ -2694,6 +2730,9 @@ def _acquisition_workflow(
 
                     # Track this position as the last AF position (for gap detection)
                     last_af_pos_idx = pos_idx
+                    # Record the AF result for nearest-spatial Z propagation
+                    af_z = hardware.get_current_position().z
+                    completed_af_positions.append((pos.x, pos.y, af_z))
                 else:
                     reason = "blank tile (RGB)" if tissue_stats.get('brightness_rejected') else "insufficient texture/area"
                     af_failed_for_this_tile = True
