@@ -2205,6 +2205,11 @@ def _acquisition_workflow(
         # Use standard autofocus on first tissue, then adaptive for speed on subsequent
         first_tissue_autofocus_done = False
 
+        # Track all completed AF positions as (x, y, z) for nearest-spatial
+        # Z propagation and spatial gap detection. Initialized here (before
+        # pre-acquisition AF) so the initial AF can append to it.
+        completed_af_positions = []
+
         metadata_txt_for_positions = output_path / "image_positions_metadata.txt"
 
         # Apply Z-focus hint if provided (predicted from tilt correction model)
@@ -2450,13 +2455,6 @@ def _acquisition_workflow(
 
         # Track last position index where AF was performed (for gap detection)
         last_af_pos_idx = -1
-
-        # Track all completed AF positions as (x, y, z) for nearest-spatial
-        # Z propagation.  Non-AF tiles use the Z from the spatially-closest
-        # AF rather than the most-recent AF in scan order.  This eliminates
-        # horizontal Z bands in serpentine scans where the scan reversal
-        # makes the most-recent AF far away in X.
-        completed_af_positions = []
 
         # Collect per-tile measurements for post-acquisition analysis
         tile_measurements = []
