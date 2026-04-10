@@ -2486,14 +2486,30 @@ def _acquisition_workflow(
             # horizontal Z bands in serpentine scans.
             needs_af = pos_idx in dynamic_af_positions
 
-            # Force AF if gap since last AF exceeds n_tiles threshold
-            # (e.g., tissue separated by blank region)
+            # Force AF if the tile is too far from any previous AF.
+            # Two checks: index gap (legacy, for dense grids) AND spatial
+            # gap (for disconnected tissue fragments within one annotation).
+            # The spatial check handles the case where the tile grid skips
+            # blank areas -- two tiles from different tissue fragments can
+            # be adjacent in the positions list (index gap = 1) but
+            # physically many mm apart.
             if not needs_af and last_af_pos_idx >= 0:
                 gap = pos_idx - last_af_pos_idx
                 if gap > af_n_tiles:
                     needs_af = True
-                    logger.info(f"  Forcing AF: gap of {gap} positions since last AF "
+                    logger.info(f"  Forcing AF: index gap of {gap} positions since last AF "
                                 f"(threshold: {af_n_tiles})")
+            if not needs_af and completed_af_positions:
+                tile_xy = np.array([[pos.x, pos.y]])
+                af_xy = np.array([(ax, ay) for ax, ay, _ in completed_af_positions])
+                nearest_af_dist = float(np.min(_cdist_scipy(tile_xy, af_xy)))
+                if nearest_af_dist > af_min_distance:
+                    needs_af = True
+                    logger.info(
+                        "  Forcing AF: spatial distance %.0f um to nearest AF "
+                        "exceeds threshold %.0f um (disconnected tissue fragment?)",
+                        nearest_af_dist, af_min_distance,
+                    )
 
             # For non-AF tiles, move Z to the spatially nearest AF's Z.
             # Without this, non-AF tiles inherit the LAST AF's Z (most-recent
