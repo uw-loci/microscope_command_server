@@ -3245,6 +3245,15 @@ def _acquisition_workflow(
 
             else:
                 # Single image acquisition: no rotation angles (BF, fluorescence, etc.)
+
+                # Wait for non-blocking XY move to complete before snapping.
+                # The multi-angle path has this inside the angles loop; for
+                # single-image we must do it here to avoid capturing a tile
+                # while the stage is still settling.
+                if xy_move_pending:
+                    hardware.wait_for_xy()
+                    xy_move_pending = False
+
                 # Set the exposure explicitly from params. Without this, the
                 # camera keeps whatever residual exposure was left by the last
                 # operation (autofocus, background collection, WB calibration),
