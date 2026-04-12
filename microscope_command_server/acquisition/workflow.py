@@ -2484,25 +2484,34 @@ def _acquisition_workflow(
             # horizontal Z bands in serpentine scans.
             needs_af = pos_idx in dynamic_af_positions
 
-            # Force AF if the tile is spatially too far from any completed AF.
-            # This handles disconnected tissue fragments where two tiles can
-            # be adjacent in the positions list (index gap = 1) but physically
-            # many mm apart. The spatial grid already provides even coverage;
-            # this check catches fragments outside the grid.
-            # NOTE: the previous index-gap check (pos_idx - last_af_pos_idx >
-            # af_n_tiles) was removed because it re-introduced vertical AF
-            # pillars: in a serpentine scan, every Nth tile in scan order
-            # maps to the same set of columns, overriding the spatial grid.
+            # Safety net 1: index gap check (softened).
+            # Force AF if too many tiles in scan order have passed without
+            # any AF. Uses 3x af_n_tiles (e.g., every ~15 tiles) to avoid
+            # the vertical pillar pattern that the old 1x threshold caused.
+            if not needs_af and last_af_pos_idx >= 0:
+                gap = pos_idx - last_af_pos_idx
+                if gap > 3 * af_n_tiles:
+                    needs_af = True
+                    logger.info(
+                        "  Forcing AF: index gap of %d positions since last AF "
+                        "(threshold: %d = 3x%d)",
+                        gap, 3 * af_n_tiles, af_n_tiles,
+                    )
+
+            # Safety net 2: spatial gap check for disconnected fragments.
+            # Uses 2x af_min_distance so it only catches truly disconnected
+            # tissue, not normal inter-row spacing (which is ~1x threshold).
             if not needs_af and completed_af_positions:
                 tile_xy = np.array([[pos.x, pos.y]])
                 af_xy = np.array([(ax, ay) for ax, ay, _ in completed_af_positions])
                 nearest_af_dist = float(np.min(_cdist_scipy(tile_xy, af_xy)))
-                if nearest_af_dist > af_min_distance:
+                spatial_gap_threshold = 2.0 * af_min_distance
+                if nearest_af_dist > spatial_gap_threshold:
                     needs_af = True
                     logger.info(
                         "  Forcing AF: spatial distance %.0f um to nearest AF "
                         "exceeds threshold %.0f um (disconnected tissue fragment?)",
-                        nearest_af_dist, af_min_distance,
+                        nearest_af_dist, spatial_gap_threshold,
                     )
 
             # For non-AF tiles, move Z to the spatially nearest AF's Z.
