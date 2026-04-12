@@ -2031,6 +2031,9 @@ def _acquisition_workflow(
         # Sweep drift check parameters
         af_sweep_range_um = 10.0  # default - total Z range for sweep (+/-5um)
         af_sweep_n_steps = 5  # default - number of Z positions to sample
+        # Safety net multipliers for gap detection
+        af_gap_index_multiplier = 3  # default - force AF after this many x n_tiles without AF
+        af_gap_spatial_multiplier = 2.0  # default - force AF when distance > this x af_min_distance
 
         # Get objective from acquisition parameters (passed via command line)
         current_objective = params.get("objective", "")
@@ -2074,6 +2077,8 @@ def _acquisition_workflow(
                     af_rgb_brightness_threshold = af_setting.get("rgb_brightness_threshold", af_rgb_brightness_threshold)
                     af_sweep_range_um = af_setting.get("sweep_range_um", af_sweep_range_um)
                     af_sweep_n_steps = af_setting.get("sweep_n_steps", af_sweep_n_steps)
+                    af_gap_index_multiplier = af_setting.get("gap_index_multiplier", af_gap_index_multiplier)
+                    af_gap_spatial_multiplier = af_setting.get("gap_spatial_multiplier", af_gap_spatial_multiplier)
                     # Legacy support: old adaptive_initial_step_um -> sweep_range_um
                     if "adaptive_initial_step_um" in af_setting and "sweep_range_um" not in af_setting:
                         af_sweep_range_um = af_setting["adaptive_initial_step_um"] * 2
@@ -2084,7 +2089,8 @@ def _acquisition_workflow(
                         f"score_metric={af_score_metric_name}, "
                         f"texture_threshold={af_texture_threshold}, tissue_area_threshold={af_tissue_area_threshold}, "
                         f"rgb_brightness_threshold={af_rgb_brightness_threshold}, "
-                        f"sweep: range={af_sweep_range_um}um, n_steps={af_sweep_n_steps}"
+                        f"sweep: range={af_sweep_range_um}um, n_steps={af_sweep_n_steps}, "
+                        f"gap_index_mult={af_gap_index_multiplier}, gap_spatial_mult={af_gap_spatial_multiplier}"
                     )
                     af_settings_found = True
                     break
@@ -2486,32 +2492,35 @@ def _acquisition_workflow(
 
             # Safety net 1: index gap check (softened).
             # Force AF if too many tiles in scan order have passed without
-            # any AF. Uses 3x af_n_tiles (e.g., every ~15 tiles) to avoid
-            # the vertical pillar pattern that the old 1x threshold caused.
+            # any AF. gap_index_multiplier (default 3) x n_tiles avoids
+            # the vertical pillar pattern that 1x caused.
+            index_gap_threshold = af_gap_index_multiplier * af_n_tiles
             if not needs_af and last_af_pos_idx >= 0:
                 gap = pos_idx - last_af_pos_idx
-                if gap > 3 * af_n_tiles:
+                if gap > index_gap_threshold:
                     needs_af = True
                     logger.info(
                         "  Forcing AF: index gap of %d positions since last AF "
-                        "(threshold: %d = 3x%d)",
-                        gap, 3 * af_n_tiles, af_n_tiles,
+                        "(threshold: %d = %dx%d)",
+                        gap, index_gap_threshold,
+                        af_gap_index_multiplier, af_n_tiles,
                     )
 
             # Safety net 2: spatial gap check for disconnected fragments.
-            # Uses 2x af_min_distance so it only catches truly disconnected
-            # tissue, not normal inter-row spacing (which is ~1x threshold).
+            # gap_spatial_multiplier (default 2.0) x af_min_distance catches
+            # truly disconnected tissue, not normal inter-row spacing.
+            spatial_gap_threshold = af_gap_spatial_multiplier * af_min_distance
             if not needs_af and completed_af_positions:
                 tile_xy = np.array([[pos.x, pos.y]])
                 af_xy = np.array([(ax, ay) for ax, ay, _ in completed_af_positions])
                 nearest_af_dist = float(np.min(_cdist_scipy(tile_xy, af_xy)))
-                spatial_gap_threshold = 2.0 * af_min_distance
                 if nearest_af_dist > spatial_gap_threshold:
                     needs_af = True
                     logger.info(
                         "  Forcing AF: spatial distance %.0f um to nearest AF "
-                        "exceeds threshold %.0f um (disconnected tissue fragment?)",
+                        "exceeds threshold %.0f um (%.1fx af_min_distance)",
                         nearest_af_dist, spatial_gap_threshold,
+                        af_gap_spatial_multiplier,
                     )
 
             # For non-AF tiles, move Z to the spatially nearest AF's Z.
