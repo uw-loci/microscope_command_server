@@ -1200,6 +1200,217 @@ def calculate_luminance_gain(r, g, b):
     return 0.299 * r + 0.587 * g + 0.114 * b
 
 
+def _merge_device_property_overrides(
+    library_props: List[Dict[str, Any]],
+    override_props: Any,
+) -> List[Dict[str, Any]]:
+    """Merges profile-level device_properties overrides into a channel's library
+    device_properties list. Match semantics parallel the Java side
+    (MicroscopeConfigManager.mergeDevicePropertyOverrides):
+
+    - Match by (device, property) tuple
+    - If match found: replace value in place (preserving list order)
+    - If no match: append to the end
+
+    Returns a new list if any overrides were applied, or the original list if
+    the override list is empty / malformed.
+    """
+    if not isinstance(override_props, list) or not override_props:
+        return list(library_props)
+    merged: List[Dict[str, Any]] = [dict(p) for p in library_props]
+    for entry in override_props:
+        if not isinstance(entry, dict):
+            continue
+        device = entry.get("device")
+        prop = entry.get("property")
+        value = entry.get("value")
+        if device is None or prop is None or value is None:
+            logger.warning(
+                "device_properties override has missing device/property/value; skipping: %s",
+                entry,
+            )
+            continue
+        match_idx = None
+        for i, existing in enumerate(merged):
+            if existing.get("device") == device and existing.get("property") == prop:
+                match_idx = i
+                break
+        if match_idx is not None:
+            merged[match_idx] = {"device": device, "property": prop, "value": value}
+        else:
+            merged.append({"device": device, "property": prop, "value": value})
+    return merged
+
+
+def resolve_channel_plan(
+    ppm_settings: Dict[str, Any],
+    scan_type: str,
+    channel_ids: List[str],
+    channel_exposures: List[float],
+) -> List[Dict[str, Any]]:
+    """Resolve the per-channel acquisition plan for a widefield IF tile.
+
+    For each requested channel id, looks up the channel definition in
+    ``modalities.<modality>.channels`` (keyed off the acquisition profile's
+    ``modality`` field) and returns a plan dict containing the id, exposure,
+    mm_setup_presets, and device_properties. Channels not found in the YAML
+    are skipped with a warning.
+
+    Profile-level ``channel_overrides.<id>.device_properties`` are merged into
+    the library entry here so that per-objective tuning (e.g. BF_IF_10x
+    overriding DiaLamp intensity) lands before the hardware state is applied.
+    Exposure overrides are typically passed in already-resolved via the
+    ``channel_exposures`` argument (Java-side merge), but the channel library
+    default is also used as a fallback when the list is shorter than ``channel_ids``.
+
+    The design is intentionally vendor-agnostic: everything is driven by
+    Micro-Manager primitives (ConfigGroup presets, device property writes),
+    so the same code path supports any multi-channel illumination hardware.
+    """
+    if not channel_ids:
+        return []
+
+    # Resolve modality from scan_type via acquisition_profiles.
+    profile_key = None
+    acq_profiles = (ppm_settings or {}).get("acquisition_profiles", {}) or {}
+    if scan_type in acq_profiles:
+        profile_key = scan_type
+    else:
+        # The Java side may append a counter suffix like "_1"; try stripping it.
+        base = "_".join(scan_type.split("_")[:-1]) if "_" in scan_type else scan_type
+        if base in acq_profiles:
+            profile_key = base
+    modality_name = None
+    profile_overrides: Dict[str, Dict[str, Any]] = {}
+    if profile_key is not None:
+        profile_cfg = acq_profiles[profile_key] or {}
+        modality_name = profile_cfg.get("modality")
+        raw_overrides = profile_cfg.get("channel_overrides") or {}
+        if isinstance(raw_overrides, dict):
+            profile_overrides = raw_overrides
+    if not modality_name:
+        return []
+
+    modalities = (ppm_settings or {}).get("modalities", {}) or {}
+    modality_cfg = modalities.get(modality_name, {}) or {}
+    library = modality_cfg.get("channels", []) or []
+    by_id: Dict[str, Dict[str, Any]] = {}
+    for entry in library:
+        if isinstance(entry, dict) and entry.get("id"):
+            by_id[entry["id"]] = entry
+
+    # Zip ids with exposures, falling back to the library default when the
+    # --channel-exposures list is shorter than --channels.
+    plan: List[Dict[str, Any]] = []
+    for i, cid in enumerate(channel_ids):
+        entry = by_id.get(cid)
+        if entry is None:
+            continue  # unknown channel id
+        exposure_ms = (
+            channel_exposures[i]
+            if i < len(channel_exposures) and channel_exposures[i] > 0
+            else float(entry.get("exposure_ms", 0) or 0)
+        )
+        # Apply profile-level device_properties overrides for this channel.
+        library_props = entry.get("device_properties", []) or []
+        channel_override = profile_overrides.get(cid, {}) or {}
+        merged_props = _merge_device_property_overrides(
+            library_props, channel_override.get("device_properties"))
+        plan.append(
+            {
+                "id": cid,
+                "display_name": entry.get("display_name", cid),
+                "exposure_ms": exposure_ms,
+                "mm_setup_presets": entry.get("mm_setup_presets", []) or [],
+                "device_properties": merged_props,
+                "settle_ms": entry.get("settle_ms"),
+            }
+        )
+    return plan
+
+
+def apply_channel_hardware_state(hardware, channel_plan_entry: Dict[str, Any], logger_: logging.Logger) -> None:
+    """Apply one channel's Micro-Manager state before snapping.
+
+    Applies ``mm_setup_presets`` via ``core.setConfig(group, preset)`` then
+    ``device_properties`` via ``core.setProperty(device, property, value)``.
+    After each batch, waits for the affected devices to report "not busy" so
+    rapid back-to-back channel transitions can't race the snap. An optional
+    ``settle_ms`` field on the channel entry adds a dumb sleep fallback for
+    hardware whose ``isBusy()`` reports complete too early (some filter
+    turrets, reflector wheels, serial LED controllers).
+
+    Both primitives are generic Micro-Manager -- no vendor-specific knowledge.
+    """
+    core = getattr(hardware, "core", None)
+    if core is None:
+        logger_.warning("Hardware has no .core attribute; cannot apply channel state")
+        return
+
+    preset_devices: set = set()
+    for preset in channel_plan_entry.get("mm_setup_presets", []) or []:
+        if not isinstance(preset, dict):
+            continue
+        group = preset.get("group")
+        preset_name = preset.get("preset")
+        if not (group and preset_name):
+            continue
+        try:
+            core.setConfig(str(group), str(preset_name))
+            core.waitForConfig(str(group), str(preset_name))
+        except Exception as e:
+            logger_.warning(
+                "Failed to apply channel preset %s=%s: %s", group, preset_name, e
+            )
+            continue
+        # Collect underlying devices for an extra settle pass: some adapters
+        # return from waitForConfig before the physical motor stops.
+        try:
+            available = core.getAvailableConfigs(str(group))
+            # Nothing to introspect further without a device list; waitForConfig
+            # is the main wait. The per-device pass below covers property writes.
+            del available
+        except Exception:
+            pass
+
+    property_devices: set = set()
+    for prop in channel_plan_entry.get("device_properties", []) or []:
+        if not isinstance(prop, dict):
+            continue
+        device = prop.get("device")
+        property_name = prop.get("property")
+        value = prop.get("value")
+        if not (device and property_name and value is not None):
+            continue
+        try:
+            core.setProperty(str(device), str(property_name), str(value))
+            property_devices.add(str(device))
+        except Exception as e:
+            logger_.warning(
+                "Failed to set channel property %s.%s=%s: %s",
+                device,
+                property_name,
+                value,
+                e,
+            )
+
+    # Wait for each touched device to idle. This is what was missing before:
+    # back-to-back setProperty calls on CoolLED/DLED/Lumencor can outrun the
+    # serial-command settle so the camera integrates before the intensity is
+    # actually applied. waitForDevice is always safe -- it no-ops on devices
+    # that don't implement isBusy().
+    for dev in property_devices:
+        try:
+            core.waitForDevice(dev)
+        except Exception as e:
+            logger_.debug("waitForDevice(%s) raised (non-fatal): %s", dev, e)
+
+    # Optional dumb-sleep fallback for hardware whose isBusy() reports early.
+    settle_ms = channel_plan_entry.get("settle_ms")
+    if isinstance(settle_ms, (int, float)) and settle_ms > 0:
+        time.sleep(float(settle_ms) / 1000.0)
+
+
 def parse_angles_exposures(angles_str, exposures_str=None) -> Tuple[List[float], List[int]]:
     """Parse angle and exposure strings from various formats."""
     angles: List[float] = []
@@ -1282,6 +1493,12 @@ def parse_acquisition_message(message: str) -> dict:
                 i += 2
             elif parts[i] == "--exposures" and i + 1 < len(parts):
                 params["exposures_str"] = parts[i + 1]
+                i += 2
+            elif parts[i] == "--channels" and i + 1 < len(parts):
+                params["channels_str"] = parts[i + 1]
+                i += 2
+            elif parts[i] == "--channel-exposures" and i + 1 < len(parts):
+                params["channel_exposures_str"] = parts[i + 1]
                 i += 2
             elif parts[i] == "--bg-correction" and i + 1 < len(parts):
                 params["background_correction_enabled"] = parts[i + 1].lower() == "true"
@@ -1377,6 +1594,44 @@ def parse_acquisition_message(message: str) -> dict:
         )
         params["angles"] = angles
         params["exposures"] = exposures
+
+        # Parse per-channel sequence (widefield IF / multi-channel fluorescence).
+        # Channel ids are strings, exposures are floats (ms). Mutually exclusive
+        # with --angles on the Java side; here we just pass both through so the
+        # acquisition loop can choose based on presence.
+        channel_ids: List[str] = []
+        channel_exposures: List[float] = []
+        channels_str = params.get("channels_str", "()")
+        if channels_str and channels_str != "()":
+            cs = channels_str.strip("()")
+            if "," in cs:
+                channel_ids = [x.strip() for x in cs.split(",") if x.strip()]
+            elif cs:
+                channel_ids = [cs.strip()]
+        channel_exposures_str = params.get("channel_exposures_str", "()")
+        if channel_exposures_str and channel_exposures_str != "()":
+            ces = channel_exposures_str.strip("()")
+            if "," in ces:
+                channel_exposures = [float(x.strip()) for x in ces.split(",") if x.strip()]
+            elif ces:
+                channel_exposures = [float(ces.strip())]
+        params["channels"] = channel_ids
+        params["channel_exposures"] = channel_exposures
+
+        # Defensive: channel-based acquisition is mutually exclusive with angle-based
+        # in the Java emitter, but stale angle fields from an old command can still
+        # arrive if a caller drifts. Force the angle branch off when channels are
+        # present so the channel path is the single source of truth.
+        if channel_ids:
+            if params.get("angles"):
+                logger.warning(
+                    "Both --channels and --angles were supplied; ignoring angles "
+                    "(%s) and proceeding with %d channels",
+                    params.get("angles"),
+                    len(channel_ids),
+                )
+            params["angles"] = []
+            # Keep params["exposures"] alone -- not used by the channel branch.
 
         # Parse disabled angles for background correction
         disabled_angles = []
@@ -1674,6 +1929,10 @@ def _acquisition_workflow(
         background_images = {}
         background_scaling_factors = {}
         background_wb_coeffs = {}
+        # Per-channel backgrounds for multi-channel widefield IF. Keyed by channel id.
+        # Loaded opportunistically below if the background folder has per-channel
+        # subdirectories; empty dict means "no per-channel BG available, skip correction".
+        channel_background_images: Dict[str, Any] = {}
 
         if background_correction_enabled:
             background_dir = None
@@ -1726,6 +1985,50 @@ def _acquisition_workflow(
                 else:
                     logger.warning("No background images found - disabling background correction")
                     background_correction_enabled = False
+
+                # Opt-in per-channel background loading for multi-channel widefield IF.
+                # Layout: {background_dir}/{channel_id}/background.tif (or {channel_id}.tif).
+                # Missing files are skipped silently -- the channel acquisition branch
+                # only applies correction for channels where a background is found.
+                if params.get("channels"):
+                    try:
+                        import skimage.io as _skio
+                        for cid in params["channels"]:
+                            candidates = [
+                                background_dir / cid / "background.tif",
+                                background_dir / f"{cid}.tif",
+                                background_dir / f"{cid}.tiff",
+                            ]
+                            for candidate in candidates:
+                                if candidate.exists():
+                                    try:
+                                        channel_background_images[cid] = _skio.imread(str(candidate))
+                                        logger.info(
+                                            "Loaded channel background for %s from %s",
+                                            cid,
+                                            candidate,
+                                        )
+                                        break
+                                    except Exception as load_e:
+                                        logger.warning(
+                                            "Failed to load channel background %s: %s",
+                                            candidate,
+                                            load_e,
+                                        )
+                        if channel_background_images:
+                            logger.info(
+                                "Loaded %d per-channel backgrounds for widefield IF "
+                                "(missing channels will acquire uncorrected)",
+                                len(channel_background_images),
+                            )
+                        else:
+                            logger.info(
+                                "No per-channel backgrounds found under %s -- "
+                                "channel acquisition will run without flat-field correction",
+                                background_dir,
+                            )
+                    except Exception as e:
+                        logger.warning("Per-channel background load failed: %s", e)
             else:
                 logger.warning(f"Background directory not found: {background_dir}")
                 logger.warning("Disabling background correction")
@@ -1998,10 +2301,31 @@ def _acquisition_workflow(
                 angle_dir.mkdir(exist_ok=True)
                 shutil.copy2(tile_config_path, angle_dir / "TileConfiguration.txt")
 
+        # Create channel subdirectories (widefield IF, BF+IF). Mirrors the angle
+        # pattern so the Java-side stitcher can do per-channel directory isolation
+        # without any knowledge of the channel naming scheme. Each subdir gets its
+        # own copy of TileConfiguration.txt with the plain tile filenames the
+        # stitcher expects.
+        if params.get("channels"):
+            for cid in params["channels"]:
+                channel_dir = output_path / str(cid)
+                channel_dir.mkdir(exist_ok=True)
+                shutil.copy2(tile_config_path, channel_dir / "TileConfiguration.txt")
+
         # Calculate total images and update progress
         n_z_planes = len(z_offsets)
+        # Channel-based acquisitions write one image per selected channel per tile
+        # (and per z plane). Angle-based acquisitions write one image per angle per
+        # tile. They are mutually exclusive upstream, so pick whichever is active.
+        n_channels = len(params.get("channels", []) or [])
+        if n_channels > 0:
+            n_steps_per_tile = n_channels
+        elif params.get("angles"):
+            n_steps_per_tile = len(params["angles"])
+        else:
+            n_steps_per_tile = 1
         n_angles = len(params["angles"]) if params["angles"] else 1
-        total_images = len(positions) * n_z_planes * n_angles
+        total_images = len(positions) * n_z_planes * n_steps_per_tile
 
         update_progress(0, total_images)
         logger.info(
@@ -3286,6 +3610,94 @@ def _acquisition_workflow(
                 if xy_move_pending:
                     hardware.wait_for_xy()
                     xy_move_pending = False
+
+                # Channel-based branch: widefield immunofluorescence and similar
+                # multi-channel modalities. Acquire one image per selected channel,
+                # applying the channel's mm_setup_presets and device_properties
+                # before each snap, and save with a "_{channel_id}" suffix so
+                # stitching can pair tiles by position later.
+                channel_plan = resolve_channel_plan(
+                    ppm_settings,
+                    params.get("scan_type", ""),
+                    params.get("channels", []) or [],
+                    params.get("channel_exposures", []) or [],
+                )
+                if channel_plan:
+                    for ch_entry in channel_plan:
+                        apply_channel_hardware_state(hardware, ch_entry, logger)
+                        exposure_ms = float(ch_entry.get("exposure_ms") or 0)
+                        if exposure_ms > 0:
+                            hardware.set_exposure(exposure_ms)
+                            logger.debug(
+                                "Channel %s: set exposure to %.2f ms",
+                                ch_entry["id"],
+                                exposure_ms,
+                            )
+                        image, metadata = hardware.snap_image()
+
+                        # Per-channel flat-field correction (opt-in): if a background
+                        # was loaded for this channel id, apply it. Matches the angle-
+                        # based path in spirit but keyed by channel id rather than angle.
+                        if channel_background_images and ch_entry["id"] in channel_background_images:
+                            try:
+                                image = BackgroundCorrectionUtils.apply_flat_field_correction(
+                                    image,
+                                    channel_background_images[ch_entry["id"]],
+                                    scaling_factor=1.0,
+                                    method=background_correction_method or "divide",
+                                )
+                                logger.debug(
+                                    "  Applied %s background for channel %s",
+                                    background_correction_method or "divide",
+                                    ch_entry["id"],
+                                )
+                            except Exception as bg_e:
+                                logger.warning(
+                                    "  Channel %s background correction failed: %s",
+                                    ch_entry["id"],
+                                    bg_e,
+                                )
+
+                        sat_result = _check_saturation(image, f"tile[{ch_entry['id']}]", logger)
+                        if sat_result:
+                            for ch_key, pct in sat_result.items():
+                                key = f"{ch_entry['id']}/{ch_key}"
+                                if pct > tile_worst_sat.get(key, 0):
+                                    tile_worst_sat[key] = pct
+
+                        # Write to {output_path}/{channel_id}/{filename} -- plain tile
+                        # filename inside the channel subdirectory. Mirrors the PPM
+                        # per-angle layout so the stitcher can isolate each channel.
+                        image_path = output_path / str(ch_entry["id"]) / filename
+                        if image_path.parent.exists():
+                            bf_pixel_size = hardware.get_pixel_size_um()
+                            write_pool.submit(
+                                ome_tiff_writer,
+                                filename=str(image_path),
+                                pixel_size_um=bf_pixel_size,
+                                data=image,
+                            )
+                            image_count += 1
+                            update_progress(image_count, total_images)
+
+                        try:
+                            write_position_metadata(
+                                metadata_txt_for_positions, image_path, hardware, modality
+                            )
+                        except Exception as e:
+                            logger.warning(
+                                f"  Failed to write position text {metadata_txt_for_positions}: {e}"
+                            )
+                    # Skip the single-snap path below; the channel loop handled it.
+                    tile_elapsed_ms = (time.perf_counter() - tile_start) * 1000
+                    logger.info(
+                        "Tile %d/%d (channels=%d): %.1fs",
+                        pos_idx + 1,
+                        len(positions),
+                        len(channel_plan),
+                        tile_elapsed_ms / 1000,
+                    )
+                    continue
 
                 # Set the exposure explicitly from params. Without this, the
                 # camera keeps whatever residual exposure was left by the last
