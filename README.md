@@ -12,6 +12,134 @@ Socket-based command server for remote microscope control and QuPath integration
 - **Client Library**: Python functions for stage control and acquisition
 - **Acquisition Workflows**: Multi-tile, multi-modality acquisition orchestration
 - **Real-time Monitoring**: Progress tracking and cancellation support
+- **Multi-Channel Widefield IF / BF+IF**: Vendor-agnostic channel library driven
+  by Micro-Manager ConfigGroup presets and device property writes
+
+## Multi-Channel Acquisition (Widefield IF, BF+IF)
+
+The BGACQUIRE command now supports a vendor-agnostic channel-based acquisition
+branch used by widefield immunofluorescence (IF) and combined brightfield + IF
+(BF+IF) workflows. When a command carries `--channels` and `--channel-exposures`
+in place of `--angles` / `--exposures`, the single-image tile loop iterates the
+resolved channel plan once per tile position, writing one TIFF per channel per
+tile. The Python server does not know anything about specific illuminators; it
+drives the hardware entirely through `core.setConfig(group, preset)` and
+`core.setProperty(device, property, value)`, so the same code path serves
+CoolLED, Lumencor, DLED, Colibri, and custom builds without modification.
+
+See the cross-repo overview at
+`QPSC/docs/multichannel-if-overview.md` for the full pipeline description,
+YAML schema, and end-to-end BF+IF example. This section covers only the
+Python server's slice of the pipeline.
+
+### New BGACQUIRE flags
+
+The BGACQUIRE (and ACQUIRE) acquisition message parser accepts two optional
+flags on top of the existing angle-based flags:
+
+- `--channels "(id1,id2,...)"` -- ordered list of channel ids to acquire at
+  every tile position. Ids must match entries in the modality's channel
+  library declared in the microscope YAML.
+- `--channel-exposures "(exp1,exp2,...)"` -- per-channel exposures in
+  milliseconds. Must be the same length and order as `--channels`; missing
+  or non-positive entries fall back to the channel library's default
+  `exposure_ms`.
+
+When `--channels` is present the server takes the channel acquisition branch
+in `acquisition/workflow.py`. `--channels` is mutually exclusive with
+`--angles`. If both are supplied (for example, a stale angle field from an
+older client), the server logs a warning and clears the angles so the
+channel path is the single source of truth.
+
+### How it works
+
+Three helpers in `microscope_command_server/acquisition/workflow.py` implement
+the channel path:
+
+- `resolve_channel_plan(ppm_settings, scan_type, channel_ids, channel_exposures)`
+  -- resolves the profile (`acquisition_profiles.<scan_type>`), looks up its
+  `modality`, then reads `modalities.<modality>.channels` from the YAML and
+  filters / reorders to the requested ids. For each channel it merges in the
+  profile's `channel_overrides.<id>.device_properties` and returns an ordered
+  list of channel plan dicts containing `id`, `display_name`, `exposure_ms`,
+  `mm_setup_presets`, `device_properties`, and optional `settle_ms`.
+- `_merge_device_property_overrides(library_props, override_props)` -- private
+  helper mirroring the Java-side merge rule
+  (`MicroscopeConfigManager.mergeDevicePropertyOverrides`) exactly: match by
+  `(device, property)` tuple, replace the value in place when matched, append
+  to the end of the list otherwise. This lets a profile tune one property on
+  one channel with a single YAML line without redeclaring the whole channel.
+- `apply_channel_hardware_state(hardware, channel_plan_entry, logger_)` --
+  applies `mm_setup_presets` via `core.setConfig(group, preset)` followed by
+  `core.waitForConfig`, then applies `device_properties` via
+  `core.setProperty(device, property, value)` and calls `core.waitForDevice`
+  on every touched device. This is the critical settle pass that stops
+  back-to-back channel transitions from racing the camera snap on serial LED
+  controllers. An optional `settle_ms` field on the channel entry adds a
+  dumb-sleep fallback for hardware whose `isBusy()` reports complete too
+  early (some filter turrets, reflector wheels, serial LED controllers).
+
+Inside the "Single image acquisition: no rotation angles" block of the tile
+loop, the server checks for a non-empty channel plan. If present, it iterates
+the plan for the current tile position: apply channel state, set the channel
+exposure, snap, (optionally) flat-field correct, saturation-check, and write
+the per-channel TIFF. The tile loop then `continue`s past the default
+single-snap path. If no channel plan is resolved, the tile loop falls back to
+the existing single-snap behavior -- see "Backward compatibility" below.
+
+### File layout on disk
+
+Per-tile the channel branch writes one TIFF per channel into a per-channel
+subdirectory under the existing annotation output folder:
+
+```
+{projectsFolder}/{sample}/{scan_type}/{annotation}/
+    {channel_id_1}/tile_0_0.tif
+    {channel_id_1}/tile_0_1.tif
+    {channel_id_2}/tile_0_0.tif
+    {channel_id_2}/tile_0_1.tif
+    ...
+    TileConfiguration.txt
+```
+
+This mirrors the PPM per-angle layout exactly -- channel ids double as
+subdirectory names. The stitcher
+(`qupath-extension-tiles-to-pyramid`) can then isolate each channel at
+stitch time by pointing its existing per-axis stitching helper at each
+channel subdirectory, without any channel-aware logic in the stitcher
+itself.
+
+### Per-channel background correction (opt-in)
+
+When the tile loop loads background images for an acquisition, the channel
+branch additionally looks for per-channel flat-field images under the
+background directory:
+
+```
+{background_dir}/{channel_id}/background.tif
+```
+
+Any channel whose file is present is flat-field corrected via
+`BackgroundCorrectionUtils.apply_flat_field_correction` using the configured
+method (`divide` by default). Channels whose file is missing are skipped
+silently -- they are acquired without correction. The loader also accepts
+the flat alternates `{background_dir}/{channel_id}.tif` and
+`{channel_id}.tiff` for convenience.
+
+This is the channel-axis analog of the PPM per-angle background path: the
+key is the channel id rather than the rotation angle, but the correction
+call and the missing-file behavior are the same.
+
+### Backward compatibility
+
+BGACQUIRE commands that do not pass `--channels` fall through unchanged:
+
+- Commands with `--angles` take the multi-angle branch (PPM and similar).
+- Commands with neither angles nor channels take the default single-snap
+  branch (brightfield, single-snap fluorescence, laser scanning).
+
+Modalities whose YAML has no `channels:` library never enter the channel
+branch, so existing profiles keep working without any YAML edits.
 
 ## Installation
 
