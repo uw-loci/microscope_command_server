@@ -1247,6 +1247,7 @@ def resolve_channel_plan(
     scan_type: str,
     channel_ids: List[str],
     channel_exposures: List[float],
+    channel_intensity_overrides: Optional[Dict[str, float]] = None,
 ) -> List[Dict[str, Any]]:
     """Resolve the per-channel acquisition plan for a widefield IF tile.
 
@@ -1302,6 +1303,7 @@ def resolve_channel_plan(
     # Zip ids with exposures, falling back to the library default when the
     # --channel-exposures list is shorter than --channels.
     plan: List[Dict[str, Any]] = []
+    runtime_overrides = channel_intensity_overrides or {}
     for i, cid in enumerate(channel_ids):
         entry = by_id.get(cid)
         if entry is None:
@@ -1316,6 +1318,50 @@ def resolve_channel_plan(
         channel_override = profile_overrides.get(cid, {}) or {}
         merged_props = _merge_device_property_overrides(
             library_props, channel_override.get("device_properties"))
+
+        # Runtime per-channel intensity override from --channel-intensities.
+        # Looks up the channel's intensity_property pointer in the YAML and
+        # replaces the matching (device, property) entry in merged_props with
+        # the override value. Falls back to append if the library didn't
+        # already include that pair. Missing intensity_property => warn and
+        # ignore the override (the channel has no declared intensity knob).
+        if cid in runtime_overrides:
+            override_value = runtime_overrides[cid]
+            intensity_ref = entry.get("intensity_property") or {}
+            ip_device = intensity_ref.get("device") if isinstance(intensity_ref, dict) else None
+            ip_property = intensity_ref.get("property") if isinstance(intensity_ref, dict) else None
+            if ip_device and ip_property:
+                merged_props = list(merged_props)  # defensive copy
+                replaced = False
+                for idx, prop in enumerate(merged_props):
+                    if (
+                        isinstance(prop, dict)
+                        and prop.get("device") == ip_device
+                        and prop.get("property") == ip_property
+                    ):
+                        merged_props[idx] = {
+                            "device": ip_device,
+                            "property": ip_property,
+                            "value": str(override_value),
+                        }
+                        replaced = True
+                        break
+                if not replaced:
+                    merged_props.append(
+                        {
+                            "device": ip_device,
+                            "property": ip_property,
+                            "value": str(override_value),
+                        }
+                    )
+            else:
+                logger.warning(
+                    "Channel '%s' received runtime intensity override %s but has no "
+                    "intensity_property declared in the YAML; ignoring override",
+                    cid,
+                    override_value,
+                )
+
         plan.append(
             {
                 "id": cid,
@@ -1500,6 +1546,9 @@ def parse_acquisition_message(message: str) -> dict:
             elif parts[i] == "--channel-exposures" and i + 1 < len(parts):
                 params["channel_exposures_str"] = parts[i + 1]
                 i += 2
+            elif parts[i] == "--channel-intensities" and i + 1 < len(parts):
+                params["channel_intensities_str"] = parts[i + 1]
+                i += 2
             elif parts[i] == "--bg-correction" and i + 1 < len(parts):
                 params["background_correction_enabled"] = parts[i + 1].lower() == "true"
                 i += 2
@@ -1617,6 +1666,33 @@ def parse_acquisition_message(message: str) -> dict:
                 channel_exposures = [float(ces.strip())]
         params["channels"] = channel_ids
         params["channel_exposures"] = channel_exposures
+
+        # Per-channel intensity overrides: --channel-intensities "(DAPI=25,FITC=30)".
+        # Map channel id -> float. Only channels that the user changed away from
+        # the YAML default appear here; the acquisition loop falls back to the
+        # YAML value for anything missing.
+        channel_intensities: Dict[str, float] = {}
+        channel_intensities_str = params.get("channel_intensities_str", "()")
+        if channel_intensities_str and channel_intensities_str != "()":
+            cis = channel_intensities_str.strip("()")
+            for pair in cis.split(","):
+                pair = pair.strip()
+                if not pair or "=" not in pair:
+                    continue
+                key, _, raw_val = pair.partition("=")
+                key = key.strip()
+                raw_val = raw_val.strip()
+                if not key or not raw_val:
+                    continue
+                try:
+                    channel_intensities[key] = float(raw_val)
+                except ValueError:
+                    logger.warning(
+                        "Ignoring non-numeric --channel-intensities value for %s: %r",
+                        key,
+                        raw_val,
+                    )
+        params["channel_intensities"] = channel_intensities
 
         # Defensive: channel-based acquisition is mutually exclusive with angle-based
         # in the Java emitter, but stale angle fields from an old command can still
@@ -3621,6 +3697,7 @@ def _acquisition_workflow(
                     params.get("scan_type", ""),
                     params.get("channels", []) or [],
                     params.get("channel_exposures", []) or [],
+                    channel_intensity_overrides=params.get("channel_intensities") or None,
                 )
                 if channel_plan:
                     for ch_entry in channel_plan:
