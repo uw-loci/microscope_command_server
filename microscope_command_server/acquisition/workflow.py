@@ -1393,7 +1393,13 @@ def apply_channel_hardware_state(hardware, channel_plan_entry: Dict[str, Any], l
         logger_.warning("Hardware has no .core attribute; cannot apply channel state")
         return
 
-    preset_devices: set = set()
+    # Pycromanager's MMCore wrapper exposes Python-idiomatic snake_case method
+    # names (set_config, set_property, wait_for_config, wait_for_device), NOT
+    # the Java camelCase (setConfig, setProperty, waitForConfig, waitForDevice).
+    # The first dryrun used camelCase and every preset / property write silently
+    # raised AttributeError and got caught by the warning handler, so the DLED
+    # was never actually switched between channels -- every tile captured the
+    # same hardware state and looked like "only one channel was collected".
     for preset in channel_plan_entry.get("mm_setup_presets", []) or []:
         if not isinstance(preset, dict):
             continue
@@ -1402,22 +1408,13 @@ def apply_channel_hardware_state(hardware, channel_plan_entry: Dict[str, Any], l
         if not (group and preset_name):
             continue
         try:
-            core.setConfig(str(group), str(preset_name))
-            core.waitForConfig(str(group), str(preset_name))
+            core.set_config(str(group), str(preset_name))
+            core.wait_for_config(str(group), str(preset_name))
         except Exception as e:
             logger_.warning(
                 "Failed to apply channel preset %s=%s: %s", group, preset_name, e
             )
             continue
-        # Collect underlying devices for an extra settle pass: some adapters
-        # return from waitForConfig before the physical motor stops.
-        try:
-            available = core.getAvailableConfigs(str(group))
-            # Nothing to introspect further without a device list; waitForConfig
-            # is the main wait. The per-device pass below covers property writes.
-            del available
-        except Exception:
-            pass
 
     property_devices: set = set()
     for prop in channel_plan_entry.get("device_properties", []) or []:
@@ -1429,7 +1426,7 @@ def apply_channel_hardware_state(hardware, channel_plan_entry: Dict[str, Any], l
         if not (device and property_name and value is not None):
             continue
         try:
-            core.setProperty(str(device), str(property_name), str(value))
+            core.set_property(str(device), str(property_name), str(value))
             property_devices.add(str(device))
         except Exception as e:
             logger_.warning(
@@ -1440,16 +1437,15 @@ def apply_channel_hardware_state(hardware, channel_plan_entry: Dict[str, Any], l
                 e,
             )
 
-    # Wait for each touched device to idle. This is what was missing before:
-    # back-to-back setProperty calls on CoolLED/DLED/Lumencor can outrun the
-    # serial-command settle so the camera integrates before the intensity is
-    # actually applied. waitForDevice is always safe -- it no-ops on devices
-    # that don't implement isBusy().
+    # Wait for each touched device to idle. Back-to-back set_property calls on
+    # CoolLED/DLED/Lumencor can outrun the serial-command settle so the camera
+    # integrates before the intensity is actually applied. wait_for_device is
+    # always safe -- it no-ops on devices that don't implement isBusy().
     for dev in property_devices:
         try:
-            core.waitForDevice(dev)
+            core.wait_for_device(dev)
         except Exception as e:
-            logger_.debug("waitForDevice(%s) raised (non-fatal): %s", dev, e)
+            logger_.debug("wait_for_device(%s) raised (non-fatal): %s", dev, e)
 
     # Optional dumb-sleep fallback for hardware whose isBusy() reports early.
     settle_ms = channel_plan_entry.get("settle_ms")
