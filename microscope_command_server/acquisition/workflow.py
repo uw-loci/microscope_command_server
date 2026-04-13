@@ -2465,6 +2465,25 @@ def _acquisition_workflow(
         # Collect per-tile measurements for post-acquisition analysis
         tile_measurements = []
 
+        # Open NDJSON stream for live Java-side tile updates.
+        # One JSON object per line, flushed after each write. The final
+        # tile_measurements.json is still written at the end as the
+        # authoritative source; this stream exists so the QuPath extension
+        # can attach per-tile measurements to detection objects as tiles
+        # complete rather than waiting for the whole acquisition to finish.
+        # Close is best-effort (GC reclaims on function exit for error paths).
+        tile_measurements_ndjson_path = output_path / "tile_measurements.ndjson"
+        try:
+            tile_measurements_stream = open(
+                tile_measurements_ndjson_path, "w", encoding="utf-8"
+            )
+            logger.info(
+                "Streaming per-tile measurements to %s", tile_measurements_ndjson_path
+            )
+        except Exception as e:
+            logger.warning("Could not open tile measurements NDJSON stream: %s", e)
+            tile_measurements_stream = None
+
         # Main acquisition loop
         for pos_idx, (pos, filename) in enumerate(positions):
             # Check for cancellation
@@ -3357,7 +3376,7 @@ def _acquisition_workflow(
 
             # Record per-tile measurement data
             # Use current_stage_pos.z (captured after autofocus) for the actual Z
-            tile_measurements.append({
+            tile_measurement_entry = {
                 "position_index": pos_idx,
                 "filename": filename,
                 "z_um": round(current_stage_pos.z, 2),
@@ -3370,7 +3389,28 @@ def _acquisition_workflow(
                 "saturation_G_pct": round(tile_worst_sat.get("G", tile_worst_sat.get("Gray", 0)), 1),
                 "saturation_B_pct": round(tile_worst_sat.get("B", tile_worst_sat.get("Gray", 0)), 1),
                 "saturation_worst_pct": round(max(tile_worst_sat.values()), 1),
-            })
+            }
+            tile_measurements.append(tile_measurement_entry)
+
+            # Stream to NDJSON for live Java-side updates (best effort)
+            if tile_measurements_stream is not None:
+                try:
+                    tile_measurements_stream.write(
+                        json.dumps(tile_measurement_entry) + "\n"
+                    )
+                    tile_measurements_stream.flush()
+                except Exception as e:
+                    logger.debug(
+                        "Failed to stream NDJSON entry for tile %d: %s", pos_idx, e
+                    )
+
+        # Close NDJSON stream now that the loop has finished normally
+        if tile_measurements_stream is not None:
+            try:
+                tile_measurements_stream.close()
+            except Exception as e:
+                logger.debug("Error closing tile measurements NDJSON stream: %s", e)
+            tile_measurements_stream = None
 
         # Drain any remaining background writes before finalizing
         if write_pool.pending_count > 0:
