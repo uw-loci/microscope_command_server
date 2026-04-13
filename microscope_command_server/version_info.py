@@ -6,9 +6,11 @@ latest git commit for each repo. Used to write version headers in
 session logs and boot logs.
 """
 
+import functools
 import platform
 import subprocess
 import sys
+from concurrent.futures import ThreadPoolExecutor
 from importlib.metadata import version as _get_version
 from pathlib import Path
 
@@ -92,16 +94,26 @@ def collect_versions() -> dict[str, str]:
     return versions
 
 
+@functools.lru_cache(maxsize=1)
 def collect_git_info() -> dict[str, str]:
     """Collect latest git commit info for each repo.
+
+    The three git subprocesses are run in parallel via a thread pool
+    (each call is independent), cutting total wall time roughly 3x.
+    The result is memoized so subsequent calls are free; repo contents
+    rarely change within a single server process, and a stale commit
+    string in a log header is harmless.
 
     Returns:
         Dictionary mapping component names to git commit strings.
     """
-    info = {}
-    for module_name, display_name in _GIT_MODULES:
-        info[display_name] = _git_info(module_name)
-    return info
+    display_names = [display for _, display in _GIT_MODULES]
+    module_names = [module for module, _ in _GIT_MODULES]
+
+    with ThreadPoolExecutor(max_workers=len(_GIT_MODULES)) as executor:
+        results = list(executor.map(_git_info, module_names))
+
+    return dict(zip(display_names, results))
 
 
 def format_log_header() -> str:

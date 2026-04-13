@@ -31,7 +31,7 @@ from microscope_control.config import ConfigManager
 from microscope_command_server.modality import get_config as get_modality_config
 
 
-def check_for_existing_server(host: str, port: int, timeout: float = 2.0) -> bool:
+def check_for_existing_server(host: str, port: int, timeout: float = 0.5) -> bool:
     """
     Check if a server is already running on the specified host and port.
 
@@ -41,7 +41,11 @@ def check_for_existing_server(host: str, port: int, timeout: float = 2.0) -> boo
     Args:
         host: The host to check (typically 127.0.0.1 for localhost)
         port: The port to check
-        timeout: Connection timeout in seconds
+        timeout: Connection timeout in seconds. 0.5s is plenty for a
+            localhost connect -- RST on a closed port is returned in ms.
+            Windows Firewall can occasionally drop SYN to a closed local
+            port (so connect() hits the timeout instead of failing fast),
+            and 0.5s caps the damage without risking false negatives.
 
     Returns:
         True if a server is already running, False otherwise
