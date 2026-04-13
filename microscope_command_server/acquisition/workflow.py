@@ -1850,8 +1850,17 @@ def _acquisition_workflow(
         logger.info(f"  Sample label: {params['sample_label']}")
         logger.info(f"  Scan type: {params['scan_type']}")
         logger.info(f"  Region: {params['region_name']}")
-        logger.info(f"  Angles: {params['angles']} degrees")
-        logger.info(f"  Exposures: {params['exposures']} ms")
+        # Channel-based and angle-based acquisitions are mutually exclusive; log
+        # whichever axis actually carries data so the operator doesn't see a
+        # confusing "Angles: []" line on a widefield IF run.
+        if params.get("channels"):
+            logger.info(f"  Channels: {params['channels']}")
+            logger.info(f"  Channel exposures: {params['channel_exposures']} ms")
+            if params.get("channel_intensities"):
+                logger.info(f"  Channel intensity overrides: {params['channel_intensities']}")
+        else:
+            logger.info(f"  Angles: {params['angles']} degrees")
+            logger.info(f"  Exposures: {params['exposures']} ms")
 
         # Load the yaml file
         if not params["yaml_file_path"]:
