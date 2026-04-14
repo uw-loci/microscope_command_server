@@ -79,10 +79,45 @@ NORMAL_SPEED_VALUE = "100"
 # DOF (~2 um).
 BLUR_BUDGET_UM = 0.5
 
-# If the live image has more than this fraction of saturated pixels
-# (>= 250 on uint8, >= 65000 on uint16), the focus metric is
-# unreliable and we refuse to run.
-SATURATION_REFUSE_FRACTION = 0.05
+# Per-modality saturation refusal thresholds. A uniform 5% check is
+# wrong for both extremes:
+#
+#   - In brightfield, the bright background saturates easily
+#     (specular highlights, bare glass, even the illumination field
+#     itself) but the tissue itself stays dark and retains focus
+#     information. 5% would refuse a perfectly usable scene.
+#
+#   - In fluorescence or laser-scanning modalities the image is
+#     mostly black and the signal is confined to a small fraction of
+#     pixels. If 5% of pixels are saturated and 5% of pixels are
+#     signal, it's likely that ALL the signal pixels are clipped and
+#     focus discrimination is gone. A 5% threshold is way too loose
+#     for these modalities -- we need 1-2%.
+#
+# Map modality names (normalized to lower case) to the max saturation
+# fraction allowed before SMOOTH refuses with UNAVAILABLE.
+# Values are chosen to be defensible defaults per modality class,
+# not per-rig calibrated. A future follow-up may move these into
+# config_<scope>.yml per modality.
+SATURATION_THRESHOLD_BY_MODALITY = {
+    "brightfield": 0.30,  # bright background with dark tissue -- tolerant
+    "bf": 0.30,
+    "ppm": 0.05,           # polarized: both channels contribute -- moderate
+    "polarized": 0.05,
+    "fluorescence": 0.02,  # widefield fluorescence -- strict
+    "fluorescent": 0.02,
+    "widefield": 0.02,
+    "wf": 0.02,
+    "laser_scanning": 0.01,  # 1P/2P/SHG -- sparse signal, very strict
+    "lsm": 0.01,
+    "shg": 0.01,
+    "multiphoton": 0.01,
+    "1p": 0.01,
+    "2p": 0.01,
+}
+# Default when no modality is provided or the provided name is unknown.
+# Matches the old blanket behavior.
+DEFAULT_SATURATION_REFUSE_FRACTION = 0.05
 
 # Parabolic fit uses this many samples on either side of the argmax
 # metric. Keeps the fit robust to flat-top regions.
@@ -541,10 +576,11 @@ def handle_smoothz(conn, client, hardware, settings, **kwargs):
             pass
         return
 
-    params = parse_flags(message, ["--yaml", "--objective", "--range"])
+    params = parse_flags(message, ["--yaml", "--objective", "--range", "--modality"])
     yaml_path = params.get("yaml")
     client_objective = params.get("objective")
     range_override_str = params.get("range")
+    client_modality = params.get("modality")
     range_override_um: Optional[float] = None
     if range_override_str:
         try:
@@ -559,8 +595,23 @@ def handle_smoothz(conn, client, hardware, settings, **kwargs):
             pass
         return
 
-    logger.info("SMOOTH: request from %s yaml=%s objective=%s range_override=%s",
-                addr, yaml_path, client_objective, range_override_um)
+    logger.info("SMOOTH: request from %s yaml=%s objective=%s modality=%s range_override=%s",
+                addr, yaml_path, client_objective, client_modality, range_override_um)
+
+    # Resolve the saturation threshold from the client-provided
+    # modality. Normalize to lower case for dict lookup; unknown or
+    # missing modalities fall back to the conservative default.
+    if client_modality:
+        sat_threshold = SATURATION_THRESHOLD_BY_MODALITY.get(
+            client_modality.strip().lower(),
+            DEFAULT_SATURATION_REFUSE_FRACTION,
+        )
+        logger.info("SMOOTH: saturation threshold for modality '%s' = %.2f",
+                    client_modality, sat_threshold)
+    else:
+        sat_threshold = DEFAULT_SATURATION_REFUSE_FRACTION
+        logger.info("SMOOTH: no modality given, using default saturation threshold %.2f",
+                    sat_threshold)
 
     core = hardware.core
     try:
@@ -634,13 +685,50 @@ def handle_smoothz(conn, client, hardware, settings, **kwargs):
         conn.sendall(f"UNAVAILABLE:{reason}".encode())
         return
 
-    # --- Pre-flight: saturation check via a single snap ---
-    snap_img = _snap_image_as_numpy(core)
-    sat_frac = _saturation_fraction(snap_img)
-    logger.info("SMOOTH: pre-flight saturation fraction = %.3f", sat_frac)
-    if sat_frac > SATURATION_REFUSE_FRACTION:
-        reason = (f"{sat_frac * 100:.1f}% of pixels saturated; focus metric will "
-                  f"not discriminate. Reduce exposure/gain before using Smooth")
+    # --- Pre-flight: saturation check ---
+    # If the Live Viewer (or any caller) has a sequence running, pop
+    # one frame from its buffer instead of calling snap_image(). A
+    # blocking snap on the JAI costs ~400 ms (exposure + readout +
+    # driver overhead) and is the single biggest fixed cost in the
+    # Smooth handler -- nearly 20% of the total scan time. Stream
+    # frames are already arriving at ~30 fps so a pop-with-timeout
+    # gets us a fresh frame in <50 ms.
+    preflight_sequence_running = False
+    try:
+        preflight_sequence_running = bool(core.is_sequence_running())
+    except Exception:
+        pass
+
+    preflight_img = None
+    if preflight_sequence_running:
+        # Wait briefly for a fresh frame from the existing stream.
+        # 100 ms is plenty at any realistic camera frame rate.
+        deadline = time.perf_counter() + 0.1
+        while time.perf_counter() < deadline:
+            try:
+                if int(core.get_remaining_image_count()) > 0:
+                    preflight_img = _pop_image_as_numpy(core)
+                    if preflight_img is not None:
+                        break
+            except Exception:
+                break
+            time.sleep(0.003)
+        if preflight_img is not None:
+            logger.info("SMOOTH: pre-flight frame via stream pop (no snap)")
+        else:
+            logger.info("SMOOTH: stream pop failed, falling back to snap_image")
+    if preflight_img is None:
+        preflight_img = _snap_image_as_numpy(core)
+        logger.info("SMOOTH: pre-flight frame via snap_image")
+
+    sat_frac = _saturation_fraction(preflight_img)
+    logger.info("SMOOTH: pre-flight saturation fraction = %.3f (threshold %.2f)",
+                sat_frac, sat_threshold)
+    if sat_frac > sat_threshold:
+        reason = (f"{sat_frac * 100:.1f}% of pixels saturated (threshold for "
+                  f"'{client_modality or 'unknown'}' modality is "
+                  f"{sat_threshold * 100:.1f}%); focus metric will not "
+                  f"discriminate. Reduce exposure/gain before using Smooth")
         logger.warning("SMOOTH: UNAVAILABLE -- %s", reason)
         conn.sendall(f"UNAVAILABLE:{reason}".encode())
         return
