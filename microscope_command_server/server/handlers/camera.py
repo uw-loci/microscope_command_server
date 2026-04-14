@@ -420,7 +420,13 @@ def handle_setcam(conn, client, hardware, settings, **kwargs):
             logger.info("SETCAM: unified gain %.2f", gains[0])
         elif gain_count >= 3:
             cam.set_unified_gain(gains[0])
-            cam.set_rb_analog_gains(red=gains[1], blue=gains[2])
+            # NB: JAICamera wrapper uses analog_red/analog_blue kwargs
+            # (matching the inner set_rb_analog_gains in jai/properties.py
+            # renamed to analog_* to avoid ambiguity with camera-role
+            # 'red channel' vs analog gain register). Earlier versions
+            # of this handler accidentally used red=/blue= which broke
+            # all per-channel WB presets with ERR_SETC.
+            cam.set_rb_analog_gains(analog_red=gains[1], analog_blue=gains[2])
             logger.info("SETCAM: unified=%.2f, aR=%.3f, aB=%.3f",
                         gains[0], gains[1], gains[2])
 

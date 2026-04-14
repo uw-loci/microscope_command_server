@@ -622,6 +622,16 @@ def handle_smoothz(conn, client, hardware, settings, **kwargs):
     n_motion_samples = 0
     z_span = 0.0
     samples: List[Tuple[float, float, float]] = []
+    # Remember whether the caller already had a sequence running. If
+    # they did (most common case: Live Viewer is streaming when the
+    # user clicks Smooth Focus), we do NOT stop and restart it -- the
+    # JAI camera takes a few hundred ms to start delivering frames
+    # after a fresh start_continuous_sequence_acquisition call, and
+    # that warmup window is usually longer than the scan motion
+    # itself. Reusing the already-warm stream is much more reliable.
+    # The caller's sequence is left running at the end so the Live
+    # Viewer keeps receiving frames.
+    sequence_was_running = False
     try:
         # Positioning seed at full speed.
         _try_set(core, focus_device, speed_prop, NORMAL_SPEED_VALUE)
@@ -635,28 +645,38 @@ def handle_smoothz(conn, client, hardware, settings, **kwargs):
             conn.sendall(f"FAILED:{reason}".encode())
             return
 
-        if core.is_sequence_running():
-            logger.warning("SMOOTH: sequence already running -- stopping first")
-            try:
-                core.stop_sequence_acquisition()
-            except Exception:
-                pass
+        try:
+            sequence_was_running = bool(core.is_sequence_running())
+        except Exception:
+            sequence_was_running = False
 
-        core.clear_circular_buffer()
-        core.start_continuous_sequence_acquisition(0)
+        if sequence_was_running:
+            logger.info("SMOOTH: reusing already-running sequence "
+                        "(avoids JAI warmup after stop/start)")
+        else:
+            logger.info("SMOOTH: no active sequence; starting one for the scan")
+            core.clear_circular_buffer()
+            core.start_continuous_sequence_acquisition(0)
+            # JAI takes ~100-200 ms to start delivering frames from a
+            # cold start. Give it a beat so the scan's pop loop is
+            # draining a real stream, not an empty buffer.
+            time.sleep(0.15)
 
         hard_deadline_s = max(1.0, range_um * HARD_DEADLINE_SEC_PER_UM + 2.0)
         samples = _run_smooth_scan(core, focus_device, speed_prop,
                                     z_start, z_end, hard_deadline_s)
 
-        try:
-            core.stop_sequence_acquisition()
-        except Exception:
-            pass
-        try:
-            core.clear_circular_buffer()
-        except Exception:
-            pass
+        # Only stop the sequence if WE started it. Otherwise the
+        # caller's stream keeps running unchanged.
+        if not sequence_was_running:
+            try:
+                core.stop_sequence_acquisition()
+            except Exception:
+                pass
+            try:
+                core.clear_circular_buffer()
+            except Exception:
+                pass
 
         # Restore normal speed BEFORE any further moves.
         _try_set(core, focus_device, speed_prop, NORMAL_SPEED_VALUE)
@@ -747,15 +767,24 @@ def handle_smoothz(conn, client, hardware, settings, **kwargs):
         except Exception:
             pass
     finally:
-        # Safety restore: speed property and stopped sequence. We
-        # intentionally do NOT restore Z in the success path because
-        # we want to leave the stage at the new focus. In error paths
-        # the except block above already tried to put it back.
-        try:
-            if core.is_sequence_running():
-                core.stop_sequence_acquisition()
-        except Exception:
-            pass
+        # Safety restore: speed property. We intentionally do NOT
+        # restore Z in the success path because we want to leave the
+        # stage at the new focus. In error paths the except block
+        # above already tried to put it back.
+        #
+        # Sequence acquisition state: we only stop it if WE started
+        # it. If the caller (typically the Live Viewer) already had
+        # a stream running when we arrived, we want to leave it
+        # running so they keep receiving frames afterwards. Calling
+        # stop_sequence_acquisition here would break the Live
+        # Viewer's frame poller until it auto-recovers (10+ seconds
+        # of dead time).
+        if not sequence_was_running:
+            try:
+                if core.is_sequence_running():
+                    core.stop_sequence_acquisition()
+            except Exception:
+                pass
         if original_speed is not None:
             _try_set(core, focus_device, speed_prop, str(original_speed))
         else:
