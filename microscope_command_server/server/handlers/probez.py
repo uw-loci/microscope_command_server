@@ -35,10 +35,19 @@ logger = logging.getLogger(__name__)
 STREAM_RANGES_UM = [2.0, 6.0, 12.0, 20.0]
 
 # MaxSpeed values to test in Step 3. Prior ProScan MaxSpeed is on a
-# 0-100 percent scale; we descend from full speed to slow to find the
-# point where a 20 um move takes ~500-1000 ms (a realistic streaming
-# target at 38 fps).
-MAXSPEED_VALUES = [100, 50, 25, 10, 5]
+# 1-100 percent scale; we descend from full speed to slowest to find
+# the operating point where a 20 um move takes long enough for a
+# streaming camera to collect 15+ frames. First probe run showed that
+# MaxSpeed=100 and 50 both hit the same floor (~100 um/s), real
+# slowdown kicks in below 25, and 5 gives ~50 um/s -- so we extend
+# down to 1 this run to characterize the slow end of the curve.
+MAXSPEED_VALUES = [100, 50, 25, 10, 5, 2, 1]
+
+# Properties we deliberately never try to restore -- Prior's Port is
+# pre-init-only and set_property throws at runtime even when the
+# value is unchanged. Listed here so we don't emit a scary stack
+# trace on the cleanup path.
+NON_RESTORABLE_PROPERTIES = frozenset({"Port"})
 
 # Relative move sizes in um for Steps 1 and 2.
 MOVE_SIZES_UM = [1.0, 5.0, 10.0, 20.0, 50.0]
@@ -182,7 +191,7 @@ def _snapshot_focus_device(core, step: str) -> dict:
         ro_str = "RO" if read_only else "RW"
         _log(step, f"  {name} = {value!r} [{ro_str}]{limits_str}{allowed_str}")
 
-        if read_only is False:
+        if read_only is False and name not in NON_RESTORABLE_PROPERTIES:
             restore[name] = value
 
     return restore
@@ -386,32 +395,137 @@ def _step4_stream_during_motion(
     several range values so we can see how frame count scales with
     range and whether sample density is adequate.
 
-    The camera exposure is left at whatever MM is currently set to.
-    Users of the probe should set an appropriate exposure via the
-    normal camera-control UI before running.
+    The camera exposure and FrameRateHz are left at whatever MM is
+    currently set to. The first probe run showed that running the
+    probe with JAICamera FrameRateHz=1 produced only 3 fps streaming
+    and made Step 4 unusable -- so this step now explicitly measures
+    free-run frame cadence BEFORE motion and reports it prominently,
+    so the user can tell immediately if they need to bump the frame
+    rate and re-run.
     """
-    # Pick the slowest speed from Step 3 that actually produced a
-    # measurable move, then use it for all streaming runs. "5" matches
-    # the slowest MAXSPEED_VALUES entry and is the most likely to give
-    # usable streaming duration on a Prior ProScan.
+    # Pick the slowest speed from Step 3. MAXSPEED_VALUES is sorted
+    # fast-to-slow so [-1] is the slowest we sweeped.
     slow_speed = MAXSPEED_VALUES[-1]
     if not _try_set_property(core, focus_device, speed_prop, str(slow_speed)):
         _err("step-4", f"Cannot set {speed_prop}={slow_speed}; skipping streaming test")
         return
     _log("step-4", f"Using {speed_prop}={slow_speed} for streaming runs")
 
-    # Report current exposure for context.
+    # Report current camera state for context. The three things that
+    # matter for streaming feasibility are: what camera is active,
+    # what its exposure is, and what its nominal frame rate property
+    # is set to. If the camera is JAI and the rate is 1 Hz, Step 4's
+    # streaming trials will be garbage -- the user has to bump it
+    # from MicroManager or via the QPSC camera control dialog.
+    try:
+        cam = core.get_camera_device()
+        _log("step-4", f"Camera device = {cam}")
+    except Exception as e:
+        _log("step-4", f"get_camera_device failed: {e}")
+        cam = None
+
     try:
         exposure_ms = core.get_exposure()
         _log("step-4", f"Camera exposure (current) = {exposure_ms:.2f} ms")
     except Exception as e:
         _log("step-4", f"Could not query exposure: {e}")
 
+    if cam:
+        for rate_prop in ("FrameRateHz", "FrameRate", "TargetFrameRate"):
+            try:
+                rate_val = core.get_property(cam, rate_prop)
+                _log("step-4", f"{cam}.{rate_prop} = {rate_val}")
+                break
+            except Exception:
+                continue
+
+    # Characterize free-run frame cadence BEFORE any motion. Measures
+    # inter-frame spacing for up to 30 frames over up to 2 seconds.
+    _measure_free_run_frame_rate(core)
+
     for range_um in STREAM_RANGES_UM:
         if range_um > MAX_STREAM_RANGE_UM:
             _warn("step-4", f"Skipping range={range_um} (exceeds MAX_STREAM_RANGE_UM)")
             continue
         _stream_one_range(core, focus_device, z0, range_um)
+
+
+def _measure_free_run_frame_rate(core) -> None:
+    """Stream the camera without any motion and measure inter-frame
+    spacing. This reveals whether the camera is actually running at
+    its nominal max rate or is throttled by FrameRateHz / exposure /
+    something else.
+    """
+    tag = "step-4 freerun"
+    try:
+        if core.is_sequence_running():
+            _warn(tag, "Sequence already running; skipping free-run measurement")
+            return
+    except Exception:
+        pass
+
+    try:
+        core.clear_circular_buffer()
+        core.start_continuous_sequence_acquisition(0)
+    except Exception as e:
+        _err(tag, f"start_continuous_sequence_acquisition failed: {e}")
+        return
+
+    # Warm-up so we skip any first-frame priming delay.
+    time.sleep(0.1)
+    try:
+        while core.get_remaining_image_count() > 0:
+            core.pop_next_image()
+    except Exception:
+        pass
+
+    # Collect up to 30 frames or 2 seconds, whichever comes first.
+    timestamps = []
+    t0 = time.perf_counter()
+    try:
+        while len(timestamps) < 30 and (time.perf_counter() - t0) < 2.0:
+            try:
+                if core.get_remaining_image_count() > 0:
+                    core.pop_next_image()
+                    timestamps.append((time.perf_counter() - t0) * 1000.0)
+                    continue
+            except Exception as e:
+                _warn(tag, f"pop failed: {e}")
+                break
+            time.sleep(0.002)
+    finally:
+        try:
+            core.stop_sequence_acquisition()
+        except Exception:
+            pass
+        try:
+            core.clear_circular_buffer()
+        except Exception:
+            pass
+
+    if len(timestamps) < 2:
+        _warn(tag, f"only captured {len(timestamps)} frames in 2 s -- camera may be idle or very slow")
+        return
+
+    deltas = [timestamps[i] - timestamps[i - 1] for i in range(1, len(timestamps))]
+    avg = sum(deltas) / len(deltas)
+    fps = 1000.0 / avg if avg > 0 else float("nan")
+    d_min = min(deltas)
+    d_max = max(deltas)
+
+    _log(
+        tag,
+        f"captured {len(timestamps)} frames in {timestamps[-1]:.0f}ms  "
+        f"inter-frame avg={avg:.1f}ms  min={d_min:.1f}ms  max={d_max:.1f}ms  "
+        f"measured_rate={fps:.1f} fps",
+    )
+    if fps < 20.0:
+        _warn(
+            tag,
+            f"measured frame rate {fps:.1f} fps is well below a normal JAI max "
+            f"(~38 fps) -- Step 4 streaming results will be frame-rate-limited, "
+            f"not stage-limited. Bump JAICamera.FrameRateHz to its max and re-run.",
+        )
 
 
 def _stream_one_range(core, focus_device: str, z0: float, range_um: float) -> None:
@@ -472,56 +586,66 @@ def _stream_one_range(core, focus_device: str, z0: float, range_um: float) -> No
             _err(tag, f"Non-blocking set_position failed: {e}", exc_info=True)
             return
 
-        # Pull frames + Z + busy until the stage reports done, plus a
-        # short tail so we can see post-motion frames for sanity.
-        samples = []  # (t_ms, z_um, is_busy, frame_seen)
-        tail_frames = 0
+        # Pull frames from the circular buffer as fast as they arrive.
+        # We only query stage Z when we actually pop a frame -- that
+        # keeps the polling loop from hammering the serial line and
+        # frees the main bottleneck seen in the first probe run, where
+        # the per-iteration get_position()+device_busy() pair was
+        # itself limiting the loop rate to ~3 fps regardless of the
+        # camera's actual frame cadence.
+        #
+        # device_busy() is also serial-bound, so we only call it every
+        # few iterations and use it only to exit the loop when the
+        # stage arrives. The hard deadline guarantees we eventually
+        # exit even if something goes wrong.
+        frame_samples = []  # (t_ms_at_pop, z_at_pop)
         stage_done_at = None
-        deadline = time.perf_counter() + 5.0  # hard cap
+        busy_check_every = 6  # ~12 ms between device_busy calls at 2 ms sleep
+        loop_count = 0
+        # Hard deadline: pessimistic upper bound on stage motion at
+        # the slowest speed we tested, + 500 ms tail for post-motion
+        # frames. 25 ms/um * range + 500 ms gives lots of headroom.
+        deadline = time.perf_counter() + (range_um * 0.05 + 1.0)
 
         while time.perf_counter() < deadline:
             t_rel = (time.perf_counter() - t0) * 1000.0
 
-            # Pop one frame if available. We don't look at pixels -- the
-            # only thing that matters for this probe is that the pop
-            # succeeded and we logged the Z at that moment.
-            frame_this_tick = False
+            # 1) Pop frames (non-blocking). If a frame came in, also
+            # query Z so we can pair it with the pop time.
+            popped_this_tick = 0
             try:
-                if core.get_remaining_image_count() > 0:
+                while core.get_remaining_image_count() > 0:
                     core.pop_next_image()
-                    frame_this_tick = True
+                    try:
+                        z_at_pop = core.get_position(focus_device)
+                    except Exception:
+                        z_at_pop = float("nan")
+                    frame_samples.append((t_rel, z_at_pop))
+                    popped_this_tick += 1
+                    if popped_this_tick >= 4:
+                        break  # don't starve the busy check
             except Exception as e:
-                _warn(tag, f"pop_next_image failed: {e}")
+                _warn(tag, f"pop loop failed: {e}")
 
-            try:
-                z_now = core.get_position(focus_device)
-            except Exception:
-                z_now = float("nan")
+            # 2) Periodically check if the stage is done. After it is,
+            # keep looping for a small tail so we catch any frames
+            # that arrive between stage_done and the post-move
+            # handshake settling.
+            loop_count += 1
+            if loop_count % busy_check_every == 0:
+                try:
+                    busy = core.device_busy(focus_device)
+                except Exception:
+                    busy = None
+                if busy is False and stage_done_at is None:
+                    stage_done_at = t_rel
 
-            try:
-                busy = core.device_busy(focus_device)
-            except Exception:
-                busy = None
+            if stage_done_at is not None and (t_rel - stage_done_at) > 300.0:
+                break  # 300 ms of post-motion tail is plenty
 
-            samples.append((t_rel, z_now, busy, frame_this_tick))
+            time.sleep(0.002)
 
-            if busy is False and stage_done_at is None:
-                stage_done_at = t_rel
-                # Keep pulling frames for a short tail so we see any
-                # drift between frame arrival and stage arrival.
-                tail_frames = 0
-
-            if stage_done_at is not None:
-                tail_frames += 1
-                if tail_frames >= 10:
-                    break
-
-            # Tight-ish sampling rate. Too fast hammers the serial
-            # layer; too slow misses frames. 3 ms is a good compromise
-            # between responsiveness and overhead.
-            time.sleep(0.003)
-
-        # Make absolutely sure the stage is done before we continue.
+        # Final defensive wait + end-position read.
         try:
             core.wait_for_device(focus_device)
         except Exception:
@@ -545,30 +669,45 @@ def _stream_one_range(core, focus_device: str, z0: float, range_um: float) -> No
         _err(tag, f"Return to z0 failed: {e}")
 
     # Summarize.
-    total_frames = sum(1 for s in samples if s[3])
-    in_motion_frames = sum(
-        1 for s in samples if s[3] and (stage_done_at is None or s[0] <= stage_done_at)
-    )
-    if samples:
-        z_min = min(s[1] for s in samples if s[1] == s[1])  # NaN-safe
-        z_max = max(s[1] for s in samples if s[1] == s[1])
+    total_frames = len(frame_samples)
+    if stage_done_at is not None:
+        in_motion = sum(1 for (t, _z) in frame_samples if t <= stage_done_at)
+    else:
+        in_motion = total_frames
+
+    z_values = [z for (_t, z) in frame_samples if z == z]  # NaN-safe
+    if z_values:
+        z_min = min(z_values)
+        z_max = max(z_values)
         z_span = z_max - z_min
     else:
         z_min = z_max = z_span = float("nan")
 
+    # Inter-frame timing stats over the first N frames.
+    if len(frame_samples) >= 2:
+        deltas = [
+            frame_samples[i][0] - frame_samples[i - 1][0]
+            for i in range(1, len(frame_samples))
+        ]
+        avg_delta = sum(deltas) / len(deltas)
+        fps = 1000.0 / avg_delta if avg_delta > 0 else float("nan")
+    else:
+        avg_delta = float("nan")
+        fps = float("nan")
+
     _log(
         tag,
-        f"done: stage_done_at={stage_done_at}ms  frames_total={total_frames}  "
-        f"frames_in_motion={in_motion_frames}  "
-        f"z_reported_span={z_span:.3f} um  z_final={z_final:.3f}",
+        f"done: stage_done_at={stage_done_at}  frames={total_frames}  "
+        f"in_motion={in_motion}  z_span={z_span:.3f}um  z_final={z_final:.3f}  "
+        f"frame_avg_dt={avg_delta:.1f}ms (~{fps:.1f} fps)",
     )
 
-    # Log a compact trace: every 3rd sample up to the first 30.
-    trace_samples = samples[::3][:30]
-    for t_rel, z_now, busy, frame in trace_samples:
-        b = "B" if busy else ("I" if busy is False else "?")
-        f = "F" if frame else "."
-        _log(tag, f"   t={t_rel:>6.1f}ms  z={z_now:.3f}  {b}{f}")
+    # Dump every (frame_time, z) pair so we can reconstruct the z(t)
+    # curve offline. Capped at 40 to keep the log readable.
+    for t_rel, z_at_pop in frame_samples[:40]:
+        _log(tag, f"   frame t={t_rel:>7.1f}ms  z={z_at_pop:.3f}")
+    if len(frame_samples) > 40:
+        _log(tag, f"   ... ({len(frame_samples) - 40} more frames not logged)")
 
 
 def handle_probez(conn, client, hardware, settings, **kwargs):
