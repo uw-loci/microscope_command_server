@@ -71,6 +71,23 @@ METRIC_VALIDATION_RANGES_UM = [6.0, 12.0]
 # Number of points per range for the ground-truth stepped sweep.
 METRIC_STEPPED_N_STEPS = 15
 
+# Exposures to sweep at the 6 um validation range (Step 5b). Chosen
+# to bracket realistic PPM operating points:
+#   0.7 ms  - real PPM acquisition exposure
+#   5 ms    - typical brightfield
+#   20 ms   - moderate fluorescence / low PPM angle
+#   50 ms   - dark fluorescence / very low PPM angle
+#   100 ms  - near the expected feasibility ceiling on Prior at MaxSpeed=1
+# At each exposure we compute the expected per-frame motion blur
+# (velocity * exposure) and compare it to the DOF budget to mark
+# samples as in or out of the safe operating envelope.
+EXPOSURE_SWEEP_MS = [0.7, 5.0, 20.0, 50.0, 100.0]
+
+# Motion blur budget -- at or above this per-frame blur, samples are
+# expected to be too smeared for a reliable focus metric. Derived
+# from ~25% of a representative 20X DOF (~2 um). Conservative.
+BLUR_BUDGET_UM = 0.5
+
 
 def _log(step: str, msg: str) -> None:
     """Uniform tagged logging so the entire probe run is greppable."""
@@ -836,24 +853,236 @@ def _step5_metric_validation(
         return
     _log("step-5", f"Metric validation -- slow scan speed {speed_prop}={MAXSPEED_VALUES[-1]}")
 
+    # Save original exposure so we can restore it after the exposure
+    # sweep. Everything in Step 5 is exposure-aware from here on.
+    original_exposure_ms = None
     try:
-        exposure_ms = core.get_exposure()
-        _log("step-5", f"Camera exposure = {exposure_ms:.2f} ms")
+        original_exposure_ms = core.get_exposure()
+        _log("step-5", f"Camera exposure (original) = {original_exposure_ms:.2f} ms "
+                        "-- will be restored at end of step-5")
     except Exception as e:
         _warn("step-5", f"get_exposure failed: {e}")
 
-    # Static stability check FIRST, regardless of any range.
-    # If this fails we abort step 5 entirely because every metric
-    # comparison downstream would be meaningless.
-    if not _step5_static_stability(core, focus_device, z0):
-        _err("step-5", "Static metric stability check failed; skipping range validation")
-        return
+    # Estimate the minimum achievable stage velocity at slow_speed so
+    # we can annotate each exposure with an expected blur budget.
+    # Uses the Step 3 curve if we can find it in the log, else a
+    # safe 11.5 um/s default (forward Prior MaxSpeed=1 measurement).
+    min_velocity_um_s = _estimate_min_velocity(core, focus_device, speed_prop,
+                                                 MAXSPEED_VALUES[-1], z0)
+    _log("step-5", f"Min achievable velocity at {speed_prop}={MAXSPEED_VALUES[-1]} "
+                    f"= {min_velocity_um_s:.2f} um/s")
+    _log("step-5", f"Blur budget (25% of ~2um DOF): {BLUR_BUDGET_UM:.2f} um")
+    _log("step-5", "Expected blur per exposure at this velocity:")
+    for exp_ms in EXPOSURE_SWEEP_MS:
+        blur = min_velocity_um_s * (exp_ms / 1000.0)
+        status = "OK" if blur <= BLUR_BUDGET_UM else "OVER-BUDGET"
+        _log("step-5", f"   exposure={exp_ms:>6.1f} ms  blur={blur:.3f} um  {status}")
 
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    for range_um in METRIC_VALIDATION_RANGES_UM:
-        csv_path = log_dir / f"probez_metric_range{int(range_um)}_{timestamp}.csv"
-        _metric_validate_one_range(core, focus_device, z0, range_um,
-                                    speed_prop, MAXSPEED_VALUES[-1], csv_path)
+
+    try:
+        # Static stability check at the ORIGINAL exposure. If the
+        # pipeline is unstable at the user's current exposure the
+        # whole validation is pointless.
+        if not _step5_static_stability(core, focus_device, z0):
+            _err("step-5", "Static stability FAILED at original exposure -- "
+                           "aborting metric validation")
+            return
+
+        # 5a. Range sweep at the original exposure. Each trial runs
+        # THREE scans: snap-motion, streaming-motion, stepped. We
+        # compare all three against the stepped ground truth so we
+        # can tell whether streaming (high sample density) or snap
+        # (slow but no buffer latency) is the right mechanism for
+        # smooth focus on this specific camera+stage combo.
+        _log("step-5", "=== 5a: three-way comparison (snap-motion, streaming-motion, stepped) ===")
+        for range_um in METRIC_VALIDATION_RANGES_UM:
+            csv_name = f"probez_metric_range{int(range_um)}_{timestamp}.csv"
+            csv_path = log_dir / csv_name
+            _metric_validate_one_range(core, focus_device, z0, range_um,
+                                        speed_prop, MAXSPEED_VALUES[-1], csv_path,
+                                        exposure_ms=original_exposure_ms or 0.0)
+
+        # 5b. Streaming-mode static stability check at multiple
+        # exposures. The previous run at 16.86 ms showed streaming-
+        # mode metric drift of ~25% over 800 ms. This run at 0.73 ms
+        # showed SNAP-mode is stable. Now we need to know: at which
+        # exposure does STREAMING become stable? That determines the
+        # exposure ceiling for using streaming as the sample
+        # mechanism (which is ~10x denser than snap on this JAI).
+        _log("step-5", "=== 5b: streaming-mode stability across exposures ===")
+        streaming_summary = []  # (exp_ms, mean, cv_pct, drift_pct, verdict)
+        for exp_ms in EXPOSURE_SWEEP_MS:
+            _log("step-5", f"--- streaming stability: set exposure = {exp_ms} ms ---")
+            try:
+                core.set_exposure(exp_ms)
+            except Exception as e:
+                _warn("step-5", f"set_exposure({exp_ms}) failed: {e}")
+                continue
+            result = _streaming_stability_at_exposure(core, focus_device, z0, exp_ms)
+            if result is not None:
+                streaming_summary.append((exp_ms, *result))
+
+        # Summary table.
+        if streaming_summary:
+            _log("step-5", "=== Streaming-mode stability summary ===")
+            _log("step-5",
+                 "exposure_ms   n_frames   mean_metric   CV_pct   drift_pct   verdict")
+            for exp_ms, n, mean, cv, drift, verdict in streaming_summary:
+                _log(
+                    "step-5",
+                    f"  {exp_ms:>6.1f}        {n:>5}    {mean:>8.3f}     "
+                    f"{cv:>5.2f}    {drift:>6.2f}     {verdict}",
+                )
+
+    finally:
+        # Always restore original exposure so the probe doesn't leave
+        # the user staring at a different camera state than they
+        # started with.
+        if original_exposure_ms is not None:
+            try:
+                core.set_exposure(original_exposure_ms)
+                _log("step-5", f"Restored camera exposure to {original_exposure_ms:.2f} ms")
+            except Exception as e:
+                _err("step-5", f"Failed to restore exposure: {e}")
+
+
+def _streaming_stability_at_exposure(core, focus_device, z0, exposure_ms):
+    """Start continuous sequence acquisition, pop ~30 frames at a
+    constant Z, compute the focus metric on each, and return stats.
+
+    Returns (n_frames, mean_metric, cv_pct, drift_pct, verdict_string)
+    or None on failure. verdict is 'STABLE' / 'DRIFT' / 'NOISY' /
+    'FAIL' based on CV and first/last-quarter drift thresholds.
+
+    This is the same kind of stability check as the snap-mode
+    _step5_static_stability, but exercised through the streaming
+    path so we can see whether streaming-mode drift is exposure-
+    dependent.
+    """
+    tag = f"step-5 stream-stable exp={exposure_ms}"
+
+    # Make sure we're at z0 at full speed.
+    _try_set_property(core, focus_device, "MaxSpeed", "100")
+    try:
+        core.set_position(focus_device, z0)
+        core.wait_for_device(focus_device)
+    except Exception as e:
+        _err(tag, f"Failed to seat at z0: {e}")
+        return None
+
+    # Abort any running sequence.
+    try:
+        if core.is_sequence_running():
+            _warn(tag, "Sequence already running; stopping first")
+            core.stop_sequence_acquisition()
+    except Exception:
+        pass
+
+    try:
+        core.clear_circular_buffer()
+        core.start_continuous_sequence_acquisition(0)
+    except Exception as e:
+        _err(tag, f"start_continuous_sequence_acquisition failed: {e}")
+        return None
+
+    metrics = []
+    timestamps = []
+    try:
+        # Warm-up: wait 100 ms then drain any frames accumulated
+        # before our loop starts. We WANT the potentially unstable
+        # early frames for this test because they are exactly what
+        # streaming-based smooth focus would see. Re-drain at the
+        # same time so we can time the first real pop from a clean
+        # starting point.
+        time.sleep(0.1)
+        try:
+            while core.get_remaining_image_count() > 0:
+                _pop_image_as_numpy(core)
+        except Exception:
+            pass
+
+        t0 = time.perf_counter()
+        deadline = t0 + 2.5
+        while len(metrics) < 30 and time.perf_counter() < deadline:
+            try:
+                if core.get_remaining_image_count() > 0:
+                    img = _pop_image_as_numpy(core)
+                    m = _focus_metric(img)
+                    t_ms = (time.perf_counter() - t0) * 1000.0
+                    metrics.append(m)
+                    timestamps.append(t_ms)
+                    _log(tag, f"   stream snap {len(metrics) - 1:>2}  "
+                               f"t={t_ms:>7.1f}ms  metric={m:.4f}")
+                else:
+                    time.sleep(0.003)
+            except Exception as e:
+                _warn(tag, f"pop failed: {e}")
+                break
+    finally:
+        try:
+            core.stop_sequence_acquisition()
+        except Exception:
+            pass
+        try:
+            core.clear_circular_buffer()
+        except Exception:
+            pass
+
+    if len(metrics) < 5:
+        _err(tag, f"only {len(metrics)} frames captured; insufficient for stats")
+        return None
+
+    mean = sum(metrics) / len(metrics)
+    var = sum((m - mean) ** 2 for m in metrics) / len(metrics)
+    std = var ** 0.5
+    cv = (std / mean * 100.0) if mean > 1e-9 else float("inf")
+    q = max(1, len(metrics) // 4)
+    first_q = sum(metrics[:q]) / q
+    last_q = sum(metrics[-q:]) / q
+    drift = abs(last_q - first_q) / mean * 100.0 if mean > 1e-9 else 0.0
+
+    if cv <= 5.0 and drift <= 5.0:
+        verdict = "STABLE"
+    elif cv > 5.0 and drift > 5.0:
+        verdict = "DRIFT+NOISY"
+    elif drift > 5.0:
+        verdict = "DRIFT"
+    else:
+        verdict = "NOISY"
+
+    _log(tag, f"n={len(metrics)}  mean={mean:.3f}  CV={cv:.2f}%  drift={drift:.2f}%  "
+               f"verdict={verdict}")
+    return (len(metrics), mean, cv, drift, verdict)
+
+
+def _estimate_min_velocity(core, focus_device, speed_prop, slow_speed, z0) -> float:
+    """Time one 10 um move at slow_speed to derive a fresh velocity
+    estimate for blur-budget reporting. Uses the new busy-poll wait
+    path via wait_for_device (close enough for a one-off measurement).
+    Falls back to a conservative Prior-MaxSpeed=1 value if anything
+    goes wrong."""
+    fallback = 11.5  # from PROBEZ second-run Step 3 data on PPM
+    try:
+        _try_set_property(core, focus_device, speed_prop, str(slow_speed))
+        # Positioning at full speed, scan at slow speed.
+        _try_set_property(core, focus_device, speed_prop, "100")
+        core.set_position(focus_device, z0)
+        core.wait_for_device(focus_device)
+        _try_set_property(core, focus_device, speed_prop, str(slow_speed))
+        t0 = time.perf_counter()
+        core.set_position(focus_device, z0 + 10.0)
+        core.wait_for_device(focus_device)
+        elapsed = time.perf_counter() - t0
+        velocity = 10.0 / elapsed if elapsed > 0 else fallback
+        # Return to z0 at full speed.
+        _try_set_property(core, focus_device, speed_prop, "100")
+        core.set_position(focus_device, z0)
+        core.wait_for_device(focus_device)
+        return max(velocity, 1.0)
+    except Exception as e:
+        _warn("step-5", f"Velocity estimate failed, using fallback {fallback}: {e}")
+        return fallback
 
 
 def _step5_static_stability(core, focus_device: str, z0: float, n_frames: int = 20) -> bool:
@@ -946,9 +1175,14 @@ def _snap_get_image_as_numpy(core):
 def _metric_validate_one_range(
     core, focus_device: str, z0: float, range_um: float,
     speed_prop: str, slow_speed: int, csv_path: pathlib.Path,
-) -> None:
+    exposure_ms: float = 0.0,
+):
     """Run snap-during-motion + stepped scans at one range and write a
     CSV comparing the two curves.
+
+    Returns (delta_um_or_None, max_z_span_um, verdict_string) so the
+    exposure-sweep driver can build a summary table. Returns None if
+    the trial failed before producing usable samples.
 
     CSV columns:
         scan_type, t_ms, z_um, metric
@@ -993,12 +1227,12 @@ def _metric_validate_one_range(
         core.wait_for_device(focus_device)
     except Exception as e:
         _err(tag, f"Seed move to {z_start:.3f} failed: {e}")
-        return
+        return None
 
     # Now switch to slow speed for the actual scan.
     if not _try_set_property(core, focus_device, speed_prop, str(slow_speed)):
         _err(tag, f"Cannot set {speed_prop}={slow_speed}; skipping snap scan")
-        return
+        return None
 
     t0 = time.perf_counter()
     try:
@@ -1006,7 +1240,7 @@ def _metric_validate_one_range(
     except Exception as e:
         _err(tag, f"Non-blocking move to z_end failed: {e}")
         _try_set_property(core, focus_device, speed_prop, "100")
-        return
+        return None
 
     # Snap loop: run until stage not-busy or hard deadline.
     # Deadline is generous at the slow speed (~25 ms/um plus setup).
@@ -1115,12 +1349,16 @@ def _metric_validate_one_range(
         f"(motion-blur window per snap)",
     )
 
+    verdict = "no_data"
     if delta is not None:
         if abs(delta) <= 0.5:
+            verdict = "GOOD"
             _log(tag, "VERDICT: snap-motion peak matches stepped within 0.5 um -- metric is viable")
         elif abs(delta) <= 1.0:
+            verdict = "BORDERLINE"
             _log(tag, "VERDICT: snap-motion peak within 1 um of stepped -- borderline, inspect CSV")
         else:
+            verdict = "BAD"
             _warn(tag, f"VERDICT: snap-motion peak off stepped by {delta:.2f} um -- "
                        "check CSV for shape; may need slower speed or wider range")
 
@@ -1135,13 +1373,17 @@ def _metric_validate_one_range(
         csv_path.parent.mkdir(parents=True, exist_ok=True)
         with open(csv_path, "w", newline="") as f:
             w = csv.writer(f)
-            w.writerow(["scan_type", "t_ms", "z_um", "metric", "z_span_um"])
+            w.writerow(["scan_type", "t_ms", "z_um", "metric", "z_span_um",
+                         "exposure_ms"])
             for row in rows:
                 w.writerow([row[0], f"{row[1]:.3f}", f"{row[2]:.3f}",
-                            f"{row[3]:.6f}", f"{row[4]:.3f}"])
+                            f"{row[3]:.6f}", f"{row[4]:.3f}",
+                            f"{exposure_ms:.2f}"])
         _log(tag, f"Wrote CSV: {csv_path}")
     except Exception as e:
         _err(tag, f"CSV write failed: {e}")
+
+    return (delta, max_span, verdict)
 
 
 def _argmax_z_generic(zm_pairs):
