@@ -3080,6 +3080,11 @@ def _acquisition_workflow(
         CHANNEL_SAT_PCT_THRESHOLD = 5.0
         channel_consecutive_saturated: Dict[str, int] = {}
 
+        # One-shot flag for the sparse-sample-aware progress sanity check.
+        # Fires at most once per acquisition so we don't spam the log. See
+        # TODO #5 / C6.
+        progress_warning_fired = False
+
         # Main acquisition loop
         for pos_idx, (pos, filename) in enumerate(positions):
             # Check for cancellation
@@ -4076,6 +4081,33 @@ def _acquisition_workflow(
                 pos_idx + 1, len(positions), tile_elapsed_ms / 1000,
                 "AF" if needs_af else "no-AF",
             )
+
+            # Sparse-sample-aware progress sanity check. If the running
+            # average tile time suddenly spikes to >= 3x the first tile's
+            # time, warn loudly once per acquisition so the user notices a
+            # bad AF strategy choice early (e.g. dense_texture applied to a
+            # sparse IF sample spends a long time searching blank areas).
+            # See TODO #5 / C6. Only fires after the first 3 tiles (window
+            # to establish a baseline) and only once per acquisition.
+            if len(tile_measurements) >= 3 and not progress_warning_fired:
+                completed_tile_times_ms = [m["tile_time_ms"] for m in tile_measurements[-10:]]
+                avg_recent_ms = sum(completed_tile_times_ms) / len(completed_tile_times_ms)
+                baseline_ms = tile_measurements[0]["tile_time_ms"]
+                if baseline_ms > 0 and avg_recent_ms > 3.0 * baseline_ms:
+                    logger.error(
+                        "PROGRESS SANITY CHECK: average tile time over last %d tiles is "
+                        "%.1fs, which is %.1fx the first tile's %.1fs. This usually means "
+                        "the autofocus strategy is a poor match for the sample (e.g. "
+                        "dense_texture applied to sparse IF). Current strategy: %s. "
+                        "Consider cancelling and picking a different strategy from the "
+                        "Advanced panel dropdown.",
+                        len(completed_tile_times_ms),
+                        avg_recent_ms / 1000.0,
+                        avg_recent_ms / baseline_ms,
+                        baseline_ms / 1000.0,
+                        af_strategy_name,
+                    )
+                    progress_warning_fired = True
 
             # Periodic progress summary (every 100 tiles)
             if (pos_idx + 1) % 100 == 0 and pos_idx > 0:
