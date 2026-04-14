@@ -131,6 +131,16 @@ BUSY_CHECK_EVERY_N = 6
 # Fewer than this and we refuse to commit -- caller falls back.
 MIN_FRAMES_FOR_FIT = 6
 
+# Maximum number of edge-retry attempts beyond the first scan. Each
+# retry shifts the scan window one full range in the direction of
+# the previously-detected peak. With 2 retries (MAX_EDGE_RETRIES=2)
+# the total Z coverage is 3 * range centered on the original initial
+# Z -- e.g. a 6 um range scan covers [-9, +9] um around start, a
+# 10 um range scan covers [-15, +15] um. Stops early if any
+# attempted scan window would step outside the stage z limits from
+# config.stage.limits.z_um.
+MAX_EDGE_RETRIES = 2
+
 # (Drain-based flushing was retired in favor of
 # core.clear_circular_buffer() at the top of _run_smooth_scan.
 # See the block comment there for why.)
@@ -418,6 +428,40 @@ def _wait_via_busy(core, device: str, timeout_s: float = 10.0) -> None:
 # ----- Parabolic peak fit -----
 
 
+def _get_z_limits(settings: Dict[str, Any]) -> Tuple[Optional[float], Optional[float]]:
+    """Return (z_low, z_high) from config.stage.limits.z_um, or
+    (None, None) if either limit is missing. The scan retry loop
+    uses these to refuse attempts that would move the stage past
+    the user's configured safety envelope."""
+    try:
+        z_um = settings.get("stage", {}).get("limits", {}).get("z_um", {})
+        low = z_um.get("low")
+        high = z_um.get("high")
+        return (
+            float(low) if low is not None else None,
+            float(high) if high is not None else None,
+        )
+    except Exception:
+        return (None, None)
+
+
+def _scan_window_within_limits(
+    z_center: float, range_um: float,
+    z_low: Optional[float], z_high: Optional[float],
+) -> bool:
+    """Check that a proposed scan window centered on `z_center` with
+    total span `range_um` fits inside [z_low, z_high]. Missing limits
+    (None) count as 'no limit on that side'."""
+    half = range_um / 2.0
+    z_start = z_center - half
+    z_end = z_center + half
+    if z_low is not None and z_start < z_low:
+        return False
+    if z_high is not None and z_end > z_high:
+        return False
+    return True
+
+
 def _parabolic_peak(zs: List[float], ms: List[float]) -> Optional[float]:
     """3-point parabolic fit around the argmax of ms.
 
@@ -559,6 +603,174 @@ def _run_smooth_scan(
 
 
 # ----- Handler entry point -----
+
+
+class _ScanAttemptResult:
+    """Result of one _attempt_one_scan call.
+
+    status is one of:
+        'success'             -- peak found, best_z set
+        'edge_low'            -- argmax at first usable sample; shift down
+        'edge_high'           -- argmax at last usable sample; shift up
+        'insufficient_samples' -- not enough samples for a fit
+        'error'               -- hardware or protocol error mid-scan
+    """
+    def __init__(self, status: str, best_z: Optional[float],
+                 n_samples: int, z_span: float, reason: str,
+                 samples_trace: Optional[list] = None):
+        self.status = status
+        self.best_z = best_z
+        self.n_samples = n_samples
+        self.z_span = z_span
+        self.reason = reason
+        self.samples_trace = samples_trace or []
+
+
+def _attempt_one_scan(
+    core,
+    focus_device: str,
+    speed_prop: str,
+    z_center: float,
+    range_um: float,
+    sequence_was_running_on_entry: bool,
+    attempt_label: str = "",
+) -> _ScanAttemptResult:
+    """Run one Smooth scan centered on z_center with the given range.
+
+    Returns an _ScanAttemptResult describing the outcome. Does NOT
+    commit the peak (caller decides whether to retry or commit) and
+    does NOT restore the stage Z (caller handles cleanup).
+
+    The `attempt_label` is prepended to log lines so multi-attempt
+    runs are easy to follow (e.g. 'attempt 2/3: ').
+    """
+    tag_prefix = f"{attempt_label}: " if attempt_label else ""
+    z_start = z_center - range_um / 2.0
+    z_end = z_center + range_um / 2.0
+    logger.info("SMOOTH: %sscan window [%.3f -> %.3f] (center %.3f, range %.2f)",
+                tag_prefix, z_start, z_end, z_center, range_um)
+
+    try:
+        # Positioning seed at full speed.
+        _try_set(core, focus_device, speed_prop, NORMAL_SPEED_VALUE)
+        core.set_position(focus_device, z_start)
+        _wait_via_busy(core, focus_device)
+
+        # Drop to slow speed for the scan motion only.
+        if not _try_set(core, focus_device, speed_prop, SLOW_SPEED_VALUE):
+            return _ScanAttemptResult(
+                "error", None, 0, 0.0,
+                f"could not set {speed_prop}={SLOW_SPEED_VALUE}",
+            )
+
+        if sequence_was_running_on_entry:
+            logger.info("SMOOTH: %sreusing already-running sequence", tag_prefix)
+        else:
+            logger.info("SMOOTH: %sno active sequence; starting one for the scan",
+                        tag_prefix)
+            core.clear_circular_buffer()
+            core.start_continuous_sequence_acquisition(0)
+            time.sleep(0.15)
+
+        hard_deadline_s = max(1.0, range_um * HARD_DEADLINE_SEC_PER_UM + 2.0)
+        samples = _run_smooth_scan(core, focus_device, speed_prop,
+                                    z_start, z_end, hard_deadline_s)
+
+        if not sequence_was_running_on_entry:
+            try:
+                core.stop_sequence_acquisition()
+            except Exception:
+                pass
+            try:
+                core.clear_circular_buffer()
+            except Exception:
+                pass
+
+        _try_set(core, focus_device, speed_prop, NORMAL_SPEED_VALUE)
+
+        # --- Sample filtering and fit ---
+        clean = [(t, z, m) for (t, z, m) in samples
+                 if z == z and m == m and math.isfinite(z) and math.isfinite(m)]
+        in_motion = []
+        stable_run = 0
+        last_z = None
+        for (t, z, m) in clean:
+            if last_z is not None and abs(z - last_z) < 0.05:
+                stable_run += 1
+                if stable_run >= 3:
+                    break
+            else:
+                stable_run = 0
+                in_motion.append((t, z, m))
+                last_z = z
+        if len(in_motion) < MIN_FRAMES_FOR_FIT and len(clean) >= MIN_FRAMES_FOR_FIT:
+            in_motion = clean[:max(MIN_FRAMES_FOR_FIT, len(in_motion))]
+
+        n_motion_samples = len(in_motion)
+        if n_motion_samples >= 2:
+            zs = [p[1] for p in in_motion]
+            ms = [p[2] for p in in_motion]
+            z_span = float(max(zs) - min(zs))
+            raw_peak_idx = int(np.argmax(ms))
+            raw_peak_z = zs[raw_peak_idx]
+            parabolic = _parabolic_peak(zs, ms) if n_motion_samples >= 3 else None
+            best_z = parabolic if parabolic is not None else raw_peak_z
+            logger.info("SMOOTH: %s%d in-motion samples  raw peak Z=%.3f  "
+                        "parabolic peak=%s  z_span=%.3f",
+                        tag_prefix, n_motion_samples, raw_peak_z,
+                        f"{parabolic:.3f}" if parabolic is not None else "None",
+                        z_span)
+        else:
+            logger.warning("SMOOTH: %sonly %d in-motion samples -- cannot fit",
+                           tag_prefix, n_motion_samples)
+            return _ScanAttemptResult(
+                "insufficient_samples", None, n_motion_samples, 0.0,
+                f"only {n_motion_samples} usable samples, need {MIN_FRAMES_FOR_FIT}",
+                samples_trace=list(in_motion),
+            )
+
+        for i, (t, z, m) in enumerate(in_motion):
+            logger.info("SMOOTH: %ssample %3d  t=%7.1f ms  z=%.3f  metric=%.4f",
+                        tag_prefix, i, t, z, m)
+
+        if n_motion_samples < MIN_FRAMES_FOR_FIT or best_z is None:
+            return _ScanAttemptResult(
+                "insufficient_samples", None, n_motion_samples, z_span,
+                f"only {n_motion_samples} usable samples, need {MIN_FRAMES_FOR_FIT}",
+                samples_trace=list(in_motion),
+            )
+
+        # Edge-of-window detection.
+        if n_motion_samples >= 3 and raw_peak_idx in (0, n_motion_samples - 1):
+            if raw_peak_idx == 0:
+                status = "edge_low"
+                direction = "more negative Z (below z_start)"
+            else:
+                status = "edge_high"
+                direction = "more positive Z (above z_end)"
+            reason = (
+                f"peak at edge of scan window (sample {raw_peak_idx} of "
+                f"{n_motion_samples}, z={zs[raw_peak_idx]:.3f}, "
+                f"metric={ms[raw_peak_idx]:.3f}). True focus is likely "
+                f"at {direction}"
+            )
+            return _ScanAttemptResult(
+                status, None, n_motion_samples, z_span, reason,
+                samples_trace=list(in_motion),
+            )
+
+        return _ScanAttemptResult(
+            "success", best_z, n_motion_samples, z_span,
+            f"peak at Z={best_z:.3f}",
+            samples_trace=list(in_motion),
+        )
+
+    except Exception as e:
+        logger.error("SMOOTH: %sunhandled error during scan: %s",
+                     tag_prefix, e, exc_info=True)
+        return _ScanAttemptResult(
+            "error", None, 0, 0.0, str(e),
+        )
 
 
 def handle_smoothz(conn, client, hardware, settings, **kwargs):
@@ -733,191 +945,155 @@ def handle_smoothz(conn, client, hardware, settings, **kwargs):
         conn.sendall(f"UNAVAILABLE:{reason}".encode())
         return
 
-    # --- Execute scan ---
-    z_start = initial_z - range_um / 2.0
-    z_end = initial_z + range_um / 2.0
-    logger.info("SMOOTH: scan window [%.3f -> %.3f] around initial Z=%.3f",
-                z_start, z_end, initial_z)
+    # --- Execute scan with edge-retry loop ---
+    # Up to (MAX_EDGE_RETRIES + 1) attempts. Each attempt runs one
+    # scan centered on a candidate Z with the current range. On
+    # edge_low we shift the next attempt's center down by one full
+    # range (covering new ground further in the -Z direction); on
+    # edge_high we shift up. The shift never crosses outside the
+    # stage Z limits from config.
+    z_low, z_high = _get_z_limits(settings)
+    logger.info("SMOOTH: stage Z limits from config: low=%s high=%s",
+                f"{z_low:.3f}" if z_low is not None else "None",
+                f"{z_high:.3f}" if z_high is not None else "None")
 
-    best_z = None
-    n_motion_samples = 0
-    z_span = 0.0
-    samples: List[Tuple[float, float, float]] = []
-    # Remember whether the caller already had a sequence running. If
-    # they did (most common case: Live Viewer is streaming when the
-    # user clicks Smooth Focus), we do NOT stop and restart it -- the
-    # JAI camera takes a few hundred ms to start delivering frames
-    # after a fresh start_continuous_sequence_acquisition call, and
-    # that warmup window is usually longer than the scan motion
-    # itself. Reusing the already-warm stream is much more reliable.
-    # The caller's sequence is left running at the end so the Live
-    # Viewer keeps receiving frames.
-    sequence_was_running = False
+    # Check whether the Live Viewer already has a sequence running.
+    # Computed once -- attempts share this state since we don't stop
+    # the caller's stream between attempts.
     try:
-        # Positioning seed at full speed.
-        _try_set(core, focus_device, speed_prop, NORMAL_SPEED_VALUE)
-        core.set_position(focus_device, z_start)
-        _wait_via_busy(core, focus_device)
+        sequence_was_running = bool(core.is_sequence_running())
+    except Exception:
+        sequence_was_running = False
 
-        # Drop to slow speed for the scan motion only.
-        if not _try_set(core, focus_device, speed_prop, SLOW_SPEED_VALUE):
-            reason = f"could not set {speed_prop}={SLOW_SPEED_VALUE}"
-            logger.error("SMOOTH: %s", reason)
-            conn.sendall(f"FAILED:{reason}".encode())
-            return
+    attempts_log: List[str] = []
+    final_result: Optional[_ScanAttemptResult] = None
+    current_center = initial_z
 
-        try:
-            sequence_was_running = bool(core.is_sequence_running())
-        except Exception:
-            sequence_was_running = False
+    try:
+        for attempt_idx in range(MAX_EDGE_RETRIES + 1):
+            attempt_num = attempt_idx + 1
+            label = f"attempt {attempt_num}/{MAX_EDGE_RETRIES + 1}"
 
-        if sequence_was_running:
-            logger.info("SMOOTH: reusing already-running sequence "
-                        "(avoids JAI warmup after stop/start)")
+            # Check Z limits before each attempt. Refuse if the
+            # proposed window would step outside the configured stage
+            # limits; the current attempt's center came from a
+            # previous edge detection, so this is where we stop
+            # walking.
+            if not _scan_window_within_limits(current_center, range_um,
+                                               z_low, z_high):
+                reason = (f"proposed scan window [{current_center - range_um/2:.3f} "
+                          f"-> {current_center + range_um/2:.3f}] on "
+                          f"{label} would exit stage z limits "
+                          f"[{z_low}, {z_high}]")
+                logger.warning("SMOOTH: %s", reason)
+                attempts_log.append(f"{label}: out-of-range")
+                final_result = _ScanAttemptResult(
+                    "error", None, 0, 0.0, reason,
+                )
+                break
+
+            # Run one attempt.
+            result = _attempt_one_scan(
+                core, focus_device, speed_prop,
+                current_center, range_um,
+                sequence_was_running,
+                attempt_label=label,
+            )
+            attempts_log.append(
+                f"{label}: center={current_center:.3f} "
+                f"range={range_um:.2f} status={result.status} "
+                f"n={result.n_samples} reason='{result.reason}'"
+            )
+
+            if result.status == "success":
+                final_result = result
+                break
+
+            if result.status == "edge_low":
+                # Shift down by one full range so the next window's
+                # upper edge equals this one's lower edge -- we cover
+                # new ground without overlap.
+                current_center = current_center - range_um
+                logger.info("SMOOTH: edge_low -- next attempt center will be %.3f",
+                            current_center)
+                continue
+
+            if result.status == "edge_high":
+                current_center = current_center + range_um
+                logger.info("SMOOTH: edge_high -- next attempt center will be %.3f",
+                            current_center)
+                continue
+
+            # Any other status (insufficient_samples, error) aborts
+            # the retry loop -- shifting won't help those.
+            final_result = result
+            break
         else:
-            logger.info("SMOOTH: no active sequence; starting one for the scan")
-            core.clear_circular_buffer()
-            core.start_continuous_sequence_acquisition(0)
-            # JAI takes ~100-200 ms to start delivering frames from a
-            # cold start. Give it a beat so the scan's pop loop is
-            # draining a real stream, not an empty buffer.
-            time.sleep(0.15)
+            # Ran out of retries without a success or early exit. The
+            # last result is stored in `result` (still in scope).
+            final_result = result  # noqa: F821  -- result is bound by the for-loop
 
-        hard_deadline_s = max(1.0, range_um * HARD_DEADLINE_SEC_PER_UM + 2.0)
-        samples = _run_smooth_scan(core, focus_device, speed_prop,
-                                    z_start, z_end, hard_deadline_s)
+        # --- Dispatch based on final result ---
+        if final_result is None:
+            # Should not happen, but defensive fallback.
+            final_result = _ScanAttemptResult(
+                "error", None, 0, 0.0, "unknown failure, no attempt completed",
+            )
 
-        # Only stop the sequence if WE started it. Otherwise the
-        # caller's stream keeps running unchanged.
-        if not sequence_was_running:
+        if final_result.status == "success":
+            # Commit the peak Z.
+            best_z = final_result.best_z
+            core.set_position(focus_device, best_z)
+            _wait_via_busy(core, focus_device)
             try:
-                core.stop_sequence_acquisition()
+                final_z = float(core.get_position(focus_device))
+            except Exception:
+                final_z = best_z
+
+            z_shift = final_z - initial_z
+            logger.info("SMOOTH: committed final Z=%.3f  shift=%+.3f  n=%d  span=%.2f  "
+                        "after %d attempt(s)",
+                        final_z, z_shift, final_result.n_samples,
+                        final_result.z_span, len(attempts_log))
+            for entry in attempts_log:
+                logger.info("SMOOTH: attempt log -- %s", entry)
+
+            response = (f"SUCCESS:{initial_z:.3f}:{final_z:.3f}:{z_shift:+.3f}:"
+                        f"{final_result.n_samples}:{final_result.z_span:.3f}")
+            try:
+                conn.sendall(response.encode())
+            except Exception as e:
+                logger.error("SMOOTH: reply send failed: %s", e)
+        else:
+            # Every attempt failed or refused. Restore original Z and
+            # respond UNAVAILABLE with a consolidated reason.
+            try:
+                core.set_position(focus_device, initial_z)
+                _wait_via_busy(core, focus_device)
             except Exception:
                 pass
-            try:
-                core.clear_circular_buffer()
-            except Exception:
-                pass
 
-        # Restore normal speed BEFORE any further moves.
-        _try_set(core, focus_device, speed_prop, NORMAL_SPEED_VALUE)
-
-        # --- Sample filtering and fit ---
-        # Drop samples with non-finite z or metric.
-        clean = [(t, z, m) for (t, z, m) in samples
-                 if z == z and m == m and math.isfinite(z) and math.isfinite(m)]
-        # Drop the small tail where z has stopped changing by more
-        # than the 0.1 um quantization step -- those are post-motion
-        # frames and we want the IN-motion samples for the fit.
-        in_motion = []
-        stable_run = 0
-        last_z = None
-        for (t, z, m) in clean:
-            if last_z is not None and abs(z - last_z) < 0.05:
-                stable_run += 1
-                if stable_run >= 3:
-                    break
+            if final_result.status in ("edge_low", "edge_high"):
+                summary = (f"could not find peak after {len(attempts_log)} "
+                           f"attempts ({MAX_EDGE_RETRIES + 1} max). Last attempt: "
+                           f"{final_result.reason}. Try moving Z closer to "
+                           f"focus manually or picking a wider scan range")
+            elif final_result.status == "insufficient_samples":
+                summary = (f"{final_result.reason}; scan too short or "
+                           f"stage/camera timing off")
             else:
-                stable_run = 0
-                in_motion.append((t, z, m))
-                last_z = z
-        # Always keep at least the first few clean samples.
-        if len(in_motion) < MIN_FRAMES_FOR_FIT and len(clean) >= MIN_FRAMES_FOR_FIT:
-            in_motion = clean[:max(MIN_FRAMES_FOR_FIT, len(in_motion))]
+                summary = final_result.reason
 
-        n_motion_samples = len(in_motion)
-        if n_motion_samples >= 2:
-            zs = [p[1] for p in in_motion]
-            ms = [p[2] for p in in_motion]
-            z_span = float(max(zs) - min(zs))
-            raw_peak_idx = int(np.argmax(ms))
-            raw_peak_z = zs[raw_peak_idx]
-            parabolic = _parabolic_peak(zs, ms) if n_motion_samples >= 3 else None
-            best_z = parabolic if parabolic is not None else raw_peak_z
-            logger.info("SMOOTH: %d in-motion samples  raw peak Z=%.3f  "
-                        "parabolic peak=%s  z_span=%.3f",
-                        n_motion_samples, raw_peak_z,
-                        f"{parabolic:.3f}" if parabolic is not None else "None",
-                        z_span)
-        else:
-            logger.warning("SMOOTH: only %d in-motion samples -- cannot fit",
-                           n_motion_samples)
-
-        # Log the full trace at INFO so Smooth's first real runs are
-        # easy to diagnose. After stable operation this drops to DEBUG.
-        for i, (t, z, m) in enumerate(in_motion):
-            logger.info("SMOOTH: sample %3d  t=%7.1f ms  z=%.3f  metric=%.4f",
-                        i, t, z, m)
-
-        if n_motion_samples < MIN_FRAMES_FOR_FIT or best_z is None:
-            reason = (f"only {n_motion_samples} usable samples, need {MIN_FRAMES_FOR_FIT}; "
-                      f"scan too short or stage/camera timing off")
-            logger.warning("SMOOTH: UNAVAILABLE -- %s", reason)
-            # Restore Z and return.
+            logger.warning("SMOOTH: UNAVAILABLE -- %s", summary)
+            for entry in attempts_log:
+                logger.warning("SMOOTH: attempt log -- %s", entry)
             try:
-                core.set_position(focus_device, initial_z)
-                _wait_via_busy(core, focus_device)
-            except Exception:
-                pass
-            conn.sendall(f"UNAVAILABLE:{reason}".encode())
-            return
-
-        # --- Edge-of-window detection ---
-        # If the argmax is at the first or last usable motion sample
-        # the true peak is very likely OUTSIDE the scan window (at
-        # either z_start or z_end extreme). Committing to the edge
-        # sample is meaningless -- we have no evidence the metric
-        # keeps rising or has already peaked. Return UNAVAILABLE with
-        # a hint about which direction the user should extend the
-        # range, and restore the initial Z.
-        #
-        # Guard: if the first motion sample is at the same Z as the
-        # stable-run plateau (very flat stationary trace), skip this
-        # check -- there's no meaningful edge to detect.
-        interior_zs = zs  # already NaN-filtered by the clean step
-        if n_motion_samples >= 3 and raw_peak_idx in (0, n_motion_samples - 1):
-            direction_hint = (
-                "more negative Z (below z_start)"
-                if raw_peak_idx == 0
-                else "more positive Z (above z_end)"
-            )
-            reason = (
-                f"peak at edge of scan window (sample {raw_peak_idx} of "
-                f"{n_motion_samples}, z={zs[raw_peak_idx]:.3f}, "
-                f"metric={ms[raw_peak_idx]:.3f}). True focus is likely "
-                f"at {direction_hint}. Widen the scan range or move Z "
-                f"manually closer to focus and retry"
-            )
-            logger.warning("SMOOTH: UNAVAILABLE -- %s", reason)
-            try:
-                core.set_position(focus_device, initial_z)
-                _wait_via_busy(core, focus_device)
-            except Exception:
-                pass
-            conn.sendall(f"UNAVAILABLE:{reason}".encode())
-            return
-
-        # --- Commit: move to peak Z ---
-        core.set_position(focus_device, best_z)
-        _wait_via_busy(core, focus_device)
-        try:
-            final_z = float(core.get_position(focus_device))
-        except Exception:
-            final_z = best_z
-
-        z_shift = final_z - initial_z
-        logger.info("SMOOTH: committed final Z=%.3f  shift=%+.3f  n=%d  span=%.2f",
-                    final_z, z_shift, n_motion_samples, z_span)
-
-        response = (f"SUCCESS:{initial_z:.3f}:{final_z:.3f}:{z_shift:+.3f}:"
-                    f"{n_motion_samples}:{z_span:.3f}")
-        try:
-            conn.sendall(response.encode())
-        except Exception as e:
-            logger.error("SMOOTH: reply send failed: %s", e)
+                conn.sendall(f"UNAVAILABLE:{summary}".encode())
+            except Exception as e:
+                logger.error("SMOOTH: reply send failed: %s", e)
 
     except Exception as e:
-        logger.error("SMOOTH: unhandled error during scan: %s", e, exc_info=True)
+        logger.error("SMOOTH: unhandled error in retry loop: %s", e, exc_info=True)
         try:
             conn.sendall(f"FAILED:{e}".encode())
         except Exception:
