@@ -122,6 +122,11 @@ class ExtendedCommand:
     # Z-stage diagnostic probe (one-shot characterization run)
     PROBEZ = b"probez__"  # Run Z-stage timing/streaming probe, log results
 
+    # Smooth (streaming) focus -- continuous-Z autofocus via streamed
+    # frames during non-blocking stage motion. Replaces the current
+    # stepped sweep drift check on calibrated hardware.
+    SMOOTHZ = b"smoothz_"  # Streaming-based smooth focus scan
+
     # Illumination & Profile Commands
     GETILLM = b"getillm_"  # Get illumination state (power, range, on/off)
     SETILLM = b"setillm_"  # Set illumination power (4-byte float)
