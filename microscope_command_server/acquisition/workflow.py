@@ -1548,6 +1548,9 @@ def parse_acquisition_message(message: str) -> dict:
             elif parts[i] == "--focus-channel" and i + 1 < len(parts):
                 params["focus_channel"] = parts[i + 1]
                 i += 2
+            elif parts[i] == "--af-strategy" and i + 1 < len(parts):
+                params["af_strategy"] = parts[i + 1]
+                i += 2
             elif parts[i] == "--bg-correction" and i + 1 < len(parts):
                 params["background_correction_enabled"] = parts[i + 1].lower() == "true"
                 i += 2
@@ -2543,6 +2546,133 @@ def _acquisition_workflow(
             logger.error(error_msg, exc_info=True)
             set_state("FAILED", error_msg)
             return
+
+        # -------- Schema v2 strategy resolution --------
+        # If autofocus_<scope>.yml declares schema_version: 2 and a strategies/
+        # modalities section, resolve the per-modality strategy now. The
+        # strategy object encapsulates validity check + focus score + a
+        # per-strategy brightness check, so the sparse-fluorescence case
+        # does NOT trip the dim-image exposure-doubling loop that would
+        # otherwise saturate bright sparse spots.
+        #
+        # If schema_version is absent or < 2, or no strategies section is
+        # present, build a DenseTextureStrategy from the flat v1 fields as
+        # a drop-in compatibility shim so existing autofocus_<scope>.yml
+        # files keep working without edits. Same goes for any modality
+        # without a binding in the v2 table.
+        #
+        # The strategy object is not yet consumed by the AF call sites --
+        # they still use has_sufficient_tissue directly. A follow-up commit
+        # swaps those calls to strategy.is_valid() / strategy.brightness_
+        # acceptable() / strategy.score(). This commit only plumbs the
+        # strategy object through the loader so it's ready.
+        from microscope_control.autofocus.strategies import (
+            build_strategy,
+            StrategyFailureMode,
+        )
+
+        af_strategy = None
+        af_strategy_name = None
+        af_focus_channel = params.get("focus_channel")  # None for angle-based / single-channel
+        try:
+            schema_version = (
+                autofocus_config.get("schema_version", 1) if isinstance(autofocus_config, dict) else 1
+            )
+            strategies_library = autofocus_config.get("strategies", {}) if isinstance(autofocus_config, dict) else {}
+            modality_bindings = autofocus_config.get("modalities", {}) if isinstance(autofocus_config, dict) else {}
+
+            if schema_version >= 2 and strategies_library:
+                # Resolve the modality binding: longest-prefix-wins, case-
+                # insensitive, matching ModalityRegistry on the Java side.
+                current_modality = params.get("modality", "") or ""
+                current_modality_lower = current_modality.lower()
+                best_match = None
+                best_len = 0
+                for mod_key in modality_bindings.keys():
+                    mod_key_str = str(mod_key).lower()
+                    if current_modality_lower.startswith(mod_key_str) and len(mod_key_str) > best_len:
+                        best_match = mod_key
+                        best_len = len(mod_key_str)
+
+                if best_match is not None:
+                    binding = modality_bindings[best_match]
+                    strategy_name = binding.get("strategy", "dense_texture")
+                    # Start from the named strategy's library defaults,
+                    # then merge in per-modality overrides. overrides is a
+                    # nested dict: {validity_params: {...}, on_failure: ...}
+                    library_entry = strategies_library.get(strategy_name, {})
+                    resolved_params = dict(library_entry)  # shallow copy
+                    overrides_block = binding.get("overrides", {}) or {}
+                    if "validity_params" in overrides_block and isinstance(
+                        overrides_block["validity_params"], dict
+                    ):
+                        merged_vp = dict(library_entry.get("validity_params", {}) or {})
+                        merged_vp.update(overrides_block["validity_params"])
+                        resolved_params = dict(library_entry)
+                        resolved_params["validity_params"] = merged_vp
+                    if "on_failure" in overrides_block:
+                        resolved_params["on_failure"] = overrides_block["on_failure"]
+
+                    af_strategy_name = strategy_name
+                    af_strategy = build_strategy(strategy_name, resolved_params)
+                    logger.info(
+                        "Autofocus strategy resolved: modality='%s' -> binding '%s' -> strategy '%s' (on_failure=%s)",
+                        current_modality,
+                        best_match,
+                        strategy_name,
+                        af_strategy.on_failure.value,
+                    )
+                else:
+                    logger.info(
+                        "No v2 modality binding found for '%s'; using v1 dense_texture compatibility",
+                        current_modality,
+                    )
+
+            # Per-acquisition override: --af-strategy CLI flag wins over YAML.
+            cli_strategy_override = params.get("af_strategy")
+            if cli_strategy_override:
+                library_entry = strategies_library.get(cli_strategy_override, {}) if strategies_library else {}
+                af_strategy = build_strategy(cli_strategy_override, library_entry)
+                af_strategy_name = cli_strategy_override
+                logger.info(
+                    "Autofocus strategy overridden by --af-strategy CLI flag: '%s' (on_failure=%s)",
+                    cli_strategy_override,
+                    af_strategy.on_failure.value,
+                )
+
+            # Fallback: build a DenseTextureStrategy from the flat v1 fields
+            # so every acquisition has a strategy object available. This is a
+            # zero-behavior-change shim: the params come straight from the
+            # current loader locals, so it matches what has_sufficient_tissue
+            # would have been called with.
+            if af_strategy is None:
+                af_strategy = build_strategy(
+                    "dense_texture",
+                    {
+                        "validity_params": {
+                            "texture_threshold": af_texture_threshold,
+                            "tissue_area_threshold": af_tissue_area_threshold,
+                            "rgb_brightness_threshold": af_rgb_brightness_threshold,
+                        },
+                    },
+                )
+                af_strategy_name = "dense_texture (v1 compat)"
+                logger.info(
+                    "Autofocus strategy: v1 compatibility dense_texture built from flat fields"
+                )
+        except Exception as strat_err:
+            # If anything in the strategy resolution fails, keep the v1 flow
+            # working by building a default dense strategy and logging loudly.
+            logger.warning(
+                "Autofocus strategy resolution failed (%s); falling back to dense_texture default",
+                strat_err,
+                exc_info=True,
+            )
+            af_strategy = build_strategy("dense_texture", {})
+            af_strategy_name = "dense_texture (fallback)"
+
+        if af_focus_channel:
+            logger.info("Autofocus focus channel: %s", af_focus_channel)
 
         # Validate af_n_tiles >= 1.
         # This invariant is required by the overlapped I/O system: pending TIFF
