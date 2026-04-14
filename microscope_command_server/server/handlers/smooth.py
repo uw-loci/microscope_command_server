@@ -141,6 +141,15 @@ MIN_FRAMES_FOR_FIT = 6
 # config.stage.limits.z_um.
 MAX_EDGE_RETRIES = 2
 
+# Default ROI crop factor (fraction of full sensor width/height
+# used during the scan). Smaller value = smaller per-frame transfer
+# = faster pop loop = denser sampling. Inspired by MM OughtaFocus's
+# cropFactor parameter. 0.5 means the center 50% width x 50% height
+# = 25% of pixels, reducing ZMQ transfer time by ~4x on cameras
+# where transfer is the bottleneck (JAI at 2064x1544 drops from
+# ~50-100ms per pop to ~15-30ms).
+DEFAULT_CROP_FACTOR = 0.5
+
 # (Drain-based flushing was retired in favor of
 # core.clear_circular_buffer() at the top of _run_smooth_scan.
 # See the block comment there for why.)
@@ -187,6 +196,78 @@ def _pop_image_as_numpy(core) -> Optional[np.ndarray]:
         return arr
 
 
+def _pop_tagged_frame(core) -> Tuple[Optional[np.ndarray], Optional[float]]:
+    """Pop one frame from the circular buffer with its camera-native
+    elapsed-time metadata.
+
+    Returns (img_numpy, elapsed_time_ms) where:
+      - img_numpy is the reshaped pixel array (H, W) or (H, W, C)
+      - elapsed_time_ms is the camera's 'ElapsedTime-ms' tag value,
+        or None if the metadata key wasn't present
+
+    Falls back to _pop_image_as_numpy() when pop_next_tagged_image()
+    isn't available or raises. In that case elapsed_time_ms is None
+    and callers should use a wall-clock estimate instead.
+
+    Why this function exists: during a Smooth scan we need to know
+    when each popped frame was CAPTURED, not when we POPPED it. The
+    buffer can queue frames faster than we pop them (pop takes
+    ~100 ms over the ZMQ bridge, camera produces every ~33 ms), so
+    by the time we pop sample N the frame is already (N-1)*33 ms
+    old and the stage has moved since. Using live stage-position
+    reads at pop time labels every sample with the wrong Z.
+    """
+    try:
+        tagged = core.pop_next_tagged_image()
+    except Exception as e:
+        logger.debug("pop_next_tagged_image unavailable: %s", e)
+        return _pop_image_as_numpy(core), None
+
+    if tagged is None:
+        return None, None
+
+    try:
+        tags = dict(tagged.tags) if hasattr(tagged, "tags") else {}
+    except Exception:
+        tags = {}
+    try:
+        pixels = tagged.pix
+    except Exception:
+        return None, None
+    if pixels is None:
+        return None, None
+
+    # Extract elapsed time. Key spelling varies across MM/pycromanager
+    # versions -- try the common ones.
+    elapsed_ms: Optional[float] = None
+    for key in ("ElapsedTime-ms", "ElapsedTimeMs", "ElapsedTime", "Elapsed-Time-ms"):
+        if key in tags:
+            try:
+                elapsed_ms = float(tags[key])
+                break
+            except (TypeError, ValueError):
+                pass
+
+    # Reshape pixels. Prefer tag-provided geometry for correctness;
+    # fall back to core queries if tags don't have it.
+    try:
+        h = int(tags.get("Height") or core.get_image_height())
+        w = int(tags.get("Width") or core.get_image_width())
+    except Exception:
+        return None, elapsed_ms
+    arr = np.asarray(pixels)
+    try:
+        total = arr.size
+        nch = total // (h * w) if (h * w) > 0 else 1
+        if nch <= 1:
+            img = arr.reshape(h, w)
+        else:
+            img = arr.reshape(h, w, nch)
+        return img, elapsed_ms
+    except Exception:
+        return arr, elapsed_ms
+
+
 def _snap_image_as_numpy(core) -> Optional[np.ndarray]:
     """Snap one image (blocking) and return as numpy array."""
     try:
@@ -209,13 +290,109 @@ def _snap_image_as_numpy(core) -> Optional[np.ndarray]:
         return arr
 
 
-def _focus_metric(img) -> float:
-    """Normalized variance on the green/first channel.
+def _focus_metric_normalized_variance(gray: np.ndarray) -> float:
+    """Variance / mean. Robust, cheap, works well for texture-rich
+    scenes (brightfield, PPM). Can be misleading for sparse-signal
+    fluorescence where a few bright pixels dominate the variance
+    regardless of focus."""
+    mean = gray.mean()
+    if mean <= 1e-9:
+        return 0.0
+    return float(gray.var() / mean)
 
-    Matches the metric family used by the acquisition-path sweep
-    drift check (normalized_variance). Implemented inline so Smooth
-    has zero runtime coupling to the autofocus module beyond what
-    the yaml schema names.
+
+def _focus_metric_volath5(gray: np.ndarray) -> float:
+    """Volath's F5 metric (autocorrelation at lag 1 minus N*mean^2).
+
+    From OughtaFocus / ImgSharpnessAnalysis in the MicroManager
+    source. The comment in the MM code describes this as 'smooths
+    out high-frequency (suppresses noise)' which is the key win for
+    noisy sparse-signal modalities -- widefield fluorescence and
+    laser-scanning microscopy both tend to have mostly-dark
+    backgrounds with signal confined to a small fraction of pixels,
+    and normalized variance in that regime is dominated by shot
+    noise in the background rather than the focus of the signal
+    pixels. Volath5's autocorrelation form effectively ignores
+    uncorrelated noise.
+
+    Math: F5 = sum_{x, y} I(x, y) * I(x+1, y) - M * N * mean(I)^2
+
+    Equivalent numpy:  (I[:, :-1] * I[:, 1:]).sum() - N * mean(I)^2
+    """
+    if gray.ndim != 2 or gray.shape[1] < 2:
+        return 0.0
+    shifted_product = float((gray[:, :-1] * gray[:, 1:]).sum())
+    n = float(gray.size)
+    mean = float(gray.mean())
+    return shifted_product - n * mean * mean
+
+
+def _focus_metric_tenengrad(gray: np.ndarray) -> float:
+    """Sum of squared Sobel gradient magnitudes. Robust sharpness
+    metric; the 2016 light-sheet paper cited in MM's
+    ImgSharpnessAnalysis calls it 'best non-spectral metric' for
+    their application. Alternative to normalized_variance for
+    texture-rich tissue imaging.
+
+    Implemented with plain numpy (no scipy dep) via first
+    differences in X and Y, squared and summed. This is the
+    discrete Sobel without the 2x center weighting; close enough
+    for focus ranking purposes.
+    """
+    if gray.ndim != 2 or gray.shape[0] < 2 or gray.shape[1] < 2:
+        return 0.0
+    gx = np.diff(gray, axis=1)
+    gy = np.diff(gray, axis=0)
+    return float((gx * gx).sum() + (gy * gy).sum())
+
+
+# Registry of available focus metrics. New implementations drop in
+# here and are automatically available to the modality dispatcher.
+_FOCUS_METRICS = {
+    "normalized_variance": _focus_metric_normalized_variance,
+    "volath5": _focus_metric_volath5,
+    "tenengrad": _focus_metric_tenengrad,
+}
+
+
+# Per-modality default metric. The mapping is defensible rather
+# than rig-calibrated: normalized_variance for texture-rich
+# modalities, volath5 for sparse-signal modalities where noise
+# suppression matters more than dynamic range.
+METRIC_BY_MODALITY = {
+    "brightfield": "normalized_variance",
+    "bf": "normalized_variance",
+    "ppm": "normalized_variance",
+    "polarized": "normalized_variance",
+    "fluorescence": "volath5",
+    "fluorescent": "volath5",
+    "widefield": "volath5",
+    "wf": "volath5",
+    "laser_scanning": "volath5",
+    "lsm": "volath5",
+    "shg": "volath5",
+    "multiphoton": "volath5",
+    "1p": "volath5",
+    "2p": "volath5",
+}
+DEFAULT_METRIC_NAME = "normalized_variance"
+
+
+def _resolve_metric_name(modality: Optional[str]) -> str:
+    """Pick a focus metric for the given modality, falling back to
+    the default when modality is None or unknown."""
+    if not modality:
+        return DEFAULT_METRIC_NAME
+    return METRIC_BY_MODALITY.get(modality.strip().lower(), DEFAULT_METRIC_NAME)
+
+
+def _focus_metric(img, metric_name: str = DEFAULT_METRIC_NAME) -> float:
+    """Compute a focus metric on the given image.
+
+    Dispatches on metric_name. Always extracts the green/first
+    channel for multi-component images, then delegates to the
+    chosen metric implementation. Returns 0.0 on empty/bad input
+    so callers can sort/argmax without special-casing None.
     """
     if img is None:
         return 0.0
@@ -228,11 +405,12 @@ def _focus_metric(img) -> float:
     else:
         gray = a
     g = gray.astype(np.float64, copy=False)
-    mean = g.mean()
-    if mean <= 1e-9:
+    fn = _FOCUS_METRICS.get(metric_name, _FOCUS_METRICS[DEFAULT_METRIC_NAME])
+    try:
+        return fn(g)
+    except Exception as e:
+        logger.debug("focus metric '%s' raised: %s", metric_name, e)
         return 0.0
-    var = g.var()
-    return float(var / mean)
 
 
 def _saturation_fraction(img) -> float:
@@ -390,6 +568,68 @@ def _try_set(core, device: str, prop: str, value: str) -> bool:
         return False
 
 
+def _apply_crop_roi(core, crop_factor: float) -> Optional[Tuple[int, int, int, int]]:
+    """Save the current camera ROI and install a centered crop.
+
+    Returns the saved (x, y, w, h) tuple for later restoration, or
+    None if the current ROI couldn't be read or set (in which case
+    the crop is treated as a no-op and the caller doesn't need to
+    restore anything). crop_factor=1.0 also returns None with no
+    side effects.
+
+    Why: during a Smooth scan every popped frame transfers pixels
+    over the ZMQ bridge, and that transfer is the biggest per-pop
+    cost on high-resolution cameras (~50-100 ms on the JAI). MM's
+    OughtaFocus has a `cropFactor` parameter that resizes the camera
+    ROI to a central fraction of the sensor for the duration of the
+    autofocus run, then restores it. This does the same thing for
+    our streaming path. The central crop usually contains the
+    region of interest anyway (user centered on tissue) so no
+    information is lost for focus purposes.
+
+    Restores the full ROI after the scan even on exceptions via the
+    caller's finally block, using _restore_roi().
+    """
+    if crop_factor <= 0.0 or crop_factor >= 1.0:
+        return None
+    try:
+        x0, y0, w0, h0 = core.get_roi()
+        x0, y0, w0, h0 = int(x0), int(y0), int(w0), int(h0)
+    except Exception as e:
+        logger.warning("SMOOTH: could not query camera ROI for crop: %s", e)
+        return None
+
+    new_w = max(1, int(round(w0 * crop_factor)))
+    new_h = max(1, int(round(h0 * crop_factor)))
+    new_x = x0 + (w0 - new_w) // 2
+    new_y = y0 + (h0 - new_h) // 2
+    try:
+        core.set_roi(new_x, new_y, new_w, new_h)
+    except Exception as e:
+        logger.warning("SMOOTH: could not install centered crop ROI "
+                        "(%d, %d, %d, %d): %s", new_x, new_y, new_w, new_h, e)
+        return None
+
+    logger.info("SMOOTH: cropped camera ROI (%d, %d, %dx%d) -> (%d, %d, %dx%d) "
+                "(factor=%.2f, pixel area %.0f%% of original)",
+                x0, y0, w0, h0, new_x, new_y, new_w, new_h,
+                crop_factor, (crop_factor * crop_factor) * 100.0)
+    return (x0, y0, w0, h0)
+
+
+def _restore_roi(core, saved_roi: Optional[Tuple[int, int, int, int]]) -> None:
+    """Put the camera ROI back to what _apply_crop_roi() saved. No-op
+    if saved_roi is None. Intended to be called in a finally block."""
+    if saved_roi is None:
+        return
+    x0, y0, w0, h0 = saved_roi
+    try:
+        core.set_roi(int(x0), int(y0), int(w0), int(h0))
+        logger.info("SMOOTH: restored camera ROI to (%d, %d, %dx%d)", x0, y0, w0, h0)
+    except Exception as e:
+        logger.warning("SMOOTH: failed to restore camera ROI: %s", e)
+
+
 def _try_get(core, device: str, prop: str) -> Optional[str]:
     try:
         return core.get_property(device, prop)
@@ -462,6 +702,75 @@ def _scan_window_within_limits(
     return True
 
 
+def _gaussian_peak(zs: List[float], ms: List[float]) -> Optional[float]:
+    """Fit a Gaussian A*exp(-(z-mu)^2 / 2 sigma^2) + C to all samples
+    and return mu, the peak location. Returns None on any failure
+    (insufficient samples, degenerate z values, fitter non-convergence,
+    out-of-bracket mu).
+
+    Motivated by MM's ZStackFocusOptimizer using a full-sample
+    Gaussian fit instead of a 3-point parabola. Uses more of the
+    scan data than _parabolic_peak does -- the parabolic fit only
+    considers the 3 samples around the argmax, discarding all the
+    rest. The Gaussian fit averages over all N samples, so a single
+    noisy point near the peak doesn't distort the result, and we
+    get a natural sigma estimate we could use later to reject flat
+    curves.
+
+    Falls back to the parabolic fit path when scipy is unavailable
+    or when the Gaussian doesn't converge within reasonable bounds.
+    """
+    n = len(zs)
+    if n < 4:
+        return None
+    try:
+        from scipy.optimize import curve_fit
+    except Exception:
+        return None
+
+    z_arr = np.asarray(zs, dtype=np.float64)
+    m_arr = np.asarray(ms, dtype=np.float64)
+
+    # Initial guesses: mu at argmax, A as max-min, sigma from the
+    # z range over 4 (tunable), C at min.
+    argmax_idx = int(np.argmax(m_arr))
+    mu_init = float(z_arr[argmax_idx])
+    m_max = float(m_arr.max())
+    m_min = float(m_arr.min())
+    A_init = max(m_max - m_min, 1e-6)
+    z_range = float(z_arr.max() - z_arr.min())
+    if z_range < 1e-6:
+        return None
+    sigma_init = z_range / 4.0
+    C_init = m_min
+
+    def gaussian(z, A, mu, sigma, C):
+        return A * np.exp(-0.5 * ((z - mu) / sigma) ** 2) + C
+
+    # Bounds: mu within the sampled range, sigma positive and
+    # bounded to prevent degenerate spikes, A positive, C
+    # within a reasonable range.
+    lo_bounds = [0.0, float(z_arr.min()), 1e-6, -np.inf]
+    hi_bounds = [np.inf, float(z_arr.max()), z_range, np.inf]
+    try:
+        popt, _ = curve_fit(
+            gaussian, z_arr, m_arr,
+            p0=[A_init, mu_init, sigma_init, C_init],
+            bounds=(lo_bounds, hi_bounds),
+            maxfev=500,
+        )
+    except Exception as e:
+        logger.debug("gaussian curve_fit failed: %s", e)
+        return None
+
+    mu_fit = float(popt[1])
+    if not math.isfinite(mu_fit):
+        return None
+    if mu_fit < z_arr.min() or mu_fit > z_arr.max():
+        return None
+    return mu_fit
+
+
 def _parabolic_peak(zs: List[float], ms: List[float]) -> Optional[float]:
     """3-point parabolic fit around the argmax of ms.
 
@@ -511,41 +820,48 @@ def _run_smooth_scan(
     z_start: float,
     z_end: float,
     hard_deadline_s: float,
+    velocity_um_s: float = 11.5,
+    metric_name: str = DEFAULT_METRIC_NAME,
 ) -> List[Tuple[float, float, float]]:
     """Execute the streaming-sample scan and return a list of
-    (t_ms, z_at_pop, metric) triples. Leaves the camera in
-    whatever streaming state it was in on entry (the caller is
+    (t_capture_ms, z_interp, metric) triples. Leaves the camera in
+    whatever streaming state it was in on entry (caller is
     responsible for starting / stopping the sequence) and does NOT
     restore the speed property; caller is responsible for that too.
+
+    Sample labeling:
+
+    Each sample's Z is computed from a LINEAR MOTION MODEL using the
+    frame's CAPTURE timestamp (from camera metadata), not a live
+    stage-position query at pop time. This is the fix for the
+    pop-time-vs-capture-time bug that corrupted early Smooth runs:
+    the buffer can accumulate frames faster than we pop (camera at
+    ~30 fps, pop over ZMQ at ~10 fps), so by the time we retrieve a
+    frame the stage has moved well past where it was when the sensor
+    captured the image. Using core.get_position() at pop time labels
+    every sample with the wrong Z and produces (z, metric) pairs
+    that are physically impossible (e.g. two samples 5 um apart
+    showing identical metric to 0.001 because one of them was
+    actually from much earlier in the motion).
+
+    Motion model: z_at_capture = z_start + (t_capture - t_move) *
+    velocity_um_s, clamped to [z_start, z_end] for the forward
+    direction. The first post-clear frame is assumed captured at
+    ~one camera period after move fire (small fixed offset ~33 ms).
+
+    Falls back to pop-time wall clock when the camera doesn't expose
+    'ElapsedTime-ms' in the pop metadata (no-metadata path prints a
+    one-time warning and uses uniform 30 fps spacing).
+
+    Args:
+        velocity_um_s: expected stage velocity during the scan at
+            the currently-set slow speed. Used to interpolate Z
+            from capture time. 11.5 um/s is the measured Prior
+            MaxSpeed=1 forward rate from PROBEZ step 3.
     """
-    # Flush the buffer with a single atomic call right before firing
-    # the non-blocking move.
-    #
-    # Pop-to-drain was the wrong primitive. The camera refills the
-    # circular buffer faster than we can pop (camera at ~30 fps =
-    # ~33 ms per frame, each pop over the ZMQ bridge is ~100 ms),
-    # so any loop-based drain is losing ground. In the reuse-Live-
-    # Viewer case the seed move to z_start takes ~200 ms, and a
-    # drain of up to 200 ms more gives the camera ~400 ms of
-    # stream time at z_start. That's ~12 frames of pre-motion
-    # content queued in the buffer. Popping and draining only
-    # removes maybe 3-4 of them, leaving 8 still queued when we
-    # start the scan loop. Those stale frames get popped early,
-    # labeled with mid-motion Z values (because z_at_pop reads the
-    # LIVE stage position), and the metric/position pairs become
-    # physical nonsense (two samples at very different labeled Z
-    # showing identical metric to 0.001).
-    #
-    # clear_circular_buffer() is a single pycromanager RPC that
-    # empties the FIFO atomically. It's safe to call on a running
-    # sequence -- the camera keeps producing new frames into the
-    # now-empty buffer as usual. Any frame that appears AFTER the
-    # clear is from the camera's ongoing post-clear stream, which
-    # means the first one arrives ~33 ms later, by which point
-    # our non-blocking move has also been issued and the stage is
-    # already accelerating toward z_end. Capture-vs-label Z skew
-    # drops from ~3-5 um (drain approach) to ~0.2-0.4 um (below
-    # stage quantization).
+    # Atomic buffer flush just before firing the move. See the
+    # earlier block comment for why the loop-based drain didn't
+    # work (buffer refills faster than we pop).
     try:
         core.clear_circular_buffer()
         logger.info("SMOOTH: flushed circular buffer before firing move")
@@ -554,6 +870,10 @@ def _run_smooth_scan(
                         "(continuing with whatever's queued): %s", e)
 
     samples: List[Tuple[float, float, float]] = []
+    direction = 1.0 if z_end >= z_start else -1.0
+    motion_um = abs(z_end - z_start)
+    motion_duration_ms = (motion_um / max(velocity_um_s, 0.01)) * 1000.0
+
     t0 = time.perf_counter()
     try:
         core.set_position(focus_device, z_end)
@@ -564,18 +884,58 @@ def _run_smooth_scan(
     stage_done_at: Optional[float] = None
     loop_count = 0
     deadline = time.perf_counter() + hard_deadline_s
+    first_elapsed_ms: Optional[float] = None
+    fallback_pop_index = 0
+    metadata_warning_logged = False
 
     while time.perf_counter() < deadline:
         popped = 0
         try:
             while core.get_remaining_image_count() > 0:
-                img = _pop_image_as_numpy(core)
-                t_pop = (time.perf_counter() - t0) * 1000.0
-                try:
-                    z_at_pop = float(core.get_position(focus_device))
-                except Exception:
-                    z_at_pop = float("nan")
-                samples.append((t_pop, z_at_pop, _focus_metric(img)))
+                img, elapsed_ms = _pop_tagged_frame(core)
+                if img is None:
+                    break
+
+                # Derive the capture time offset from move fire.
+                # Camera ElapsedTime-ms is relative to the start of
+                # the sequence acquisition, so we subtract the first
+                # frame's elapsed to get offsets relative to our
+                # clear+fire moment.
+                if elapsed_ms is not None:
+                    if first_elapsed_ms is None:
+                        first_elapsed_ms = elapsed_ms
+                        # First post-clear frame is captured ~one
+                        # camera period after the clear. Use 33 ms
+                        # as the fixed offset; refined by subsequent
+                        # frames' spacing.
+                        capture_offset_ms = 33.0
+                    else:
+                        capture_offset_ms = 33.0 + (elapsed_ms - first_elapsed_ms)
+                else:
+                    # No metadata available: fall back to assumed
+                    # 30 fps uniform spacing starting 33 ms after
+                    # move fire. This was the previous-behavior
+                    # approximation and is correct modulo small
+                    # frame-rate jitter.
+                    if not metadata_warning_logged:
+                        logger.warning("SMOOTH: no ElapsedTime-ms in pop metadata; "
+                                        "falling back to 30 fps uniform spacing")
+                        metadata_warning_logged = True
+                    capture_offset_ms = 33.0 + fallback_pop_index * 33.0
+
+                # Linear motion model -> Z at capture time. Clamp
+                # to the commanded window.
+                if capture_offset_ms <= 0:
+                    z_interp = z_start
+                elif capture_offset_ms >= motion_duration_ms:
+                    z_interp = z_end
+                else:
+                    progress_um = (capture_offset_ms / 1000.0) * velocity_um_s * direction
+                    z_interp = z_start + progress_um
+
+                samples.append((capture_offset_ms, float(z_interp),
+                                _focus_metric(img, metric_name)))
+                fallback_pop_index += 1
                 popped += 1
                 if popped >= 4:
                     break
@@ -634,6 +994,8 @@ def _attempt_one_scan(
     range_um: float,
     sequence_was_running_on_entry: bool,
     attempt_label: str = "",
+    velocity_um_s: float = 11.5,
+    metric_name: str = "normalized_variance",
 ) -> _ScanAttemptResult:
     """Run one Smooth scan centered on z_center with the given range.
 
@@ -643,6 +1005,11 @@ def _attempt_one_scan(
 
     The `attempt_label` is prepended to log lines so multi-attempt
     runs are easy to follow (e.g. 'attempt 2/3: ').
+
+    Args:
+        velocity_um_s: expected slow-speed stage velocity; used by
+            _run_smooth_scan to interpolate Z at frame capture time.
+        metric_name: which focus metric to compute per frame.
     """
     tag_prefix = f"{attempt_label}: " if attempt_label else ""
     z_start = z_center - range_um / 2.0
@@ -674,7 +1041,8 @@ def _attempt_one_scan(
 
         hard_deadline_s = max(1.0, range_um * HARD_DEADLINE_SEC_PER_UM + 2.0)
         samples = _run_smooth_scan(core, focus_device, speed_prop,
-                                    z_start, z_end, hard_deadline_s)
+                                    z_start, z_end, hard_deadline_s,
+                                    velocity_um_s=velocity_um_s)
 
         if not sequence_was_running_on_entry:
             try:
@@ -713,13 +1081,25 @@ def _attempt_one_scan(
             z_span = float(max(zs) - min(zs))
             raw_peak_idx = int(np.argmax(ms))
             raw_peak_z = zs[raw_peak_idx]
+            # Prefer a full-sample Gaussian fit (uses all N samples,
+            # robust to a single noisy point), fall back to 3-point
+            # parabolic (uses only the argmax neighborhood), fall
+            # back to raw argmax.
+            gaussian_fit = _gaussian_peak(zs, ms) if n_motion_samples >= 4 else None
             parabolic = _parabolic_peak(zs, ms) if n_motion_samples >= 3 else None
-            best_z = parabolic if parabolic is not None else raw_peak_z
+            if gaussian_fit is not None:
+                best_z = gaussian_fit
+                fit_kind = "gaussian"
+            elif parabolic is not None:
+                best_z = parabolic
+                fit_kind = "parabolic"
+            else:
+                best_z = raw_peak_z
+                fit_kind = "raw-argmax"
             logger.info("SMOOTH: %s%d in-motion samples  raw peak Z=%.3f  "
-                        "parabolic peak=%s  z_span=%.3f",
+                        "fit=%s best_z=%.3f  z_span=%.3f",
                         tag_prefix, n_motion_samples, raw_peak_z,
-                        f"{parabolic:.3f}" if parabolic is not None else "None",
-                        z_span)
+                        fit_kind, best_z, z_span)
         else:
             logger.warning("SMOOTH: %sonly %d in-motion samples -- cannot fit",
                            tag_prefix, n_motion_samples)
@@ -773,6 +1153,124 @@ def _attempt_one_scan(
         )
 
 
+def _brent_fallback_scan(
+    core,
+    focus_device: str,
+    speed_prop: str,
+    z_lo: float,
+    z_hi: float,
+    metric_name: str,
+    max_evals: int = 8,
+    abs_tolerance_um: float = 0.5,
+) -> _ScanAttemptResult:
+    """Stop-and-snap Brent's method search over [z_lo, z_hi].
+
+    Used as a final fallback when the streaming retry loop exhausts
+    all attempts without finding a peak. Brent's method is much
+    smarter about WHERE to sample than the streaming scan's
+    uniform coverage, converging in 6-8 evaluations even when the
+    peak location is uncertain. On PPM with ~250 ms per snap that's
+    ~2 s for a 6 um-wide search, which is competitive with a single
+    streaming attempt while being more robust to partial failures.
+
+    This is a stop-and-snap path: each evaluation does a blocking
+    move at FULL speed (NORMAL_SPEED_VALUE) + snap + metric. It
+    intentionally does NOT use streaming / slow-speed motion
+    because Brent only does single Z queries; there's no advantage
+    to running the stage slowly for a stationary snap.
+
+    The caller is responsible for:
+      - Leaving the camera in a state where snap_image() works
+      - Restoring stage speed property on exit
+      - Committing the returned best_z (or not)
+
+    Returns a _ScanAttemptResult shaped like _attempt_one_scan's
+    success/error results so callers can dispatch uniformly.
+    """
+    tag = "brent-fallback"
+    logger.info("SMOOTH: %s: Brent search over [%.3f, %.3f] metric=%s",
+                tag, z_lo, z_hi, metric_name)
+
+    try:
+        from scipy.optimize import minimize_scalar
+    except Exception as e:
+        return _ScanAttemptResult(
+            "error", None, 0, 0.0, f"scipy not available for Brent: {e}",
+        )
+
+    if z_hi <= z_lo:
+        return _ScanAttemptResult(
+            "error", None, 0, 0.0, f"empty Brent bracket [{z_lo}, {z_hi}]",
+        )
+
+    # Brent's method needs a 3-point bracket where the middle has a
+    # lower function value than both ends (we're MINIMIZING negative
+    # metric, i.e. maximizing metric). Start with a center at
+    # midpoint of the bracket.
+    z_mid = (z_lo + z_hi) / 2.0
+
+    # Use full stage speed for Brent evaluations -- each one is a
+    # stationary snap, no benefit to running slowly.
+    _try_set(core, focus_device, speed_prop, NORMAL_SPEED_VALUE)
+
+    # Track every evaluation for the eventual result.
+    evals: List[Tuple[float, float]] = []  # (z, metric)
+
+    def neg_metric(z: float) -> float:
+        try:
+            core.set_position(focus_device, float(z))
+            _wait_via_busy(core, focus_device)
+            core.snap_image()
+            img = _snap_image_as_numpy(core)
+            z_actual = float(core.get_position(focus_device))
+        except Exception as e:
+            logger.warning("SMOOTH: %s eval at z=%.3f failed: %s", tag, z, e)
+            return 0.0
+        m = _focus_metric(img, metric_name)
+        evals.append((z_actual, m))
+        logger.info("SMOOTH: %s eval %2d  z=%.3f  metric=%.4f",
+                    tag, len(evals), z_actual, m)
+        # minimize_scalar expects a MINIMIZATION objective, so flip
+        # the sign: better focus -> lower (more negative) value.
+        return -m
+
+    try:
+        result = minimize_scalar(
+            neg_metric,
+            bracket=(z_lo, z_mid, z_hi),
+            method="brent",
+            options={"xtol": abs_tolerance_um, "maxiter": max_evals},
+        )
+    except Exception as e:
+        logger.warning("SMOOTH: %s minimize_scalar raised: %s", tag, e)
+        # Fall back to argmax of what we collected.
+        if evals:
+            best_z, best_m = max(evals, key=lambda p: p[1])
+            z_span = max(z for z, _ in evals) - min(z for z, _ in evals)
+            return _ScanAttemptResult(
+                "success" if best_m > 0 else "error",
+                best_z, len(evals), z_span,
+                f"Brent raised ({e}); argmax of {len(evals)} evals",
+                samples_trace=list(evals),
+            )
+        return _ScanAttemptResult(
+            "error", None, 0, 0.0, f"Brent failed with no evals: {e}",
+        )
+
+    best_z = float(result.x)
+    # Clamp to bracket (scipy Brent can sometimes report just outside)
+    best_z = max(z_lo, min(z_hi, best_z))
+    z_span = (max(z for z, _ in evals) - min(z for z, _ in evals)) if evals else 0.0
+
+    logger.info("SMOOTH: %s converged at z=%.3f after %d evals",
+                tag, best_z, len(evals))
+    return _ScanAttemptResult(
+        "success", best_z, len(evals), z_span,
+        f"Brent converged at z={best_z:.3f} after {len(evals)} evals",
+        samples_trace=list(evals),
+    )
+
+
 def handle_smoothz(conn, client, hardware, settings, **kwargs):
     """Entry point for the SMOOTHZ command."""
     addr = getattr(client, "addr", client)
@@ -788,17 +1286,33 @@ def handle_smoothz(conn, client, hardware, settings, **kwargs):
             pass
         return
 
-    params = parse_flags(message, ["--yaml", "--objective", "--range", "--modality"])
+    params = parse_flags(message,
+                          ["--yaml", "--objective", "--range", "--modality",
+                           "--crop-factor"])
     yaml_path = params.get("yaml")
     client_objective = params.get("objective")
     range_override_str = params.get("range")
     client_modality = params.get("modality")
+    crop_factor_str = params.get("crop_factor")
     range_override_um: Optional[float] = None
     if range_override_str:
         try:
             range_override_um = float(range_override_str)
         except ValueError:
             logger.warning("SMOOTH: ignoring non-numeric --range: %r", range_override_str)
+
+    crop_factor = DEFAULT_CROP_FACTOR
+    if crop_factor_str:
+        try:
+            cf = float(crop_factor_str)
+            if 0.0 < cf <= 1.0:
+                crop_factor = cf
+            else:
+                logger.warning("SMOOTH: --crop-factor=%r out of (0, 1]; "
+                                "using default %.2f", crop_factor_str, DEFAULT_CROP_FACTOR)
+        except ValueError:
+            logger.warning("SMOOTH: ignoring non-numeric --crop-factor: %r",
+                            crop_factor_str)
 
     if not yaml_path:
         try:
@@ -807,8 +1321,18 @@ def handle_smoothz(conn, client, hardware, settings, **kwargs):
             pass
         return
 
-    logger.info("SMOOTH: request from %s yaml=%s objective=%s modality=%s range_override=%s",
-                addr, yaml_path, client_objective, client_modality, range_override_um)
+    logger.info("SMOOTH: request from %s yaml=%s objective=%s modality=%s "
+                "range_override=%s crop_factor=%.2f",
+                addr, yaml_path, client_objective, client_modality,
+                range_override_um, crop_factor)
+
+    # Resolve focus metric from modality. Pattern matches the
+    # saturation threshold dispatch just below -- brightfield/PPM
+    # use normalized_variance, fluorescence and laser-scanning use
+    # Volath5 for noise robustness.
+    metric_name = _resolve_metric_name(client_modality)
+    logger.info("SMOOTH: focus metric for modality '%s' = '%s'",
+                client_modality or "unknown", metric_name)
 
     # Resolve the saturation threshold from the client-provided
     # modality. Normalize to lower case for dict lookup; unknown or
@@ -870,6 +1394,14 @@ def handle_smoothz(conn, client, hardware, settings, **kwargs):
         logger.error("SMOOTH: get_position failed: %s", e)
         conn.sendall(f"FAILED:get-position: {e}".encode())
         return
+
+    # Apply the central ROI crop before preflight. This reduces the
+    # per-frame pixel transfer for both the saturation-check frame
+    # AND every frame popped during the scan, which is the single
+    # biggest speedup available on cameras where the ZMQ transfer
+    # dominates per-pop cost. Saved ROI is restored in the handler's
+    # finally block below.
+    saved_roi = _apply_crop_roi(core, crop_factor)
 
     # --- Pre-flight: exposure * velocity blur budget ---
     try:
@@ -998,6 +1530,8 @@ def handle_smoothz(conn, client, hardware, settings, **kwargs):
                 current_center, range_um,
                 sequence_was_running,
                 attempt_label=label,
+                velocity_um_s=min_velocity_um_s,
+                metric_name=metric_name,
             )
             attempts_log.append(
                 f"{label}: center={current_center:.3f} "
@@ -1039,6 +1573,62 @@ def handle_smoothz(conn, client, hardware, settings, **kwargs):
             final_result = _ScanAttemptResult(
                 "error", None, 0, 0.0, "unknown failure, no attempt completed",
             )
+
+        # --- Brent fallback ---
+        # If all streaming retries exhausted with edge detection,
+        # run a final Brent's method search over the full Z span
+        # that the retry loop COULD have covered (clamped to
+        # configured stage limits). Brent uses smart point placement
+        # and typically converges in 6-8 evaluations even when the
+        # peak location is unknown, so it rescues cases where the
+        # streaming+shift approach misses the peak due to sample
+        # density, metric noise, or awkward initial offset.
+        if final_result.status in ("edge_low", "edge_high"):
+            total_span = range_um * (MAX_EDGE_RETRIES + 1)
+            brent_lo = initial_z - total_span / 2.0
+            brent_hi = initial_z + total_span / 2.0
+            if z_low is not None:
+                brent_lo = max(brent_lo, z_low)
+            if z_high is not None:
+                brent_hi = min(brent_hi, z_high)
+            if brent_hi - brent_lo >= 2.0:  # need at least 2 um bracket
+                logger.info("SMOOTH: streaming retries exhausted with edge; "
+                            "escalating to Brent fallback over [%.3f, %.3f]",
+                            brent_lo, brent_hi)
+                try:
+                    # Stop the caller's sequence temporarily because
+                    # Brent's snap_image conflicts with a running stream.
+                    resume_sequence = False
+                    if sequence_was_running:
+                        try:
+                            if core.is_sequence_running():
+                                core.stop_sequence_acquisition()
+                                resume_sequence = True
+                        except Exception:
+                            pass
+                    brent_result = _brent_fallback_scan(
+                        core, focus_device, speed_prop,
+                        brent_lo, brent_hi, metric_name,
+                    )
+                    # Restart the sequence if the Live Viewer was
+                    # depending on it when we arrived.
+                    if resume_sequence:
+                        try:
+                            core.clear_circular_buffer()
+                            core.start_continuous_sequence_acquisition(0)
+                        except Exception as e:
+                            logger.warning("SMOOTH: could not resume sequence "
+                                            "after Brent: %s", e)
+                    attempts_log.append(
+                        f"brent-fallback: bracket=[{brent_lo:.3f}, "
+                        f"{brent_hi:.3f}] status={brent_result.status} "
+                        f"n={brent_result.n_samples} "
+                        f"reason='{brent_result.reason}'"
+                    )
+                    if brent_result.status == "success":
+                        final_result = brent_result
+                except Exception as e:
+                    logger.error("SMOOTH: Brent fallback raised: %s", e, exc_info=True)
 
         if final_result.status == "success":
             # Commit the peak Z.
@@ -1121,3 +1711,8 @@ def handle_smoothz(conn, client, hardware, settings, **kwargs):
             _try_set(core, focus_device, speed_prop, str(original_speed))
         else:
             _try_set(core, focus_device, speed_prop, NORMAL_SPEED_VALUE)
+        # Always restore the camera ROI -- a no-op if crop wasn't
+        # applied. Leaving a cropped ROI would affect every
+        # subsequent live-viewer frame and every acquisition snap
+        # until the user manually reconfigured the camera.
+        _restore_roi(core, saved_roi)
