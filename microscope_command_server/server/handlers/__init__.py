@@ -49,6 +49,7 @@ from microscope_command_server.server.handlers.illumination import (
 from microscope_command_server.server.handlers.system import (
     handle_config, handle_disconnect, handle_shutdown, handle_siftal,
 )
+from microscope_command_server.server.handlers.probez import handle_probez
 
 
 # Map 8-byte command bytes -> handler function
@@ -128,4 +129,7 @@ COMMAND_HANDLERS = {
     ExtendedCommand.DISCONNECT: handle_disconnect,
     ExtendedCommand.SHUTDOWN: handle_shutdown,
     ExtendedCommand.SIFTAL: handle_siftal,
+
+    # Z-stage diagnostic probe
+    ExtendedCommand.PROBEZ: handle_probez,
 }

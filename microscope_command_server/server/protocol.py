@@ -119,6 +119,9 @@ class ExtendedCommand:
     MOVZNW = b"movznw__"  # Move Z non-blocking (no wait_for_device) - for sweep focus
     GETZF = b"getzf___"  # Get Z position only (fast, no X/Y read) - for sweep focus
 
+    # Z-stage diagnostic probe (one-shot characterization run)
+    PROBEZ = b"probez__"  # Run Z-stage timing/streaming probe, log results
+
     # Illumination & Profile Commands
     GETILLM = b"getillm_"  # Get illumination state (power, range, on/off)
     SETILLM = b"setillm_"  # Set illumination power (4-byte float)
