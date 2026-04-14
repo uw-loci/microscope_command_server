@@ -23,8 +23,14 @@ thorough logging beat speed. A probe run takes ~15-40 seconds
 depending on how many streaming ranges are tested.
 """
 
+import csv
 import logging
+import os
+import pathlib
 import time
+from datetime import datetime
+
+import numpy as np
 
 logger = logging.getLogger(__name__)
 
@@ -57,6 +63,14 @@ MOVE_SIZES_UM = [1.0, 5.0, 10.0, 20.0, 50.0]
 # realistic Z limit envelope but still larger than STREAM_RANGES_UM[-1].
 MAX_STREAM_RANGE_UM = 25.0
 
+# Ranges to exercise in Step 5 (metric validation). Smaller list than
+# Step 4 since each range pays the cost of a ground-truth stepped
+# sweep on top of the continuous scan.
+METRIC_VALIDATION_RANGES_UM = [6.0, 12.0]
+
+# Number of points per range for the ground-truth stepped sweep.
+METRIC_STEPPED_N_STEPS = 15
+
 
 def _log(step: str, msg: str) -> None:
     """Uniform tagged logging so the entire probe run is greppable."""
@@ -87,6 +101,67 @@ def _try_set_property(core, device: str, prop: str, value) -> bool:
     except Exception as e:
         _warn("setprop", f"{device}.{prop} <- {value!r} failed: {e}")
         return False
+
+
+def _pop_image_as_numpy(core):
+    """Pop one frame from the circular buffer as a numpy array.
+
+    Handles both monochrome (ndim=2) and multi-component (ndim=3)
+    cameras. Returns None if the pop failed or the buffer was empty.
+    """
+    try:
+        pixels = core.pop_next_image()
+    except Exception as e:
+        logger.debug("pop_next_image failed: %s", e)
+        return None
+    if pixels is None:
+        return None
+    try:
+        w = core.get_image_width()
+        h = core.get_image_height()
+        nch = core.get_number_of_components()
+    except Exception as e:
+        logger.debug("image geometry query failed: %s", e)
+        return None
+    arr = np.asarray(pixels)
+    try:
+        if nch == 1:
+            return arr.reshape(h, w)
+        return arr.reshape(h, w, nch)
+    except Exception as e:
+        logger.debug("reshape to (%dx%d x %d) failed: %s", h, w, nch, e)
+        return arr
+
+
+def _focus_metric(img) -> float:
+    """Normalized variance on the green/first channel.
+
+    This is the same metric family that the current sweep drift check
+    uses on the acquisition path (normalized_variance in
+    autofocus_PPM.yml). We implement it inline rather than importing
+    the full autofocus stack so the probe stays self-contained.
+
+    Returns 0.0 for empty / unreadable images so callers can sort
+    without special-casing None.
+    """
+    if img is None:
+        return 0.0
+    a = np.asarray(img)
+    if a.size == 0:
+        return 0.0
+    if a.ndim == 3:
+        # Green channel is ch=1 in RGB; fall back to ch=0 for
+        # single-component or 2-channel images.
+        ch = 1 if a.shape[2] >= 2 else 0
+        gray = a[:, :, ch]
+    else:
+        gray = a
+    g = gray.astype(np.float64, copy=False)
+    mean = g.mean()
+    if mean <= 1e-9:
+        return 0.0
+    var = g.var()
+    return float(var / mean)
 
 
 def _str_vector_to_list(vec) -> list:
@@ -610,17 +685,21 @@ def _stream_one_range(core, focus_device: str, z0: float, range_um: float) -> No
         while time.perf_counter() < deadline:
             t_rel = (time.perf_counter() - t0) * 1000.0
 
-            # 1) Pop frames (non-blocking). If a frame came in, also
-            # query Z so we can pair it with the pop time.
+            # 1) Pop frames (non-blocking). Stamp each pop with its
+            # own perf_counter() reading -- the outer t_rel at the top
+            # of the loop is stale by the time we fetch the 2nd, 3rd,
+            # 4th frame from a burst, which made the first probe run's
+            # traces misleading (4 frames at the same t_rel).
             popped_this_tick = 0
             try:
                 while core.get_remaining_image_count() > 0:
                     core.pop_next_image()
+                    t_pop = (time.perf_counter() - t0) * 1000.0
                     try:
                         z_at_pop = core.get_position(focus_device)
                     except Exception:
                         z_at_pop = float("nan")
-                    frame_samples.append((t_rel, z_at_pop))
+                    frame_samples.append((t_pop, z_at_pop))
                     popped_this_tick += 1
                     if popped_this_tick >= 4:
                         break  # don't starve the busy check
@@ -710,6 +789,277 @@ def _stream_one_range(core, focus_device: str, z0: float, range_um: float) -> No
         _log(tag, f"   ... ({len(frame_samples) - 40} more frames not logged)")
 
 
+def _step5_metric_validation(
+    core, focus_device: str, z0: float, speed_prop: str, log_dir: pathlib.Path
+) -> None:
+    """The real feasibility gate: do frames captured during a smooth
+    Z scan actually produce a usable focus metric curve?
+
+    For each validation range we run TWO scans back-to-back:
+
+    1. **Continuous scan at MaxSpeed=1**: start streaming, fire a
+       non-blocking move, pop each frame, compute the focus metric,
+       record (t_ms, z_um, metric). Pixel data is handled in memory
+       only (no disk writes for the images themselves).
+
+    2. **Stepped sweep at MaxSpeed=100 (ground truth)**: step through
+       the same z range blocking-stopping at each point, snap a fresh
+       frame, compute the same metric. This is what 'correct' looks
+       like, unaffected by motion blur / timing artifacts.
+
+    Both curves are written to a CSV file under the server log
+    directory so we can pull it offline and plot, and both peak
+    Z estimates are logged inline for quick comparison. If the
+    continuous-scan peak matches the stepped-sweep peak within
+    ~0.5 um, motion-based focus metrics are viable on this rig.
+    If they diverge, we have a hard stop for the smooth scan
+    approach and a clear reason why.
+
+    Nothing is committed: Z is returned to z0 at the end. The probe
+    is exploration, not action.
+    """
+    slow_speed = MAXSPEED_VALUES[-1]
+    if not _try_set_property(core, focus_device, speed_prop, str(slow_speed)):
+        _err("step-5", f"Cannot set {speed_prop}={slow_speed}; skipping metric validation")
+        return
+    _log("step-5", f"Metric validation using {speed_prop}={slow_speed} for continuous scans")
+
+    # Make sure we're exposed sensibly before the scans.
+    try:
+        exposure_ms = core.get_exposure()
+        _log("step-5", f"Camera exposure = {exposure_ms:.2f} ms")
+    except Exception as e:
+        _warn("step-5", f"get_exposure failed: {e}")
+
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    for range_um in METRIC_VALIDATION_RANGES_UM:
+        csv_path = log_dir / f"probez_metric_range{int(range_um)}_{timestamp}.csv"
+        _metric_validate_one_range(core, focus_device, z0, range_um,
+                                    speed_prop, slow_speed, csv_path)
+
+
+def _metric_validate_one_range(
+    core, focus_device: str, z0: float, range_um: float,
+    speed_prop: str, slow_speed: int, csv_path: pathlib.Path,
+) -> None:
+    """Run continuous + stepped scans at one range and write a CSV.
+
+    CSV columns:
+        scan_type, t_ms, z_um, metric
+    where scan_type is 'continuous' or 'stepped'.
+    """
+    tag = f"step-5 range={range_um:.1f}"
+    half = range_um / 2.0
+    z_start = z0 - half
+    z_end = z0 + half
+
+    _log(tag, f"Scan window [{z_start:.3f} -> {z_end:.3f}]  csv={csv_path.name}")
+
+    rows = []  # (scan_type, t_ms, z_um, metric)
+    cont_samples = []
+    stepped_samples = []
+
+    # ---- Part 1: continuous scan at slow speed ----
+    if not _try_set_property(core, focus_device, speed_prop, str(slow_speed)):
+        _err(tag, f"Cannot set {speed_prop}={slow_speed}; skipping continuous scan")
+        return
+
+    try:
+        core.set_position(focus_device, z_start)
+        # Use core.wait_for_device here (not our new busy path) so we
+        # definitely land before starting the camera -- this is
+        # pre-scan setup, not a perf-critical step.
+        core.wait_for_device(focus_device)
+    except Exception as e:
+        _err(tag, f"Seed move to {z_start:.3f} failed: {e}")
+        return
+
+    try:
+        if core.is_sequence_running():
+            _err(tag, "Sequence already running; aborting continuous scan")
+            return
+    except Exception:
+        pass
+
+    try:
+        core.clear_circular_buffer()
+        core.start_continuous_sequence_acquisition(0)
+    except Exception as e:
+        _err(tag, f"start_continuous_sequence_acquisition failed: {e}")
+        return
+
+    try:
+        time.sleep(0.08)
+        # Drain warmup frames.
+        try:
+            while core.get_remaining_image_count() > 0:
+                _pop_image_as_numpy(core)
+        except Exception:
+            pass
+
+        t0 = time.perf_counter()
+        try:
+            core.set_position(focus_device, z_end)
+        except Exception as e:
+            _err(tag, f"Non-blocking move failed: {e}")
+            return
+
+        stage_done_at = None
+        loop_count = 0
+        busy_check_every = 8
+        deadline = time.perf_counter() + (range_um * 0.12 + 1.5)
+
+        while time.perf_counter() < deadline:
+            popped = 0
+            try:
+                while core.get_remaining_image_count() > 0:
+                    img = _pop_image_as_numpy(core)
+                    t_pop = (time.perf_counter() - t0) * 1000.0
+                    try:
+                        z_at_pop = core.get_position(focus_device)
+                    except Exception:
+                        z_at_pop = float("nan")
+                    metric = _focus_metric(img)
+                    cont_samples.append((t_pop, z_at_pop, metric))
+                    popped += 1
+                    if popped >= 4:
+                        break
+            except Exception as e:
+                _warn(tag, f"continuous pop+metric failed: {e}")
+
+            loop_count += 1
+            if loop_count % busy_check_every == 0:
+                try:
+                    busy = core.device_busy(focus_device)
+                except Exception:
+                    busy = None
+                if busy is False and stage_done_at is None:
+                    stage_done_at = (time.perf_counter() - t0) * 1000.0
+
+            if stage_done_at is not None and \
+               ((time.perf_counter() - t0) * 1000.0 - stage_done_at) > 300.0:
+                break
+            time.sleep(0.002)
+    finally:
+        try:
+            core.stop_sequence_acquisition()
+        except Exception:
+            pass
+        try:
+            core.clear_circular_buffer()
+        except Exception:
+            pass
+
+    # ---- Part 2: stepped sweep at full speed (ground truth) ----
+    if not _try_set_property(core, focus_device, speed_prop, "100"):
+        _warn(tag, "Cannot restore MaxSpeed=100 for stepped sweep; using current")
+
+    step_size = range_um / (METRIC_STEPPED_N_STEPS - 1)
+    try:
+        t0_step = time.perf_counter()
+        for i in range(METRIC_STEPPED_N_STEPS):
+            z = z_start + i * step_size
+            try:
+                core.set_position(focus_device, z)
+                core.wait_for_device(focus_device)
+                # Snap a fresh frame via the proper snap path so we
+                # get the same image shape as the continuous pops.
+                core.snap_image()
+                pixels = core.get_image()
+                w = core.get_image_width()
+                h = core.get_image_height()
+                nch = core.get_number_of_components()
+                arr = np.asarray(pixels)
+                try:
+                    img = arr.reshape(h, w, nch) if nch > 1 else arr.reshape(h, w)
+                except Exception:
+                    img = arr
+                metric = _focus_metric(img)
+                t_ms = (time.perf_counter() - t0_step) * 1000.0
+                z_actual = core.get_position(focus_device)
+                stepped_samples.append((t_ms, z_actual, metric))
+            except Exception as e:
+                _warn(tag, f"stepped point i={i} failed: {e}")
+    except Exception as e:
+        _err(tag, f"stepped sweep failed: {e}")
+
+    # Return to z0 cleanly.
+    try:
+        core.set_position(focus_device, z0)
+        core.wait_for_device(focus_device)
+    except Exception as e:
+        _warn(tag, f"Return to z0 failed: {e}")
+
+    # ---- Analysis + CSV ----
+    cont_peak = _argmax_z(cont_samples)
+    step_peak = _argmax_z(stepped_samples)
+    delta = (cont_peak - step_peak) if (cont_peak is not None and step_peak is not None) else None
+
+    _log(
+        tag,
+        f"continuous: {len(cont_samples)} samples, peak Z={_fmt(cont_peak)}  "
+        f"stepped: {len(stepped_samples)} samples, peak Z={_fmt(step_peak)}  "
+        f"delta={_fmt(delta)} um",
+    )
+
+    if delta is not None:
+        if abs(delta) <= 0.5:
+            _log(tag, "VERDICT: continuous peak matches stepped within 0.5 um -- metric is viable")
+        elif abs(delta) <= 1.0:
+            _log(tag, "VERDICT: continuous peak within 1 um of stepped -- borderline, inspect CSV")
+        else:
+            _warn(tag, f"VERDICT: continuous peak off stepped by {delta:.2f} um -- metric may be corrupted by motion")
+
+    # Log a compact trace of both curves inline so the log alone is
+    # enough to eyeball (z, metric) ordering without opening the CSV.
+    for (t_ms, z, m) in cont_samples:
+        rows.append(("continuous", t_ms, z, m))
+        _log(tag, f"   CONT t={t_ms:>7.1f}ms  z={z:.3f}  metric={m:.2f}")
+    for (t_ms, z, m) in stepped_samples:
+        rows.append(("stepped", t_ms, z, m))
+        _log(tag, f"   STEP t={t_ms:>7.1f}ms  z={z:.3f}  metric={m:.2f}")
+
+    # Write CSV for offline analysis / plotting.
+    try:
+        csv_path.parent.mkdir(parents=True, exist_ok=True)
+        with open(csv_path, "w", newline="") as f:
+            w = csv.writer(f)
+            w.writerow(["scan_type", "t_ms", "z_um", "metric"])
+            for row in rows:
+                w.writerow([row[0], f"{row[1]:.3f}", f"{row[2]:.3f}", f"{row[3]:.6f}"])
+        _log(tag, f"Wrote CSV: {csv_path}")
+    except Exception as e:
+        _err(tag, f"CSV write failed: {e}")
+
+
+def _argmax_z(samples):
+    """Return the Z with the maximum metric, or None if empty/NaN.
+
+    Uses a simple argmax rather than a parabolic fit for this first
+    validation pass -- we just want to know 'do continuous and
+    stepped agree on where the peak is'. A parabolic fit would smooth
+    out real disagreements.
+    """
+    best_z = None
+    best_m = float("-inf")
+    for _, z, m in samples:
+        if z != z or m != m:  # NaN-safe
+            continue
+        if m > best_m:
+            best_m = m
+            best_z = z
+    return best_z
+
+
+def _fmt(v):
+    if v is None:
+        return "None"
+    try:
+        return f"{v:.3f}"
+    except Exception:
+        return str(v)
+
+
 def handle_probez(conn, client, hardware, settings, **kwargs):
     """PROBEZ -- one-shot Z-stage diagnostic probe.
 
@@ -779,11 +1129,21 @@ def handle_probez(conn, client, hardware, settings, **kwargs):
             _warn(
                 "step-3",
                 "No MaxSpeed/Velocity/Speed/MaxVelocity property found on focus "
-                "device; skipping steps 3 and 4",
+                "device; skipping steps 3, 4, 5",
             )
         else:
             _step3_maxspeed_sensitivity(core, focus_device, z0, speed_prop)
             _step4_stream_during_motion(core, focus_device, z0, speed_prop)
+
+            # Step 5: pixel + metric validation. Writes a CSV per
+            # range into the same directory as the active session
+            # log so it's easy to find.
+            active_config_path = kwargs.get("active_connection_config_path")
+            if active_config_path:
+                csv_dir = pathlib.Path(active_config_path).resolve().parent / "logs"
+            else:
+                csv_dir = pathlib.Path.cwd()
+            _step5_metric_validation(core, focus_device, z0, speed_prop, csv_dir)
 
         _log("done", "Probe completed successfully")
         try:
