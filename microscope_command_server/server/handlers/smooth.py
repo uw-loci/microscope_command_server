@@ -599,66 +599,152 @@ def _read_roi(core) -> Optional[Tuple[int, int, int, int]]:
         return None
 
 
-def _apply_crop_roi(core, crop_factor: float) -> Optional[Tuple[int, int, int, int]]:
+def _apply_crop_roi(
+    core, crop_factor: float
+) -> Tuple[Optional[Tuple[int, int, int, int]], bool]:
     """Save the current camera ROI and install a centered crop.
 
-    Returns the saved (x, y, w, h) tuple for later restoration, or
-    None if the current ROI couldn't be read or set (in which case
-    the crop is treated as a no-op and the caller doesn't need to
-    restore anything). crop_factor=1.0 also returns None with no
-    side effects.
+    Returns (saved_roi, sequence_was_running_when_called) where:
+      - saved_roi is (x, y, w, h) tuple of the ORIGINAL ROI for
+        later restoration, or None if the crop didn't apply
+      - sequence_was_running_when_called is True if we had to
+        stop+restart a running sequence to set the ROI (callers
+        of _restore_roi must pass this back)
 
-    Why: during a Smooth scan every popped frame transfers pixels
-    over the ZMQ bridge, and that transfer is the biggest per-pop
-    cost on high-resolution cameras (~50-100 ms on the JAI). MM's
-    OughtaFocus has a `cropFactor` parameter that resizes the camera
-    ROI to a central fraction of the sensor for the duration of the
-    autofocus run, then restores it. This does the same thing for
-    our streaming path. The central crop usually contains the
-    region of interest anyway (user centered on tissue) so no
-    information is lost for focus purposes.
+    JAI / GenAPI cameras lock the Width and Height properties as
+    "not writable" while a sequence acquisition is running. So
+    the only way to install a new ROI is:
 
-    Restores the full ROI after the scan even on exceptions via the
-    caller's finally block, using _restore_roi().
+      1. Stop the sequence
+      2. Set the ROI
+      3. Restart the sequence (with the new ROI in effect)
+
+    This costs ~150 ms of camera warmup vs. the unstop-able path,
+    but the per-frame transfer savings dwarf that overhead -- a
+    50% crop is 4x fewer pixels per frame, dropping per-pop time
+    from ~150 ms to ~40 ms on the JAI. For a 20-sample scan that
+    saves ~2 seconds, well over the 300 ms warmup penalty.
+
+    crop_factor=1.0 (no crop) is a no-op that returns (None, False)
+    with no camera state changes.
+
+    Restoration is symmetric: caller's finally block invokes
+    _restore_roi() which stops the sequence again, sets the
+    original ROI, and restarts. The Live Viewer's frame poller
+    sees a brief gap in frames and recovers automatically.
     """
     if crop_factor <= 0.0 or crop_factor >= 1.0:
-        return None
+        return (None, False)
     saved = _read_roi(core)
     if saved is None:
         logger.warning("SMOOTH: could not query camera ROI for crop "
                         "(see prior warning); skipping crop")
-        return None
+        return (None, False)
     x0, y0, w0, h0 = saved
 
     new_w = max(1, int(round(w0 * crop_factor)))
     new_h = max(1, int(round(h0 * crop_factor)))
     new_x = x0 + (w0 - new_w) // 2
     new_y = y0 + (h0 - new_h) // 2
+
+    # JAI / GenAPI requires the sequence to be stopped before ROI
+    # changes. Stop, set, restart.
+    seq_running = False
+    try:
+        seq_running = bool(core.is_sequence_running())
+    except Exception:
+        pass
+
+    if seq_running:
+        try:
+            core.stop_sequence_acquisition()
+        except Exception as e:
+            logger.warning("SMOOTH: could not stop sequence for ROI crop: %s", e)
+            return (None, False)
+
     try:
         core.set_roi(new_x, new_y, new_w, new_h)
     except Exception as e:
         logger.warning("SMOOTH: could not install centered crop ROI "
                         "(%d, %d, %d, %d): %s", new_x, new_y, new_w, new_h, e)
-        return None
+        # Try to restart the sequence we stopped before bailing.
+        if seq_running:
+            try:
+                core.start_continuous_sequence_acquisition(0)
+            except Exception:
+                pass
+        return (None, seq_running)
+
+    if seq_running:
+        try:
+            core.clear_circular_buffer()
+            core.start_continuous_sequence_acquisition(0)
+            # Brief warmup to let the camera deliver its first
+            # post-ROI-change frame before the scan starts popping.
+            time.sleep(0.15)
+        except Exception as e:
+            logger.warning("SMOOTH: could not restart sequence after "
+                            "ROI crop: %s", e)
+            # Best-effort restore and bail.
+            try:
+                core.set_roi(int(x0), int(y0), int(w0), int(h0))
+            except Exception:
+                pass
+            return (None, seq_running)
 
     logger.info("SMOOTH: cropped camera ROI (%d, %d, %dx%d) -> (%d, %d, %dx%d) "
                 "(factor=%.2f, pixel area %.0f%% of original)",
                 x0, y0, w0, h0, new_x, new_y, new_w, new_h,
                 crop_factor, (crop_factor * crop_factor) * 100.0)
-    return (x0, y0, w0, h0)
+    return ((x0, y0, w0, h0), seq_running)
 
 
-def _restore_roi(core, saved_roi: Optional[Tuple[int, int, int, int]]) -> None:
-    """Put the camera ROI back to what _apply_crop_roi() saved. No-op
-    if saved_roi is None. Intended to be called in a finally block."""
+def _restore_roi(
+    core,
+    saved_roi: Optional[Tuple[int, int, int, int]],
+    sequence_was_running: bool,
+) -> None:
+    """Put the camera ROI back to what _apply_crop_roi() saved.
+
+    Symmetric inverse of _apply_crop_roi: stops the sequence (if
+    we had stopped one to install the crop), restores the ROI,
+    and restarts. No-op if saved_roi is None.
+    """
     if saved_roi is None:
         return
     x0, y0, w0, h0 = saved_roi
+
+    # Stop the sequence again to allow the ROI change. Use the
+    # current state, not the saved sequence_was_running flag,
+    # because the sequence may have been stopped/restarted in
+    # the interim.
+    stopped_for_restore = False
+    try:
+        if core.is_sequence_running():
+            core.stop_sequence_acquisition()
+            stopped_for_restore = True
+    except Exception:
+        pass
+
     try:
         core.set_roi(int(x0), int(y0), int(w0), int(h0))
-        logger.info("SMOOTH: restored camera ROI to (%d, %d, %dx%d)", x0, y0, w0, h0)
+        logger.info("SMOOTH: restored camera ROI to (%d, %d, %dx%d)",
+                    x0, y0, w0, h0)
     except Exception as e:
         logger.warning("SMOOTH: failed to restore camera ROI: %s", e)
+
+    # Restart the sequence iff:
+    #   (a) we just stopped it for the restore, OR
+    #   (b) the caller had a sequence on entry to _apply_crop_roi
+    # We never want to restart a sequence that wasn't running
+    # before, but we always want to leave it running if it was.
+    if stopped_for_restore or sequence_was_running:
+        try:
+            core.clear_circular_buffer()
+            core.start_continuous_sequence_acquisition(0)
+        except Exception as e:
+            logger.warning("SMOOTH: could not restart sequence after "
+                            "ROI restore: %s", e)
 
 
 def _try_get(core, device: str, prop: str) -> Optional[str]:
@@ -1481,9 +1567,15 @@ def handle_smoothz(conn, client, hardware, settings, **kwargs):
     # per-frame pixel transfer for both the saturation-check frame
     # AND every frame popped during the scan, which is the single
     # biggest speedup available on cameras where the ZMQ transfer
-    # dominates per-pop cost. Saved ROI is restored in the handler's
-    # finally block below.
-    saved_roi = _apply_crop_roi(core, crop_factor)
+    # dominates per-pop cost.
+    #
+    # On JAI / GenAPI cameras the Width property is not writable
+    # while a sequence acquisition is running, so _apply_crop_roi
+    # may need to stop+restart an in-progress stream. The second
+    # return value tells _restore_roi whether to put the sequence
+    # back at the end. Both saved values are passed to the helper
+    # in the handler's finally block.
+    saved_roi, roi_seq_was_running = _apply_crop_roi(core, crop_factor)
 
     # --- Pre-flight: exposure * velocity blur budget ---
     try:
@@ -1796,5 +1888,7 @@ def handle_smoothz(conn, client, hardware, settings, **kwargs):
         # Always restore the camera ROI -- a no-op if crop wasn't
         # applied. Leaving a cropped ROI would affect every
         # subsequent live-viewer frame and every acquisition snap
-        # until the user manually reconfigured the camera.
-        _restore_roi(core, saved_roi)
+        # until the user manually reconfigured the camera. The
+        # roi_seq_was_running flag tells _restore_roi to bring
+        # the original streaming state back up.
+        _restore_roi(core, saved_roi, roi_seq_was_running)
