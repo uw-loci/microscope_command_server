@@ -82,32 +82,52 @@ def read_message_string(conn, timeout=5.0, max_bytes=10000, chunk_size=1024):
 def parse_flags(message, flags):
     """Parse flag-based parameters from a message string.
 
-    Extracts values for flags like --yaml, --output, etc. from
-    a space-separated message string. Handles flags whose values
-    may contain spaces (e.g., file paths) by finding the next flag
-    as the delimiter.
+    Extracts values for flags like --yaml, --output, etc. from a
+    space-separated message string. Handles flags whose values may
+    contain spaces (e.g. file paths) by finding the next flag --
+    from ANY position in the flags list -- as the delimiter.
+
+    Order-independence is important: clients may serialize flags in
+    any order, and the flags list the handler declares does not
+    necessarily match the on-wire order. The previous implementation
+    only scanned flags[i+1:] and break'd at the first hit, which
+    meant that if the client sent '--yaml X --modality Y --range Z'
+    but the handler declared flags=['--yaml', '--range', '--modality'],
+    the '--yaml' value would be terminated by the NEXT declared flag
+    that happened to be in the message ('--range') rather than the
+    actually-closest flag ('--modality'). That caused '--modality Y'
+    to be swallowed into the '--yaml' value and '--modality' itself
+    to be parsed out of the leftover text, corrupting both values.
 
     Args:
         message: The message string to parse.
-        flags: List of flag strings (e.g., ["--yaml", "--output"]).
+        flags: List of flag strings (e.g. ['--yaml', '--output']).
 
     Returns:
-        Dict mapping flag names (without --) to their string values.
-        Only includes flags that were found in the message.
+        Dict mapping flag names (without leading dashes, with internal
+        dashes replaced by underscores) to their string values. Only
+        includes flags that were found in the message.
     """
     result = {}
-    for i, flag in enumerate(flags):
-        if flag in message:
-            start_idx = message.index(flag) + len(flag)
-            end_idx = len(message)
-            for next_flag in flags[i + 1:]:
-                if next_flag in message[start_idx:]:
-                    next_pos = message.index(next_flag, start_idx)
-                    if next_pos < end_idx:
-                        end_idx = next_pos
-                        break
-            value = message[start_idx:end_idx].strip()
-            # Store with flag name minus leading dashes
-            key = flag.lstrip("-").replace("-", "_")
-            result[key] = value
+    for flag in flags:
+        if flag not in message:
+            continue
+        start_idx = message.index(flag) + len(flag)
+        end_idx = len(message)
+        # Walk ALL declared flags (not just flags later in the list)
+        # and take the nearest one after start_idx as the terminator.
+        # This is the minimum-next-flag-position search, not the
+        # first-match search the old implementation did.
+        for other_flag in flags:
+            if other_flag == flag:
+                continue
+            if other_flag not in message[start_idx:]:
+                continue
+            pos = message.index(other_flag, start_idx)
+            if pos < end_idx:
+                end_idx = pos
+        value = message[start_idx:end_idx].strip()
+        # Store with flag name minus leading dashes.
+        key = flag.lstrip("-").replace("-", "_")
+        result[key] = value
     return result

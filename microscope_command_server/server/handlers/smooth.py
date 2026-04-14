@@ -131,14 +131,9 @@ BUSY_CHECK_EVERY_N = 6
 # Fewer than this and we refuse to commit -- caller falls back.
 MIN_FRAMES_FOR_FIT = 6
 
-# Drain bounds. The reuse-existing-sequence path can't use an
-# unbounded drain because the camera keeps producing frames while
-# we drain; either of these caps, whichever hits first, stops the
-# drain. We don't reshape the popped pixel data during the drain
-# (pop_next_image() alone does the ZMQ transfer; everything else
-# is wasted work since we're throwing the frame away).
-DRAIN_MAX_FRAMES = 40
-DRAIN_MAX_SECONDS = 0.2
+# (Drain-based flushing was retired in favor of
+# core.clear_circular_buffer() at the top of _run_smooth_scan.
+# See the block comment there for why.)
 
 # Hard deadline multiplier. Scan deadline = range_um * HARD_DEADLINE_SEC_PER_UM + 2.0s.
 # At SLOW_SPEED_VALUE=1 on Prior (~11.5 um/s) we need ~0.09 s/um, so
@@ -479,35 +474,40 @@ def _run_smooth_scan(
     responsible for starting / stopping the sequence) and does NOT
     restore the speed property; caller is responsible for that too.
     """
-    # Drain stale frames -- bounded by BOTH time and count so we
-    # can't hang on an actively-refilling buffer (the reuse-Live-
-    # Viewer case). Crucially, we DON'T reshape the popped pixel
-    # data here: reshape forces a 10+ MB ZMQ transfer plus three
-    # geometry queries per frame, and we're throwing the data
-    # away anyway. Raw pop_next_image alone is ~3x faster, which
-    # matters a lot when we're racing a 30 fps refill.
-    drained = 0
-    drain_start = time.perf_counter()
+    # Flush the buffer with a single atomic call right before firing
+    # the non-blocking move.
+    #
+    # Pop-to-drain was the wrong primitive. The camera refills the
+    # circular buffer faster than we can pop (camera at ~30 fps =
+    # ~33 ms per frame, each pop over the ZMQ bridge is ~100 ms),
+    # so any loop-based drain is losing ground. In the reuse-Live-
+    # Viewer case the seed move to z_start takes ~200 ms, and a
+    # drain of up to 200 ms more gives the camera ~400 ms of
+    # stream time at z_start. That's ~12 frames of pre-motion
+    # content queued in the buffer. Popping and draining only
+    # removes maybe 3-4 of them, leaving 8 still queued when we
+    # start the scan loop. Those stale frames get popped early,
+    # labeled with mid-motion Z values (because z_at_pop reads the
+    # LIVE stage position), and the metric/position pairs become
+    # physical nonsense (two samples at very different labeled Z
+    # showing identical metric to 0.001).
+    #
+    # clear_circular_buffer() is a single pycromanager RPC that
+    # empties the FIFO atomically. It's safe to call on a running
+    # sequence -- the camera keeps producing new frames into the
+    # now-empty buffer as usual. Any frame that appears AFTER the
+    # clear is from the camera's ongoing post-clear stream, which
+    # means the first one arrives ~33 ms later, by which point
+    # our non-blocking move has also been issued and the stage is
+    # already accelerating toward z_end. Capture-vs-label Z skew
+    # drops from ~3-5 um (drain approach) to ~0.2-0.4 um (below
+    # stage quantization).
     try:
-        while drained < DRAIN_MAX_FRAMES:
-            if time.perf_counter() - drain_start > DRAIN_MAX_SECONDS:
-                break
-            try:
-                remaining = int(core.get_remaining_image_count())
-            except Exception:
-                break
-            if remaining <= 0:
-                break
-            try:
-                core.pop_next_image()
-            except Exception:
-                break
-            drained += 1
-    except Exception:
-        pass
-    drain_ms = (time.perf_counter() - drain_start) * 1000.0
-    logger.info("SMOOTH: drained %d stale frames in %.0f ms before scan",
-                 drained, drain_ms)
+        core.clear_circular_buffer()
+        logger.info("SMOOTH: flushed circular buffer before firing move")
+    except Exception as e:
+        logger.warning("SMOOTH: clear_circular_buffer failed "
+                        "(continuing with whatever's queued): %s", e)
 
     samples: List[Tuple[float, float, float]] = []
     t0 = time.perf_counter()
