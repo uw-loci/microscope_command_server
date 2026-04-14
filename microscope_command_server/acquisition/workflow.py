@@ -2867,19 +2867,21 @@ def _acquisition_workflow(
                     else:
                         test_img = np.clip(test_img, 0, 255).astype(np.uint8)
 
-                # Brightness safety check: if the test image is very dim,
-                # the BG-reported exposure may be too low for tissue AF.
-                # This happens when per_angle BG returns the calibrated green
-                # exposure (tuned for WB at blank) which can be too short for
-                # tissue. Double the exposure until we get a usable image.
-                test_median = float(np.median(test_img))
-                AF_MIN_BRIGHTNESS = 15.0
+                # Brightness safety check: dispatched through the active AF
+                # strategy so sparse bright samples do NOT get their exposure
+                # bumped. DenseTextureStrategy uses a median floor (matches
+                # the old behavior); SparseSignalStrategy uses a dynamic-range
+                # check so dark-background sparse spots pass through without
+                # triggering exposure doubling that would saturate the spots.
                 af_brightness_attempts = 0
-                while test_median < AF_MIN_BRIGHTNESS and af_brightness_attempts < 4:
+                while af_brightness_attempts < 4:
+                    bright_ok, bright_stats = af_strategy.brightness_acceptable(test_img)
+                    if bright_ok:
+                        break
                     exposure_90 *= 2.0
                     hardware.set_exposure(exposure_90)
                     logger.warning(
-                        f"AF test image too dim (median={test_median:.1f}), "
+                        f"AF test image brightness_check failed ({bright_stats}), "
                         f"doubling exposure to {exposure_90:.2f}ms"
                     )
                     test_img, _ = hardware.snap_image()
@@ -2888,39 +2890,57 @@ def _acquisition_workflow(
                             test_img = (test_img * 255).astype(np.uint8)
                         else:
                             test_img = np.clip(test_img, 0, 255).astype(np.uint8)
-                    test_median = float(np.median(test_img))
                     af_brightness_attempts += 1
                 if af_brightness_attempts > 0:
                     logger.info(
                         f"AF exposure adjusted to {exposure_90:.2f}ms "
-                        f"(median now {test_median:.1f})"
+                        f"(strategy={af_strategy_name})"
                     )
 
-                # Check for tissue
-                has_tissue, tissue_stats = AutofocusUtils.has_sufficient_tissue(
-                    test_img,
-                    texture_threshold=af_texture_threshold,
-                    tissue_area_threshold=af_tissue_area_threshold,
-                    modality=modality,
-                    logger=logger,
-                    return_stats=True,
-                    rgb_brightness_threshold=af_rgb_brightness_threshold,
-                )
+                # Strategy-aware validity check. Replaces the old
+                # has_sufficient_tissue call: each strategy defines its own
+                # "is there enough signal?" gate (dense=texture+area,
+                # sparse=bright-spot-count, dark=total-gradient-energy).
+                signal_valid, strategy_stats = af_strategy.is_valid(test_img, logger_=logger)
 
-                if has_tissue:
-                    logger.info(f"Tissue found at attempt {attempt + 1}")
+                if signal_valid:
+                    logger.info(
+                        f"Signal valid at attempt {attempt + 1} (strategy={af_strategy_name})"
+                    )
                     tissue_found = True
                     break
-                else:
-                    reason = "blank tile (RGB)" if tissue_stats.get('brightness_rejected') else "insufficient texture/area"
-                    logger.warning(f"No tissue at attempt {attempt + 1} ({reason}) - "
-                                   f"texture={tissue_stats['texture']:.4f}, area={tissue_stats['area']:.3f}")
 
-                    if attempt < max_tissue_search_attempts - 1:
-                        # Move one FOV diagonal toward center for next attempt
-                        new_xy = np.array([search_pos.x, search_pos.y]) + direction * fov_diagonal
-                        search_pos = Position(new_xy[0], new_xy[1], search_pos.z)
-                        logger.info(f"Moving 1 FOV diagonal toward center for next attempt")
+                # Validity failed -- dispatch on the strategy's failure mode.
+                # DEFER: retry at next position (dense behavior).
+                # PROCEED: break out of the search loop and run AF anyway
+                #   (sparse samples often focus fine even when spot count is
+                #   borderline; searching more blank tiles is wasted time).
+                # MANUAL: break out and let the post-loop autofocus dispatch
+                #   fall through to the manual dialog (manual_only strategy).
+                failure_mode = af_strategy.on_failure
+                logger.warning(
+                    f"Signal check failed at attempt {attempt + 1} "
+                    f"(strategy={af_strategy_name}, on_failure={failure_mode.value}, "
+                    f"stats={strategy_stats})"
+                )
+                if failure_mode is StrategyFailureMode.PROCEED:
+                    logger.info(
+                        "Strategy failure_mode=PROCEED: breaking search loop and running AF anyway"
+                    )
+                    tissue_found = True  # treat as found so post-loop AF uses the normal path
+                    break
+                if failure_mode is StrategyFailureMode.MANUAL:
+                    logger.info(
+                        "Strategy failure_mode=MANUAL: breaking search loop to pop manual dialog"
+                    )
+                    break
+
+                # DEFER: fall through to next search position.
+                if attempt < max_tissue_search_attempts - 1:
+                    # Move one FOV diagonal toward center for next attempt
+                    new_xy = np.array([search_pos.x, search_pos.y]) + direction * fov_diagonal
+                    search_pos = Position(new_xy[0], new_xy[1], search_pos.z)
+                    logger.info(f"Moving 1 FOV diagonal toward center for next attempt")
 
             # Run autofocus (with manual fallback if no tissue found)
             try:
@@ -3224,15 +3244,16 @@ def _acquisition_workflow(
                     else:
                         test_img = np.clip(test_img, 0, 255).astype(np.uint8)
 
-                # Brightness safety check (same as initial AF block)
-                test_median = float(np.median(test_img))
-                AF_MIN_BRIGHTNESS = 15.0
+                # Brightness safety check (strategy-aware, same as initial AF block).
                 af_brightness_attempts = 0
-                while test_median < AF_MIN_BRIGHTNESS and af_brightness_attempts < 4:
+                while af_brightness_attempts < 4:
+                    bright_ok, bright_stats = af_strategy.brightness_acceptable(test_img)
+                    if bright_ok:
+                        break
                     exposure_90 *= 2.0
                     hardware.set_exposure(exposure_90)
                     logger.warning(
-                        f"AF test image too dim (median={test_median:.1f}), "
+                        f"AF drift-check image brightness_check failed ({bright_stats}), "
                         f"doubling exposure to {exposure_90:.2f}ms"
                     )
                     test_img, _ = hardware.snap_image()
@@ -3241,34 +3262,25 @@ def _acquisition_workflow(
                             test_img = (test_img * 255).astype(np.uint8)
                         else:
                             test_img = np.clip(test_img, 0, 255).astype(np.uint8)
-                    test_median = float(np.median(test_img))
                     af_brightness_attempts += 1
                 if af_brightness_attempts > 0:
                     logger.info(
-                        f"AF exposure adjusted to {exposure_90:.2f}ms "
-                        f"(median now {test_median:.1f})"
+                        f"AF drift-check exposure adjusted to {exposure_90:.2f}ms "
+                        f"(strategy={af_strategy_name})"
                     )
 
-                # Check if there's sufficient tissue for reliable autofocus
-                # Use thresholds from autofocus config (per-objective settings)
-                has_tissue, tissue_stats = AutofocusUtils.has_sufficient_tissue(
-                    test_img,
-                    texture_threshold=af_texture_threshold,
-                    tissue_area_threshold=af_tissue_area_threshold,
-                    modality=modality,
-                    logger=logger,
-                    return_stats=True,
-                    rgb_brightness_threshold=af_rgb_brightness_threshold,
-                )
+                # Strategy-aware validity check (replaces has_sufficient_tissue).
+                signal_valid, strategy_stats = af_strategy.is_valid(test_img, logger_=logger)
 
-                if has_tissue:
-                    logger.info(f"Sufficient tissue detected - performing autofocus")
-                    rgb_info = ""
-                    if tissue_stats.get('rgb_mean') is not None:
-                        rgb_info = f", RGB brightness={tissue_stats['avg_brightness']:.1f} (threshold<{tissue_stats['brightness_threshold']:.1f})"
+                # PROCEED strategies (sparse/dark-field) run AF even when the
+                # validity gate is borderline; only DEFER/MANUAL modes defer.
+                failure_mode = af_strategy.on_failure
+                should_run_af = signal_valid or failure_mode is StrategyFailureMode.PROCEED
+
+                if should_run_af:
                     logger.info(
-                        f"  Tissue stats: texture={tissue_stats['texture']:.4f} (threshold={tissue_stats['texture_threshold']:.4f}), "
-                        f"area={tissue_stats['area']:.3f} (threshold={tissue_stats['area_threshold']:.3f}){rgb_info}"
+                        f"Running drift-check AF (strategy={af_strategy_name}, "
+                        f"valid={signal_valid}, stats={strategy_stats})"
                     )
 
                     # Use STANDARD autofocus on first tissue position for accuracy
@@ -3319,17 +3331,12 @@ def _acquisition_workflow(
                     af_z = hardware.get_current_position().z
                     completed_af_positions.append((pos.x, pos.y, af_z))
                 else:
-                    reason = "blank tile (RGB)" if tissue_stats.get('brightness_rejected') else "insufficient texture/area"
+                    # Strategy validity check failed with DEFER or MANUAL mode.
+                    # (PROCEED strategies took the should_run_af=True branch.)
                     af_failed_for_this_tile = True
                     logger.warning(
-                        f"Insufficient tissue at position {pos_idx} ({reason}) - deferring autofocus"
-                    )
-                    rgb_info = ""
-                    if tissue_stats.get('rgb_mean') is not None:
-                        rgb_info = f", RGB brightness={tissue_stats['avg_brightness']:.1f} (threshold<{tissue_stats['brightness_threshold']:.1f})"
-                    logger.warning(
-                        f"  Tissue stats: texture={tissue_stats['texture']:.4f} (threshold={tissue_stats['texture_threshold']:.4f}), "
-                        f"area={tissue_stats['area']:.3f} (threshold={tissue_stats['area_threshold']:.3f}){rgb_info}"
+                        f"Strategy {af_strategy_name} rejected tile {pos_idx} "
+                        f"(on_failure={failure_mode.value}, stats={strategy_stats}) - deferring autofocus"
                     )
 
                     # Remove this position from autofocus list
@@ -4009,6 +4016,7 @@ def _acquisition_workflow(
                 "z_um": round(current_stage_pos.z, 2),
                 "af_performed": needs_af,
                 "af_type": af_type_for_this_tile,
+                "af_strategy": af_strategy_name,
                 "af_drift_um": round(drift_for_this_tile, 2),
                 "af_failed": af_failed_for_this_tile,
                 "tile_time_ms": round(tile_elapsed_ms, 0),
