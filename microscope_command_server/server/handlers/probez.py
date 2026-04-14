@@ -792,61 +792,185 @@ def _stream_one_range(core, focus_device: str, z0: float, range_um: float) -> No
 def _step5_metric_validation(
     core, focus_device: str, z0: float, speed_prop: str, log_dir: pathlib.Path
 ) -> None:
-    """The real feasibility gate: do frames captured during a smooth
-    Z scan actually produce a usable focus metric curve?
+    """Real feasibility gate: do frames captured during a smooth scan
+    produce a usable focus metric curve?
 
-    For each validation range we run TWO scans back-to-back:
+    Second-probe-run findings that changed this design:
 
-    1. **Continuous scan at MaxSpeed=1**: start streaming, fire a
-       non-blocking move, pop each frame, compute the focus metric,
-       record (t_ms, z_um, metric). Pixel data is handled in memory
-       only (no disk writes for the images themselves).
+    - JAI streaming mode has an ~800 ms 'settling' transient after
+      startContinuousSequenceAcquisition where the normalized_variance
+      metric decays by ~25% at a constant Z position. This makes every
+      in-motion pop sample useless as a focus indicator; the motion-
+      phase metrics are inflated relative to steady-state by an
+      unknown, time-varying amount. We abandoned the pop-from-stream
+      approach in favor of fresh snap_image() calls during motion.
 
-    2. **Stepped sweep at MaxSpeed=100 (ground truth)**: step through
-       the same z range blocking-stopping at each point, snap a fresh
-       frame, compute the same metric. This is what 'correct' looks
-       like, unaffected by motion blur / timing artifacts.
+    - At MaxSpeed=1 the Prior's non-blocking set_position leaves the
+      stage with accumulated positioning error (observed 2-5 um
+      overshoot on Step 4 trials). We now keep MaxSpeed at the
+      default (100) for positioning moves and only drop to the slow
+      value for the actual scan motion, which bounds the weirdness
+      to the scan window.
 
-    Both curves are written to a CSV file under the server log
-    directory so we can pull it offline and plot, and both peak
-    Z estimates are logged inline for quick comparison. If the
-    continuous-scan peak matches the stepped-sweep peak within
-    ~0.5 um, motion-based focus metrics are viable on this rig.
-    If they diverge, we have a hard stop for the smooth scan
-    approach and a clear reason why.
+    - Before any motion at all, we now run a static metric stability
+      check: 20 consecutive snaps at the same Z, just to catch any
+      camera-side drift (auto-gain, auto-WB, thermal) that would
+      invalidate ALL metric comparisons independent of motion.
 
-    Nothing is committed: Z is returned to z0 at the end. The probe
-    is exploration, not action.
+    Each validation range runs:
+      0) Static stability (before any motion, once per range)
+      1) Snap-during-motion at slow MaxSpeed: fire non-blocking move,
+         loop calling snap_image + get_position during motion, record
+         (t_ms, z_avg, metric) per snap. z_avg = (z_before + z_after)/2
+         brackets the per-exposure motion so we have a known z window
+         per sample.
+      2) Stepped sweep at full MaxSpeed ground truth: blocking
+         step + snap + metric, 15 points.
+      3) Argmax comparison, VERDICT, CSV dump.
+
+    Nothing is committed: Z is returned to z0 at the end.
     """
-    slow_speed = MAXSPEED_VALUES[-1]
-    if not _try_set_property(core, focus_device, speed_prop, str(slow_speed)):
-        _err("step-5", f"Cannot set {speed_prop}={slow_speed}; skipping metric validation")
+    if not _try_set_property(core, focus_device, speed_prop, str(MAXSPEED_VALUES[-1])):
+        _err("step-5", f"Cannot set {speed_prop}={MAXSPEED_VALUES[-1]}; "
+                       f"skipping metric validation")
         return
-    _log("step-5", f"Metric validation using {speed_prop}={slow_speed} for continuous scans")
+    _log("step-5", f"Metric validation -- slow scan speed {speed_prop}={MAXSPEED_VALUES[-1]}")
 
-    # Make sure we're exposed sensibly before the scans.
     try:
         exposure_ms = core.get_exposure()
         _log("step-5", f"Camera exposure = {exposure_ms:.2f} ms")
     except Exception as e:
         _warn("step-5", f"get_exposure failed: {e}")
 
+    # Static stability check FIRST, regardless of any range.
+    # If this fails we abort step 5 entirely because every metric
+    # comparison downstream would be meaningless.
+    if not _step5_static_stability(core, focus_device, z0):
+        _err("step-5", "Static metric stability check failed; skipping range validation")
+        return
+
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     for range_um in METRIC_VALIDATION_RANGES_UM:
         csv_path = log_dir / f"probez_metric_range{int(range_um)}_{timestamp}.csv"
         _metric_validate_one_range(core, focus_device, z0, range_um,
-                                    speed_prop, slow_speed, csv_path)
+                                    speed_prop, MAXSPEED_VALUES[-1], csv_path)
+
+
+def _step5_static_stability(core, focus_device: str, z0: float, n_frames: int = 20) -> bool:
+    """Snap n_frames images at a constant Z and log the metric of
+    each. Returns True if the metric is stable (CV < 5%), False if
+    it drifts -- drift would invalidate every subsequent motion-based
+    metric comparison, so we abort downstream tests if we can't trust
+    the pipeline.
+    """
+    tag = "step-5 static"
+    _log(tag, f"Static stability: {n_frames} snaps at z={z0:.3f} (no motion)")
+
+    # Make sure we're at z0 and not on a bogus adapter speed.
+    if not _try_set_property(core, focus_device, "MaxSpeed", "100"):
+        _warn(tag, "Could not set MaxSpeed=100 for static prep; continuing")
+    try:
+        core.set_position(focus_device, z0)
+        core.wait_for_device(focus_device)
+    except Exception as e:
+        _err(tag, f"Failed to seat at z0: {e}")
+        return False
+
+    metrics = []
+    t0 = time.perf_counter()
+    for i in range(n_frames):
+        try:
+            core.snap_image()
+            img = _snap_get_image_as_numpy(core)
+            m = _focus_metric(img)
+        except Exception as e:
+            _warn(tag, f"snap {i} failed: {e}")
+            continue
+        t_ms = (time.perf_counter() - t0) * 1000.0
+        metrics.append(m)
+        _log(tag, f"   static snap {i:>2}  t={t_ms:>7.1f}ms  metric={m:.4f}")
+
+    if len(metrics) < 3:
+        _err(tag, f"only {len(metrics)} static snaps usable; aborting")
+        return False
+
+    mean = sum(metrics) / len(metrics)
+    var = sum((m - mean) ** 2 for m in metrics) / len(metrics)
+    std = var ** 0.5
+    cv = (std / mean * 100.0) if mean > 1e-9 else float("inf")
+
+    _log(tag, f"static metric: mean={mean:.4f}  std={std:.4f}  CV={cv:.2f}%  "
+               f"min={min(metrics):.4f}  max={max(metrics):.4f}")
+
+    if cv > 5.0:
+        _err(tag, f"static metric CV = {cv:.1f}% exceeds 5% threshold -- "
+                   "camera pipeline is not stable enough for motion-based focus")
+        return False
+
+    # Additional check: is there a monotonic trend indicating drift?
+    # Compare first quarter mean to last quarter mean.
+    q = max(1, len(metrics) // 4)
+    first_q = sum(metrics[:q]) / q
+    last_q = sum(metrics[-q:]) / q
+    drift_pct = abs(last_q - first_q) / mean * 100.0 if mean > 1e-9 else 0.0
+    _log(tag, f"first-quarter mean={first_q:.4f}  last-quarter mean={last_q:.4f}  "
+               f"drift={drift_pct:.2f}%")
+
+    if drift_pct > 5.0:
+        _err(tag, f"static metric drift = {drift_pct:.1f}% across capture window -- "
+                   "camera has adaptive behavior that invalidates motion metrics")
+        return False
+
+    _log(tag, "static stability PASSED -- metric pipeline is usable")
+    return True
+
+
+def _snap_get_image_as_numpy(core):
+    """Pull the last snapped image out of MMCore as numpy. Handles
+    mono and multi-component cameras."""
+    pixels = core.get_image()
+    if pixels is None:
+        return None
+    w = core.get_image_width()
+    h = core.get_image_height()
+    nch = core.get_number_of_components()
+    arr = np.asarray(pixels)
+    try:
+        if nch == 1:
+            return arr.reshape(h, w)
+        return arr.reshape(h, w, nch)
+    except Exception:
+        return arr
 
 
 def _metric_validate_one_range(
     core, focus_device: str, z0: float, range_um: float,
     speed_prop: str, slow_speed: int, csv_path: pathlib.Path,
 ) -> None:
-    """Run continuous + stepped scans at one range and write a CSV.
+    """Run snap-during-motion + stepped scans at one range and write a
+    CSV comparing the two curves.
 
     CSV columns:
         scan_type, t_ms, z_um, metric
-    where scan_type is 'continuous' or 'stepped'.
+    where scan_type is one of 'snap_motion' (new) or 'stepped'.
+
+    Design notes motivated by the second probe run:
+
+    - 'snap_motion' replaces the old 'continuous' streaming approach.
+      We snap_image() in a tight loop while the stage is moving
+      non-blocking. Each sample uses the same camera pipeline as
+      snap-mode ground truth, avoiding the ~800 ms streaming
+      startup transient that corrupted the previous run.
+
+    - Z is bracketed per sample: we read get_position() before and
+      after the snap so z_avg and z_span tell us exactly how far the
+      stage moved during exposure (the motion-blur window).
+
+    - Positioning moves (seed to z_start, return to z0) use MaxSpeed
+      = 100, not slow_speed. At slow_speed the Prior left ~3 um of
+      accumulated error between Step 4 trials; keeping positioning
+      at full speed and only dropping to slow for the scan itself
+      bounds the quirky behavior to the scan window.
     """
     tag = f"step-5 range={range_um:.1f}"
     half = range_um / 2.0
@@ -856,104 +980,86 @@ def _metric_validate_one_range(
     _log(tag, f"Scan window [{z_start:.3f} -> {z_end:.3f}]  csv={csv_path.name}")
 
     rows = []  # (scan_type, t_ms, z_um, metric)
-    cont_samples = []
-    stepped_samples = []
+    snap_motion_samples = []  # (t_ms, z_avg, metric, z_span)
+    stepped_samples = []      # (t_ms, z_actual, metric)
 
-    # ---- Part 1: continuous scan at slow speed ----
-    if not _try_set_property(core, focus_device, speed_prop, str(slow_speed)):
-        _err(tag, f"Cannot set {speed_prop}={slow_speed}; skipping continuous scan")
-        return
-
+    # ---- Part 1: snap-during-motion at slow scan speed ----
+    # Positioning move uses MaxSpeed=100 to avoid the Prior's
+    # accumulated-error behavior at MaxSpeed=1.
+    if not _try_set_property(core, focus_device, speed_prop, "100"):
+        _warn(tag, "Could not restore MaxSpeed=100 for positioning")
     try:
         core.set_position(focus_device, z_start)
-        # Use core.wait_for_device here (not our new busy path) so we
-        # definitely land before starting the camera -- this is
-        # pre-scan setup, not a perf-critical step.
         core.wait_for_device(focus_device)
     except Exception as e:
         _err(tag, f"Seed move to {z_start:.3f} failed: {e}")
         return
 
-    try:
-        if core.is_sequence_running():
-            _err(tag, "Sequence already running; aborting continuous scan")
-            return
-    except Exception:
-        pass
-
-    try:
-        core.clear_circular_buffer()
-        core.start_continuous_sequence_acquisition(0)
-    except Exception as e:
-        _err(tag, f"start_continuous_sequence_acquisition failed: {e}")
+    # Now switch to slow speed for the actual scan.
+    if not _try_set_property(core, focus_device, speed_prop, str(slow_speed)):
+        _err(tag, f"Cannot set {speed_prop}={slow_speed}; skipping snap scan")
         return
 
+    t0 = time.perf_counter()
     try:
-        time.sleep(0.08)
-        # Drain warmup frames.
-        try:
-            while core.get_remaining_image_count() > 0:
-                _pop_image_as_numpy(core)
-        except Exception:
-            pass
+        core.set_position(focus_device, z_end)
+    except Exception as e:
+        _err(tag, f"Non-blocking move to z_end failed: {e}")
+        _try_set_property(core, focus_device, speed_prop, "100")
+        return
 
-        t0 = time.perf_counter()
-        try:
-            core.set_position(focus_device, z_end)
-        except Exception as e:
-            _err(tag, f"Non-blocking move failed: {e}")
-            return
-
-        stage_done_at = None
-        loop_count = 0
-        busy_check_every = 8
-        deadline = time.perf_counter() + (range_um * 0.12 + 1.5)
-
+    # Snap loop: run until stage not-busy or hard deadline.
+    # Deadline is generous at the slow speed (~25 ms/um plus setup).
+    deadline = time.perf_counter() + (range_um * 0.12 + 2.0)
+    consecutive_not_busy = 0
+    try:
         while time.perf_counter() < deadline:
-            popped = 0
             try:
-                while core.get_remaining_image_count() > 0:
-                    img = _pop_image_as_numpy(core)
-                    t_pop = (time.perf_counter() - t0) * 1000.0
-                    try:
-                        z_at_pop = core.get_position(focus_device)
-                    except Exception:
-                        z_at_pop = float("nan")
-                    metric = _focus_metric(img)
-                    cont_samples.append((t_pop, z_at_pop, metric))
-                    popped += 1
-                    if popped >= 4:
-                        break
+                z_before = core.get_position(focus_device)
+            except Exception:
+                z_before = float("nan")
+            try:
+                core.snap_image()
+                img = _snap_get_image_as_numpy(core)
             except Exception as e:
-                _warn(tag, f"continuous pop+metric failed: {e}")
-
-            loop_count += 1
-            if loop_count % busy_check_every == 0:
-                try:
-                    busy = core.device_busy(focus_device)
-                except Exception:
-                    busy = None
-                if busy is False and stage_done_at is None:
-                    stage_done_at = (time.perf_counter() - t0) * 1000.0
-
-            if stage_done_at is not None and \
-               ((time.perf_counter() - t0) * 1000.0 - stage_done_at) > 300.0:
+                _warn(tag, f"snap during motion failed: {e}")
                 break
-            time.sleep(0.002)
+            try:
+                z_after = core.get_position(focus_device)
+            except Exception:
+                z_after = float("nan")
+
+            t_ms = (time.perf_counter() - t0) * 1000.0
+            metric = _focus_metric(img)
+            if z_before == z_before and z_after == z_after:
+                z_avg = (z_before + z_after) / 2.0
+                z_span = abs(z_after - z_before)
+            else:
+                z_avg = z_after if z_after == z_after else z_before
+                z_span = float("nan")
+            snap_motion_samples.append((t_ms, z_avg, metric, z_span))
+
+            # Check if we've stopped. Need two consecutive not-busy
+            # reads so a fleeting ready-signal doesn't exit early.
+            try:
+                busy = core.device_busy(focus_device)
+            except Exception:
+                busy = None
+            if busy is False:
+                consecutive_not_busy += 1
+                if consecutive_not_busy >= 2:
+                    break
+            else:
+                consecutive_not_busy = 0
     finally:
+        # Restore MaxSpeed=100 for the stepped-sweep phase.
+        _try_set_property(core, focus_device, speed_prop, "100")
         try:
-            core.stop_sequence_acquisition()
-        except Exception:
-            pass
-        try:
-            core.clear_circular_buffer()
+            core.wait_for_device(focus_device)
         except Exception:
             pass
 
     # ---- Part 2: stepped sweep at full speed (ground truth) ----
-    if not _try_set_property(core, focus_device, speed_prop, "100"):
-        _warn(tag, "Cannot restore MaxSpeed=100 for stepped sweep; using current")
-
     step_size = range_um / (METRIC_STEPPED_N_STEPS - 1)
     try:
         t0_step = time.perf_counter()
@@ -962,18 +1068,8 @@ def _metric_validate_one_range(
             try:
                 core.set_position(focus_device, z)
                 core.wait_for_device(focus_device)
-                # Snap a fresh frame via the proper snap path so we
-                # get the same image shape as the continuous pops.
                 core.snap_image()
-                pixels = core.get_image()
-                w = core.get_image_width()
-                h = core.get_image_height()
-                nch = core.get_number_of_components()
-                arr = np.asarray(pixels)
-                try:
-                    img = arr.reshape(h, w, nch) if nch > 1 else arr.reshape(h, w)
-                except Exception:
-                    img = arr
+                img = _snap_get_image_as_numpy(core)
                 metric = _focus_metric(img)
                 t_ms = (time.perf_counter() - t0_step) * 1000.0
                 z_actual = core.get_position(focus_device)
@@ -991,58 +1087,75 @@ def _metric_validate_one_range(
         _warn(tag, f"Return to z0 failed: {e}")
 
     # ---- Analysis + CSV ----
-    cont_peak = _argmax_z(cont_samples)
-    step_peak = _argmax_z(stepped_samples)
-    delta = (cont_peak - step_peak) if (cont_peak is not None and step_peak is not None) else None
+    # For snap-motion samples, the argmax uses z_avg (column 1) and
+    # metric (column 2).
+    snap_peak = _argmax_z_generic(
+        [(s[1], s[2]) for s in snap_motion_samples]
+    )
+    step_peak = _argmax_z_generic(
+        [(s[1], s[2]) for s in stepped_samples]
+    )
+    delta = (snap_peak - step_peak) if (snap_peak is not None and step_peak is not None) else None
+
+    # Max z_span during motion snaps -- tells us how much the stage
+    # moved during a single exposure (motion-blur window).
+    valid_spans = [s[3] for s in snap_motion_samples if s[3] == s[3]]  # NaN-safe
+    max_span = max(valid_spans) if valid_spans else float("nan")
+    avg_span = sum(valid_spans) / len(valid_spans) if valid_spans else float("nan")
 
     _log(
         tag,
-        f"continuous: {len(cont_samples)} samples, peak Z={_fmt(cont_peak)}  "
+        f"snap_motion: {len(snap_motion_samples)} samples, peak Z={_fmt(snap_peak)}  "
         f"stepped: {len(stepped_samples)} samples, peak Z={_fmt(step_peak)}  "
         f"delta={_fmt(delta)} um",
+    )
+    _log(
+        tag,
+        f"per-exposure z span: avg={avg_span:.3f} um  max={max_span:.3f} um "
+        f"(motion-blur window per snap)",
     )
 
     if delta is not None:
         if abs(delta) <= 0.5:
-            _log(tag, "VERDICT: continuous peak matches stepped within 0.5 um -- metric is viable")
+            _log(tag, "VERDICT: snap-motion peak matches stepped within 0.5 um -- metric is viable")
         elif abs(delta) <= 1.0:
-            _log(tag, "VERDICT: continuous peak within 1 um of stepped -- borderline, inspect CSV")
+            _log(tag, "VERDICT: snap-motion peak within 1 um of stepped -- borderline, inspect CSV")
         else:
-            _warn(tag, f"VERDICT: continuous peak off stepped by {delta:.2f} um -- metric may be corrupted by motion")
+            _warn(tag, f"VERDICT: snap-motion peak off stepped by {delta:.2f} um -- "
+                       "check CSV for shape; may need slower speed or wider range")
 
-    # Log a compact trace of both curves inline so the log alone is
-    # enough to eyeball (z, metric) ordering without opening the CSV.
-    for (t_ms, z, m) in cont_samples:
-        rows.append(("continuous", t_ms, z, m))
-        _log(tag, f"   CONT t={t_ms:>7.1f}ms  z={z:.3f}  metric={m:.2f}")
+    for (t_ms, z_avg, m, z_span) in snap_motion_samples:
+        rows.append(("snap_motion", t_ms, z_avg, m, z_span))
+        _log(tag, f"   SNAP t={t_ms:>7.1f}ms  z={z_avg:.3f}  metric={m:.2f}  span={z_span:.3f}")
     for (t_ms, z, m) in stepped_samples:
-        rows.append(("stepped", t_ms, z, m))
+        rows.append(("stepped", t_ms, z, m, 0.0))
         _log(tag, f"   STEP t={t_ms:>7.1f}ms  z={z:.3f}  metric={m:.2f}")
 
-    # Write CSV for offline analysis / plotting.
     try:
         csv_path.parent.mkdir(parents=True, exist_ok=True)
         with open(csv_path, "w", newline="") as f:
             w = csv.writer(f)
-            w.writerow(["scan_type", "t_ms", "z_um", "metric"])
+            w.writerow(["scan_type", "t_ms", "z_um", "metric", "z_span_um"])
             for row in rows:
-                w.writerow([row[0], f"{row[1]:.3f}", f"{row[2]:.3f}", f"{row[3]:.6f}"])
+                w.writerow([row[0], f"{row[1]:.3f}", f"{row[2]:.3f}",
+                            f"{row[3]:.6f}", f"{row[4]:.3f}"])
         _log(tag, f"Wrote CSV: {csv_path}")
     except Exception as e:
         _err(tag, f"CSV write failed: {e}")
 
 
-def _argmax_z(samples):
-    """Return the Z with the maximum metric, or None if empty/NaN.
+def _argmax_z_generic(zm_pairs):
+    """Return the Z with the maximum metric from a list of (z, metric)
+    pairs, or None if empty/NaN.
 
-    Uses a simple argmax rather than a parabolic fit for this first
-    validation pass -- we just want to know 'do continuous and
-    stepped agree on where the peak is'. A parabolic fit would smooth
-    out real disagreements.
+    Uses a simple argmax rather than a parabolic fit for this
+    validation pass -- we just want to know 'do snap-motion and
+    stepped agree on where the peak is'. A parabolic fit would
+    smooth out real disagreements.
     """
     best_z = None
     best_m = float("-inf")
-    for _, z, m in samples:
+    for z, m in zm_pairs:
         if z != z or m != m:  # NaN-safe
             continue
         if m > best_m:
