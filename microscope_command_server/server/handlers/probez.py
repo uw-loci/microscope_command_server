@@ -80,6 +80,26 @@ def _try_set_property(core, device: str, prop: str, value) -> bool:
         return False
 
 
+def _str_vector_to_list(vec) -> list:
+    """Convert an MMCore StrVector (mmcorej_StrVector / std::vector<string>)
+    into a Python list. The Java bindings expose .size()/.get(i) but are
+    not directly iterable via `for` / `list()` in pycromanager's JNI
+    wrappers -- so we fall through from Python iteration to indexed
+    access, then finally to an empty list.
+    """
+    if vec is None:
+        return []
+    try:
+        return list(vec)
+    except TypeError:
+        pass
+    try:
+        n = int(vec.size())
+        return [vec.get(i) for i in range(n)]
+    except Exception:
+        return []
+
+
 def _snapshot_focus_device(core, step: str) -> dict:
     """Log every property on the current focus device and return a
     dict of {property_name: current_value} suitable for restoring.
@@ -115,9 +135,12 @@ def _snapshot_focus_device(core, step: str) -> dict:
     restore = {"__focus_device__": focus_device, "__z_original__": z_current}
 
     try:
-        prop_names = list(core.get_device_property_names(focus_device))
+        prop_names = _str_vector_to_list(core.get_device_property_names(focus_device))
     except Exception as e:
         _err(step, f"get_device_property_names({focus_device}) failed: {e}")
+        return restore
+    if not prop_names:
+        _err(step, f"Property list for {focus_device} came back empty")
         return restore
 
     _log(step, f"Property count = {len(prop_names)}")
@@ -149,7 +172,9 @@ def _snapshot_focus_device(core, step: str) -> dict:
             limits_str = ""
 
         try:
-            allowed = list(core.get_allowed_property_values(focus_device, name))
+            allowed = _str_vector_to_list(
+                core.get_allowed_property_values(focus_device, name)
+            )
         except Exception:
             allowed = []
         allowed_str = f" allowed={allowed}" if allowed else ""
@@ -176,7 +201,9 @@ def _restore_focus_device(core, restore: dict) -> None:
         if name.startswith("__"):
             continue
         try:
-            core.set_property(focus_device, name, value)
+            # Prior/Prior-like adapters expect string values; MM core
+            # does the coercion for us if we pass a string consistently.
+            core.set_property(focus_device, name, str(value))
         except Exception as e:
             _warn("cleanup", f"restore {name}={value!r} failed: {e}")
 
@@ -314,7 +341,9 @@ def _step3_maxspeed_sensitivity(
     _log("step-3", f"MaxSpeed sensitivity sweep via property '{speed_prop}'")
     dz = 20.0
     for speed in MAXSPEED_VALUES:
-        if not _try_set_property(core, focus_device, speed_prop, speed):
+        # Prior property values are strings -- pass as str to avoid
+        # MM Java binding type-coercion quirks.
+        if not _try_set_property(core, focus_device, speed_prop, str(speed)):
             continue
         try:
             t0 = time.perf_counter()
@@ -366,7 +395,7 @@ def _step4_stream_during_motion(
     # the slowest MAXSPEED_VALUES entry and is the most likely to give
     # usable streaming duration on a Prior ProScan.
     slow_speed = MAXSPEED_VALUES[-1]
-    if not _try_set_property(core, focus_device, speed_prop, slow_speed):
+    if not _try_set_property(core, focus_device, speed_prop, str(slow_speed)):
         _err("step-4", f"Cannot set {speed_prop}={slow_speed}; skipping streaming test")
         return
     _log("step-4", f"Using {speed_prop}={slow_speed} for streaming runs")
