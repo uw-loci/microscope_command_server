@@ -1545,6 +1545,9 @@ def parse_acquisition_message(message: str) -> dict:
             elif parts[i] == "--channel-intensities" and i + 1 < len(parts):
                 params["channel_intensities_str"] = parts[i + 1]
                 i += 2
+            elif parts[i] == "--focus-channel" and i + 1 < len(parts):
+                params["focus_channel"] = parts[i + 1]
+                i += 2
             elif parts[i] == "--bg-correction" and i + 1 < len(parts):
                 params["background_correction_enabled"] = parts[i + 1].lower() == "true"
                 i += 2
