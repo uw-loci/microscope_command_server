@@ -431,15 +431,35 @@ def _run_smooth_scan(
 ) -> List[Tuple[float, float, float]]:
     """Execute the streaming-sample scan and return a list of
     (t_ms, z_at_pop, metric) triples. Leaves the camera in
-    stopped-sequence state and does NOT restore the speed property;
-    caller is responsible for both.
+    whatever streaming state it was in on entry (the caller is
+    responsible for starting / stopping the sequence) and does NOT
+    restore the speed property; caller is responsible for that too.
     """
-    # Drain any stale frames.
+    # Drain stale frames, bounded so we can't hang when the camera
+    # is streaming faster than we can pop (the 'reuse the Live
+    # Viewer's active sequence' case -- at 38 fps, new frames
+    # arrive every ~26 ms, which is less than the time each
+    # pop_next_image+reshape takes over the network, so an
+    # unbounded `while get_remaining > 0: pop` loop runs forever).
+    # 20 frames is ~500 ms of buffered content at max rate --
+    # plenty to drop anything stale from before the scan started,
+    # not enough to eat the motion window if the drain runs long.
+    drained = 0
+    DRAIN_CAP = 20
     try:
-        while core.get_remaining_image_count() > 0:
-            _pop_image_as_numpy(core)
+        while drained < DRAIN_CAP:
+            try:
+                remaining = int(core.get_remaining_image_count())
+            except Exception:
+                break
+            if remaining <= 0:
+                break
+            if _pop_image_as_numpy(core) is None:
+                break
+            drained += 1
     except Exception:
         pass
+    logger.info("SMOOTH: drained %d stale frames before scan", drained)
 
     samples: List[Tuple[float, float, float]] = []
     t0 = time.perf_counter()
