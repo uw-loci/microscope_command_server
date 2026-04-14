@@ -3069,6 +3069,17 @@ def _acquisition_workflow(
         # so each acquisition re-applies presets from scratch.
         channel_preset_cache: Dict[str, str] = {}
 
+        # Per-channel consecutive-saturation counter. When a channel produces
+        # N tiles in a row with worst-channel saturation above CHANNEL_SAT_PCT,
+        # emit a prominent warning so downstream UI can surface it. The goal is
+        # to catch runaway intensity settings early before wasting imaging time.
+        # TODO #17: the actual mid-acquisition dialog requires adding a socket
+        # notification channel from Python -> Java; for now we just write the
+        # warning to the server log and to tile_measurements.json.
+        CHANNEL_SAT_RUNAWAY_N = 3
+        CHANNEL_SAT_PCT_THRESHOLD = 5.0
+        channel_consecutive_saturated: Dict[str, int] = {}
+
         # Main acquisition loop
         for pos_idx, (pos, filename) in enumerate(positions):
             # Check for cancellation
@@ -3939,6 +3950,29 @@ def _acquisition_workflow(
                                 key = f"{ch_entry['id']}/{ch_key}"
                                 if pct > tile_worst_sat.get(key, 0):
                                     tile_worst_sat[key] = pct
+                            # Per-channel consecutive-saturation runaway detection.
+                            worst_channel_sat = max(sat_result.values(), default=0.0)
+                            ch_id = ch_entry["id"]
+                            if worst_channel_sat > CHANNEL_SAT_PCT_THRESHOLD:
+                                channel_consecutive_saturated[ch_id] = (
+                                    channel_consecutive_saturated.get(ch_id, 0) + 1
+                                )
+                                if channel_consecutive_saturated[ch_id] == CHANNEL_SAT_RUNAWAY_N:
+                                    logger.error(
+                                        "CHANNEL SATURATION RUNAWAY: channel %s has "
+                                        "exceeded %.1f%% worst-channel saturation on "
+                                        "%d consecutive tiles (current: %.1f%%). "
+                                        "Consider cancelling and lowering the %s "
+                                        "intensity before more imaging time is wasted.",
+                                        ch_id,
+                                        CHANNEL_SAT_PCT_THRESHOLD,
+                                        CHANNEL_SAT_RUNAWAY_N,
+                                        worst_channel_sat,
+                                        ch_id,
+                                    )
+                            else:
+                                # Reset consecutive counter on first non-saturated tile.
+                                channel_consecutive_saturated[ch_id] = 0
 
                         # Write to {output_path}/{channel_id}/{filename} -- plain tile
                         # filename inside the channel subdirectory. Mirrors the PPM
