@@ -1375,16 +1375,28 @@ def resolve_channel_plan(
     return plan
 
 
-def apply_channel_hardware_state(hardware, channel_plan_entry: Dict[str, Any], logger_: logging.Logger) -> None:
+def apply_channel_hardware_state(
+    hardware,
+    channel_plan_entry: Dict[str, Any],
+    logger_: logging.Logger,
+    preset_cache: Optional[Dict[str, str]] = None,
+) -> None:
     """Apply one channel's Micro-Manager state before snapping.
 
-    Applies ``mm_setup_presets`` via ``core.setConfig(group, preset)`` then
-    ``device_properties`` via ``core.setProperty(device, property, value)``.
+    Applies ``mm_setup_presets`` via ``core.set_config(group, preset)`` then
+    ``device_properties`` via ``core.set_property(device, property, value)``.
     After each batch, waits for the affected devices to report "not busy" so
     rapid back-to-back channel transitions can't race the snap. An optional
     ``settle_ms`` field on the channel entry adds a dumb sleep fallback for
     hardware whose ``isBusy()`` reports complete too early (some filter
     turrets, reflector wheels, serial LED controllers).
+
+    When ``preset_cache`` is a dict, it is used as a memoization table keyed
+    by ConfigGroup name. If a preset request matches the last-applied value
+    for that group, the ``set_config`` + ``wait_for_config`` pair is skipped
+    entirely. On OWS3 every channel targets the same Filter Turret preset, so
+    caching saves ~300-600 ms per channel per tile. The caller owns the cache
+    lifetime -- reset the dict between acquisitions.
 
     Both primitives are generic Micro-Manager -- no vendor-specific knowledge.
     """
@@ -1407,9 +1419,17 @@ def apply_channel_hardware_state(hardware, channel_plan_entry: Dict[str, Any], l
         preset_name = preset.get("preset")
         if not (group and preset_name):
             continue
+        group_str = str(group)
+        preset_str = str(preset_name)
+        # Skip the MMCore roundtrip if we just applied this exact preset
+        # for the same group. Cache lifetime is owned by the caller.
+        if preset_cache is not None and preset_cache.get(group_str) == preset_str:
+            continue
         try:
-            core.set_config(str(group), str(preset_name))
-            core.wait_for_config(str(group), str(preset_name))
+            core.set_config(group_str, preset_str)
+            core.wait_for_config(group_str, preset_str)
+            if preset_cache is not None:
+                preset_cache[group_str] = preset_str
         except Exception as e:
             logger_.warning(
                 "Failed to apply channel preset %s=%s: %s", group, preset_name, e
@@ -3042,6 +3062,13 @@ def _acquisition_workflow(
             logger.warning("Could not open tile measurements NDJSON stream: %s", e)
             tile_measurements_stream = None
 
+        # Per-acquisition ConfigGroup preset cache. Shared across all tiles so
+        # apply_channel_hardware_state skips redundant MMCore set_config calls
+        # when consecutive channels target the same group preset (e.g. the
+        # filter turret on OWS3 never changes between channels). Reset to empty
+        # so each acquisition re-applies presets from scratch.
+        channel_preset_cache: Dict[str, str] = {}
+
         # Main acquisition loop
         for pos_idx, (pos, filename) in enumerate(positions):
             # Check for cancellation
@@ -3308,22 +3335,46 @@ def _acquisition_workflow(
                         af_type_for_this_tile = "standard"
                         logger.info(f"  Standard autofocus :: New Z {new_z}")
                     else:
-                        # Get Z position before adaptive autofocus for drift detection
-                        z_before_adaptive = hardware.get_current_position().z
+                        # Small-grid drift-check skip: for tiny acquisitions
+                        # (<= SMALL_GRID_SKIP_DRIFT_MAX_TILES tiles), the
+                        # ~5-9s per-tile sweep drift check dominates wall-
+                        # clock time and rarely finds meaningful drift. Reuse
+                        # the most recently computed Z from completed_af_positions
+                        # instead. TODO #6 from the 2026-04-14 optimization
+                        # list. Safe to ship independently of the strategy
+                        # system. Disable by setting SMALL_GRID_SKIP_DRIFT_MAX_TILES
+                        # to 0, or make this configurable per-scope in
+                        # autofocus_<scope>.yml in a follow-up.
+                        SMALL_GRID_SKIP_DRIFT_MAX_TILES = 9
+                        if len(positions) <= SMALL_GRID_SKIP_DRIFT_MAX_TILES:
+                            z_before_adaptive = hardware.get_current_position().z
+                            logger.info(
+                                "  Small grid (%d tiles <= %d) - skipping sweep drift check, "
+                                "reusing Z=%.2f um from initial AF",
+                                len(positions),
+                                SMALL_GRID_SKIP_DRIFT_MAX_TILES,
+                                z_before_adaptive,
+                            )
+                            new_z = z_before_adaptive
+                            af_type_for_this_tile = "skip_small_grid"
+                            drift_for_this_tile = 0.0
+                        else:
+                            # Get Z position before adaptive autofocus for drift detection
+                            z_before_adaptive = hardware.get_current_position().z
 
-                        logger.info(f"  Subsequent tissue position - using SWEEP drift check for speed")
-                        t_af = time.perf_counter()
-                        new_z = hardware.autofocus_sweep_drift_check(
-                            range_um=af_sweep_range_um,
-                            n_steps=af_sweep_n_steps,
-                            score_metric=af_score_metric_name,
-                        )
-                        t_af = log_timing(logger, "SWEEP drift check", t_af)
+                            logger.info(f"  Subsequent tissue position - using SWEEP drift check for speed")
+                            t_af = time.perf_counter()
+                            new_z = hardware.autofocus_sweep_drift_check(
+                                range_um=af_sweep_range_um,
+                                n_steps=af_sweep_n_steps,
+                                score_metric=af_score_metric_name,
+                            )
+                            t_af = log_timing(logger, "SWEEP drift check", t_af)
 
-                        drift = new_z - z_before_adaptive
-                        af_type_for_this_tile = "sweep"
-                        drift_for_this_tile = drift
-                        logger.info(f"  Sweep drift check :: New Z {new_z} (drift: {drift:+.2f} um)")
+                            drift = new_z - z_before_adaptive
+                            af_type_for_this_tile = "sweep"
+                            drift_for_this_tile = drift
+                            logger.info(f"  Sweep drift check :: New Z {new_z} (drift: {drift:+.2f} um)")
 
                     # Track this position as the last AF position (for gap detection)
                     last_af_pos_idx = pos_idx
@@ -3846,7 +3897,9 @@ def _acquisition_workflow(
                 )
                 if channel_plan:
                     for ch_entry in channel_plan:
-                        apply_channel_hardware_state(hardware, ch_entry, logger)
+                        apply_channel_hardware_state(
+                            hardware, ch_entry, logger, preset_cache=channel_preset_cache
+                        )
                         exposure_ms = float(ch_entry.get("exposure_ms") or 0)
                         if exposure_ms > 0:
                             hardware.set_exposure(exposure_ms)
