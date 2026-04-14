@@ -96,6 +96,15 @@ BUSY_CHECK_EVERY_N = 6
 # Fewer than this and we refuse to commit -- caller falls back.
 MIN_FRAMES_FOR_FIT = 6
 
+# Drain bounds. The reuse-existing-sequence path can't use an
+# unbounded drain because the camera keeps producing frames while
+# we drain; either of these caps, whichever hits first, stops the
+# drain. We don't reshape the popped pixel data during the drain
+# (pop_next_image() alone does the ZMQ transfer; everything else
+# is wasted work since we're throwing the frame away).
+DRAIN_MAX_FRAMES = 40
+DRAIN_MAX_SECONDS = 0.2
+
 # Hard deadline multiplier. Scan deadline = range_um * HARD_DEADLINE_SEC_PER_UM + 2.0s.
 # At SLOW_SPEED_VALUE=1 on Prior (~11.5 um/s) we need ~0.09 s/um, so
 # 0.15 gives enough headroom for other stage hardware without being
@@ -435,31 +444,35 @@ def _run_smooth_scan(
     responsible for starting / stopping the sequence) and does NOT
     restore the speed property; caller is responsible for that too.
     """
-    # Drain stale frames, bounded so we can't hang when the camera
-    # is streaming faster than we can pop (the 'reuse the Live
-    # Viewer's active sequence' case -- at 38 fps, new frames
-    # arrive every ~26 ms, which is less than the time each
-    # pop_next_image+reshape takes over the network, so an
-    # unbounded `while get_remaining > 0: pop` loop runs forever).
-    # 20 frames is ~500 ms of buffered content at max rate --
-    # plenty to drop anything stale from before the scan started,
-    # not enough to eat the motion window if the drain runs long.
+    # Drain stale frames -- bounded by BOTH time and count so we
+    # can't hang on an actively-refilling buffer (the reuse-Live-
+    # Viewer case). Crucially, we DON'T reshape the popped pixel
+    # data here: reshape forces a 10+ MB ZMQ transfer plus three
+    # geometry queries per frame, and we're throwing the data
+    # away anyway. Raw pop_next_image alone is ~3x faster, which
+    # matters a lot when we're racing a 30 fps refill.
     drained = 0
-    DRAIN_CAP = 20
+    drain_start = time.perf_counter()
     try:
-        while drained < DRAIN_CAP:
+        while drained < DRAIN_MAX_FRAMES:
+            if time.perf_counter() - drain_start > DRAIN_MAX_SECONDS:
+                break
             try:
                 remaining = int(core.get_remaining_image_count())
             except Exception:
                 break
             if remaining <= 0:
                 break
-            if _pop_image_as_numpy(core) is None:
+            try:
+                core.pop_next_image()
+            except Exception:
                 break
             drained += 1
     except Exception:
         pass
-    logger.info("SMOOTH: drained %d stale frames before scan", drained)
+    drain_ms = (time.perf_counter() - drain_start) * 1000.0
+    logger.info("SMOOTH: drained %d stale frames in %.0f ms before scan",
+                 drained, drain_ms)
 
     samples: List[Tuple[float, float, float]] = []
     t0 = time.perf_counter()
@@ -753,6 +766,41 @@ def handle_smoothz(conn, client, hardware, settings, **kwargs):
                       f"scan too short or stage/camera timing off")
             logger.warning("SMOOTH: UNAVAILABLE -- %s", reason)
             # Restore Z and return.
+            try:
+                core.set_position(focus_device, initial_z)
+                _wait_via_busy(core, focus_device)
+            except Exception:
+                pass
+            conn.sendall(f"UNAVAILABLE:{reason}".encode())
+            return
+
+        # --- Edge-of-window detection ---
+        # If the argmax is at the first or last usable motion sample
+        # the true peak is very likely OUTSIDE the scan window (at
+        # either z_start or z_end extreme). Committing to the edge
+        # sample is meaningless -- we have no evidence the metric
+        # keeps rising or has already peaked. Return UNAVAILABLE with
+        # a hint about which direction the user should extend the
+        # range, and restore the initial Z.
+        #
+        # Guard: if the first motion sample is at the same Z as the
+        # stable-run plateau (very flat stationary trace), skip this
+        # check -- there's no meaningful edge to detect.
+        interior_zs = zs  # already NaN-filtered by the clean step
+        if n_motion_samples >= 3 and raw_peak_idx in (0, n_motion_samples - 1):
+            direction_hint = (
+                "more negative Z (below z_start)"
+                if raw_peak_idx == 0
+                else "more positive Z (above z_end)"
+            )
+            reason = (
+                f"peak at edge of scan window (sample {raw_peak_idx} of "
+                f"{n_motion_samples}, z={zs[raw_peak_idx]:.3f}, "
+                f"metric={ms[raw_peak_idx]:.3f}). True focus is likely "
+                f"at {direction_hint}. Widen the scan range or move Z "
+                f"manually closer to focus and retry"
+            )
+            logger.warning("SMOOTH: UNAVAILABLE -- %s", reason)
             try:
                 core.set_position(focus_device, initial_z)
                 _wait_via_busy(core, focus_device)
