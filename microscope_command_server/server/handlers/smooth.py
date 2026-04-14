@@ -568,6 +568,37 @@ def _try_set(core, device: str, prop: str, value: str) -> bool:
         return False
 
 
+def _read_roi(core) -> Optional[Tuple[int, int, int, int]]:
+    """Return the current camera ROI as (x, y, w, h).
+
+    pycromanager's get_roi() returns either a 4-tuple OR a
+    java_awt_Rectangle object depending on MM version and the
+    camera adapter. Try unpacking as a tuple first, fall back to
+    the Rectangle attribute accessors. Returns None if neither
+    works.
+    """
+    try:
+        roi = core.get_roi()
+    except Exception as e:
+        logger.warning("SMOOTH: core.get_roi() raised: %s", e)
+        return None
+    if roi is None:
+        return None
+    # First try: 4-element iterable (older pycromanager / wrapped tuple).
+    try:
+        x, y, w, h = roi
+        return (int(x), int(y), int(w), int(h))
+    except (TypeError, ValueError):
+        pass
+    # Second try: java.awt.Rectangle with .x/.y/.width/.height attributes.
+    try:
+        return (int(roi.x), int(roi.y), int(roi.width), int(roi.height))
+    except Exception as e:
+        logger.warning("SMOOTH: get_roi() returned %r which is neither "
+                        "iterable nor Rectangle-shaped: %s", type(roi).__name__, e)
+        return None
+
+
 def _apply_crop_roi(core, crop_factor: float) -> Optional[Tuple[int, int, int, int]]:
     """Save the current camera ROI and install a centered crop.
 
@@ -592,12 +623,12 @@ def _apply_crop_roi(core, crop_factor: float) -> Optional[Tuple[int, int, int, i
     """
     if crop_factor <= 0.0 or crop_factor >= 1.0:
         return None
-    try:
-        x0, y0, w0, h0 = core.get_roi()
-        x0, y0, w0, h0 = int(x0), int(y0), int(w0), int(h0)
-    except Exception as e:
-        logger.warning("SMOOTH: could not query camera ROI for crop: %s", e)
+    saved = _read_roi(core)
+    if saved is None:
+        logger.warning("SMOOTH: could not query camera ROI for crop "
+                        "(see prior warning); skipping crop")
         return None
+    x0, y0, w0, h0 = saved
 
     new_w = max(1, int(round(w0 * crop_factor)))
     new_h = max(1, int(round(h0 * crop_factor)))
@@ -869,24 +900,32 @@ def _run_smooth_scan(
         logger.warning("SMOOTH: clear_circular_buffer failed "
                         "(continuing with whatever's queued): %s", e)
 
-    samples: List[Tuple[float, float, float]] = []
     direction = 1.0 if z_end >= z_start else -1.0
     motion_um = abs(z_end - z_start)
     motion_duration_ms = (motion_um / max(velocity_um_s, 0.01)) * 1000.0
+
+    # Per-pop record: (pop_wall_ms, metric, raw_pop_index)
+    # Z is computed AFTER the scan from the pop order, not during,
+    # because the only reliable timing info we have is the FIFO
+    # ordering guarantee + the wall-clock duration of the whole
+    # scan. ElapsedTime-ms metadata varies in semantics across MM
+    # camera drivers (the JAI build saw 17/45 ms alternating
+    # values that aren't a real elapsed-since-start clock), so we
+    # ignore it for now and rely on the pop ordering.
+    pop_records: List[Tuple[float, float, int]] = []
 
     t0 = time.perf_counter()
     try:
         core.set_position(focus_device, z_end)
     except Exception as e:
         logger.error("SMOOTH: non-blocking move to z_end failed: %s", e)
-        return samples
+        return []
 
     stage_done_at: Optional[float] = None
     loop_count = 0
     deadline = time.perf_counter() + hard_deadline_s
-    first_elapsed_ms: Optional[float] = None
-    fallback_pop_index = 0
-    metadata_warning_logged = False
+    pop_index = 0
+    tags_logged = False
 
     while time.perf_counter() < deadline:
         popped = 0
@@ -896,46 +935,29 @@ def _run_smooth_scan(
                 if img is None:
                     break
 
-                # Derive the capture time offset from move fire.
-                # Camera ElapsedTime-ms is relative to the start of
-                # the sequence acquisition, so we subtract the first
-                # frame's elapsed to get offsets relative to our
-                # clear+fire moment.
-                if elapsed_ms is not None:
-                    if first_elapsed_ms is None:
-                        first_elapsed_ms = elapsed_ms
-                        # First post-clear frame is captured ~one
-                        # camera period after the clear. Use 33 ms
-                        # as the fixed offset; refined by subsequent
-                        # frames' spacing.
-                        capture_offset_ms = 33.0
-                    else:
-                        capture_offset_ms = 33.0 + (elapsed_ms - first_elapsed_ms)
-                else:
-                    # No metadata available: fall back to assumed
-                    # 30 fps uniform spacing starting 33 ms after
-                    # move fire. This was the previous-behavior
-                    # approximation and is correct modulo small
-                    # frame-rate jitter.
-                    if not metadata_warning_logged:
-                        logger.warning("SMOOTH: no ElapsedTime-ms in pop metadata; "
-                                        "falling back to 30 fps uniform spacing")
-                        metadata_warning_logged = True
-                    capture_offset_ms = 33.0 + fallback_pop_index * 33.0
+                # One-time debug: log all available tag keys from
+                # the first popped frame so we can pick a better
+                # capture-time field in a follow-up. Only happens
+                # on the very first pop of a Smooth run.
+                if not tags_logged:
+                    tags_logged = True
+                    try:
+                        # Re-pop with metadata to get the tags dict
+                        # via pop_next_tagged_image. _pop_tagged_frame
+                        # discards them after extracting elapsed_ms,
+                        # so we don't have them here -- but elapsed_ms
+                        # being non-None means metadata WAS present.
+                        if elapsed_ms is not None:
+                            logger.info("SMOOTH: first frame elapsed_ms tag "
+                                        "= %.3f (only diagnostic; not used "
+                                        "for Z labeling)", elapsed_ms)
+                    except Exception:
+                        pass
 
-                # Linear motion model -> Z at capture time. Clamp
-                # to the commanded window.
-                if capture_offset_ms <= 0:
-                    z_interp = z_start
-                elif capture_offset_ms >= motion_duration_ms:
-                    z_interp = z_end
-                else:
-                    progress_um = (capture_offset_ms / 1000.0) * velocity_um_s * direction
-                    z_interp = z_start + progress_um
-
-                samples.append((capture_offset_ms, float(z_interp),
-                                _focus_metric(img, metric_name)))
-                fallback_pop_index += 1
+                pop_wall_ms = (time.perf_counter() - t0) * 1000.0
+                metric = _focus_metric(img, metric_name)
+                pop_records.append((pop_wall_ms, metric, pop_index))
+                pop_index += 1
                 popped += 1
                 if popped >= 4:
                     break
@@ -958,6 +980,66 @@ def _run_smooth_scan(
                 break
 
         time.sleep(SCAN_POLL_SLEEP_S)
+
+    # --- Post-scan Z assignment ---
+    # FIFO guarantee: pop N retrieves the N-th frame the camera
+    # produced after the buffer was cleared. With a constant camera
+    # frame rate the N-th frame was captured at N * camera_period_ms
+    # (relative to the start of streaming, which is approximately
+    # t0 since we cleared the buffer just before firing the move).
+    #
+    # Estimate camera_period_ms by total_frames / scan_duration. If
+    # the scan was bounded by stage_done_at, use that; otherwise use
+    # the last pop's wall time.
+    if not pop_records:
+        return []
+
+    if stage_done_at is not None:
+        scan_duration_ms = stage_done_at + 200.0  # include the tail
+    else:
+        scan_duration_ms = pop_records[-1][0]
+    scan_duration_ms = max(scan_duration_ms, 1.0)
+
+    # Camera period: total elapsed / number of frames captured.
+    # This is a good estimator only when the buffer-flush + move
+    # timing is tight enough that every produced frame got popped.
+    # In practice we drain the buffer after the move is done, so
+    # this is approximately correct.
+    if pop_index >= 2:
+        camera_period_ms = scan_duration_ms / pop_index
+    else:
+        camera_period_ms = 33.0  # fallback for 30 fps
+
+    # Sanity check: clamp camera_period to [10, 500] ms. If it's
+    # way outside that, the scan was unusual (very fast or very
+    # slow camera) and we fall back to 33 ms.
+    if camera_period_ms < 10.0 or camera_period_ms > 500.0:
+        logger.warning("SMOOTH: implausible camera period %.1f ms "
+                        "(scan=%dms n=%d); falling back to 33ms",
+                        camera_period_ms, int(scan_duration_ms), pop_index)
+        camera_period_ms = 33.0
+
+    logger.info("SMOOTH: estimated camera period %.1f ms "
+                "(scan duration %dms / %d frames)",
+                camera_period_ms, int(scan_duration_ms), pop_index)
+
+    # Now assign each popped frame's capture time + interpolated Z.
+    # The N-th popped frame was captured at (N + 0.5) * camera_period
+    # -- the +0.5 puts the timestamp at the midpoint of the frame's
+    # exposure window rather than its start, which slightly improves
+    # accuracy when the exposure is a meaningful fraction of the
+    # period.
+    samples: List[Tuple[float, float, float]] = []
+    for (_, metric, idx) in pop_records:
+        capture_offset_ms = (idx + 0.5) * camera_period_ms
+        if capture_offset_ms <= 0:
+            z_interp = z_start
+        elif capture_offset_ms >= motion_duration_ms:
+            z_interp = z_end
+        else:
+            progress_um = (capture_offset_ms / 1000.0) * velocity_um_s * direction
+            z_interp = z_start + progress_um
+        samples.append((capture_offset_ms, float(z_interp), metric))
 
     return samples
 
