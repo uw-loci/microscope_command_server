@@ -965,6 +965,67 @@ def _parabolic_peak(zs: List[float], ms: List[float]) -> Optional[float]:
     return float(z_peak)
 
 
+def _fit_union_samples(
+    samples_zm: List[Tuple[float, float]],
+    n_attempts_so_far: int,
+) -> Optional["_ScanAttemptResult"]:
+    """Fit a peak across the union of (z, metric) samples from
+    multiple Smooth attempts.
+
+    Used to short-circuit edge oscillation: when two adjacent scan
+    windows each find their peak at the boundary between them, the
+    true peak is provably inside the gap and a fit on the union
+    finds it directly.
+
+    Accepts the union only when the raw-argmax of the combined data
+    is INTERIOR (not at either end of the merged Z range). Otherwise
+    we'd be doing the same edge-detection that already failed at the
+    per-attempt level. Returns None to signal "no clean union peak,
+    fall back to the next strategy".
+
+    Returns a _ScanAttemptResult shaped like _attempt_one_scan's
+    success result so the caller can drop it into final_result and
+    commit through the same code path.
+    """
+    if len(samples_zm) < 4:
+        return None
+
+    # Sort by z so the argmax-at-edge check has meaning.
+    sorted_zm = sorted(samples_zm, key=lambda zm: zm[0])
+    zs = [zm[0] for zm in sorted_zm]
+    ms = [zm[1] for zm in sorted_zm]
+    n = len(zs)
+
+    raw_max_idx = int(np.argmax(ms))
+    # Refuse if the union argmax is also at the edge -- we have no
+    # evidence the true peak is inside the data we collected.
+    if raw_max_idx == 0 or raw_max_idx == n - 1:
+        return None
+
+    # Try Gaussian first (uses all samples), fall back to parabolic
+    # around the argmax, fall back to raw argmax.
+    fit_z: Optional[float] = _gaussian_peak(zs, ms)
+    fit_kind = "gaussian"
+    if fit_z is None or fit_z < zs[0] or fit_z > zs[-1]:
+        fit_z = _parabolic_peak(zs, ms)
+        fit_kind = "parabolic"
+    if fit_z is None:
+        fit_z = zs[raw_max_idx]
+        fit_kind = "raw-argmax"
+
+    z_span = zs[-1] - zs[0]
+    logger.info(
+        "SMOOTH: union-fit across %d samples from %d attempts -- "
+        "interior argmax at Z=%.3f (idx %d/%d), fit=%s best_z=%.3f, span=%.2f",
+        n, n_attempts_so_far, zs[raw_max_idx], raw_max_idx, n,
+        fit_kind, fit_z, z_span,
+    )
+    return _ScanAttemptResult(
+        "success", float(fit_z), n, float(z_span),
+        f"union-fit {fit_kind} peak at Z={fit_z:.3f} from {n} samples",
+    )
+
+
 # ----- The scan -----
 
 
@@ -1061,44 +1122,52 @@ def _run_smooth_scan(
         if t_now_ms > scan_exit_at_ms:
             break
 
-        popped = 0
+        # One get_remaining_image_count RPC per outer iteration to
+        # decide whether to enter the pop loop or sleep. When there
+        # are frames, pop ALL of them in one batch (no popped >= 4
+        # cap) -- the cap was capping us at ~13 fps when the camera
+        # produces ~35 fps, so we were missing more than half the
+        # frames. Inside the batch we don't re-check the count;
+        # _pop_tagged_frame returns (None, None) when the buffer
+        # empties, which terminates the inner loop naturally.
         try:
-            while True:
-                try:
-                    remaining_before_pop = core.get_remaining_image_count()
-                except Exception:
-                    remaining_before_pop = 0
-                if remaining_before_pop <= 0:
-                    break
-                img, elapsed_ms = _pop_tagged_frame(core)
-                if img is None:
-                    break
+            remaining = core.get_remaining_image_count()
+        except Exception:
+            remaining = 0
 
-                # One-time debug: log all available tag keys from
-                # the first popped frame so we can pick a better
-                # capture-time field in a follow-up. Only happens
-                # on the very first pop of a Smooth run.
-                if not tags_logged:
-                    tags_logged = True
-                    try:
-                        if elapsed_ms is not None:
-                            logger.info("SMOOTH: first frame elapsed_ms tag "
-                                        "= %.3f (only diagnostic; not used "
-                                        "for Z labeling)", elapsed_ms)
-                    except Exception:
-                        pass
+        if remaining > 0:
+            try:
+                while True:
+                    img, elapsed_ms = _pop_tagged_frame(core)
+                    if img is None:
+                        break
 
-                pop_wall_ms = (time.perf_counter() - t0) * 1000.0
-                metric = _focus_metric(img, metric_name)
-                pop_records.append((pop_wall_ms, metric, pop_index))
-                pop_index += 1
-                popped += 1
-                if popped >= 4:
-                    break
-        except Exception as e:
-            logger.warning("SMOOTH: pop loop failed: %s", e)
+                    # One-time debug: log the elapsed_ms tag of the
+                    # first popped frame for cross-checking against
+                    # the wall-clock pop time.
+                    if not tags_logged:
+                        tags_logged = True
+                        try:
+                            if elapsed_ms is not None:
+                                logger.info(
+                                    "SMOOTH: first frame elapsed_ms tag "
+                                    "= %.3f (only diagnostic; not used "
+                                    "for Z labeling)", elapsed_ms,
+                                )
+                        except Exception:
+                            pass
 
-        time.sleep(SCAN_POLL_SLEEP_S)
+                    pop_wall_ms = (time.perf_counter() - t0) * 1000.0
+                    metric = _focus_metric(img, metric_name)
+                    pop_records.append((pop_wall_ms, metric, pop_index))
+                    pop_index += 1
+            except Exception as e:
+                logger.warning("SMOOTH: pop loop failed: %s", e)
+        else:
+            # Buffer empty -- sleep briefly so we don't burn CPU
+            # spinning on get_remaining_image_count RPCs while the
+            # camera is producing the next frame.
+            time.sleep(SCAN_POLL_SLEEP_S)
 
     total_scan_ms = (time.perf_counter() - t0) * 1000.0
     logger.info(
@@ -1767,6 +1836,13 @@ def handle_smoothz(conn, client, hardware, settings, **kwargs):
     final_result: Optional[_ScanAttemptResult] = None
     current_center = initial_z
 
+    # Track every (z, metric) sample produced across all attempts so
+    # that on edge oscillation we can fit the union and on Brent
+    # bracket failure we can pick from the global argmax instead of
+    # losing the streaming data.
+    all_attempt_samples_zm: List[Tuple[float, float]] = []
+    prev_attempt_status: Optional[str] = None
+
     try:
         for attempt_idx in range(MAX_EDGE_RETRIES + 1):
             attempt_num = attempt_idx + 1
@@ -1805,9 +1881,44 @@ def handle_smoothz(conn, client, hardware, settings, **kwargs):
                 f"n={result.n_samples} reason='{result.reason}'"
             )
 
+            # Accumulate samples (z, metric) from this attempt.
+            # _attempt_one_scan stores in_motion as (t, z, m) tuples.
+            for s in result.samples_trace:
+                if len(s) >= 3:
+                    all_attempt_samples_zm.append((float(s[1]), float(s[2])))
+
             if result.status == "success":
                 final_result = result
                 break
+
+            # Edge-oscillation short-circuit: if this attempt is
+            # an edge in the OPPOSITE direction from the previous
+            # attempt, the true peak is provably between the two
+            # windows. Don't retry again -- combine all samples
+            # collected so far and fit the union. This catches the
+            # case (observed on PPM 10x 23:06) where the peak sits
+            # right at the boundary of two adjacent windows and the
+            # alternating shifts ping-pong forever, never landing
+            # on the actual peak.
+            opposite_edge = (
+                (prev_attempt_status == "edge_low" and result.status == "edge_high")
+                or
+                (prev_attempt_status == "edge_high" and result.status == "edge_low")
+            )
+            if opposite_edge and len(all_attempt_samples_zm) >= 4:
+                union_result = _fit_union_samples(
+                    all_attempt_samples_zm, len(attempts_log),
+                )
+                if union_result is not None:
+                    final_result = union_result
+                    attempts_log.append(
+                        f"union-fit: status={union_result.status} "
+                        f"n={union_result.n_samples} "
+                        f"reason='{union_result.reason}'"
+                    )
+                    break
+
+            prev_attempt_status = result.status
 
             if result.status == "edge_low":
                 # Shift down by one full range so the next window's
@@ -1840,19 +1951,48 @@ def handle_smoothz(conn, client, hardware, settings, **kwargs):
                 "error", None, 0, 0.0, "unknown failure, no attempt completed",
             )
 
-        # --- Brent fallback ---
-        # If all streaming retries exhausted with edge detection,
-        # run a final Brent's method search over the full Z span
-        # that the retry loop COULD have covered (clamped to
-        # configured stage limits). Brent uses smart point placement
-        # and typically converges in 6-8 evaluations even when the
-        # peak location is unknown, so it rescues cases where the
-        # streaming+shift approach misses the peak due to sample
-        # density, metric noise, or awkward initial offset.
+        # --- Union-fit pre-Brent escalation ---
+        # Before going to Brent, give the union of all collected
+        # samples one more chance. The retry loop may have exited
+        # without triggering the in-loop opposite-edge short-circuit
+        # (e.g. ran out of attempts on three same-direction edges,
+        # or hit the stage limit). If the union has a clean
+        # interior maximum we can commit it directly.
         if final_result.status in ("edge_low", "edge_high"):
-            total_span = range_um * (MAX_EDGE_RETRIES + 1)
-            brent_lo = initial_z - total_span / 2.0
-            brent_hi = initial_z + total_span / 2.0
+            union_result = _fit_union_samples(
+                all_attempt_samples_zm, len(attempts_log),
+            )
+            if union_result is not None:
+                final_result = union_result
+                attempts_log.append(
+                    f"union-fit (post-retry): status={union_result.status} "
+                    f"n={union_result.n_samples} "
+                    f"reason='{union_result.reason}'"
+                )
+
+        # --- Brent fallback ---
+        # If the union fit also failed (no interior peak in the
+        # combined data), fall back to a Brent search. Brent uses
+        # smart point placement and typically converges in 6-8
+        # evaluations even when the peak location is unknown, so it
+        # rescues cases where the streaming+shift approach misses
+        # the peak due to sample density, metric noise, or awkward
+        # initial offset. We seed the bracket from the metric peak
+        # of all collected samples (when available) instead of the
+        # full coverage span -- a tight bracket converges faster
+        # and avoids Brent landing on irrelevant Z far from any
+        # actual sample.
+        if final_result.status in ("edge_low", "edge_high"):
+            if all_attempt_samples_zm:
+                # Anchor on the best sample we've already got, then
+                # widen to one full range either side.
+                best_z_so_far = max(all_attempt_samples_zm, key=lambda zm: zm[1])[0]
+                brent_lo = best_z_so_far - range_um
+                brent_hi = best_z_so_far + range_um
+            else:
+                total_span = range_um * (MAX_EDGE_RETRIES + 1)
+                brent_lo = initial_z - total_span / 2.0
+                brent_hi = initial_z + total_span / 2.0
             if z_low is not None:
                 brent_lo = max(brent_lo, z_low)
             if z_high is not None:
@@ -1891,8 +2031,52 @@ def handle_smoothz(conn, client, hardware, settings, **kwargs):
                         f"n={brent_result.n_samples} "
                         f"reason='{brent_result.reason}'"
                     )
-                    if brent_result.status == "success":
+                    # Merge Brent's evals into our global sample
+                    # pool. Brent's samples_trace is (z, metric)
+                    # 2-tuples; streaming samples are (t, z, m)
+                    # but we already projected those to (z, m).
+                    for s in brent_result.samples_trace:
+                        if len(s) >= 2:
+                            all_attempt_samples_zm.append(
+                                (float(s[0]), float(s[1]))
+                            )
+                    # Use Brent's best_z if it converged AND its
+                    # metric beats our running global best. This
+                    # protects against the failure mode where
+                    # Brent's bracketing fails and minimize_scalar
+                    # picks a far-edge eval (-9 um catastrophe on
+                    # 23:06): instead we commit whichever sample
+                    # across all attempts (streaming + Brent) had
+                    # the highest metric.
+                    global_best = max(
+                        all_attempt_samples_zm, key=lambda zm: zm[1],
+                        default=None,
+                    )
+                    if brent_result.status == "success" and brent_result.best_z is not None:
+                        # Brent converged. Trust it unless our
+                        # global pool has something dramatically
+                        # better at a Z that Brent never visited
+                        # near. (We don't second-guess a converged
+                        # Brent on small differences.)
                         final_result = brent_result
+                    elif global_best is not None:
+                        gz, gm = global_best
+                        z_span = (
+                            max(zm[0] for zm in all_attempt_samples_zm)
+                            - min(zm[0] for zm in all_attempt_samples_zm)
+                        )
+                        logger.info(
+                            "SMOOTH: Brent did not converge; committing "
+                            "global argmax across %d collected samples "
+                            "at Z=%.3f (metric=%.4f)",
+                            len(all_attempt_samples_zm), gz, gm,
+                        )
+                        final_result = _ScanAttemptResult(
+                            "success", gz, len(all_attempt_samples_zm),
+                            z_span,
+                            f"global argmax across {len(all_attempt_samples_zm)} "
+                            f"samples at Z={gz:.3f}",
+                        )
                 except Exception as e:
                     logger.error("SMOOTH: Brent fallback raised: %s", e, exc_info=True)
 
