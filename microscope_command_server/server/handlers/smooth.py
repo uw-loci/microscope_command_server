@@ -42,6 +42,49 @@ Protocol (reuses the existing "--flag value" text payload pattern):
 where UNAVAILABLE means a pre-flight check refused to run (caller
 should fall back gracefully) and FAILED means a mid-scan error
 (caller should report but the stage state is still restored).
+
+----------------------------------------------------------------
+Attribution / Prior art
+----------------------------------------------------------------
+
+Several pieces of this handler are adapted (re-implemented in
+Python) from the Micro-Manager open-source project:
+
+    https://github.com/micro-manager/micro-manager
+    License: LGPL-2.0
+
+Specifically:
+
+- The ROI crop-factor optimization (``_apply_crop_roi`` /
+  ``_restore_roi`` / ``DEFAULT_CROP_FACTOR``) is inspired by the
+  ``cropFactor`` parameter in ``OughtaFocus.java`` (MM plugin
+  ``plugins/AutofocusFunctions``). MM uses it to cut per-frame
+  transfer cost during a scan; we use it the same way for the
+  continuous-stream case.
+
+- ``_focus_metric_volath5`` (Volath's F5 autocorrelation metric)
+  and ``_focus_metric_tenengrad`` (Sobel-squared sum) are
+  Python re-implementations of the corresponding methods in
+  MM's ``ImgSharpnessAnalysis.java``
+  (``mmstudio/src/main/java/org/micromanager/internal/utils/imageanalysis``).
+  The MM source comments describing these metrics ("smooths out
+  high-frequency noise", "best non-spectral metric") guided our
+  per-modality metric dispatch.
+
+- ``_gaussian_peak`` fits a full-sample Gaussian to the scan data
+  rather than just a 3-point parabolic triplet around the argmax.
+  This approach is motivated by MM's ``ZStackFocusOptimizer.java``,
+  which uses a full-sample fit via its internal Fitter class.
+
+- ``_brent_fallback_scan`` is a Python port of the Brent's-method
+  search pattern from MM's ``BrentFocusOptimizer.java``. We use
+  ``scipy.optimize.minimize_scalar`` with the same bracket-then-
+  refine structure as the Java version.
+
+No code is copied verbatim; every piece was re-written against
+the same algorithmic description. The attribution is here so the
+origin of the ideas is traceable and so any reader who wants to
+cross-check the implementation can find the upstream source.
 """
 
 import logging
@@ -154,11 +197,14 @@ MAX_EDGE_RETRIES = 2
 
 # Default ROI crop factor (fraction of full sensor width/height
 # used during the scan). Smaller value = smaller per-frame transfer
-# = faster pop loop = denser sampling. Inspired by MM OughtaFocus's
-# cropFactor parameter. 0.5 means the center 50% width x 50% height
-# = 25% of pixels, reducing ZMQ transfer time by ~4x on cameras
-# where transfer is the bottleneck (JAI at 2064x1544 drops from
-# ~50-100ms per pop to ~15-30ms).
+# = faster pop loop = denser sampling. 0.5 means the center 50%
+# width x 50% height = 25% of pixels, reducing ZMQ transfer time
+# by ~4x on cameras where transfer is the bottleneck (JAI at
+# 2064x1544 drops from ~50-100ms per pop to ~15-30ms).
+#
+# Adapted from: Micro-Manager's OughtaFocus.java ``cropFactor``
+# parameter. See the "Attribution / Prior art" section in the
+# module docstring above for the full citation.
 DEFAULT_CROP_FACTOR = 0.5
 
 # (Drain-based flushing was retired in favor of
@@ -326,20 +372,22 @@ def _focus_metric_normalized_variance(gray: np.ndarray) -> float:
 def _focus_metric_volath5(gray: np.ndarray) -> float:
     """Volath's F5 metric (autocorrelation at lag 1 minus N*mean^2).
 
-    From OughtaFocus / ImgSharpnessAnalysis in the MicroManager
-    source. The comment in the MM code describes this as 'smooths
-    out high-frequency (suppresses noise)' which is the key win for
-    noisy sparse-signal modalities -- widefield fluorescence and
-    laser-scanning microscopy both tend to have mostly-dark
-    backgrounds with signal confined to a small fraction of pixels,
-    and normalized variance in that regime is dominated by shot
-    noise in the background rather than the focus of the signal
-    pixels. Volath5's autocorrelation form effectively ignores
-    uncorrelated noise.
+    The MM source comments describe this as 'smooths out
+    high-frequency (suppresses noise)' -- the key win for noisy
+    sparse-signal modalities (widefield fluorescence, laser-scanning
+    microscopy), which have mostly-dark backgrounds with signal
+    confined to a small fraction of pixels. Normalized variance in
+    that regime is dominated by shot noise in the background rather
+    than the focus of the signal pixels; Volath5's autocorrelation
+    form effectively ignores uncorrelated noise.
 
     Math: F5 = sum_{x, y} I(x, y) * I(x+1, y) - M * N * mean(I)^2
 
     Equivalent numpy:  (I[:, :-1] * I[:, 1:]).sum() - N * mean(I)^2
+
+    Adapted from: Micro-Manager's ImgSharpnessAnalysis.java (also
+    exposed via OughtaFocus). See the "Attribution / Prior art"
+    section in the module docstring for the full citation.
     """
     if gray.ndim != 2 or gray.shape[1] < 2:
         return 0.0
@@ -360,6 +408,10 @@ def _focus_metric_tenengrad(gray: np.ndarray) -> float:
     differences in X and Y, squared and summed. This is the
     discrete Sobel without the 2x center weighting; close enough
     for focus ranking purposes.
+
+    Adapted from: Micro-Manager's ImgSharpnessAnalysis.java. See
+    the "Attribution / Prior art" section in the module docstring
+    for the full citation.
     """
     if gray.ndim != 2 or gray.shape[0] < 2 or gray.shape[1] < 2:
         return 0.0
@@ -654,6 +706,11 @@ def _apply_crop_roi(
     _restore_roi() which stops the sequence again, sets the
     original ROI, and restarts. The Live Viewer's frame poller
     sees a brief gap in frames and recovers automatically.
+
+    Adapted from: Micro-Manager's OughtaFocus.java ``cropFactor``
+    parameter and the surrounding save/restore pattern. See the
+    "Attribution / Prior art" section in the module docstring for
+    the full citation.
     """
     if crop_factor <= 0.0 or crop_factor >= 1.0:
         return (None, False)
@@ -874,17 +931,21 @@ def _gaussian_peak(zs: List[float], ms: List[float]) -> Optional[float]:
     (insufficient samples, degenerate z values, fitter non-convergence,
     out-of-bracket mu).
 
-    Motivated by MM's ZStackFocusOptimizer using a full-sample
-    Gaussian fit instead of a 3-point parabola. Uses more of the
-    scan data than _parabolic_peak does -- the parabolic fit only
-    considers the 3 samples around the argmax, discarding all the
-    rest. The Gaussian fit averages over all N samples, so a single
-    noisy point near the peak doesn't distort the result, and we
-    get a natural sigma estimate we could use later to reject flat
-    curves.
+    Full-sample fit (uses all N samples) instead of a 3-point
+    parabola. Uses more of the scan data than _parabolic_peak
+    does -- the parabolic fit only considers the 3 samples around
+    the argmax, discarding all the rest. The Gaussian fit averages
+    over all N samples, so a single noisy point near the peak
+    doesn't distort the result, and we get a natural sigma
+    estimate we could use later to reject flat curves.
 
     Falls back to the parabolic fit path when scipy is unavailable
     or when the Gaussian doesn't converge within reasonable bounds.
+
+    Adapted from: Micro-Manager's ZStackFocusOptimizer.java, which
+    uses a full-sample Gaussian fit via its internal Fitter class.
+    See the "Attribution / Prior art" section in the module
+    docstring for the full citation.
     """
     n = len(zs)
     if n < 4:
@@ -1487,6 +1548,12 @@ def _brent_fallback_scan(
 
     Returns a _ScanAttemptResult shaped like _attempt_one_scan's
     success/error results so callers can dispatch uniformly.
+
+    Adapted from: Micro-Manager's BrentFocusOptimizer.java. We
+    use scipy.optimize.minimize_scalar in place of MM's Java
+    Brent implementation, with the same bracket-then-refine
+    structure. See the "Attribution / Prior art" section in the
+    module docstring for the full citation.
     """
     tag = "brent-fallback"
     logger.info("SMOOTH: %s: Brent search over [%.3f, %.3f] metric=%s",
