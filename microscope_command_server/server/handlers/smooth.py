@@ -123,9 +123,9 @@ DEFAULT_SATURATION_REFUSE_FRACTION = 0.05
 # metric. Keeps the fit robust to flat-top regions.
 FIT_NEIGHBORHOOD = 3
 
-# Polling intervals inside the scan loop.
+# Polling interval inside the scan loop. Tight enough to keep the
+# pop loop responsive without burning CPU.
 SCAN_POLL_SLEEP_S = 0.002
-BUSY_CHECK_EVERY_N = 6
 
 # Minimum in-motion frames required for a reliable parabolic fit.
 # Fewer than this and we refuse to commit -- caller falls back.
@@ -159,6 +159,17 @@ DEFAULT_CROP_FACTOR = 0.5
 # 0.15 gives enough headroom for other stage hardware without being
 # absurd.
 HARD_DEADLINE_SEC_PER_UM = 0.15
+
+# Tail after expected motion end (motion_duration_ms) before we
+# exit the scan loop. Catches frames in flight from the camera
+# pipeline plus a small margin for velocity-model error. Kept
+# tight (100 ms) because the data showed Prior's device_busy
+# lingers for ~2 seconds after physical motion ends -- if we
+# waited for device_busy we'd waste that whole window popping
+# stable frames at z_end. The retry loop in _attempt_one_scan
+# handles the case where velocity_um_s is so wrong that we exit
+# before useful samples arrive (it widens the range and re-runs).
+SCAN_TAIL_MS = 100.0
 
 # Default fallback range if yaml lookup completely fails.
 FALLBACK_RANGE_UM = 6.0
@@ -1003,62 +1014,26 @@ def _run_smooth_scan(
             from capture time. 11.5 um/s is the measured Prior
             MaxSpeed=1 forward rate from PROBEZ step 3.
     """
-    # ===== DIAGNOSTIC INSTRUMENTATION =====
-    # Temporary logging to disambiguate the "1-sample regression"
-    # observed on PPM JAI after fbd52c7. The questions we want
-    # answered with one Smooth attempt:
-    #   1. Is the camera producing frames immediately after
-    #      clear_circular_buffer? (pre-fire fill probe)
-    #   2. Does the buffer grow during the scan motion? (per-50ms
-    #      remaining-count probe inside the pop loop)
-    #   3. When does each successful pop happen relative to t0?
-    #      (per-pop log line)
-    #   4. When does the stage actually report done? (explicit log
-    #      instead of inferring from scan_duration)
-    #   5. End-of-scan summary: total pops, total wall-time.
-    # Removable wholesale once the regression is understood.
-    # ======================================
-    try:
-        pre_clear_remaining = core.get_remaining_image_count()
-    except Exception:
-        pre_clear_remaining = -1
+    # Atomic buffer flush just before firing the move. See the
+    # earlier block comment for why the loop-based drain didn't
+    # work (buffer refills faster than we pop).
     try:
         core.clear_circular_buffer()
-        logger.info(
-            "SMOOTH: flushed circular buffer before firing move "
-            "(was %d frames pre-clear)", pre_clear_remaining,
-        )
+        logger.info("SMOOTH: flushed circular buffer before firing move")
     except Exception as e:
         logger.warning("SMOOTH: clear_circular_buffer failed "
                         "(continuing with whatever's queued): %s", e)
 
-    # DIAGNOSTIC: post-clear fill probe. Sample remaining count
-    # every ~10 ms for 100 ms BEFORE firing the move so we can see
-    # in zero ambiguity whether the camera is producing frames at
-    # all in its current state. Re-clears the buffer afterwards so
-    # the probe doesn't pollute the actual scan samples.
-    probe_t0 = time.perf_counter()
-    probe_samples: List[Tuple[int, int]] = []
-    while (time.perf_counter() - probe_t0) < 0.1:
-        try:
-            cnt = core.get_remaining_image_count()
-        except Exception:
-            cnt = -1
-        t_probe_ms = int((time.perf_counter() - probe_t0) * 1000)
-        probe_samples.append((t_probe_ms, cnt))
-        time.sleep(0.01)
-    logger.info(
-        "SMOOTH: post-clear fill probe (100ms): %s",
-        " ".join(f"{t}ms={c}" for t, c in probe_samples),
-    )
-    try:
-        core.clear_circular_buffer()
-    except Exception:
-        pass
-
     direction = 1.0 if z_end >= z_start else -1.0
     motion_um = abs(z_end - z_start)
     motion_duration_ms = (motion_um / max(velocity_um_s, 0.01)) * 1000.0
+    # Time-based scan exit. Replaces the old device_busy poll loop:
+    # on Prior's serial-driven adapter, device_busy lingers ~2 s
+    # after physical motion ends, so the loop wasted that whole
+    # window popping stable frames at z_end. The motion model
+    # (velocity_um_s, calibrated by PROBEZ) is a much tighter
+    # predictor of when the stage is actually done.
+    scan_exit_at_ms = motion_duration_ms + SCAN_TAIL_MS
 
     # Per-pop record: (pop_wall_ms, metric, raw_pop_index)
     # Z is computed AFTER the scan from the pop order, not during,
@@ -1076,30 +1051,15 @@ def _run_smooth_scan(
     except Exception as e:
         logger.error("SMOOTH: non-blocking move to z_end failed: %s", e)
         return []
-    logger.info("SMOOTH: move fired at t=0ms (target Z=%.3f)", z_end)
 
-    stage_done_at: Optional[float] = None
-    loop_count = 0
     deadline = time.perf_counter() + hard_deadline_s
     pop_index = 0
     tags_logged = False
-    last_periodic_probe_ms = 0.0  # diagnostic: last time we logged remaining count
 
     while time.perf_counter() < deadline:
-        # DIAGNOSTIC: periodic buffer-count probe every 50 ms even
-        # when the pop loop finds nothing. Tells us if the camera
-        # is producing frames during the scan window.
         t_now_ms = (time.perf_counter() - t0) * 1000.0
-        if t_now_ms - last_periodic_probe_ms >= 50.0:
-            try:
-                periodic_remaining = core.get_remaining_image_count()
-            except Exception:
-                periodic_remaining = -1
-            logger.info(
-                "SMOOTH: t=%4.0fms remaining=%d popped=%d",
-                t_now_ms, periodic_remaining, pop_index,
-            )
-            last_periodic_probe_ms = t_now_ms
+        if t_now_ms > scan_exit_at_ms:
+            break
 
         popped = 0
         try:
@@ -1121,11 +1081,6 @@ def _run_smooth_scan(
                 if not tags_logged:
                     tags_logged = True
                     try:
-                        # Re-pop with metadata to get the tags dict
-                        # via pop_next_tagged_image. _pop_tagged_frame
-                        # discards them after extracting elapsed_ms,
-                        # so we don't have them here -- but elapsed_ms
-                        # being non-None means metadata WAS present.
                         if elapsed_ms is not None:
                             logger.info("SMOOTH: first frame elapsed_ms tag "
                                         "= %.3f (only diagnostic; not used "
@@ -1136,10 +1091,6 @@ def _run_smooth_scan(
                 pop_wall_ms = (time.perf_counter() - t0) * 1000.0
                 metric = _focus_metric(img, metric_name)
                 pop_records.append((pop_wall_ms, metric, pop_index))
-                logger.info(
-                    "SMOOTH: pop #%d at t=%.0fms (remaining_before=%d)",
-                    pop_index, pop_wall_ms, remaining_before_pop,
-                )
                 pop_index += 1
                 popped += 1
                 if popped >= 4:
@@ -1147,36 +1098,13 @@ def _run_smooth_scan(
         except Exception as e:
             logger.warning("SMOOTH: pop loop failed: %s", e)
 
-        loop_count += 1
-        if loop_count % BUSY_CHECK_EVERY_N == 0:
-            try:
-                busy = core.device_busy(focus_device)
-            except Exception:
-                busy = None
-            if busy is False and stage_done_at is None:
-                stage_done_at = (time.perf_counter() - t0) * 1000.0
-                logger.info(
-                    "SMOOTH: stage_done detected at t=%.0fms (popped=%d so far)",
-                    stage_done_at, pop_index,
-                )
-
-        if stage_done_at is not None:
-            # Short tail so we catch any frames arriving between
-            # stage-done and the command handshake settling.
-            if (time.perf_counter() - t0) * 1000.0 - stage_done_at > 200.0:
-                break
-
         time.sleep(SCAN_POLL_SLEEP_S)
 
-    # DIAGNOSTIC: end-of-scan summary
     total_scan_ms = (time.perf_counter() - t0) * 1000.0
-    stage_done_str = (
-        f"{stage_done_at:.0f}ms" if stage_done_at is not None else "never"
-    )
     logger.info(
-        "SMOOTH: scan loop exit: total=%.0fms total_pops=%d stage_done_at=%s "
-        "outer_iters=%d",
-        total_scan_ms, pop_index, stage_done_str, loop_count,
+        "SMOOTH: scan exit at t=%.0fms (motion_end=%.0fms + tail=%.0fms) "
+        "total_pops=%d", total_scan_ms, motion_duration_ms, SCAN_TAIL_MS,
+        pop_index,
     )
 
     # --- Post-scan Z assignment ---
@@ -1186,17 +1114,14 @@ def _run_smooth_scan(
     # (relative to the start of streaming, which is approximately
     # t0 since we cleared the buffer just before firing the move).
     #
-    # Estimate camera_period_ms by total_frames / scan_duration. If
-    # the scan was bounded by stage_done_at, use that; otherwise use
-    # the last pop's wall time.
+    # Estimate camera_period_ms by total_frames / scan_duration.
+    # Now that the scan loop exits at motion_duration_ms + tail
+    # (not on device_busy), we use the same value here -- it's the
+    # actual wall-clock window during which frames were captured.
     if not pop_records:
         return []
 
-    if stage_done_at is not None:
-        scan_duration_ms = stage_done_at + 200.0  # include the tail
-    else:
-        scan_duration_ms = pop_records[-1][0]
-    scan_duration_ms = max(scan_duration_ms, 1.0)
+    scan_duration_ms = max(motion_duration_ms + SCAN_TAIL_MS, 1.0)
 
     # Camera period: total elapsed / number of frames captured.
     # This is a good estimator only when the buffer-flush + move
@@ -2059,19 +1984,37 @@ def handle_smoothz(conn, client, hardware, settings, **kwargs):
         # roi_seq_was_running flag tells _restore_roi to bring
         # the original streaming state back up.
         _restore_roi(core, saved_roi, roi_seq_was_running)
-        # Restore JAI FrameRateHz if we bumped it. We deliberately
-        # restore even though "low" is almost always a misconfiguration
-        # (see the warning at scan entry) -- the operator may have a
-        # legitimate reason for the value, and forcing 38 Hz
-        # permanently would be silently changing camera state.
-        if saved_frame_rate_hz is not None and saved_frame_rate_hz < 30.0:
-            try:
-                core.set_property("JAICamera", "FrameRateHz", saved_frame_rate_hz)
+        # JAI FrameRateHz: deliberately do NOT restore if the saved
+        # value was below the streaming threshold. A low FrameRateHz
+        # is almost always a stale misconfiguration (the JAI device
+        # adapter persists this property across MM sessions, and the
+        # only code path that keeps it in sync with Exposure is
+        # JAICamera.set_exposure -- anything that writes Exposure
+        # directly leaves FrameRateHz dangling). "Restoring" to a
+        # broken value would just perpetuate the bug AND keep the
+        # Live Viewer running at the same slow rate. Leaving it at
+        # 38 Hz fixes both. If the saved value was already healthy
+        # (>= 30 Hz), we restore it so we don't silently change
+        # whatever the operator had configured.
+        if saved_frame_rate_hz is not None:
+            if saved_frame_rate_hz >= 30.0:
+                try:
+                    core.set_property(
+                        "JAICamera", "FrameRateHz", saved_frame_rate_hz,
+                    )
+                    logger.info(
+                        "SMOOTH: restored JAICamera FrameRateHz to %.2f",
+                        saved_frame_rate_hz,
+                    )
+                except Exception as e:
+                    logger.warning(
+                        "SMOOTH: could not restore JAICamera FrameRateHz: %s",
+                        e,
+                    )
+            else:
                 logger.info(
-                    "SMOOTH: restored JAICamera FrameRateHz to %.2f",
+                    "SMOOTH: leaving JAICamera FrameRateHz at 38.0 Hz "
+                    "(saved %.2f Hz was a stale misconfiguration; "
+                    "Live Viewer will now stream at full rate)",
                     saved_frame_rate_hz,
-                )
-            except Exception as e:
-                logger.warning(
-                    "SMOOTH: could not restore JAICamera FrameRateHz: %s", e,
                 )
