@@ -1003,15 +1003,58 @@ def _run_smooth_scan(
             from capture time. 11.5 um/s is the measured Prior
             MaxSpeed=1 forward rate from PROBEZ step 3.
     """
-    # Atomic buffer flush just before firing the move. See the
-    # earlier block comment for why the loop-based drain didn't
-    # work (buffer refills faster than we pop).
+    # ===== DIAGNOSTIC INSTRUMENTATION =====
+    # Temporary logging to disambiguate the "1-sample regression"
+    # observed on PPM JAI after fbd52c7. The questions we want
+    # answered with one Smooth attempt:
+    #   1. Is the camera producing frames immediately after
+    #      clear_circular_buffer? (pre-fire fill probe)
+    #   2. Does the buffer grow during the scan motion? (per-50ms
+    #      remaining-count probe inside the pop loop)
+    #   3. When does each successful pop happen relative to t0?
+    #      (per-pop log line)
+    #   4. When does the stage actually report done? (explicit log
+    #      instead of inferring from scan_duration)
+    #   5. End-of-scan summary: total pops, total wall-time.
+    # Removable wholesale once the regression is understood.
+    # ======================================
+    try:
+        pre_clear_remaining = core.get_remaining_image_count()
+    except Exception:
+        pre_clear_remaining = -1
     try:
         core.clear_circular_buffer()
-        logger.info("SMOOTH: flushed circular buffer before firing move")
+        logger.info(
+            "SMOOTH: flushed circular buffer before firing move "
+            "(was %d frames pre-clear)", pre_clear_remaining,
+        )
     except Exception as e:
         logger.warning("SMOOTH: clear_circular_buffer failed "
                         "(continuing with whatever's queued): %s", e)
+
+    # DIAGNOSTIC: post-clear fill probe. Sample remaining count
+    # every ~10 ms for 100 ms BEFORE firing the move so we can see
+    # in zero ambiguity whether the camera is producing frames at
+    # all in its current state. Re-clears the buffer afterwards so
+    # the probe doesn't pollute the actual scan samples.
+    probe_t0 = time.perf_counter()
+    probe_samples: List[Tuple[int, int]] = []
+    while (time.perf_counter() - probe_t0) < 0.1:
+        try:
+            cnt = core.get_remaining_image_count()
+        except Exception:
+            cnt = -1
+        t_probe_ms = int((time.perf_counter() - probe_t0) * 1000)
+        probe_samples.append((t_probe_ms, cnt))
+        time.sleep(0.01)
+    logger.info(
+        "SMOOTH: post-clear fill probe (100ms): %s",
+        " ".join(f"{t}ms={c}" for t, c in probe_samples),
+    )
+    try:
+        core.clear_circular_buffer()
+    except Exception:
+        pass
 
     direction = 1.0 if z_end >= z_start else -1.0
     motion_um = abs(z_end - z_start)
@@ -1033,17 +1076,40 @@ def _run_smooth_scan(
     except Exception as e:
         logger.error("SMOOTH: non-blocking move to z_end failed: %s", e)
         return []
+    logger.info("SMOOTH: move fired at t=0ms (target Z=%.3f)", z_end)
 
     stage_done_at: Optional[float] = None
     loop_count = 0
     deadline = time.perf_counter() + hard_deadline_s
     pop_index = 0
     tags_logged = False
+    last_periodic_probe_ms = 0.0  # diagnostic: last time we logged remaining count
 
     while time.perf_counter() < deadline:
+        # DIAGNOSTIC: periodic buffer-count probe every 50 ms even
+        # when the pop loop finds nothing. Tells us if the camera
+        # is producing frames during the scan window.
+        t_now_ms = (time.perf_counter() - t0) * 1000.0
+        if t_now_ms - last_periodic_probe_ms >= 50.0:
+            try:
+                periodic_remaining = core.get_remaining_image_count()
+            except Exception:
+                periodic_remaining = -1
+            logger.info(
+                "SMOOTH: t=%4.0fms remaining=%d popped=%d",
+                t_now_ms, periodic_remaining, pop_index,
+            )
+            last_periodic_probe_ms = t_now_ms
+
         popped = 0
         try:
-            while core.get_remaining_image_count() > 0:
+            while True:
+                try:
+                    remaining_before_pop = core.get_remaining_image_count()
+                except Exception:
+                    remaining_before_pop = 0
+                if remaining_before_pop <= 0:
+                    break
                 img, elapsed_ms = _pop_tagged_frame(core)
                 if img is None:
                     break
@@ -1070,6 +1136,10 @@ def _run_smooth_scan(
                 pop_wall_ms = (time.perf_counter() - t0) * 1000.0
                 metric = _focus_metric(img, metric_name)
                 pop_records.append((pop_wall_ms, metric, pop_index))
+                logger.info(
+                    "SMOOTH: pop #%d at t=%.0fms (remaining_before=%d)",
+                    pop_index, pop_wall_ms, remaining_before_pop,
+                )
                 pop_index += 1
                 popped += 1
                 if popped >= 4:
@@ -1085,6 +1155,10 @@ def _run_smooth_scan(
                 busy = None
             if busy is False and stage_done_at is None:
                 stage_done_at = (time.perf_counter() - t0) * 1000.0
+                logger.info(
+                    "SMOOTH: stage_done detected at t=%.0fms (popped=%d so far)",
+                    stage_done_at, pop_index,
+                )
 
         if stage_done_at is not None:
             # Short tail so we catch any frames arriving between
@@ -1093,6 +1167,17 @@ def _run_smooth_scan(
                 break
 
         time.sleep(SCAN_POLL_SLEEP_S)
+
+    # DIAGNOSTIC: end-of-scan summary
+    total_scan_ms = (time.perf_counter() - t0) * 1000.0
+    stage_done_str = (
+        f"{stage_done_at:.0f}ms" if stage_done_at is not None else "never"
+    )
+    logger.info(
+        "SMOOTH: scan loop exit: total=%.0fms total_pops=%d stage_done_at=%s "
+        "outer_iters=%d",
+        total_scan_ms, pop_index, stage_done_str, loop_count,
+    )
 
     # --- Post-scan Z assignment ---
     # FIFO guarantee: pop N retrieves the N-th frame the camera
