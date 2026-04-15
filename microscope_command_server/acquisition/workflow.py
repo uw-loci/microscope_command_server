@@ -2604,7 +2604,9 @@ def _acquisition_workflow(
             if schema_version >= 2 and strategies_library:
                 # Resolve the modality binding: longest-prefix-wins, case-
                 # insensitive, matching ModalityRegistry on the Java side.
-                current_modality = params.get("modality", "") or ""
+                # Reuse the modality already extracted from scan_type above;
+                # params has no "modality" key.
+                current_modality = modality or ""
                 current_modality_lower = current_modality.lower()
                 best_match = None
                 best_len = 0
