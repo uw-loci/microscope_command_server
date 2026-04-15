@@ -1115,7 +1115,20 @@ def _run_smooth_scan(
 
     deadline = time.perf_counter() + hard_deadline_s
     pop_index = 0
-    tags_logged = False
+
+    # Cache image geometry once outside the pop loop. _pop_tagged_frame
+    # was reading width/height/components per frame via 3 extra RPCs,
+    # which dominated per-pop cost. The geometry can't change mid-scan
+    # without a stop+restart of the sequence (we never do that here),
+    # so a single cached read is correct AND ~3x faster.
+    try:
+        img_w = int(core.get_image_width())
+        img_h = int(core.get_image_height())
+        img_nch = int(core.get_number_of_components())
+    except Exception as e:
+        logger.warning("SMOOTH: could not query image geometry up front: %s", e)
+        img_w = img_h = 0
+        img_nch = 1
 
     while time.perf_counter() < deadline:
         t_now_ms = (time.perf_counter() - t0) * 1000.0
@@ -1123,13 +1136,13 @@ def _run_smooth_scan(
             break
 
         # One get_remaining_image_count RPC per outer iteration to
-        # decide whether to enter the pop loop or sleep. When there
-        # are frames, pop ALL of them in one batch (no popped >= 4
-        # cap) -- the cap was capping us at ~13 fps when the camera
-        # produces ~35 fps, so we were missing more than half the
-        # frames. Inside the batch we don't re-check the count;
-        # _pop_tagged_frame returns (None, None) when the buffer
-        # empties, which terminates the inner loop naturally.
+        # decide whether to enter the pop loop or sleep. Inside the
+        # batch we pop until either (a) the buffer empties or
+        # (b) we hit the scan exit time. The (b) check is critical:
+        # the camera produces ~38 fps continuously, so without an
+        # in-batch time check the inner loop would never return
+        # control to the outer loop and the scan would run forever
+        # (observed 23:20: 18-second scan over a 1.7 second motion).
         try:
             remaining = core.get_remaining_image_count()
         except Exception:
@@ -1138,24 +1151,31 @@ def _run_smooth_scan(
         if remaining > 0:
             try:
                 while True:
-                    img, elapsed_ms = _pop_tagged_frame(core)
-                    if img is None:
+                    # In-batch time check -- guarantees the loop
+                    # exits at scan_exit_at_ms even when the camera
+                    # is producing fast enough that the buffer
+                    # never empties between pops.
+                    if (time.perf_counter() - t0) * 1000.0 > scan_exit_at_ms:
                         break
 
-                    # One-time debug: log the elapsed_ms tag of the
-                    # first popped frame for cross-checking against
-                    # the wall-clock pop time.
-                    if not tags_logged:
-                        tags_logged = True
-                        try:
-                            if elapsed_ms is not None:
-                                logger.info(
-                                    "SMOOTH: first frame elapsed_ms tag "
-                                    "= %.3f (only diagnostic; not used "
-                                    "for Z labeling)", elapsed_ms,
-                                )
-                        except Exception:
-                            pass
+                    # Use pop_next_image directly with cached
+                    # geometry instead of _pop_tagged_frame: skips
+                    # the tag-dict construction and the per-frame
+                    # geometry RPCs.
+                    try:
+                        pixels = core.pop_next_image()
+                    except Exception:
+                        pixels = None
+                    if pixels is None:
+                        break
+                    arr = np.asarray(pixels)
+                    try:
+                        if img_nch <= 1:
+                            img = arr.reshape(img_h, img_w)
+                        else:
+                            img = arr.reshape(img_h, img_w, img_nch)
+                    except Exception:
+                        img = arr
 
                     pop_wall_ms = (time.perf_counter() - t0) * 1000.0
                     metric = _focus_metric(img, metric_name)
@@ -1184,13 +1204,16 @@ def _run_smooth_scan(
     # t0 since we cleared the buffer just before firing the move).
     #
     # Estimate camera_period_ms by total_frames / scan_duration.
-    # Now that the scan loop exits at motion_duration_ms + tail
-    # (not on device_busy), we use the same value here -- it's the
-    # actual wall-clock window during which frames were captured.
+    # Use the ACTUAL loop wall time (total_scan_ms) rather than the
+    # expected motion_duration_ms + SCAN_TAIL_MS -- if the loop ever
+    # overruns the expected exit time (bug in the inner pop loop,
+    # slower-than-expected stage, etc.) the actual elapsed value is
+    # always correct, while the expected value would understate the
+    # period and corrupt the back-filled Z labels.
     if not pop_records:
         return []
 
-    scan_duration_ms = max(motion_duration_ms + SCAN_TAIL_MS, 1.0)
+    scan_duration_ms = max(total_scan_ms, 1.0)
 
     # Camera period: total elapsed / number of frames captured.
     # This is a good estimator only when the buffer-flush + move
