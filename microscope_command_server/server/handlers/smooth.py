@@ -731,7 +731,34 @@ def _restore_roi(
         logger.info("SMOOTH: restored camera ROI to (%d, %d, %dx%d)",
                     x0, y0, w0, h0)
     except Exception as e:
-        logger.warning("SMOOTH: failed to restore camera ROI: %s", e)
+        # JAI / GenAPI failure mode: when the camera is currently in
+        # a cropped state, the GenAPI Width and Height nodes report a
+        # Max equal to the *current* (cropped) extent, not the full
+        # sensor. set_roi() back to the full-sensor original then
+        # fails with "Value=2064 must be <= Max=1552" or similar.
+        # Recovery: clear_roi() resets the camera to its full sensor
+        # (which restores Width/Height Max to the absolute maximum),
+        # then we re-apply the original ROI only if it wasn't already
+        # equal to the full sensor.
+        logger.debug(
+            "SMOOTH: set_roi(%d, %d, %dx%d) failed (%s); "
+            "trying clear_roi + retry",
+            x0, y0, w0, h0, e,
+        )
+        try:
+            core.clear_roi()
+            full_roi = _read_roi(core)
+            if full_roi != (x0, y0, w0, h0):
+                core.set_roi(int(x0), int(y0), int(w0), int(h0))
+            logger.info(
+                "SMOOTH: restored camera ROI to (%d, %d, %dx%d) via clear_roi",
+                x0, y0, w0, h0,
+            )
+        except Exception as e2:
+            logger.warning(
+                "SMOOTH: failed to restore camera ROI even after "
+                "clear_roi (%s -> %s)", e, e2,
+            )
 
     # Restart the sequence iff:
     #   (a) we just stopped it for the restore, OR
