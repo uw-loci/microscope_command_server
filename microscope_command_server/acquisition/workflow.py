@@ -5214,6 +5214,86 @@ def acquire_background_with_per_channel_adaptive(
     return last_image, last_exposures
 
 
+def _resolve_background_profile_key(
+    modality: str,
+    objective: str,
+    hardware: PycromanagerHardware,
+    logger,
+) -> "str | None":
+    """Resolve a background-collection modality + objective pair to a full
+    acquisition_profiles key.
+
+    Java sends --modality as the bare modality name ("Brightfield") and
+    --objective as the full objective id ("0.5NA_AIR_10x" on OWS3, or
+    "LOCI_OBJECTIVE_OLYMPUS_10X_POL_001" on PPM), but acquisition_profiles
+    in the YAML are keyed by <modality>_<objective-suffix>
+    ("Brightfield_10x"). We walk the profiles dict and pick the first key
+    that starts with "<modality>_" and whose suffix is a substring of the
+    objective id (case-insensitive). This is intentionally scope-agnostic
+    so every scope's objective-id convention works without a lookup table.
+
+    Returns the matched profile key, or None if no match is found (in
+    which case the caller falls back to using the bare modality and lets
+    apply_profile_illumination log its own "profile not found" warning).
+    """
+    if not modality:
+        return None
+    try:
+        profiles = hardware.settings.get("acquisition_profiles", {}) or {}
+    except Exception:
+        return None
+    if not profiles:
+        return None
+
+    modality_prefix = modality + "_"
+    # Strategy 1: exact match on modality alone (unusual but possible if
+    # someone keyed a profile by modality-only).
+    if modality in profiles:
+        return modality
+
+    obj_lower = (objective or "").lower()
+
+    # Strategy 2: look for "<modality>_<suffix>" where <suffix> appears in
+    # the objective id. Prefer the longest matching suffix so e.g. "10x"
+    # beats a hypothetical "x" on the same scope.
+    candidates = []
+    for key in profiles:
+        if not key.startswith(modality_prefix):
+            continue
+        suffix = key[len(modality_prefix):]
+        if suffix and suffix.lower() in obj_lower:
+            candidates.append((len(suffix), key))
+    if candidates:
+        candidates.sort(reverse=True)
+        matched = candidates[0][1]
+        logger.info(
+            "Resolved background profile: modality='%s' objective='%s' -> '%s'",
+            modality, objective, matched,
+        )
+        return matched
+
+    # Strategy 3: case-insensitive fallback for strategy 2, in case the
+    # profile key and the modality arg differ in capitalization.
+    modality_prefix_lower = modality_prefix.lower()
+    for key in profiles:
+        if not key.lower().startswith(modality_prefix_lower):
+            continue
+        suffix = key[len(modality_prefix):]
+        if suffix and suffix.lower() in obj_lower:
+            logger.info(
+                "Resolved background profile (case-insensitive): modality='%s' objective='%s' -> '%s'",
+                modality, objective, key,
+            )
+            return key
+
+    logger.warning(
+        "Could not resolve background profile for modality='%s' objective='%s'. "
+        "Available profiles: %s",
+        modality, objective, sorted(profiles.keys()),
+    )
+    return None
+
+
 def simple_background_collection(
     yaml_file_path: str,
     output_folder_path: str,
@@ -5297,16 +5377,27 @@ def simple_background_collection(
         # This only touches lamp intensity -- it does NOT move stages,
         # switch detectors, or apply MM presets, so the user's manually
         # positioned blank area is preserved.
+        # The Java client sends --modality as the bare modality name (e.g.
+        # "Brightfield"), but acquisition_profiles in the YAML are keyed by
+        # the enhanced form <modality>_<objective-suffix> (e.g. "Brightfield_10x").
+        # Calling apply_profile_illumination("Brightfield") would fail the
+        # lookup and silently leave whatever lamp level the Live Viewer last
+        # used, producing flat-fields against the wrong intensity. Resolve
+        # the full profile key here using both modality and objective.
+        resolved_profile = _resolve_background_profile_key(
+            modality, objective, hardware, logger
+        )
+        profile_to_apply = resolved_profile or modality
         try:
-            applied_intensity = hardware.apply_profile_illumination(modality)
+            applied_intensity = hardware.apply_profile_illumination(profile_to_apply)
             if applied_intensity is not None:
                 logger.info(
-                    f"Background collection aligned to profile '{modality}' "
+                    f"Background collection aligned to profile '{profile_to_apply}' "
                     f"illumination intensity: {applied_intensity}"
                 )
             else:
                 logger.info(
-                    f"Background collection: no profile illumination applied for '{modality}' "
+                    f"Background collection: no profile illumination applied for '{profile_to_apply}' "
                     "(profile missing, no illumination_intensity, or no active illumination device)"
                 )
         except Exception as e:
