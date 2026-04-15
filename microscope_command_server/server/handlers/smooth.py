@@ -1689,6 +1689,61 @@ def handle_smoothz(conn, client, hardware, settings, **kwargs):
     # in the handler's finally block.
     saved_roi, roi_seq_was_running = _apply_crop_roi(core, crop_factor)
 
+    # --- JAI FrameRateHz sanity check + force-to-max ---
+    # The JAI device adapter has a 'FrameRateHz' property hardware-
+    # coupled to the Exposure property. The two are normally kept in
+    # sync by JAICamera.set_exposure(), which sets BOTH properties.
+    # But if anything has set the JAI's Exposure directly (Device
+    # Property Browser, a stale preset, or any code path that bypasses
+    # the camera class) FrameRateHz can be left at a value that
+    # bottlenecks streaming production rate, regardless of how short
+    # the actual exposure is. Observed on PPM 2026-04-14: a 0.5 ms
+    # Exposure with FrameRateHz=1 produced ~1.2 fps during a Smooth
+    # scan, giving 1-2 samples instead of 15+.
+    #
+    # Fix: read FrameRateHz, force it to FRAME_RATE_MAX (38 Hz) for
+    # the scan if it's below a usable threshold, and restore on exit.
+    # The warning tells the operator that their camera preset is
+    # misconfigured and Live Viewer streaming will also be running
+    # slow until they re-apply a SETCAM-driven preset.
+    saved_frame_rate_hz: Optional[float] = None
+    try:
+        active_cam = core.get_camera_device()
+    except Exception:
+        active_cam = None
+    if active_cam == "JAICamera":
+        try:
+            saved_frame_rate_hz = float(
+                core.get_property("JAICamera", "FrameRateHz")
+            )
+        except Exception as e:
+            logger.warning("SMOOTH: could not read JAICamera FrameRateHz: %s", e)
+            saved_frame_rate_hz = None
+        if saved_frame_rate_hz is not None and saved_frame_rate_hz < 30.0:
+            logger.warning(
+                "SMOOTH: JAICamera FrameRateHz=%.2f Hz is too low for "
+                "streaming focus; temporarily forcing to 38 Hz. The Live "
+                "Viewer was also producing frames at this rate -- re-apply "
+                "your camera preset to fix it permanently.",
+                saved_frame_rate_hz,
+            )
+            try:
+                core.set_property("JAICamera", "FrameRateHz", 38.0)
+                logger.info(
+                    "SMOOTH: bumped JAICamera FrameRateHz from %.2f to 38.0",
+                    saved_frame_rate_hz,
+                )
+            except Exception as e:
+                logger.warning(
+                    "SMOOTH: could not set JAICamera FrameRateHz=38 mid-stream "
+                    "(%s); scan may still be starved", e,
+                )
+        elif saved_frame_rate_hz is not None:
+            logger.info(
+                "SMOOTH: JAICamera FrameRateHz=%.2f Hz (above threshold, leaving alone)",
+                saved_frame_rate_hz,
+            )
+
     # --- Pre-flight: exposure * velocity blur budget ---
     try:
         exposure_ms = float(core.get_exposure())
@@ -2004,3 +2059,19 @@ def handle_smoothz(conn, client, hardware, settings, **kwargs):
         # roi_seq_was_running flag tells _restore_roi to bring
         # the original streaming state back up.
         _restore_roi(core, saved_roi, roi_seq_was_running)
+        # Restore JAI FrameRateHz if we bumped it. We deliberately
+        # restore even though "low" is almost always a misconfiguration
+        # (see the warning at scan entry) -- the operator may have a
+        # legitimate reason for the value, and forcing 38 Hz
+        # permanently would be silently changing camera state.
+        if saved_frame_rate_hz is not None and saved_frame_rate_hz < 30.0:
+            try:
+                core.set_property("JAICamera", "FrameRateHz", saved_frame_rate_hz)
+                logger.info(
+                    "SMOOTH: restored JAICamera FrameRateHz to %.2f",
+                    saved_frame_rate_hz,
+                )
+            except Exception as e:
+                logger.warning(
+                    "SMOOTH: could not restore JAICamera FrameRateHz: %s", e,
+                )
