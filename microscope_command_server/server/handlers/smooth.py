@@ -131,6 +131,17 @@ SCAN_POLL_SLEEP_S = 0.002
 # Fewer than this and we refuse to commit -- caller falls back.
 MIN_FRAMES_FOR_FIT = 6
 
+# Minimum metric range (as a fraction of the metric peak value)
+# required to trust the fit. Below this the entire scan sits in
+# what is effectively one depth-of-field and the metric variation
+# is indistinguishable from noise -- the argmax becomes random.
+# Dominant failure mode at 10x NA 0.25 when sweep_range_um is
+# 10 um or less: the whole scan stays inside the ~10 um DOF, the
+# metric varies by <1%, and any committed shift is coin-flip
+# random. Empirically seen as 0.6-0.7% at PPM 10x; a real peak
+# at 20x gives ~80%+. 5% is a comfortable threshold for both.
+FLAT_METRIC_FRACTION = 0.05
+
 # Maximum number of edge-retry attempts beyond the first scan. Each
 # retry shifts the scan window one full range in the direction of
 # the previously-detected peak. With 2 retries (MAX_EDGE_RETRIES=2)
@@ -1262,6 +1273,10 @@ class _ScanAttemptResult:
         'edge_low'            -- argmax at first usable sample; shift down
         'edge_high'           -- argmax at last usable sample; shift up
         'insufficient_samples' -- not enough samples for a fit
+        'metric_flat'         -- metric variation across the scan is
+                                 within noise (scan window inside one
+                                 depth-of-field); retrying with the
+                                 same range will not help
         'error'               -- hardware or protocol error mid-scan
     """
     def __init__(self, status: str, best_z: Optional[float],
@@ -1370,6 +1385,43 @@ def _attempt_one_scan(
             z_span = float(max(zs) - min(zs))
             raw_peak_idx = int(np.argmax(ms))
             raw_peak_z = zs[raw_peak_idx]
+
+            # --- Flat-metric refusal ---
+            # If the metric range across all samples is within noise
+            # of the metric peak, there is no findable peak and any
+            # "argmax" is whichever sample won a coin flip. This is
+            # the dominant failure mode at 10x where the configured
+            # scan range is smaller than the depth of field: the
+            # entire scan sits inside one DOF and normalized_variance
+            # varies by <1% which is indistinguishable from noise.
+            # Committing such a fit produces a ~random small shift
+            # that drifts the tile off focus over time; refusing with
+            # a specific reason lets the operator choose to widen
+            # --range or fall back to Sweep.
+            metric_peak = float(max(ms))
+            metric_trough = float(min(ms))
+            metric_range = metric_peak - metric_trough
+            metric_range_frac = (
+                metric_range / max(abs(metric_peak), 1e-6)
+            )
+            if metric_range_frac < FLAT_METRIC_FRACTION:
+                logger.warning(
+                    "SMOOTH: %smetric range %.3f (%.2f%% of peak %.3f) "
+                    "is within noise -- scan window is entirely within "
+                    "DOF, cannot find focus. Widen --range or use a "
+                    "higher-mag objective.",
+                    tag_prefix, metric_range,
+                    metric_range_frac * 100.0, metric_peak,
+                )
+                return _ScanAttemptResult(
+                    "metric_flat", None, n_motion_samples, z_span,
+                    f"metric range {metric_range_frac:.2%} of peak is "
+                    f"within noise; scan window {z_span:.2f} um is "
+                    f"likely inside one depth-of-field. Widen --range "
+                    f"or switch to Sweep Focus.",
+                    samples_trace=list(in_motion),
+                )
+
             # Prefer a full-sample Gaussian fit (uses all N samples,
             # robust to a single noisy point), fall back to 3-point
             # parabolic (uses only the argmax neighborhood), fall
