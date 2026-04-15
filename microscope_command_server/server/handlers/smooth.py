@@ -1086,9 +1086,36 @@ def _run_smooth_scan(
             from capture time. 11.5 um/s is the measured Prior
             MaxSpeed=1 forward rate from PROBEZ step 3.
     """
-    # Atomic buffer flush just before firing the move. See the
-    # earlier block comment for why the loop-based drain didn't
-    # work (buffer refills faster than we pop).
+    # Peek-based sampling. The old FIFO pop_next_image approach
+    # was fundamentally bottlenecked at ~10 fps because every pop
+    # issued a ZMQ image transfer that serialized on the bridge,
+    # while the camera produces at ~38 fps. We were draining only
+    # the first ~10-20% of frames the camera generated during the
+    # scan, so a 20 um scan that saw focus pass through the middle
+    # would only sample the first ~4 um of Z -- the focus
+    # transition was there, we just never retrieved the frames.
+    # (Observed 00:18 PPM 10x: user *visually* saw focus pass
+    # through the middle of a 20 um scan, but the metric showed
+    # only 1.17% variation because sampled frames were all from
+    # the first few microns of travel.)
+    #
+    # Fix: use core.get_last_image() -- the same non-consuming
+    # PEEK that the Live Viewer already uses to display the
+    # running stream. It returns whatever frame the camera
+    # currently has most-recent, without removing it from the
+    # circular buffer. We poll it at a fixed cadence (every
+    # SCAN_POLL_SLEEP_S seconds), tagging each sample with the
+    # wall time since the move fired. Z is computed directly
+    # from wall_time * velocity -- no back-fill, no camera_period
+    # inference.
+    #
+    # Duplicate detection: multiple consecutive calls to
+    # get_last_image can return the same underlying frame if we
+    # poll faster than the camera produces. We track the camera's
+    # remaining-image count as a monotonic "new frame arrived"
+    # signal -- when it increases, the latest frame is
+    # guaranteed-new. When it doesn't, we skip the compute to
+    # avoid wasted metric evaluations on duplicates.
     try:
         core.clear_circular_buffer()
         logger.info("SMOOTH: flushed circular buffer before firing move")
@@ -1099,23 +1126,26 @@ def _run_smooth_scan(
     direction = 1.0 if z_end >= z_start else -1.0
     motion_um = abs(z_end - z_start)
     motion_duration_ms = (motion_um / max(velocity_um_s, 0.01)) * 1000.0
-    # Time-based scan exit. Replaces the old device_busy poll loop:
-    # on Prior's serial-driven adapter, device_busy lingers ~2 s
-    # after physical motion ends, so the loop wasted that whole
-    # window popping stable frames at z_end. The motion model
-    # (velocity_um_s, calibrated by PROBEZ) is a much tighter
-    # predictor of when the stage is actually done.
     scan_exit_at_ms = motion_duration_ms + SCAN_TAIL_MS
 
-    # Per-pop record: (pop_wall_ms, metric, raw_pop_index)
-    # Z is computed AFTER the scan from the pop order, not during,
-    # because the only reliable timing info we have is the FIFO
-    # ordering guarantee + the wall-clock duration of the whole
-    # scan. ElapsedTime-ms metadata varies in semantics across MM
-    # camera drivers (the JAI build saw 17/45 ms alternating
-    # values that aren't a real elapsed-since-start clock), so we
-    # ignore it for now and rely on the pop ordering.
-    pop_records: List[Tuple[float, float, int]] = []
+    # Cache image geometry once. get_last_image returns a flat
+    # pixel buffer; we need width/height/channels to reshape.
+    try:
+        img_w = int(core.get_image_width())
+        img_h = int(core.get_image_height())
+        img_nch = int(core.get_number_of_components())
+    except Exception as e:
+        logger.warning("SMOOTH: could not query image geometry: %s", e)
+        img_w = img_h = 0
+        img_nch = 1
+
+    # Raw captures during the scan. Each entry is
+    # (wall_ms, image_array). Metric is computed AFTER the loop
+    # so we don't block the sampling cadence on per-frame CPU
+    # work (normalized_variance on a 1024x772x3 image is ~5-15ms,
+    # enough to skew a 20-50ms poll cadence if done inline).
+    raw_captures: List[Tuple[float, np.ndarray]] = []
+    last_remaining = -1
 
     t0 = time.perf_counter()
     try:
@@ -1125,139 +1155,69 @@ def _run_smooth_scan(
         return []
 
     deadline = time.perf_counter() + hard_deadline_s
-    pop_index = 0
-    pop_exception_logged = False  # one-shot warning if pop API itself fails
 
     while time.perf_counter() < deadline:
         t_now_ms = (time.perf_counter() - t0) * 1000.0
         if t_now_ms > scan_exit_at_ms:
             break
 
-        # One get_remaining_image_count RPC per outer iteration to
-        # decide whether to enter the pop loop or sleep. Inside the
-        # batch we pop until either (a) the buffer empties or
-        # (b) we hit the scan exit time. The (b) check is critical:
-        # the camera produces ~38 fps continuously, so without an
-        # in-batch time check the inner loop would never return
-        # control to the outer loop and the scan would run forever
-        # (observed 23:20: 18-second scan over a 1.7 second motion).
+        # Detect new frame via the remaining-image-count delta.
+        # Cheaper than a full pixel fingerprint; reliable while
+        # the buffer is filling monotonically (which it is for
+        # the duration of a single scan, since nothing is
+        # popping).
         try:
             remaining = core.get_remaining_image_count()
         except Exception:
-            remaining = 0
+            remaining = last_remaining
 
-        if remaining > 0:
+        if remaining > last_remaining:
             try:
-                while True:
-                    # In-batch time check -- guarantees the loop
-                    # exits at scan_exit_at_ms even when the camera
-                    # is producing fast enough that the buffer
-                    # never empties between pops.
-                    if (time.perf_counter() - t0) * 1000.0 > scan_exit_at_ms:
-                        break
+                pixels = core.get_last_image()
+            except Exception:
+                pixels = None
+            if pixels is not None:
+                arr = np.asarray(pixels)
+                raw_captures.append((t_now_ms, arr))
+            last_remaining = remaining
 
-                    # _pop_tagged_frame already pulls width/height
-                    # from the tag dict (no per-pop geometry RPCs)
-                    # and is the call we have empirical evidence
-                    # works on this build -- the previous attempt
-                    # to use core.pop_next_image() directly
-                    # silently produced 0 pops (23:27).
-                    img, _elapsed_ms = _pop_tagged_frame(core)
-                    if img is None:
-                        # Could be: buffer transiently empty (normal),
-                        # OR pop API raising every call (broken). Log
-                        # one-shot warning the first time so the next
-                        # debug round has something to grep for.
-                        if not pop_exception_logged:
-                            pop_exception_logged = True
-                            logger.warning(
-                                "SMOOTH: _pop_tagged_frame returned None "
-                                "at t=%.0fms (remaining was %d). If this "
-                                "repeats and total_pops is 0, the pop API "
-                                "is failing.",
-                                (time.perf_counter() - t0) * 1000.0,
-                                remaining,
-                            )
-                        break
-
-                    pop_wall_ms = (time.perf_counter() - t0) * 1000.0
-                    metric = _focus_metric(img, metric_name)
-                    pop_records.append((pop_wall_ms, metric, pop_index))
-                    pop_index += 1
-            except Exception as e:
-                logger.warning("SMOOTH: pop loop failed: %s", e)
-        else:
-            # Buffer empty -- sleep briefly so we don't burn CPU
-            # spinning on get_remaining_image_count RPCs while the
-            # camera is producing the next frame.
-            time.sleep(SCAN_POLL_SLEEP_S)
+        time.sleep(SCAN_POLL_SLEEP_S)
 
     total_scan_ms = (time.perf_counter() - t0) * 1000.0
-    logger.info(
-        "SMOOTH: scan exit at t=%.0fms (motion_end=%.0fms + tail=%.0fms) "
-        "total_pops=%d", total_scan_ms, motion_duration_ms, SCAN_TAIL_MS,
-        pop_index,
-    )
 
-    # --- Post-scan Z assignment ---
-    # FIFO guarantee: pop N retrieves the N-th frame the camera
-    # produced after the buffer was cleared. With a constant camera
-    # frame rate the N-th frame was captured at N * camera_period_ms
-    # (relative to the start of streaming, which is approximately
-    # t0 since we cleared the buffer just before firing the move).
-    #
-    # Estimate camera_period_ms by total_frames / scan_duration.
-    # Use the ACTUAL loop wall time (total_scan_ms) rather than the
-    # expected motion_duration_ms + SCAN_TAIL_MS -- if the loop ever
-    # overruns the expected exit time (bug in the inner pop loop,
-    # slower-than-expected stage, etc.) the actual elapsed value is
-    # always correct, while the expected value would understate the
-    # period and corrupt the back-filled Z labels.
-    if not pop_records:
-        return []
-
-    scan_duration_ms = max(total_scan_ms, 1.0)
-
-    # Camera period: total elapsed / number of frames captured.
-    # This is a good estimator only when the buffer-flush + move
-    # timing is tight enough that every produced frame got popped.
-    # In practice we drain the buffer after the move is done, so
-    # this is approximately correct.
-    if pop_index >= 2:
-        camera_period_ms = scan_duration_ms / pop_index
-    else:
-        camera_period_ms = 33.0  # fallback for 30 fps
-
-    # Sanity check: clamp camera_period to [10, 500] ms. If it's
-    # way outside that, the scan was unusual (very fast or very
-    # slow camera) and we fall back to 33 ms.
-    if camera_period_ms < 10.0 or camera_period_ms > 500.0:
-        logger.warning("SMOOTH: implausible camera period %.1f ms "
-                        "(scan=%dms n=%d); falling back to 33ms",
-                        camera_period_ms, int(scan_duration_ms), pop_index)
-        camera_period_ms = 33.0
-
-    logger.info("SMOOTH: estimated camera period %.1f ms "
-                "(scan duration %dms / %d frames)",
-                camera_period_ms, int(scan_duration_ms), pop_index)
-
-    # Now assign each popped frame's capture time + interpolated Z.
-    # The N-th popped frame was captured at (N + 0.5) * camera_period
-    # -- the +0.5 puts the timestamp at the midpoint of the frame's
-    # exposure window rather than its start, which slightly improves
-    # accuracy when the exposure is a meaningful fraction of the
-    # period.
+    # --- Post-scan: reshape + metric computation ---
     samples: List[Tuple[float, float, float]] = []
-    for (_, metric, idx) in pop_records:
-        capture_offset_ms = (idx + 0.5) * camera_period_ms
-        if capture_offset_ms <= 0:
+    for (wall_ms, arr) in raw_captures:
+        try:
+            if img_nch <= 1:
+                img = arr.reshape(img_h, img_w)
+            else:
+                img = arr.reshape(img_h, img_w, img_nch)
+        except Exception:
+            img = arr
+        try:
+            metric = _focus_metric(img, metric_name)
+        except Exception as e:
+            logger.debug("SMOOTH: metric compute failed: %s", e)
+            continue
+
+        # Z from wall time * velocity. This is now directly
+        # accurate -- no camera_period back-fill, no inference.
+        if wall_ms <= 0:
             z_interp = z_start
-        elif capture_offset_ms >= motion_duration_ms:
+        elif wall_ms >= motion_duration_ms:
             z_interp = z_end
         else:
-            progress_um = (capture_offset_ms / 1000.0) * velocity_um_s * direction
+            progress_um = (wall_ms / 1000.0) * velocity_um_s * direction
             z_interp = z_start + progress_um
-        samples.append((capture_offset_ms, float(z_interp), metric))
+        samples.append((wall_ms, float(z_interp), metric))
+
+    logger.info(
+        "SMOOTH: scan exit at t=%.0fms (motion_end=%.0fms + tail=%.0fms) "
+        "captures=%d samples=%d",
+        total_scan_ms, motion_duration_ms, SCAN_TAIL_MS,
+        len(raw_captures), len(samples),
+    )
 
     return samples
 
