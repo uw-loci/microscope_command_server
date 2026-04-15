@@ -13,12 +13,35 @@ from microscope_control.hardware import Position
 
 logger = logging.getLogger(__name__)
 
+# GETXY / GETZ / GETXYZ handlers serve the live position display in
+# QuPath's StageControlPanel and the live-viewer overlay. Both poll
+# at ~500 ms and don't need sub-100 ms-accurate positions, so we
+# read from the shared StagePositionCache instead of hitting the
+# serial bus on every request. Cache staleness up to STALE_MS is
+# acceptable; older than that, force a live read.
+_POSITION_CACHE_STALE_MS = 250.0
+
+
+def _read_position_cached_or_live(hardware) -> Position:
+    """Read position from the shared cache, falling back to live.
+
+    The cache is owned by PycromanagerHardware and present in normal
+    operation. Defensive fallback to a live query covers (a) any
+    hardware backend that doesn't expose a stage_cache property and
+    (b) the brief window during config reload before a new cache is
+    spun up.
+    """
+    cache = getattr(hardware, "stage_cache", None)
+    if cache is None:
+        return hardware.get_current_position()
+    return cache.get_cached_position(max_age_ms=_POSITION_CACHE_STALE_MS)
+
 
 def handle_getxy(conn, client, hardware, settings, **kwargs):
     """Return current XY stage position as two big-endian floats."""
     logger.debug("Client %s requested XY position", client.addr)
     try:
-        pos = hardware.get_current_position()
+        pos = _read_position_cached_or_live(hardware)
         conn.sendall(struct.pack("!ff", pos.x, pos.y))
         logger.debug("Sent XY position: (%.1f, %.1f)", pos.x, pos.y)
     except Exception as e:
@@ -30,7 +53,7 @@ def handle_getz(conn, client, hardware, settings, **kwargs):
     """Return current Z position as one big-endian float."""
     logger.debug("Client %s requested Z position", client.addr)
     try:
-        pos = hardware.get_current_position()
+        pos = _read_position_cached_or_live(hardware)
         conn.sendall(struct.pack("!f", pos.z))
         logger.debug("Sent Z position: %.2f", pos.z)
     except Exception as e:
@@ -42,7 +65,7 @@ def handle_getxyz(conn, client, hardware, settings, **kwargs):
     """Return current XYZ position as three big-endian floats."""
     logger.debug("Client %s requested XYZ position", client.addr)
     try:
-        pos = hardware.get_current_position()
+        pos = _read_position_cached_or_live(hardware)
         conn.sendall(struct.pack("!fff", pos.x, pos.y, pos.z))
         logger.debug("Sent XYZ: (%.1f, %.1f, %.2f)", pos.x, pos.y, pos.z)
     except Exception as e:
@@ -106,10 +129,16 @@ def handle_getr(conn, client, hardware, settings, **kwargs):
 
 
 def handle_getzf(conn, client, hardware, settings, **kwargs):
-    """Return fast Z position (no XY read) as one big-endian float."""
+    """Return fast Z position (no XY read) as one big-endian float.
+
+    Routed through the StagePositionCache like the other GET*
+    handlers: the cache is a full XYZ snapshot so reading just Z
+    from it is as cheap as reading XY, and we get the same
+    serial-bus protection.
+    """
     try:
-        z = hardware.get_z_position()
-        conn.sendall(struct.pack("!f", z))
+        pos = _read_position_cached_or_live(hardware)
+        conn.sendall(struct.pack("!f", pos.z))
     except Exception as e:
         logger.error("Failed fast Z read: %s", e, exc_info=True)
         conn.sendall(struct.pack("!f", 0.0))
