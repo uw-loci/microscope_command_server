@@ -1115,20 +1115,7 @@ def _run_smooth_scan(
 
     deadline = time.perf_counter() + hard_deadline_s
     pop_index = 0
-
-    # Cache image geometry once outside the pop loop. _pop_tagged_frame
-    # was reading width/height/components per frame via 3 extra RPCs,
-    # which dominated per-pop cost. The geometry can't change mid-scan
-    # without a stop+restart of the sequence (we never do that here),
-    # so a single cached read is correct AND ~3x faster.
-    try:
-        img_w = int(core.get_image_width())
-        img_h = int(core.get_image_height())
-        img_nch = int(core.get_number_of_components())
-    except Exception as e:
-        logger.warning("SMOOTH: could not query image geometry up front: %s", e)
-        img_w = img_h = 0
-        img_nch = 1
+    pop_exception_logged = False  # one-shot warning if pop API itself fails
 
     while time.perf_counter() < deadline:
         t_now_ms = (time.perf_counter() - t0) * 1000.0
@@ -1158,24 +1145,29 @@ def _run_smooth_scan(
                     if (time.perf_counter() - t0) * 1000.0 > scan_exit_at_ms:
                         break
 
-                    # Use pop_next_image directly with cached
-                    # geometry instead of _pop_tagged_frame: skips
-                    # the tag-dict construction and the per-frame
-                    # geometry RPCs.
-                    try:
-                        pixels = core.pop_next_image()
-                    except Exception:
-                        pixels = None
-                    if pixels is None:
+                    # _pop_tagged_frame already pulls width/height
+                    # from the tag dict (no per-pop geometry RPCs)
+                    # and is the call we have empirical evidence
+                    # works on this build -- the previous attempt
+                    # to use core.pop_next_image() directly
+                    # silently produced 0 pops (23:27).
+                    img, _elapsed_ms = _pop_tagged_frame(core)
+                    if img is None:
+                        # Could be: buffer transiently empty (normal),
+                        # OR pop API raising every call (broken). Log
+                        # one-shot warning the first time so the next
+                        # debug round has something to grep for.
+                        if not pop_exception_logged:
+                            pop_exception_logged = True
+                            logger.warning(
+                                "SMOOTH: _pop_tagged_frame returned None "
+                                "at t=%.0fms (remaining was %d). If this "
+                                "repeats and total_pops is 0, the pop API "
+                                "is failing.",
+                                (time.perf_counter() - t0) * 1000.0,
+                                remaining,
+                            )
                         break
-                    arr = np.asarray(pixels)
-                    try:
-                        if img_nch <= 1:
-                            img = arr.reshape(img_h, img_w)
-                        else:
-                            img = arr.reshape(img_h, img_w, img_nch)
-                    except Exception:
-                        img = arr
 
                     pop_wall_ms = (time.perf_counter() - t0) * 1000.0
                     metric = _focus_metric(img, metric_name)
