@@ -2199,19 +2199,47 @@ def handle_smoothz(conn, client, hardware, settings, **kwargs):
             except Exception as e:
                 logger.error("SMOOTH: reply send failed: %s", e)
         else:
-            # Every attempt failed or refused. Restore original Z and
-            # respond UNAVAILABLE with a consolidated reason.
-            try:
-                core.set_position(focus_device, initial_z)
-                _wait_via_busy(core, focus_device)
-            except Exception:
-                pass
+            # Every attempt failed to find an interior peak.
+            # If we have collected samples with a focus slope, move to the
+            # global argmax -- it's better than returning to initial_z.
+            best_slope_z = None
+            if (final_result.status in ("edge_low", "edge_high")
+                    and all_attempt_samples_zm):
+                global_best = max(
+                    all_attempt_samples_zm, key=lambda zm: zm[1],
+                    default=None,
+                )
+                if global_best is not None:
+                    best_slope_z = global_best[0]
+                    try:
+                        core.set_position(focus_device, best_slope_z)
+                        _wait_via_busy(core, focus_device)
+                        logger.info(
+                            "SMOOTH: no peak found but moving to best Z=%.3f "
+                            "(slope argmax across %d samples, shift %+.3f)",
+                            best_slope_z, len(all_attempt_samples_zm),
+                            best_slope_z - initial_z)
+                    except Exception:
+                        best_slope_z = None
+
+            if best_slope_z is None:
+                try:
+                    core.set_position(focus_device, initial_z)
+                    _wait_via_busy(core, focus_device)
+                except Exception:
+                    pass
 
             if final_result.status in ("edge_low", "edge_high"):
-                summary = (f"could not find peak after {len(attempts_log)} "
-                           f"attempts ({MAX_EDGE_RETRIES + 1} max). Last attempt: "
-                           f"{final_result.reason}. Try moving Z closer to "
-                           f"focus manually or picking a wider scan range")
+                if best_slope_z is not None:
+                    summary = (f"no peak found after {len(attempts_log)} "
+                               f"attempts ({MAX_EDGE_RETRIES + 1} max), "
+                               f"moved to best Z={best_slope_z:.3f} "
+                               f"(shift {best_slope_z - initial_z:+.3f}um)")
+                else:
+                    summary = (f"could not find peak after {len(attempts_log)} "
+                               f"attempts ({MAX_EDGE_RETRIES + 1} max). Last attempt: "
+                               f"{final_result.reason}. Try moving Z closer to "
+                               f"focus manually or picking a wider scan range")
             elif final_result.status == "insufficient_samples":
                 summary = (f"{final_result.reason}; scan too short or "
                            f"stage/camera timing off")
