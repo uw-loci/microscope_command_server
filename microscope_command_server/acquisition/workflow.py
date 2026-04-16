@@ -3396,9 +3396,18 @@ def _acquisition_workflow(
 
                     # Track this position as the last AF position (for gap detection)
                     last_af_pos_idx = pos_idx
-                    # Record the AF result for nearest-spatial Z propagation
+                    # Record the AF result for nearest-spatial Z propagation,
+                    # but only if the sweep actually found a valid focus.
+                    # Zero-drift sweeps failed to find a peak and recording
+                    # their stale Z propagates bad values to neighboring
+                    # tiles via nearest-neighbor lookup.
                     af_z = hardware.get_current_position().z
-                    completed_af_positions.append((pos.x, pos.y, af_z))
+                    if af_type_for_this_tile == "sweep" and abs(drift_for_this_tile) < 0.05:
+                        logger.info(
+                            "  Sweep produced no drift -- not recording "
+                            "in AF map (prevents stale Z propagation)")
+                    else:
+                        completed_af_positions.append((pos.x, pos.y, af_z))
                 else:
                     # Strategy validity check failed with DEFER or MANUAL mode.
                     # (PROCEED strategies took the should_run_af=True branch.)
