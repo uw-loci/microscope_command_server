@@ -2462,6 +2462,7 @@ def _acquisition_workflow(
         # Sweep drift check parameters
         af_sweep_range_um = 10.0  # default - total Z range for sweep (+/-5um)
         af_sweep_n_steps = 5  # default - number of Z positions to sample
+        af_edge_retries = 2  # default - additional sweep attempts on boundary peaks
         # Safety net multipliers for gap detection
         af_gap_index_multiplier = 3  # default - force AF after this many x n_tiles without AF
         af_gap_spatial_multiplier = 2.0  # default - force AF when distance > this x af_min_distance
@@ -2508,6 +2509,7 @@ def _acquisition_workflow(
                     af_rgb_brightness_threshold = af_setting.get("rgb_brightness_threshold", af_rgb_brightness_threshold)
                     af_sweep_range_um = af_setting.get("sweep_range_um", af_sweep_range_um)
                     af_sweep_n_steps = af_setting.get("sweep_n_steps", af_sweep_n_steps)
+                    af_edge_retries = af_setting.get("edge_retries", af_edge_retries)
                     af_gap_index_multiplier = af_setting.get("gap_index_multiplier", af_gap_index_multiplier)
                     af_gap_spatial_multiplier = af_setting.get("gap_spatial_multiplier", af_gap_spatial_multiplier)
                     # Legacy support: old adaptive_initial_step_um -> sweep_range_um
@@ -2521,6 +2523,7 @@ def _acquisition_workflow(
                         f"texture_threshold={af_texture_threshold}, tissue_area_threshold={af_tissue_area_threshold}, "
                         f"rgb_brightness_threshold={af_rgb_brightness_threshold}, "
                         f"sweep: range={af_sweep_range_um}um, n_steps={af_sweep_n_steps}, "
+                        f"edge_retries={af_edge_retries}, "
                         f"gap_index_mult={af_gap_index_multiplier}, gap_spatial_mult={af_gap_spatial_multiplier}"
                     )
                     af_settings_found = True
@@ -3386,6 +3389,7 @@ def _acquisition_workflow(
                                 range_um=af_sweep_range_um,
                                 n_steps=af_sweep_n_steps,
                                 score_metric=af_score_metric_name,
+                                max_retries=af_edge_retries,
                             )
                             t_af = log_timing(logger, "SWEEP drift check", t_af)
 
