@@ -848,6 +848,13 @@ def _restore_roi(
         try:
             core.clear_circular_buffer()
             core.start_continuous_sequence_acquisition(0)
+            # Wait briefly for the first frame at the restored ROI to
+            # arrive in the circular buffer. Without this, the next
+            # get_live_frame call can pull a stale frame whose pixel
+            # count doesn't match the restored dimensions, causing a
+            # reshape crash (observed on PPM 2026-04-16).
+            import time
+            time.sleep(0.15)
         except Exception as e:
             logger.warning("STREAM_AF:could not restart sequence after "
                             "ROI restore: %s", e)
