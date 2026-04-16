@@ -1,4 +1,4 @@
-"""Smooth (streaming) focus autofocus handler.
+"""Streaming autofocus handler.
 
 Continuous-Z autofocus built on top of the camera's continuous
 sequence acquisition path:
@@ -29,7 +29,7 @@ objective is resolved in this order:
 
 Protocol (reuses the existing "--flag value" text payload pattern):
 
-    Command: SMOOTHZ (8 bytes)
+    Command: STRMAFZ (8 bytes)
     Payload: variable-length string terminated by END_MARKER
              --yaml <path>           (required; path to the active config yaml)
              --objective <id>        (optional; preferred source of truth)
@@ -118,7 +118,7 @@ SLOW_SPEED_VALUE = "1"
 NORMAL_SPEED_VALUE = "100"
 
 # Motion blur budget (um). If expected blur per frame exceeds this,
-# Smooth is not feasible. Derived from 25% of a representative 20X
+# Streaming autofocus is not feasible. Derived from 25% of a representative 20X
 # DOF (~2 um).
 BLUR_BUDGET_UM = 0.5
 
@@ -138,7 +138,7 @@ BLUR_BUDGET_UM = 0.5
 #     for these modalities -- we need 1-2%.
 #
 # Map modality names (normalized to lower case) to the max saturation
-# fraction allowed before SMOOTH refuses with UNAVAILABLE.
+# fraction allowed before streaming AF refuses with UNAVAILABLE.
 # Values are chosen to be defensible defaults per modality class,
 # not per-rig calibrated. A future follow-up may move these into
 # config_<scope>.yml per modality.
@@ -208,7 +208,7 @@ MAX_EDGE_RETRIES = 2
 DEFAULT_CROP_FACTOR = 0.5
 
 # (Drain-based flushing was retired in favor of
-# core.clear_circular_buffer() at the top of _run_smooth_scan.
+# core.clear_circular_buffer() at the top of _run_streaming_scan.
 # See the block comment there for why.)
 
 # Hard deadline multiplier. Scan deadline = range_um * HARD_DEADLINE_SEC_PER_UM + 2.0s.
@@ -277,7 +277,7 @@ def _pop_tagged_frame(core) -> Tuple[Optional[np.ndarray], Optional[float]]:
     isn't available or raises. In that case elapsed_time_ms is None
     and callers should use a wall-clock estimate instead.
 
-    Why this function exists: during a Smooth scan we need to know
+    Why this function exists: during a streaming AF scan we need to know
     when each popped frame was CAPTURED, not when we POPPED it. The
     buffer can queue frames faster than we pop them (pop takes
     ~100 ms over the ZMQ bridge, camera produces every ~33 ms), so
@@ -558,7 +558,7 @@ def _load_autofocus_yaml_for_objective(yaml_path: str, objective: Optional[str])
 
 
 def _resolve_objective(core, settings, client_objective: Optional[str], pixel_tol: float = 0.01) -> Tuple[Optional[str], str]:
-    """Pick an objective id for this Smooth run.
+    """Pick an objective id for this streaming AF run.
 
     Returns (objective_id, source_string). source_string is one of
     'client', 'pixel-match', 'fallback', or 'unknown', for logging.
@@ -654,7 +654,7 @@ def _read_roi(core) -> Optional[Tuple[int, int, int, int]]:
     try:
         roi = core.get_roi()
     except Exception as e:
-        logger.warning("SMOOTH: core.get_roi() raised: %s", e)
+        logger.warning("STREAM_AF:core.get_roi() raised: %s", e)
         return None
     if roi is None:
         return None
@@ -668,7 +668,7 @@ def _read_roi(core) -> Optional[Tuple[int, int, int, int]]:
     try:
         return (int(roi.x), int(roi.y), int(roi.width), int(roi.height))
     except Exception as e:
-        logger.warning("SMOOTH: get_roi() returned %r which is neither "
+        logger.warning("STREAM_AF:get_roi() returned %r which is neither "
                         "iterable nor Rectangle-shaped: %s", type(roi).__name__, e)
         return None
 
@@ -716,7 +716,7 @@ def _apply_crop_roi(
         return (None, False)
     saved = _read_roi(core)
     if saved is None:
-        logger.warning("SMOOTH: could not query camera ROI for crop "
+        logger.warning("STREAM_AF:could not query camera ROI for crop "
                         "(see prior warning); skipping crop")
         return (None, False)
     x0, y0, w0, h0 = saved
@@ -738,13 +738,13 @@ def _apply_crop_roi(
         try:
             core.stop_sequence_acquisition()
         except Exception as e:
-            logger.warning("SMOOTH: could not stop sequence for ROI crop: %s", e)
+            logger.warning("STREAM_AF:could not stop sequence for ROI crop: %s", e)
             return (None, False)
 
     try:
         core.set_roi(new_x, new_y, new_w, new_h)
     except Exception as e:
-        logger.warning("SMOOTH: could not install centered crop ROI "
+        logger.warning("STREAM_AF:could not install centered crop ROI "
                         "(%d, %d, %d, %d): %s", new_x, new_y, new_w, new_h, e)
         # Try to restart the sequence we stopped before bailing.
         if seq_running:
@@ -762,7 +762,7 @@ def _apply_crop_roi(
             # post-ROI-change frame before the scan starts popping.
             time.sleep(0.15)
         except Exception as e:
-            logger.warning("SMOOTH: could not restart sequence after "
+            logger.warning("STREAM_AF:could not restart sequence after "
                             "ROI crop: %s", e)
             # Best-effort restore and bail.
             try:
@@ -771,7 +771,7 @@ def _apply_crop_roi(
                 pass
             return (None, seq_running)
 
-    logger.info("SMOOTH: cropped camera ROI (%d, %d, %dx%d) -> (%d, %d, %dx%d) "
+    logger.info("STREAM_AF:cropped camera ROI (%d, %d, %dx%d) -> (%d, %d, %dx%d) "
                 "(factor=%.2f, pixel area %.0f%% of original)",
                 x0, y0, w0, h0, new_x, new_y, new_w, new_h,
                 crop_factor, (crop_factor * crop_factor) * 100.0)
@@ -807,7 +807,7 @@ def _restore_roi(
 
     try:
         core.set_roi(int(x0), int(y0), int(w0), int(h0))
-        logger.info("SMOOTH: restored camera ROI to (%d, %d, %dx%d)",
+        logger.info("STREAM_AF:restored camera ROI to (%d, %d, %dx%d)",
                     x0, y0, w0, h0)
     except Exception as e:
         # JAI / GenAPI failure mode: when the camera is currently in
@@ -820,7 +820,7 @@ def _restore_roi(
         # then we re-apply the original ROI only if it wasn't already
         # equal to the full sensor.
         logger.debug(
-            "SMOOTH: set_roi(%d, %d, %dx%d) failed (%s); "
+            "STREAM_AF:set_roi(%d, %d, %dx%d) failed (%s); "
             "trying clear_roi + retry",
             x0, y0, w0, h0, e,
         )
@@ -830,12 +830,12 @@ def _restore_roi(
             if full_roi != (x0, y0, w0, h0):
                 core.set_roi(int(x0), int(y0), int(w0), int(h0))
             logger.info(
-                "SMOOTH: restored camera ROI to (%d, %d, %dx%d) via clear_roi",
+                "STREAM_AF:restored camera ROI to (%d, %d, %dx%d) via clear_roi",
                 x0, y0, w0, h0,
             )
         except Exception as e2:
             logger.warning(
-                "SMOOTH: failed to restore camera ROI even after "
+                "STREAM_AF:failed to restore camera ROI even after "
                 "clear_roi (%s -> %s)", e, e2,
             )
 
@@ -849,7 +849,7 @@ def _restore_roi(
             core.clear_circular_buffer()
             core.start_continuous_sequence_acquisition(0)
         except Exception as e:
-            logger.warning("SMOOTH: could not restart sequence after "
+            logger.warning("STREAM_AF:could not restart sequence after "
                             "ROI restore: %s", e)
 
 
@@ -1042,7 +1042,7 @@ def _fit_union_samples(
     n_attempts_so_far: int,
 ) -> Optional["_ScanAttemptResult"]:
     """Fit a peak across the union of (z, metric) samples from
-    multiple Smooth attempts.
+    multiple streaming AF attempts.
 
     Used to short-circuit edge oscillation: when two adjacent scan
     windows each find their peak at the boundary between them, the
@@ -1087,7 +1087,7 @@ def _fit_union_samples(
 
     z_span = zs[-1] - zs[0]
     logger.info(
-        "SMOOTH: union-fit across %d samples from %d attempts -- "
+        "STREAM_AF:union-fit across %d samples from %d attempts -- "
         "interior argmax at Z=%.3f (idx %d/%d), fit=%s best_z=%.3f, span=%.2f",
         n, n_attempts_so_far, zs[raw_max_idx], raw_max_idx, n,
         fit_kind, fit_z, z_span,
@@ -1101,7 +1101,7 @@ def _fit_union_samples(
 # ----- The scan -----
 
 
-def _run_smooth_scan(
+def _run_streaming_scan(
     core,
     focus_device: str,
     speed_prop: str,
@@ -1122,7 +1122,7 @@ def _run_smooth_scan(
     Each sample's Z is computed from a LINEAR MOTION MODEL using the
     frame's CAPTURE timestamp (from camera metadata), not a live
     stage-position query at pop time. This is the fix for the
-    pop-time-vs-capture-time bug that corrupted early Smooth runs:
+    pop-time-vs-capture-time bug that corrupted early streaming AF runs:
     the buffer can accumulate frames faster than we pop (camera at
     ~30 fps, pop over ZMQ at ~10 fps), so by the time we retrieve a
     frame the stage has moved well past where it was when the sensor
@@ -1179,9 +1179,9 @@ def _run_smooth_scan(
     # avoid wasted metric evaluations on duplicates.
     try:
         core.clear_circular_buffer()
-        logger.info("SMOOTH: flushed circular buffer before firing move")
+        logger.info("STREAM_AF:flushed circular buffer before firing move")
     except Exception as e:
-        logger.warning("SMOOTH: clear_circular_buffer failed "
+        logger.warning("STREAM_AF:clear_circular_buffer failed "
                         "(continuing with whatever's queued): %s", e)
 
     direction = 1.0 if z_end >= z_start else -1.0
@@ -1196,7 +1196,7 @@ def _run_smooth_scan(
         img_h = int(core.get_image_height())
         img_nch = int(core.get_number_of_components())
     except Exception as e:
-        logger.warning("SMOOTH: could not query image geometry: %s", e)
+        logger.warning("STREAM_AF:could not query image geometry: %s", e)
         img_w = img_h = 0
         img_nch = 1
 
@@ -1212,7 +1212,7 @@ def _run_smooth_scan(
     try:
         core.set_position(focus_device, z_end)
     except Exception as e:
-        logger.error("SMOOTH: non-blocking move to z_end failed: %s", e)
+        logger.error("STREAM_AF:non-blocking move to z_end failed: %s", e)
         return []
 
     deadline = time.perf_counter() + hard_deadline_s
@@ -1259,7 +1259,7 @@ def _run_smooth_scan(
         try:
             metric = _focus_metric(img, metric_name)
         except Exception as e:
-            logger.debug("SMOOTH: metric compute failed: %s", e)
+            logger.debug("STREAM_AF:metric compute failed: %s", e)
             continue
 
         # Z from wall time * velocity. This is now directly
@@ -1274,7 +1274,7 @@ def _run_smooth_scan(
         samples.append((wall_ms, float(z_interp), metric))
 
     logger.info(
-        "SMOOTH: scan exit at t=%.0fms (motion_end=%.0fms + tail=%.0fms) "
+        "STREAM_AF:scan exit at t=%.0fms (motion_end=%.0fms + tail=%.0fms) "
         "captures=%d samples=%d",
         total_scan_ms, motion_duration_ms, SCAN_TAIL_MS,
         len(raw_captures), len(samples),
@@ -1322,7 +1322,7 @@ def _attempt_one_scan(
     velocity_um_s: float = 11.5,
     metric_name: str = "normalized_variance",
 ) -> _ScanAttemptResult:
-    """Run one Smooth scan centered on z_center with the given range.
+    """Run one streaming AF scan centered on z_center with the given range.
 
     Returns an _ScanAttemptResult describing the outcome. Does NOT
     commit the peak (caller decides whether to retry or commit) and
@@ -1333,13 +1333,13 @@ def _attempt_one_scan(
 
     Args:
         velocity_um_s: expected slow-speed stage velocity; used by
-            _run_smooth_scan to interpolate Z at frame capture time.
+            _run_streaming_scan to interpolate Z at frame capture time.
         metric_name: which focus metric to compute per frame.
     """
     tag_prefix = f"{attempt_label}: " if attempt_label else ""
     z_start = z_center - range_um / 2.0
     z_end = z_center + range_um / 2.0
-    logger.info("SMOOTH: %sscan window [%.3f -> %.3f] (center %.3f, range %.2f)",
+    logger.info("STREAM_AF:%sscan window [%.3f -> %.3f] (center %.3f, range %.2f)",
                 tag_prefix, z_start, z_end, z_center, range_um)
 
     try:
@@ -1356,16 +1356,16 @@ def _attempt_one_scan(
             )
 
         if sequence_was_running_on_entry:
-            logger.info("SMOOTH: %sreusing already-running sequence", tag_prefix)
+            logger.info("STREAM_AF:%sreusing already-running sequence", tag_prefix)
         else:
-            logger.info("SMOOTH: %sno active sequence; starting one for the scan",
+            logger.info("STREAM_AF:%sno active sequence; starting one for the scan",
                         tag_prefix)
             core.clear_circular_buffer()
             core.start_continuous_sequence_acquisition(0)
             time.sleep(0.15)
 
         hard_deadline_s = max(1.0, range_um * HARD_DEADLINE_SEC_PER_UM + 2.0)
-        samples = _run_smooth_scan(core, focus_device, speed_prop,
+        samples = _run_streaming_scan(core, focus_device, speed_prop,
                                     z_start, z_end, hard_deadline_s,
                                     velocity_um_s=velocity_um_s)
 
@@ -1427,7 +1427,7 @@ def _attempt_one_scan(
             )
             if metric_range_frac < FLAT_METRIC_FRACTION:
                 logger.warning(
-                    "SMOOTH: %smetric range %.3f (%.2f%% of peak %.3f) "
+                    "STREAM_AF:%smetric range %.3f (%.2f%% of peak %.3f) "
                     "is within noise -- scan window is entirely within "
                     "DOF, cannot find focus. Widen --range or use a "
                     "higher-mag objective.",
@@ -1458,12 +1458,12 @@ def _attempt_one_scan(
             else:
                 best_z = raw_peak_z
                 fit_kind = "raw-argmax"
-            logger.info("SMOOTH: %s%d in-motion samples  raw peak Z=%.3f  "
+            logger.info("STREAM_AF:%s%d in-motion samples  raw peak Z=%.3f  "
                         "fit=%s best_z=%.3f  z_span=%.3f",
                         tag_prefix, n_motion_samples, raw_peak_z,
                         fit_kind, best_z, z_span)
         else:
-            logger.warning("SMOOTH: %sonly %d in-motion samples -- cannot fit",
+            logger.warning("STREAM_AF:%sonly %d in-motion samples -- cannot fit",
                            tag_prefix, n_motion_samples)
             return _ScanAttemptResult(
                 "insufficient_samples", None, n_motion_samples, 0.0,
@@ -1472,7 +1472,7 @@ def _attempt_one_scan(
             )
 
         for i, (t, z, m) in enumerate(in_motion):
-            logger.info("SMOOTH: %ssample %3d  t=%7.1f ms  z=%.3f  metric=%.4f",
+            logger.info("STREAM_AF:%ssample %3d  t=%7.1f ms  z=%.3f  metric=%.4f",
                         tag_prefix, i, t, z, m)
 
         if n_motion_samples < MIN_FRAMES_FOR_FIT or best_z is None:
@@ -1508,7 +1508,7 @@ def _attempt_one_scan(
         )
 
     except Exception as e:
-        logger.error("SMOOTH: %sunhandled error during scan: %s",
+        logger.error("STREAM_AF:%sunhandled error during scan: %s",
                      tag_prefix, e, exc_info=True)
         return _ScanAttemptResult(
             "error", None, 0, 0.0, str(e),
@@ -1556,7 +1556,7 @@ def _brent_fallback_scan(
     module docstring for the full citation.
     """
     tag = "brent-fallback"
-    logger.info("SMOOTH: %s: Brent search over [%.3f, %.3f] metric=%s",
+    logger.info("STREAM_AF:%s: Brent search over [%.3f, %.3f] metric=%s",
                 tag, z_lo, z_hi, metric_name)
 
     try:
@@ -1592,11 +1592,11 @@ def _brent_fallback_scan(
             img = _snap_image_as_numpy(core)
             z_actual = float(core.get_position(focus_device))
         except Exception as e:
-            logger.warning("SMOOTH: %s eval at z=%.3f failed: %s", tag, z, e)
+            logger.warning("STREAM_AF:%s eval at z=%.3f failed: %s", tag, z, e)
             return 0.0
         m = _focus_metric(img, metric_name)
         evals.append((z_actual, m))
-        logger.info("SMOOTH: %s eval %2d  z=%.3f  metric=%.4f",
+        logger.info("STREAM_AF:%s eval %2d  z=%.3f  metric=%.4f",
                     tag, len(evals), z_actual, m)
         # minimize_scalar expects a MINIMIZATION objective, so flip
         # the sign: better focus -> lower (more negative) value.
@@ -1610,7 +1610,7 @@ def _brent_fallback_scan(
             options={"xtol": abs_tolerance_um, "maxiter": max_evals},
         )
     except Exception as e:
-        logger.warning("SMOOTH: %s minimize_scalar raised: %s", tag, e)
+        logger.warning("STREAM_AF:%s minimize_scalar raised: %s", tag, e)
         # Fall back to argmax of what we collected.
         if evals:
             best_z, best_m = max(evals, key=lambda p: p[1])
@@ -1630,7 +1630,7 @@ def _brent_fallback_scan(
     best_z = max(z_lo, min(z_hi, best_z))
     z_span = (max(z for z, _ in evals) - min(z for z, _ in evals)) if evals else 0.0
 
-    logger.info("SMOOTH: %s converged at z=%.3f after %d evals",
+    logger.info("STREAM_AF:%s converged at z=%.3f after %d evals",
                 tag, best_z, len(evals))
     return _ScanAttemptResult(
         "success", best_z, len(evals), z_span,
@@ -1639,15 +1639,15 @@ def _brent_fallback_scan(
     )
 
 
-def handle_smoothz(conn, client, hardware, settings, **kwargs):
-    """Entry point for the SMOOTHZ command."""
+def handle_streaming_focus(conn, client, hardware, settings, **kwargs):
+    """Entry point for the STRMAFZ (streaming autofocus) command."""
     addr = getattr(client, "addr", client)
 
     # Read the text payload (same framing as other flag-based handlers).
     try:
         message = read_message_string(conn)
     except Exception as e:
-        logger.error("SMOOTH: failed to read payload from %s: %s", addr, e)
+        logger.error("STREAM_AF:failed to read payload from %s: %s", addr, e)
         try:
             conn.sendall(f"FAILED:payload-read-error: {e}".encode())
         except Exception:
@@ -1667,7 +1667,7 @@ def handle_smoothz(conn, client, hardware, settings, **kwargs):
         try:
             range_override_um = float(range_override_str)
         except ValueError:
-            logger.warning("SMOOTH: ignoring non-numeric --range: %r", range_override_str)
+            logger.warning("STREAM_AF:ignoring non-numeric --range: %r", range_override_str)
 
     crop_factor = DEFAULT_CROP_FACTOR
     if crop_factor_str:
@@ -1676,10 +1676,10 @@ def handle_smoothz(conn, client, hardware, settings, **kwargs):
             if 0.0 < cf <= 1.0:
                 crop_factor = cf
             else:
-                logger.warning("SMOOTH: --crop-factor=%r out of (0, 1]; "
+                logger.warning("STREAM_AF:--crop-factor=%r out of (0, 1]; "
                                 "using default %.2f", crop_factor_str, DEFAULT_CROP_FACTOR)
         except ValueError:
-            logger.warning("SMOOTH: ignoring non-numeric --crop-factor: %r",
+            logger.warning("STREAM_AF:ignoring non-numeric --crop-factor: %r",
                             crop_factor_str)
 
     if not yaml_path:
@@ -1689,7 +1689,7 @@ def handle_smoothz(conn, client, hardware, settings, **kwargs):
             pass
         return
 
-    logger.info("SMOOTH: request from %s yaml=%s objective=%s modality=%s "
+    logger.info("STREAM_AF:request from %s yaml=%s objective=%s modality=%s "
                 "range_override=%s crop_factor=%.2f",
                 addr, yaml_path, client_objective, client_modality,
                 range_override_um, crop_factor)
@@ -1699,7 +1699,7 @@ def handle_smoothz(conn, client, hardware, settings, **kwargs):
     # use normalized_variance, fluorescence and laser-scanning use
     # Volath5 for noise robustness.
     metric_name = _resolve_metric_name(client_modality)
-    logger.info("SMOOTH: focus metric for modality '%s' = '%s'",
+    logger.info("STREAM_AF:focus metric for modality '%s' = '%s'",
                 client_modality or "unknown", metric_name)
 
     # Resolve the saturation threshold from the client-provided
@@ -1710,56 +1710,56 @@ def handle_smoothz(conn, client, hardware, settings, **kwargs):
             client_modality.strip().lower(),
             DEFAULT_SATURATION_REFUSE_FRACTION,
         )
-        logger.info("SMOOTH: saturation threshold for modality '%s' = %.2f",
+        logger.info("STREAM_AF:saturation threshold for modality '%s' = %.2f",
                     client_modality, sat_threshold)
     else:
         sat_threshold = DEFAULT_SATURATION_REFUSE_FRACTION
-        logger.info("SMOOTH: no modality given, using default saturation threshold %.2f",
+        logger.info("STREAM_AF:no modality given, using default saturation threshold %.2f",
                     sat_threshold)
 
     core = hardware.core
     try:
         focus_device = core.get_focus_device()
     except Exception as e:
-        logger.error("SMOOTH: get_focus_device failed: %s", e)
+        logger.error("STREAM_AF:get_focus_device failed: %s", e)
         conn.sendall(f"FAILED:no-focus-device: {e}".encode())
         return
-    logger.info("SMOOTH: focus device = %s", focus_device)
+    logger.info("STREAM_AF:focus device = %s", focus_device)
 
     # --- Objective resolution ---
     objective, source = _resolve_objective(core, settings, client_objective)
     if objective:
-        logger.info("SMOOTH: resolved objective '%s' via %s", objective, source)
+        logger.info("STREAM_AF:resolved objective '%s' via %s", objective, source)
     else:
-        logger.warning("SMOOTH: could not resolve objective; using first yaml entry")
+        logger.warning("STREAM_AF:could not resolve objective; using first yaml entry")
 
     af_entry = _load_autofocus_yaml_for_objective(yaml_path, objective)
     if not af_entry:
-        logger.warning("SMOOTH: no autofocus yaml entry -- using fallback range %s um",
+        logger.warning("STREAM_AF:no autofocus yaml entry -- using fallback range %s um",
                        FALLBACK_RANGE_UM)
 
     if range_override_um is not None:
         range_um = max(1.0, float(range_override_um))
-        logger.info("SMOOTH: using range override = %.2f um", range_um)
+        logger.info("STREAM_AF:using range override = %.2f um", range_um)
     else:
         range_um = float(af_entry.get("sweep_range_um", FALLBACK_RANGE_UM))
-        logger.info("SMOOTH: using sweep_range_um from yaml = %.2f um", range_um)
+        logger.info("STREAM_AF:using sweep_range_um from yaml = %.2f um", range_um)
 
     # --- Speed property discovery ---
     speed_prop = _find_speed_property(core, focus_device)
     if speed_prop is None:
         reason = (f"focus device '{focus_device}' has no speed property "
                   f"(MaxSpeed/Velocity/Speed/MaxVelocity)")
-        logger.warning("SMOOTH: UNAVAILABLE -- %s", reason)
+        logger.warning("STREAM_AF:UNAVAILABLE -- %s", reason)
         conn.sendall(f"UNAVAILABLE:{reason}".encode())
         return
-    logger.info("SMOOTH: stage speed property = '%s'", speed_prop)
+    logger.info("STREAM_AF:stage speed property = '%s'", speed_prop)
 
     original_speed = _try_get(core, focus_device, speed_prop)
     try:
         initial_z = float(core.get_position(focus_device))
     except Exception as e:
-        logger.error("SMOOTH: get_position failed: %s", e)
+        logger.error("STREAM_AF:get_position failed: %s", e)
         conn.sendall(f"FAILED:get-position: {e}".encode())
         return
 
@@ -1786,7 +1786,7 @@ def handle_smoothz(conn, client, hardware, settings, **kwargs):
     # the camera class) FrameRateHz can be left at a value that
     # bottlenecks streaming production rate, regardless of how short
     # the actual exposure is. Observed on PPM 2026-04-14: a 0.5 ms
-    # Exposure with FrameRateHz=1 produced ~1.2 fps during a Smooth
+    # Exposure with FrameRateHz=1 produced ~1.2 fps during a streaming AF
     # scan, giving 1-2 samples instead of 15+.
     #
     # Fix: read FrameRateHz, force it to FRAME_RATE_MAX (38 Hz) for
@@ -1805,11 +1805,11 @@ def handle_smoothz(conn, client, hardware, settings, **kwargs):
                 core.get_property("JAICamera", "FrameRateHz")
             )
         except Exception as e:
-            logger.warning("SMOOTH: could not read JAICamera FrameRateHz: %s", e)
+            logger.warning("STREAM_AF:could not read JAICamera FrameRateHz: %s", e)
             saved_frame_rate_hz = None
         if saved_frame_rate_hz is not None and saved_frame_rate_hz < 30.0:
             logger.warning(
-                "SMOOTH: JAICamera FrameRateHz=%.2f Hz is too low for "
+                "STREAM_AF:JAICamera FrameRateHz=%.2f Hz is too low for "
                 "streaming focus; temporarily forcing to 38 Hz. The Live "
                 "Viewer was also producing frames at this rate -- re-apply "
                 "your camera preset to fix it permanently.",
@@ -1818,17 +1818,17 @@ def handle_smoothz(conn, client, hardware, settings, **kwargs):
             try:
                 core.set_property("JAICamera", "FrameRateHz", 38.0)
                 logger.info(
-                    "SMOOTH: bumped JAICamera FrameRateHz from %.2f to 38.0",
+                    "STREAM_AF:bumped JAICamera FrameRateHz from %.2f to 38.0",
                     saved_frame_rate_hz,
                 )
             except Exception as e:
                 logger.warning(
-                    "SMOOTH: could not set JAICamera FrameRateHz=38 mid-stream "
+                    "STREAM_AF:could not set JAICamera FrameRateHz=38 mid-stream "
                     "(%s); scan may still be starved", e,
                 )
         elif saved_frame_rate_hz is not None:
             logger.info(
-                "SMOOTH: JAICamera FrameRateHz=%.2f Hz (above threshold, leaving alone)",
+                "STREAM_AF:JAICamera FrameRateHz=%.2f Hz (above threshold, leaving alone)",
                 saved_frame_rate_hz,
             )
 
@@ -1836,7 +1836,7 @@ def handle_smoothz(conn, client, hardware, settings, **kwargs):
     try:
         exposure_ms = float(core.get_exposure())
     except Exception as e:
-        logger.warning("SMOOTH: get_exposure failed: %s", e)
+        logger.warning("STREAM_AF:get_exposure failed: %s", e)
         exposure_ms = 0.0
 
     # Use a conservative min velocity estimate of 11.5 um/s (Prior
@@ -1845,7 +1845,7 @@ def handle_smoothz(conn, client, hardware, settings, **kwargs):
     # matches the only rig we've measured.
     min_velocity_um_s = 11.5
     expected_blur_um = min_velocity_um_s * (exposure_ms / 1000.0) if exposure_ms else 0.0
-    logger.info("SMOOTH: exposure=%.2fms  est min velocity=%.2f um/s  "
+    logger.info("STREAM_AF:exposure=%.2fms  est min velocity=%.2f um/s  "
                 "expected blur=%.3f um  budget=%.3f um",
                 exposure_ms, min_velocity_um_s, expected_blur_um, BLUR_BUDGET_UM)
     if expected_blur_um > BLUR_BUDGET_UM:
@@ -1854,7 +1854,7 @@ def handle_smoothz(conn, client, hardware, settings, **kwargs):
                   f"{BLUR_BUDGET_UM:.2f} um budget. Reduce exposure to "
                   f"<={BLUR_BUDGET_UM / min_velocity_um_s * 1000:.1f} ms "
                   f"or use a faster stage")
-        logger.warning("SMOOTH: UNAVAILABLE -- %s", reason)
+        logger.warning("STREAM_AF:UNAVAILABLE -- %s", reason)
         conn.sendall(f"UNAVAILABLE:{reason}".encode())
         return
 
@@ -1863,7 +1863,7 @@ def handle_smoothz(conn, client, hardware, settings, **kwargs):
     # one frame from its buffer instead of calling snap_image(). A
     # blocking snap on the JAI costs ~400 ms (exposure + readout +
     # driver overhead) and is the single biggest fixed cost in the
-    # Smooth handler -- nearly 20% of the total scan time. Stream
+    # Streaming AF handler -- nearly 20% of the total scan time. Stream
     # frames are already arriving at ~30 fps so a pop-with-timeout
     # gets us a fresh frame in <50 ms.
     preflight_sequence_running = False
@@ -1887,22 +1887,22 @@ def handle_smoothz(conn, client, hardware, settings, **kwargs):
                 break
             time.sleep(0.003)
         if preflight_img is not None:
-            logger.info("SMOOTH: pre-flight frame via stream pop (no snap)")
+            logger.info("STREAM_AF:pre-flight frame via stream pop (no snap)")
         else:
-            logger.info("SMOOTH: stream pop failed, falling back to snap_image")
+            logger.info("STREAM_AF:stream pop failed, falling back to snap_image")
     if preflight_img is None:
         preflight_img = _snap_image_as_numpy(core)
-        logger.info("SMOOTH: pre-flight frame via snap_image")
+        logger.info("STREAM_AF:pre-flight frame via snap_image")
 
     sat_frac = _saturation_fraction(preflight_img)
-    logger.info("SMOOTH: pre-flight saturation fraction = %.3f (threshold %.2f)",
+    logger.info("STREAM_AF:pre-flight saturation fraction = %.3f (threshold %.2f)",
                 sat_frac, sat_threshold)
     if sat_frac > sat_threshold:
         reason = (f"{sat_frac * 100:.1f}% of pixels saturated (threshold for "
                   f"'{client_modality or 'unknown'}' modality is "
                   f"{sat_threshold * 100:.1f}%); focus metric will not "
-                  f"discriminate. Reduce exposure/gain before using Smooth")
-        logger.warning("SMOOTH: UNAVAILABLE -- %s", reason)
+                  f"discriminate. Reduce exposure/gain before using streaming autofocus")
+        logger.warning("STREAM_AF:UNAVAILABLE -- %s", reason)
         conn.sendall(f"UNAVAILABLE:{reason}".encode())
         return
 
@@ -1914,7 +1914,7 @@ def handle_smoothz(conn, client, hardware, settings, **kwargs):
     # edge_high we shift up. The shift never crosses outside the
     # stage Z limits from config.
     z_low, z_high = _get_z_limits(settings)
-    logger.info("SMOOTH: stage Z limits from config: low=%s high=%s",
+    logger.info("STREAM_AF:stage Z limits from config: low=%s high=%s",
                 f"{z_low:.3f}" if z_low is not None else "None",
                 f"{z_high:.3f}" if z_high is not None else "None")
 
@@ -1953,7 +1953,7 @@ def handle_smoothz(conn, client, hardware, settings, **kwargs):
                           f"-> {current_center + range_um/2:.3f}] on "
                           f"{label} would exit stage z limits "
                           f"[{z_low}, {z_high}]")
-                logger.warning("SMOOTH: %s", reason)
+                logger.warning("STREAM_AF:%s", reason)
                 attempts_log.append(f"{label}: out-of-range")
                 final_result = _ScanAttemptResult(
                     "error", None, 0, 0.0, reason,
@@ -2019,13 +2019,13 @@ def handle_smoothz(conn, client, hardware, settings, **kwargs):
                 # upper edge equals this one's lower edge -- we cover
                 # new ground without overlap.
                 current_center = current_center - range_um
-                logger.info("SMOOTH: edge_low -- next attempt center will be %.3f",
+                logger.info("STREAM_AF:edge_low -- next attempt center will be %.3f",
                             current_center)
                 continue
 
             if result.status == "edge_high":
                 current_center = current_center + range_um
-                logger.info("SMOOTH: edge_high -- next attempt center will be %.3f",
+                logger.info("STREAM_AF:edge_high -- next attempt center will be %.3f",
                             current_center)
                 continue
 
@@ -2092,7 +2092,7 @@ def handle_smoothz(conn, client, hardware, settings, **kwargs):
             if z_high is not None:
                 brent_hi = min(brent_hi, z_high)
             if brent_hi - brent_lo >= 2.0:  # need at least 2 um bracket
-                logger.info("SMOOTH: streaming retries exhausted with edge; "
+                logger.info("STREAM_AF:streaming retries exhausted with edge; "
                             "escalating to Brent fallback over [%.3f, %.3f]",
                             brent_lo, brent_hi)
                 try:
@@ -2117,7 +2117,7 @@ def handle_smoothz(conn, client, hardware, settings, **kwargs):
                             core.clear_circular_buffer()
                             core.start_continuous_sequence_acquisition(0)
                         except Exception as e:
-                            logger.warning("SMOOTH: could not resume sequence "
+                            logger.warning("STREAM_AF:could not resume sequence "
                                             "after Brent: %s", e)
                     attempts_log.append(
                         f"brent-fallback: bracket=[{brent_lo:.3f}, "
@@ -2160,7 +2160,7 @@ def handle_smoothz(conn, client, hardware, settings, **kwargs):
                             - min(zm[0] for zm in all_attempt_samples_zm)
                         )
                         logger.info(
-                            "SMOOTH: Brent did not converge; committing "
+                            "STREAM_AF:Brent did not converge; committing "
                             "global argmax across %d collected samples "
                             "at Z=%.3f (metric=%.4f)",
                             len(all_attempt_samples_zm), gz, gm,
@@ -2172,7 +2172,7 @@ def handle_smoothz(conn, client, hardware, settings, **kwargs):
                             f"samples at Z={gz:.3f}",
                         )
                 except Exception as e:
-                    logger.error("SMOOTH: Brent fallback raised: %s", e, exc_info=True)
+                    logger.error("STREAM_AF:Brent fallback raised: %s", e, exc_info=True)
 
         if final_result.status == "success":
             # Commit the peak Z.
@@ -2185,19 +2185,19 @@ def handle_smoothz(conn, client, hardware, settings, **kwargs):
                 final_z = best_z
 
             z_shift = final_z - initial_z
-            logger.info("SMOOTH: committed final Z=%.3f  shift=%+.3f  n=%d  span=%.2f  "
+            logger.info("STREAM_AF:committed final Z=%.3f  shift=%+.3f  n=%d  span=%.2f  "
                         "after %d attempt(s)",
                         final_z, z_shift, final_result.n_samples,
                         final_result.z_span, len(attempts_log))
             for entry in attempts_log:
-                logger.info("SMOOTH: attempt log -- %s", entry)
+                logger.info("STREAM_AF:attempt log -- %s", entry)
 
             response = (f"SUCCESS:{initial_z:.3f}:{final_z:.3f}:{z_shift:+.3f}:"
                         f"{final_result.n_samples}:{final_result.z_span:.3f}")
             try:
                 conn.sendall(response.encode())
             except Exception as e:
-                logger.error("SMOOTH: reply send failed: %s", e)
+                logger.error("STREAM_AF:reply send failed: %s", e)
         else:
             # Every attempt failed to find an interior peak.
             # If we have collected samples with a focus slope, move to the
@@ -2215,7 +2215,7 @@ def handle_smoothz(conn, client, hardware, settings, **kwargs):
                         core.set_position(focus_device, best_slope_z)
                         _wait_via_busy(core, focus_device)
                         logger.info(
-                            "SMOOTH: no peak found but moving to best Z=%.3f "
+                            "STREAM_AF:no peak found but moving to best Z=%.3f "
                             "(slope argmax across %d samples, shift %+.3f)",
                             best_slope_z, len(all_attempt_samples_zm),
                             best_slope_z - initial_z)
@@ -2246,16 +2246,16 @@ def handle_smoothz(conn, client, hardware, settings, **kwargs):
             else:
                 summary = final_result.reason
 
-            logger.warning("SMOOTH: UNAVAILABLE -- %s", summary)
+            logger.warning("STREAM_AF:UNAVAILABLE -- %s", summary)
             for entry in attempts_log:
-                logger.warning("SMOOTH: attempt log -- %s", entry)
+                logger.warning("STREAM_AF:attempt log -- %s", entry)
             try:
                 conn.sendall(f"UNAVAILABLE:{summary}".encode())
             except Exception as e:
-                logger.error("SMOOTH: reply send failed: %s", e)
+                logger.error("STREAM_AF:reply send failed: %s", e)
 
     except Exception as e:
-        logger.error("SMOOTH: unhandled error in retry loop: %s", e, exc_info=True)
+        logger.error("STREAM_AF:unhandled error in retry loop: %s", e, exc_info=True)
         try:
             conn.sendall(f"FAILED:{e}".encode())
         except Exception:
@@ -2309,17 +2309,17 @@ def handle_smoothz(conn, client, hardware, settings, **kwargs):
                         "JAICamera", "FrameRateHz", saved_frame_rate_hz,
                     )
                     logger.info(
-                        "SMOOTH: restored JAICamera FrameRateHz to %.2f",
+                        "STREAM_AF:restored JAICamera FrameRateHz to %.2f",
                         saved_frame_rate_hz,
                     )
                 except Exception as e:
                     logger.warning(
-                        "SMOOTH: could not restore JAICamera FrameRateHz: %s",
+                        "STREAM_AF:could not restore JAICamera FrameRateHz: %s",
                         e,
                     )
             else:
                 logger.info(
-                    "SMOOTH: leaving JAICamera FrameRateHz at 38.0 Hz "
+                    "STREAM_AF:leaving JAICamera FrameRateHz at 38.0 Hz "
                     "(saved %.2f Hz was a stale misconfiguration; "
                     "Live Viewer will now stream at full rate)",
                     saved_frame_rate_hz,

@@ -50,7 +50,7 @@ from microscope_command_server.server.handlers.system import (
     handle_config, handle_disconnect, handle_shutdown, handle_siftal,
 )
 from microscope_command_server.server.handlers.probez import handle_probez
-from microscope_command_server.server.handlers.smooth import handle_smoothz
+from microscope_command_server.server.handlers.streaming_focus import handle_streaming_focus
 
 
 # Map 8-byte command bytes -> handler function
@@ -134,6 +134,6 @@ COMMAND_HANDLERS = {
     # Z-stage diagnostic probe
     ExtendedCommand.PROBEZ: handle_probez,
 
-    # Smooth (streaming) focus
-    ExtendedCommand.SMOOTHZ: handle_smoothz,
+    # Streaming autofocus
+    ExtendedCommand.STRMAFZ: handle_streaming_focus,
 }
