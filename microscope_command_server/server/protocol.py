@@ -126,6 +126,7 @@ class ExtendedCommand:
     # during non-blocking stage motion. Replaces the stepped sweep
     # drift check on calibrated hardware.
     STRMAFZ = b"strmafz_"  # Streaming autofocus scan
+    RPDSCAN = b"rpdscan_"  # Rapid scan -- fast tiled brightfield, no AF, no Z
 
     # Illumination & Profile Commands
     GETILLM = b"getillm_"  # Get illumination state (power, range, on/off)
