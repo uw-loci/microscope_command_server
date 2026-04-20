@@ -1362,6 +1362,7 @@ def _attempt_one_scan(
                 f"could not set {speed_prop}={SLOW_SPEED_VALUE}",
             )
 
+        sequence_started_here = False
         if sequence_was_running_on_entry:
             logger.info("STREAM_AF:%sreusing already-running sequence", tag_prefix)
         else:
@@ -1369,22 +1370,24 @@ def _attempt_one_scan(
                         tag_prefix)
             core.clear_circular_buffer()
             core.start_continuous_sequence_acquisition(0)
+            sequence_started_here = True
             time.sleep(0.15)
 
-        hard_deadline_s = max(1.0, range_um * HARD_DEADLINE_SEC_PER_UM + 2.0)
-        samples = _run_streaming_scan(core, focus_device, speed_prop,
-                                    z_start, z_end, hard_deadline_s,
-                                    velocity_um_s=velocity_um_s)
-
-        if not sequence_was_running_on_entry:
-            try:
-                core.stop_sequence_acquisition()
-            except Exception:
-                pass
-            try:
-                core.clear_circular_buffer()
-            except Exception:
-                pass
+        try:
+            hard_deadline_s = max(1.0, range_um * HARD_DEADLINE_SEC_PER_UM + 2.0)
+            samples = _run_streaming_scan(core, focus_device, speed_prop,
+                                        z_start, z_end, hard_deadline_s,
+                                        velocity_um_s=velocity_um_s)
+        finally:
+            if sequence_started_here:
+                try:
+                    core.stop_sequence_acquisition()
+                except Exception:
+                    pass
+                try:
+                    core.clear_circular_buffer()
+                except Exception:
+                    pass
 
         _try_set(core, focus_device, speed_prop, NORMAL_SPEED_VALUE)
 

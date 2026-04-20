@@ -63,13 +63,26 @@ def handle_setlive(conn, client, hardware, settings, **kwargs):
         logger.info("Setting live mode: %s", "ON" if enable_live else "OFF")
 
         if not enable_live:
-            # Also stop core-level sequence acquisition (QPSC Live Viewer uses this)
+            # Stop core-level sequence acquisition (QPSC Live Viewer uses this).
+            # Verify the stop actually took effect to avoid stuck-live state
+            # where is_sequence_running() stays True after a workflow error.
             try:
                 if hardware.core.is_sequence_running():
                     hardware.core.stop_sequence_acquisition()
+                    import time
+                    time.sleep(0.05)
+                    if hardware.core.is_sequence_running():
+                        logger.warning("Sequence still running after stop -- retrying")
+                        hardware.core.stop_sequence_acquisition()
+                        time.sleep(0.1)
                     logger.info("Stopped core sequence acquisition via SETLIVE OFF")
+                    # Clear stale frames from the circular buffer
+                    try:
+                        hardware.core.clear_circular_buffer()
+                    except Exception:
+                        pass
             except Exception as seq_err:
-                logger.debug("Could not stop core sequence: %s", seq_err)
+                logger.warning("Could not stop core sequence: %s", seq_err)
 
         if hardware.studio is not None:
             hardware.studio.live().set_live_mode(enable_live)
