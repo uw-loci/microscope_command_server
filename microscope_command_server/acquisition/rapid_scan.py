@@ -204,33 +204,42 @@ def acquire_rapid_scan(
     except Exception:
         pass
 
-    # Find and set XY stage speed property
+    # Set XY stage speed to match frame capture rate.
+    # Try MaxSpeed directly (Prior ProScan 1-100% scale) -- the property
+    # search can fail due to StrVector iteration issues over Pycromanager.
     xy_device = core.get_xy_stage_device()
-    speed_prop = _find_speed_property(core, xy_device)
     original_speed = None
+    speed_prop = "MaxSpeed"  # Prior ProScan XY stage property
+
+    try:
+        original_speed = core.get_property(xy_device, speed_prop)
+        logger.info("XY stage current %s=%s", speed_prop, original_speed)
+    except Exception:
+        # Try fallback property names
+        for candidate in ("Velocity", "Speed", "MaxVelocity"):
+            try:
+                original_speed = core.get_property(xy_device, candidate)
+                speed_prop = candidate
+                logger.info("XY stage current %s=%s", speed_prop, original_speed)
+                break
+            except Exception:
+                continue
+        else:
+            speed_prop = None
+            logger.warning("No speed property found on XY device '%s'", xy_device)
 
     if speed_prop:
-        try:
-            original_speed = core.get_property(xy_device, speed_prop)
-        except Exception:
-            pass
-
-        # Calculate speed setting.
-        # Prior ProScan MaxSpeed is 1-100 (percentage of max).
-        # Max XY velocity is ~20 mm/s = 20000 um/s.
-        # speed_pct = (target_velocity / max_velocity) * 100
-        max_xy_velocity = 20000.0  # um/s, typical Prior ProScan
+        # Prior ProScan MaxSpeed is 1-100 (percentage of max ~20 mm/s).
+        max_xy_velocity = 20000.0  # um/s
         speed_pct = max(1, min(100, int(target_velocity / max_xy_velocity * 100)))
 
         if _try_set(core, xy_device, speed_prop, str(speed_pct)):
             logger.info(
-                "Set XY stage %s=%d%% (target %.0f um/s, was %s)",
-                speed_prop, speed_pct, target_velocity, original_speed,
+                "Set XY stage %s=%d%% (target %.0f um/s)",
+                speed_prop, speed_pct, target_velocity,
             )
         else:
-            logger.warning("Could not set XY stage speed -- will use current speed")
-    else:
-        logger.warning("No speed property found on XY stage device '%s'", xy_device)
+            logger.warning("Could not set XY stage speed")
 
     # Start continuous acquisition
     core.clear_circular_buffer()
