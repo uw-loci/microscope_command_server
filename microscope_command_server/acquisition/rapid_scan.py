@@ -94,14 +94,25 @@ def acquire_rapid_scan(
 
     n_tiles = len(positions)
     logger.info(
-        "Rapid scan: %dx%d = %d tiles, step=(%.1f, %.1f) um, "
+        "Rapid scan: %dx%d grid = %d tiles, step=(%.1f, %.1f) um, "
         "exposure=%.3f ms, overlap=%.1f%%",
         n_cols, n_rows, n_tiles, step_x, step_y, exposure_ms, overlap_percent,
     )
     logger.info(
-        "Rapid scan region: center=(%.1f, %.1f), size=%.1fx%.1f um",
-        center_x, center_y, width, height,
+        "Rapid scan region: center=(%.1f, %.1f), size=%.1fx%.1f um, "
+        "FOV=%.1fx%.1f um",
+        center_x, center_y, width, height, fov_width, fov_height,
     )
+    logger.info(
+        "Rapid scan grid origin: (%.1f, %.1f), "
+        "last position: (%.1f, %.1f)",
+        start_x, start_y,
+        positions[-1][0] if positions else 0,
+        positions[-1][1] if positions else 0,
+    )
+    # Log first few positions to verify serpentine
+    for i, (px, py, fn) in enumerate(positions[:min(6, n_tiles)]):
+        logger.info("  tile %d: (%.1f, %.1f) -> %s", i, px, py, fn)
 
     # Write TileConfiguration.txt (stage coordinates in microns)
     config_path = output_path / "TileConfiguration.txt"
