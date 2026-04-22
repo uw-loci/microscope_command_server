@@ -23,9 +23,35 @@ logger = logging.getLogger(__name__)
 # 2ms matches the streaming AF cadence.
 STREAM_POLL_SLEEP_S = 0.002
 
-# After the stage should have arrived, keep polling this long
-# to catch trailing frames (ms).
+# After the stage reports idle, keep polling this long to catch
+# trailing frames in the buffer (ms).
 STREAM_TAIL_MS = 100.0
+
+
+def _process_raw_frame(arr, img_w, img_h, img_nch):
+    """Reshape raw pixel buffer and convert BGRA -> RGB if needed.
+
+    Raw frames from core.get_last_image() / pop_next_image() are flat
+    pixel buffers in the camera's native byte order. For 3-CCD cameras
+    like JAI, this is BGRA (4 components). We need standard RGB TIFFs
+    for the stitcher.
+    """
+    if img_w <= 0 or img_h <= 0:
+        return arr
+
+    try:
+        if img_nch > 1:
+            arr = arr.reshape(img_h, img_w, img_nch)
+            # BGRA -> RGB: reverse channel order, drop alpha if 4 channels
+            arr = arr[:, :, ::-1]  # BGRA -> ARGB
+            if arr.shape[2] == 4:
+                arr = arr[:, :, 1:]  # ARGB -> RGB
+        else:
+            arr = arr.reshape(img_h, img_w)
+    except Exception as e:
+        logger.debug("Frame reshape/reorder failed: %s", e)
+
+    return arr
 
 
 def acquire_rapid_scan(
@@ -85,10 +111,9 @@ def acquire_rapid_scan(
     step_y = fov_height * (1.0 - overlap_percent / 100.0)
     n_rows = max(1, math.ceil(height / step_y))
 
-    # X scan boundaries (full width, with half-FOV margin so edge tiles
-    # have their center at the region boundary)
-    x_left = center_x - width / 2.0
-    x_right = center_x + width / 2.0
+    # X scan boundaries -- extend by half FOV so edges are fully covered
+    x_left = center_x - width / 2.0 - fov_width / 2.0
+    x_right = center_x + width / 2.0 + fov_width / 2.0
 
     # Y positions for each row
     start_y = center_y - (n_rows - 1) * step_y / 2.0
@@ -97,7 +122,7 @@ def acquire_rapid_scan(
     logger.info(
         "Rapid scan (streaming): %d rows, Y step=%.1f um, "
         "X sweep=%.1f -> %.1f um (%.1f um), exposure=%.3f ms",
-        n_rows, step_y, x_left, x_right, width, exposure_ms,
+        n_rows, step_y, x_left, x_right, x_right - x_left, exposure_ms,
     )
     logger.info(
         "Rapid scan region: center=(%.1f, %.1f), size=%.1fx%.1f um, "
@@ -125,6 +150,31 @@ def acquire_rapid_scan(
         img_nch = 1
     logger.info("Camera frame: %dx%d, %d channels", img_w, img_h, img_nch)
 
+    # Pause stage position cache to avoid serial bus contention
+    stage_cache = getattr(hardware, "_stage_cache", None)
+    if stage_cache is None:
+        stage_cache = getattr(hardware, "stage_cache", None)
+    cache_was_running = False
+    if stage_cache is not None:
+        try:
+            cache_was_running = stage_cache.is_running()
+            if cache_was_running:
+                stage_cache.pause()
+                logger.info("Paused stage position cache for streaming scan")
+        except Exception as e:
+            logger.debug("Could not pause stage cache: %s", e)
+
+    # Stop any existing sequence (e.g., Live Viewer) before starting ours
+    sequence_was_running = False
+    try:
+        if core.is_sequence_running():
+            sequence_was_running = True
+            core.stop_sequence_acquisition()
+            time.sleep(0.05)
+            logger.info("Stopped pre-existing sequence acquisition")
+    except Exception as e:
+        logger.debug("Could not stop existing sequence: %s", e)
+
     # Start continuous acquisition
     core.clear_circular_buffer()
     core.start_continuous_sequence_acquisition(0)
@@ -147,7 +197,7 @@ def acquire_rapid_scan(
             # Move to row start (blocking)
             hardware.stage.move_xy(row_x_start, row_y)
 
-            # Flush stale frames
+            # Flush stale frames from buffer
             try:
                 core.clear_circular_buffer()
             except Exception:
@@ -157,73 +207,83 @@ def acquire_rapid_scan(
             # Fire non-blocking move across the row
             hardware.stage.move_xy_no_wait(row_x_end, row_y)
 
-            # Estimate move duration for deadline.
-            # Prior stage: ~15-20 mm/s at full speed. Use conservative 10 mm/s.
-            est_velocity = 10000.0  # um/s
-            est_duration_s = row_distance / max(est_velocity, 1.0)
-            tail_s = STREAM_TAIL_MS / 1000.0
-            hard_deadline_s = max(est_duration_s * 3.0, 2.0) + tail_s
-
             logger.info(
                 "Row %d/%d: streaming (%.1f, %.1f) -> (%.1f, %.1f), "
-                "%.0f um, est %.2fs",
+                "%.0f um, %d tiles so far",
                 row_idx + 1, n_rows,
                 row_x_start, row_y, row_x_end, row_y, row_distance,
-                est_duration_s,
+                tile_idx,
             )
 
-            # Pop frames from circular buffer while stage moves
-            last_remaining = -1
+            # Grab frames while stage moves.
+            # Use stage busy state as primary exit condition, with a hard
+            # deadline as safety net.
+            est_velocity = 10000.0  # um/s, conservative
+            est_duration_s = row_distance / max(est_velocity, 1.0)
+            hard_deadline_s = max(est_duration_s * 5.0, 3.0)
+
+            xy_device = core.get_xy_stage_device()
             t0 = time.perf_counter()
             deadline = t0 + hard_deadline_s
             row_frames: List[Tuple[np.ndarray, float, float]] = []
+            last_remaining = -1
+            stage_idle_since = None
 
             while time.perf_counter() < deadline:
+                # Read position BEFORE image to minimize temporal offset
+                try:
+                    actual_x = core.get_x_position()
+                    actual_y = core.get_y_position()
+                except Exception:
+                    actual_x = actual_y = float("nan")
+
+                # Drain all available frames from the buffer
                 try:
                     remaining = core.get_remaining_image_count()
                 except Exception:
-                    remaining = last_remaining
+                    remaining = 0
 
-                if remaining > last_remaining:
+                if remaining > 0:
                     try:
-                        pixels = core.get_last_image()
+                        pixels = core.pop_next_image()
                     except Exception:
                         pixels = None
 
                     if pixels is not None:
-                        # Read actual stage position at capture time
-                        try:
-                            actual_x = core.get_x_position()
-                            actual_y = core.get_y_position()
-                        except Exception:
-                            actual_x = actual_y = float("nan")
-
                         arr = np.asarray(pixels).copy()
                         row_frames.append((arr, actual_x, actual_y))
 
-                    last_remaining = remaining
+                # Check if stage has finished moving
+                try:
+                    stage_busy = core.device_busy(xy_device)
+                except Exception:
+                    stage_busy = True
+
+                if not stage_busy:
+                    if stage_idle_since is None:
+                        stage_idle_since = time.perf_counter()
+                    # Tail: keep capturing for STREAM_TAIL_MS after stage stops
+                    elif (time.perf_counter() - stage_idle_since) * 1000.0 > STREAM_TAIL_MS:
+                        break
+                else:
+                    stage_idle_since = None
 
                 time.sleep(STREAM_POLL_SLEEP_S)
 
             row_elapsed_ms = (time.perf_counter() - t0) * 1000.0
 
-            # Wait for stage to finish
+            # Warn on buffer overflow
             try:
-                hardware.stage.wait_xy()
+                if core.is_buffer_overflowed():
+                    logger.warning("  row %d: circular buffer overflowed!", row_idx + 1)
             except Exception:
                 pass
 
-            # Reshape and save all captured frames
+            # Process and save all captured frames for this row
             n_saved_this_row = 0
             for arr, actual_x, actual_y in row_frames:
                 filename = f"{tile_idx}.tif"
-                try:
-                    if img_nch > 1 and img_w > 0 and img_h > 0:
-                        arr = arr.reshape(img_h, img_w, img_nch)
-                    elif img_w > 0 and img_h > 0:
-                        arr = arr.reshape(img_h, img_w)
-                except Exception:
-                    pass
+                arr = _process_raw_frame(arr, img_w, img_h, img_nch)
 
                 filepath = output_path / filename
                 tifffile.imwrite(str(filepath), arr)
@@ -232,15 +292,19 @@ def acquire_rapid_scan(
                 n_saved_this_row += 1
 
             logger.info(
-                "  row %d: %d frames captured in %.0fms (%.1f fps effective)",
+                "  row %d: %d frames in %.0fms (%.1f fps)",
                 row_idx + 1, n_saved_this_row, row_elapsed_ms,
                 n_saved_this_row / (row_elapsed_ms / 1000.0) if row_elapsed_ms > 0 else 0,
             )
+
+            if n_saved_this_row == 0:
+                logger.warning("  row %d: NO FRAMES captured!", row_idx + 1)
 
             if progress_dict is not None:
                 progress_dict["completed_rows"] = row_idx + 1
 
     finally:
+        # Always stop our continuous acquisition
         try:
             core.stop_sequence_acquisition()
         except Exception:
@@ -250,6 +314,14 @@ def acquire_rapid_scan(
         except Exception:
             pass
         logger.info("Stopped continuous acquisition")
+
+        # Restore stage position cache
+        if stage_cache is not None and cache_was_running:
+            try:
+                stage_cache.resume()
+                logger.info("Resumed stage position cache")
+            except Exception as e:
+                logger.debug("Could not resume stage cache: %s", e)
 
     # Write TileConfiguration.txt with ACTUAL captured positions
     config_path = output_path / "TileConfiguration.txt"
