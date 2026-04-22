@@ -26,10 +26,10 @@ STREAM_POLL_SLEEP_S = 0.002
 # the last in-motion frame (ms).
 STREAM_TAIL_MS = 50.0
 
-# Conservative effective frame rate for full-frame ZMQ transfer.
-# Used to calculate the required stage velocity.
-# The actual rate depends on frame size and system load.
-ESTIMATED_EFFECTIVE_FPS = 5.0
+# Effective frame rate for full-frame ZMQ transfer (~12.7MB per JAI frame).
+# Measured at ~2.5 fps on PPM (2026-04-22). The Pycromanager ZMQ bridge
+# bottleneck is the image data transfer, not the camera frame rate.
+ESTIMATED_EFFECTIVE_FPS = 2.5
 
 # Stage speed property candidates (same as streaming AF).
 SPEED_PROPERTY_CANDIDATES = ("MaxSpeed", "Velocity", "Speed", "MaxVelocity")
@@ -181,6 +181,11 @@ def acquire_rapid_scan(
         img_nch = 1
     logger.info("Camera frame: %dx%d, %d channels", img_w, img_h, img_nch)
 
+    # Save starting position to restore after scan
+    start_stage_x = core.get_x_position()
+    start_stage_y = core.get_y_position()
+    logger.info("Saved starting position: (%.1f, %.1f)", start_stage_x, start_stage_y)
+
     # Pause stage position cache
     stage_cache = getattr(hardware, "_stage_cache", None)
     if stage_cache is None:
@@ -229,13 +234,19 @@ def acquire_rapid_scan(
             logger.warning("No speed property found on XY device '%s'", xy_device)
 
     if speed_prop:
-        # Prior ProScan MaxSpeed is 1-100 (percentage of max ~20 mm/s).
-        max_xy_velocity = 20000.0  # um/s
-        speed_pct = max(1, min(100, int(target_velocity / max_xy_velocity * 100)))
+        # Prior ProScan MaxSpeed is 1-100. Observed calibration (PPM 2026-04-22):
+        #   MaxSpeed=100 -> ~6800 um/s avg (short moves)
+        #   MaxSpeed=8   -> ~2600 um/s avg
+        # The mapping is NOT linear. Use 1 (minimum) for slow streaming.
+        # At MaxSpeed=1, the stage should be ~800-1000 um/s, which matches
+        # our target for ~2.5 fps with 320um tile steps.
+        speed_pct = 1  # slowest available
+        if target_velocity > 3000:
+            speed_pct = max(1, min(100, int(target_velocity / 6800.0 * 100)))
 
         if _try_set(core, xy_device, speed_prop, str(speed_pct)):
             logger.info(
-                "Set XY stage %s=%d%% (target %.0f um/s)",
+                "Set XY stage %s=%d (target %.0f um/s)",
                 speed_prop, speed_pct, target_velocity,
             )
         else:
@@ -386,13 +397,20 @@ def acquire_rapid_scan(
             pass
         logger.info("Stopped continuous acquisition")
 
-        # Restore XY stage speed
+        # Restore XY stage speed (BEFORE moving back, so return is at full speed)
         if speed_prop and original_speed is not None:
             if _try_set(core, xy_device, speed_prop, original_speed):
                 logger.info("Restored XY stage %s=%s", speed_prop, original_speed)
             else:
-                # Always try to restore to full speed
                 _try_set(core, xy_device, speed_prop, NORMAL_SPEED_VALUE)
+
+        # Return stage to starting position
+        try:
+            hardware.stage.move_xy(start_stage_x, start_stage_y)
+            logger.info("Returned stage to starting position (%.1f, %.1f)",
+                        start_stage_x, start_stage_y)
+        except Exception as e:
+            logger.warning("Could not return stage to start: %s", e)
 
         # Restore stage cache
         if stage_cache is not None and cache_was_running:
