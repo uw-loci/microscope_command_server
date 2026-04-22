@@ -93,13 +93,14 @@ def acquire_rapid_scan(
     exposure_ms,
     fov_width,
     fov_height,
+    binning=2,
     progress_dict=None,
 ):
     """Streaming XY tiled acquisition over a rectangular region.
 
     The stage is slowed so that at the effective ZMQ frame capture rate,
-    consecutive frames have the desired overlap. This is the same principle
-    as the streaming autofocus slowing the Z stage.
+    consecutive frames have the desired overlap. Camera binning reduces
+    the frame size transferred over ZMQ, increasing effective fps.
 
     Args:
         hardware: Hardware abstraction with .stage, .set_exposure, .core
@@ -109,10 +110,12 @@ def acquire_rapid_scan(
         overlap_percent: Tile overlap (0-50%)
         exposure_ms: Exposure time (max 0.5ms)
         fov_width, fov_height: Camera FOV (um)
+        binning: Camera binning factor (1=full res, 2=2x2 binning).
+                 Higher binning = faster ZMQ transfer = more frames/row.
         progress_dict: Optional dict for progress tracking
 
     Returns:
-        dict with n_tiles, saved, elapsed_seconds, etc.
+        dict with n_tiles, saved, elapsed_seconds, binning, etc.
     """
     import tifffile
 
@@ -127,6 +130,21 @@ def acquire_rapid_scan(
     # Set camera exposure
     logger.info("Setting exposure to %.3f ms", exposure_ms)
     hardware.set_exposure(exposure_ms)
+
+    # Set camera binning for faster ZMQ transfer.
+    # Binning=2 -> 2x2 -> 4x fewer pixels -> ~4x faster frame transfer.
+    # FOV stays the same, pixel size doubles.
+    core = hardware.core
+    camera_device = core.get_camera_device()
+    original_binning = None
+    if binning > 1:
+        try:
+            original_binning = core.get_property(camera_device, "Binning")
+            core.set_property(camera_device, "Binning", str(binning))
+            logger.info("Set camera binning=%d (was %s)", binning, original_binning)
+        except Exception as e:
+            logger.warning("Could not set binning=%d: %s", binning, e)
+            binning = 1  # fall back to no binning
 
     # Compute row positions
     step_y = fov_height * (1.0 - overlap_percent / 100.0)
@@ -149,20 +167,24 @@ def acquire_rapid_scan(
     # Therefore:
     #   velocity = fov_width * (1 - overlap/100) * fps
     target_step_x = fov_width * (1.0 - overlap_percent / 100.0)
-    target_velocity = target_step_x * ESTIMATED_EFFECTIVE_FPS  # um/s
+    # Binning reduces frame size -> faster ZMQ transfer -> higher effective fps.
+    # Binning=2 -> 4x fewer pixels -> ~4x faster transfer.
+    effective_fps = ESTIMATED_EFFECTIVE_FPS * (binning * binning)
+    target_velocity = target_step_x * effective_fps  # um/s
 
     logger.info(
         "Rapid scan (streaming): %d rows, Y step=%.1f um, "
-        "X sweep=%.1f um, target velocity=%.0f um/s (%.1f mm/s)",
-        n_rows, step_y, row_distance, target_velocity, target_velocity / 1000.0,
+        "X sweep=%.1f um, binning=%d, effective fps=%.0f, "
+        "target velocity=%.0f um/s (%.1f mm/s)",
+        n_rows, step_y, row_distance, binning, effective_fps,
+        target_velocity, target_velocity / 1000.0,
     )
     logger.info(
         "  Target tile step: %.1f um at ~%.0f fps -> %.1f%% overlap",
-        target_step_x, ESTIMATED_EFFECTIVE_FPS, overlap_percent,
+        target_step_x, effective_fps, overlap_percent,
     )
 
     # ---- Hardware setup ----
-    core = hardware.core
     all_tiles = []
     start_time = time.time()
 
@@ -397,6 +419,14 @@ def acquire_rapid_scan(
             pass
         logger.info("Stopped continuous acquisition")
 
+        # Restore camera binning
+        if original_binning is not None:
+            try:
+                core.set_property(camera_device, "Binning", original_binning)
+                logger.info("Restored camera binning=%s", original_binning)
+            except Exception as e:
+                logger.warning("Could not restore binning: %s", e)
+
         # Restore XY stage speed (BEFORE moving back, so return is at full speed)
         if speed_prop and original_speed is not None:
             if _try_set(core, xy_device, speed_prop, original_speed):
@@ -447,4 +477,5 @@ def acquire_rapid_scan(
         "output_folder": str(output_path),
         "elapsed_seconds": elapsed,
         "tile_config_path": str(config_path),
+        "binning": binning,
     }

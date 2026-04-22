@@ -79,6 +79,9 @@ def handle_rapid_scan(conn, client, hardware, settings, **kwargs):
         elif parts[i] == "--fov-h" and i + 1 < len(parts):
             params["fov_h"] = float(parts[i + 1])
             i += 2
+        elif parts[i] == "--binning" and i + 1 < len(parts):
+            params["binning"] = int(parts[i + 1])
+            i += 2
         else:
             i += 1
 
@@ -103,6 +106,8 @@ def handle_rapid_scan(conn, client, hardware, settings, **kwargs):
         # Use server-level progress dict if available
         progress_dict = settings.get("acquisition_progress") if settings else None
 
+        binning = int(params.get("binning", 2))
+
         result = acquire_rapid_scan(
             hardware=hardware,
             output_folder=params["output"],
@@ -114,15 +119,18 @@ def handle_rapid_scan(conn, client, hardware, settings, **kwargs):
             exposure_ms=params["exposure"],
             fov_width=params["fov_w"],
             fov_height=params["fov_h"],
+            binning=binning,
             progress_dict=progress_dict,
         )
 
-        response = f"SUCCESS:{result['n_tiles']}:{result['elapsed_seconds']:.1f}"
+        response = (f"SUCCESS:{result['n_tiles']}:{result['elapsed_seconds']:.1f}"
+                    f":{result['binning']}")
         conn.sendall(response.encode())
         logger.info(
-            "RPDSCAN complete: %d tiles in %.1fs",
+            "RPDSCAN complete: %d tiles in %.1fs (binning=%d)",
             result["n_tiles"],
             result["elapsed_seconds"],
+            result["binning"],
         )
     except Exception as e:
         logger.error("RPDSCAN failed: %s", e, exc_info=True)
