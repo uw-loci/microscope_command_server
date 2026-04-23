@@ -1,13 +1,15 @@
 """System and alignment command handlers.
 
 Handles connection management, configuration, and alignment commands:
-CONFIG, DISCONNECT, SHUTDOWN, SIFTAL
+CONFIG, RECONFG, DISCONNECT, SHUTDOWN, SIFTAL
 """
 
 import struct
 import socket
 import time
 import logging
+
+import yaml
 
 from microscope_command_server.server.protocol import END_MARKER
 from microscope_command_server.server.handlers.utils import read_message_string
@@ -230,6 +232,80 @@ def handle_config(conn, client, hardware, settings, **kwargs):
         error_bytes = error_msg.encode("utf-8")
         error_length = struct.pack("!I", len(error_bytes))
         conn.sendall(b"CFG_FAIL" + error_length + error_bytes)
+        return None
+
+
+def handle_reconfig(conn, client, hardware, settings, **kwargs):
+    """Re-read YAML config files from disk after a calibration write.
+
+    Java sends this after WB calibration, polarizer calibration, or
+    background collection writes new values to the YAML.  Without it
+    the Python server keeps stale cached values until restart.
+
+    No payload.  Response: ACK_____ on success, FAILED:<reason> on error.
+
+    Does NOT rebuild hardware objects (camera, stage, etc.) -- only the
+    cached settings dict and any derived config caches are refreshed.
+    """
+    addr = kwargs.get(
+        "addr",
+        client if isinstance(client, tuple) else getattr(client, "addr", client),
+    )
+    config_path = kwargs.get("active_connection_config_path")
+    config_manager = kwargs.get("config_manager")
+
+    logger.info("Client %s requested RECONFIG", addr)
+
+    if not config_path:
+        msg = "No config path set -- send CONFIG first"
+        logger.error("RECONFIG: %s", msg)
+        conn.sendall(f"FAILED:{msg}".encode())
+        return None
+
+    try:
+        from pathlib import Path
+
+        config_dir = Path(config_path).parent
+        microscope_name = Path(config_path).stem.replace("config_", "")
+
+        # 1. Re-read the main config YAML
+        new_settings = config_manager.load_config_file(config_path)
+        hardware.settings = new_settings
+        logger.info("RECONFIG: Reloaded %s", config_path)
+
+        # 2. Re-read imageprocessing YAML (calibration results live here)
+        imgproc_path = config_dir / f"imageprocessing_{microscope_name}.yml"
+        if imgproc_path.exists():
+            with open(imgproc_path) as f:
+                imgproc_data = yaml.safe_load(f) or {}
+            # Store for workflow.py's load_jai_calibration_from_imageprocessing()
+            # which re-reads from disk anyway, but update the settings cache
+            # in case anything caches the old values.
+            new_settings["_imageprocessing_data"] = imgproc_data
+            logger.info("RECONFIG: Reloaded %s", imgproc_path)
+        else:
+            logger.debug("RECONFIG: No imageprocessing file at %s", imgproc_path)
+
+        # 3. Re-read autofocus YAML
+        af_path = config_dir / f"autofocus_{microscope_name}.yml"
+        if af_path.exists():
+            with open(af_path) as f:
+                af_data = yaml.safe_load(f) or {}
+            new_settings["_autofocus_data"] = af_data
+            logger.info("RECONFIG: Reloaded %s", af_path)
+        else:
+            logger.debug("RECONFIG: No autofocus file at %s", af_path)
+
+        conn.sendall(b"ACK_____")
+        logger.info("RECONFIG: Complete -- server now using latest YAML values")
+
+        # Return updated settings for the server to store
+        return {"settings": new_settings}
+
+    except Exception as e:
+        msg = str(e)
+        logger.error("RECONFIG failed: %s", msg, exc_info=True)
+        conn.sendall(f"FAILED:{msg}".encode())
         return None
 
 

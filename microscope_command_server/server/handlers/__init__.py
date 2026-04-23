@@ -47,7 +47,7 @@ from microscope_command_server.server.handlers.illumination import (
     handle_getillm, handle_setillm, handle_applypr,
 )
 from microscope_command_server.server.handlers.system import (
-    handle_config, handle_disconnect, handle_shutdown, handle_siftal,
+    handle_config, handle_reconfig, handle_disconnect, handle_shutdown, handle_siftal,
 )
 from microscope_command_server.server.handlers.probez import handle_probez
 from microscope_command_server.server.handlers.streaming_focus import handle_streaming_focus
@@ -128,6 +128,7 @@ COMMAND_HANDLERS = {
 
     # System & alignment
     ExtendedCommand.CONFIG: handle_config,
+    ExtendedCommand.RECONFG: handle_reconfig,
     ExtendedCommand.DISCONNECT: handle_disconnect,
     ExtendedCommand.SHUTDOWN: handle_shutdown,
     ExtendedCommand.SIFTAL: handle_siftal,

@@ -45,6 +45,7 @@ class ExtendedCommand:
 
     # New commands (8 bytes each)
     CONFIG = b"config__"  # Set microscope configuration file (CRITICAL - must be first command)
+    RECONFG = b"reconfg_"  # Re-read YAML configs from disk (after calibration writes)
     STATUS = b"status__"  # Get acquisition status
     PROGRESS = b"progress"  # Get acquisition progress
     CANCEL = b"cancel__"  # Cancel acquisition
