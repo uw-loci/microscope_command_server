@@ -1066,6 +1066,196 @@ def log_timing(logger, operation_name, start_time):
     return time.perf_counter()
 
 
+def write_acquisition_metadata(output_path, params, tile_measurements,
+                               sat_monitor, camera_settings=None):
+    """Write acquisition_metadata.json alongside tile data.
+
+    Captures acquisition parameters, camera settings, autofocus config,
+    timing summary, and software versions in a single structured file
+    for FAIR-compliant metadata export.
+
+    This is Phase 1 of the 4DN-BINA-OME metadata integration -- sidecar
+    JSON alongside the stitched output. Failure here never blocks acquisition.
+
+    Args:
+        output_path: Path to the acquisition output directory
+        params: The parsed acquisition parameters dict
+        tile_measurements: List of per-tile measurement dicts
+        sat_monitor: SaturationMonitor instance for summary stats
+        camera_settings: Optional dict of per-angle camera settings
+                        (exposures, gains) captured during acquisition
+    """
+    _log = logging.getLogger(__name__)
+    try:
+        from datetime import datetime, timezone
+        import platform
+
+        # --- Acquisition parameters ---
+        acq_params = {
+            "scan_type": params.get("scan_type"),
+            "objective": params.get("objective"),
+            "detector": params.get("detector"),
+            "pixel_size_um": params.get("pixel_size"),
+            "modality": params.get("modality"),
+            "region_name": params.get("region_name"),
+            "sample_label": params.get("sample_label"),
+        }
+
+        # Angles / channels
+        if params.get("angles"):
+            acq_params["angles_deg"] = params["angles"]
+        if params.get("exposures"):
+            acq_params["exposures_ms"] = params["exposures"]
+        if params.get("channels_str"):
+            acq_params["channels"] = params["channels_str"]
+        if params.get("channel_exposures_str"):
+            acq_params["channel_exposures_ms"] = params["channel_exposures_str"]
+
+        # White balance
+        acq_params["wb_mode"] = params.get("wb_mode", "off")
+        acq_params["wb_enabled"] = params.get("white_balance_enabled", False)
+        acq_params["wb_per_angle"] = params.get("white_balance_per_angle", False)
+
+        # Background correction
+        acq_params["bg_correction_enabled"] = params.get(
+            "background_correction_enabled", False)
+        acq_params["bg_correction_method"] = params.get(
+            "background_correction_method")
+
+        # Z-stack
+        if params.get("z_stack"):
+            acq_params["z_stack"] = {
+                "enabled": True,
+                "z_start_um": params.get("z_start"),
+                "z_end_um": params.get("z_end"),
+                "z_step_um": params.get("z_step"),
+                "z_pixel_size_um": params.get("z_pixel_size_um"),
+                "projection": params.get("z_projection"),
+            }
+
+        # Processing pipeline
+        acq_params["processing_pipeline"] = params.get("processing_pipeline")
+        acq_params["save_raw"] = params.get("save_raw", False)
+
+        # --- Autofocus config ---
+        af_config = {
+            "strategy": params.get("af_strategy"),
+            "n_tiles": params.get("autofocus_tiles"),
+            "n_steps": params.get("autofocus_steps"),
+            "range_um": params.get("autofocus_range"),
+        }
+
+        # --- Camera settings (per-angle exposures/gains if available) ---
+        camera_section = camera_settings if camera_settings else {}
+
+        # --- Timing summary ---
+        timing = {}
+        if tile_measurements:
+            all_times = [m["tile_time_ms"] for m in tile_measurements]
+            af_tiles = [m for m in tile_measurements if m.get("af_performed")]
+            non_af = [m for m in tile_measurements if not m.get("af_performed")]
+            total_wall_s = sum(all_times) / 1000
+            timing = {
+                "total_tiles": len(all_times),
+                "total_wall_time_s": round(total_wall_s, 1),
+                "avg_tile_ms": round(sum(all_times) / len(all_times), 1),
+                "avg_af_tile_ms": round(
+                    sum(m["tile_time_ms"] for m in af_tiles) / len(af_tiles), 1
+                ) if af_tiles else None,
+                "avg_non_af_tile_ms": round(
+                    sum(m["tile_time_ms"] for m in non_af) / len(non_af), 1
+                ) if non_af else None,
+                "af_tile_count": len(af_tiles),
+                "tiles_per_hour": round(
+                    len(all_times) / (total_wall_s / 3600), 0
+                ) if total_wall_s > 0 else None,
+            }
+
+        # --- AF quality summary ---
+        af_summary = {}
+        if tile_measurements:
+            af_performed = [m for m in tile_measurements if m.get("af_performed")]
+            af_failed = [m for m in tile_measurements if m.get("af_failed")]
+            af_types = {}
+            for m in tile_measurements:
+                t = m.get("af_type", "none")
+                af_types[t] = af_types.get(t, 0) + 1
+            af_summary = {
+                "total_af_events": len(af_performed),
+                "af_failures": len(af_failed),
+                "af_type_counts": af_types,
+            }
+            # Drift statistics from sweep drift checks
+            drifts = [m.get("af_drift_um") for m in tile_measurements
+                      if m.get("af_drift_um") is not None]
+            if drifts:
+                af_summary["drift_um_min"] = round(min(drifts), 2)
+                af_summary["drift_um_max"] = round(max(drifts), 2)
+                af_summary["drift_um_mean"] = round(sum(drifts) / len(drifts), 2)
+
+        # --- Saturation summary ---
+        sat_section = {}
+        try:
+            sat_section = {
+                "summary": sat_monitor.get_summary_string(),
+            }
+        except Exception:
+            pass
+
+        # --- Software versions ---
+        versions = {}
+        try:
+            import microscope_command_server
+            versions["microscope_command_server"] = getattr(
+                microscope_command_server, "__version__", "unknown")
+        except Exception:
+            pass
+        try:
+            import microscope_control
+            versions["microscope_control"] = getattr(
+                microscope_control, "__version__", "unknown")
+        except Exception:
+            pass
+        try:
+            import microscope_imageprocessing
+            versions["microscope_imageprocessing"] = getattr(
+                microscope_imageprocessing, "__version__", "unknown")
+        except Exception:
+            pass
+        versions["python"] = platform.python_version()
+
+        # --- Assemble ---
+        metadata = {
+            "schema_version": "1.0",
+            "timestamp_utc": datetime.now(timezone.utc).isoformat(),
+            "acquisition": acq_params,
+            "autofocus": af_config,
+            "autofocus_quality": af_summary,
+            "camera_settings": camera_section,
+            "timing": timing,
+            "saturation": sat_section,
+            "software_versions": versions,
+        }
+
+        # Strip None values for cleaner output
+        def strip_none(d):
+            if isinstance(d, dict):
+                return {k: strip_none(v) for k, v in d.items() if v is not None}
+            if isinstance(d, list):
+                return [strip_none(i) for i in d]
+            return d
+
+        metadata = strip_none(metadata)
+
+        meta_path = output_path / "acquisition_metadata.json"
+        with open(meta_path, "w") as f:
+            json.dump(metadata, f, indent=2)
+        _log.info("Wrote acquisition metadata to %s", meta_path)
+
+    except Exception as e:
+        _log.warning("Failed to write acquisition metadata (non-fatal): %s", e)
+
+
 def autofocus_with_manual_fallback(
     hardware: PycromanagerHardware,
     logger,
@@ -4239,6 +4429,10 @@ def _acquisition_workflow(
             )
         except Exception as e:
             logger.warning("Failed to write tile measurements: %s", e)
+
+        # Write structured acquisition metadata (FAIR / 4DN-BINA-OME Phase 1)
+        write_acquisition_metadata(
+            output_path, params, tile_measurements, sat_monitor)
 
         # Post-acquisition timing report
         if tile_measurements:
