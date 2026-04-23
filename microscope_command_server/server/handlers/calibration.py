@@ -5,12 +5,10 @@ measurement commands:
 WBCALIBR, WBSIMPLE, WBPPM, POLCAL, PPMSENS, PPMBIREF, SBCALIB,
 GETNOISE, NOISCHAR
 
-NOTE: Calibration handlers (WBCALIBR, WBSIMPLE, WBPPM, NOISCHAR) pass
-JAICameraProperties to external calibrator classes (JAIWhiteBalanceCalibrator,
-JAINoiseCharacterization) which require it as their API. All direct camera
-property manipulation (finally-block cleanup) uses the Camera ABC methods
-instead. The calibrator pass-throughs remain until those classes are migrated
-to accept the Camera interface directly.
+NOTE: Calibration handlers (WBCALIBR, WBSIMPLE, WBPPM, NOISCHAR) access
+JAI camera properties via hardware.camera.properties (the lazily-initialized
+JAICameraProperties instance on the JAICamera). All direct camera property
+manipulation (finally-block cleanup) uses the Camera ABC methods instead.
 """
 
 import socket
@@ -138,7 +136,6 @@ def handle_wbcalibr(conn, client, hardware, settings, **kwargs):
                     from microscope_control.jai import (
                         JAIWhiteBalanceCalibrator,
                         CalibrationConfig,
-                        JAICameraProperties,
                     )
                     from pathlib import Path
                     from microscope_command_server.modality import (
@@ -153,7 +150,7 @@ def handle_wbcalibr(conn, client, hardware, settings, **kwargs):
                     )
 
                     # Create calibrator with hardware
-                    jai_props = JAICameraProperties(hardware.core)
+                    jai_props = hardware.camera.properties
                     calibrator = JAIWhiteBalanceCalibrator(hardware, jai_props)
 
                     # Set up rotation callback if modality has rotation
@@ -409,12 +406,11 @@ def handle_wbsimple(conn, client, hardware, settings, **kwargs):
                     # TODO: JAI-specific -- migrate to camera-agnostic interface
                     from microscope_control.jai import (
                         JAIWhiteBalanceCalibrator,
-                        JAICameraProperties,
                     )
                     from pathlib import Path
 
                     # Create calibrator with hardware
-                    jai_props = JAICameraProperties(hardware.core)
+                    jai_props = hardware.camera.properties
                     calibrator = JAIWhiteBalanceCalibrator(hardware, jai_props)
 
                     # Run simple calibration at uncrossed (90 deg) first
@@ -922,7 +918,6 @@ def handle_wbppm(conn, client, hardware, settings, **kwargs):
                     # TODO: JAI-specific -- migrate to camera-agnostic interface
                     from microscope_control.jai import (
                         JAIWhiteBalanceCalibrator,
-                        JAICameraProperties,
                     )
                     from pathlib import Path
 
@@ -981,7 +976,7 @@ def handle_wbppm(conn, client, hardware, settings, **kwargs):
                                 per_angle_targets[angle_name] = client_targets[angle_name]
 
                     # Create calibrator with hardware
-                    jai_props = JAICameraProperties(hardware.core)
+                    jai_props = hardware.camera.properties
                     calibrator = JAIWhiteBalanceCalibrator(hardware, jai_props)
 
                     # Set up rotation callback
@@ -1815,11 +1810,10 @@ def handle_noischar(conn, client, hardware, settings, **kwargs):
                     # TODO: JAI-specific -- migrate to camera-agnostic interface
                     from microscope_control.jai import (
                         JAINoiseCharacterization,
-                        JAICameraProperties,
                     )
 
                     # Create characterization tool
-                    jai_props = JAICameraProperties(hardware.core)
+                    jai_props = hardware.camera.properties
                     tool = JAINoiseCharacterization(
                         hardware,
                         jai_props,

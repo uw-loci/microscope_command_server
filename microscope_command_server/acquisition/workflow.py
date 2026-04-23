@@ -176,14 +176,15 @@ class SaturationMonitor:
         self._abort_reason = ""
 
         # Per-tile detail records for saturated tiles
-        # Each entry: {filename, angle, pos_idx, r_pct, g_pct, b_pct, stage_x, stage_y}
+        # Each entry: {filename, angle, pos_idx, r_pct, g_pct, b_pct, stage_x, stage_y, stage_z}
         self._saturated_tiles = []
 
     def _is_uncrossed(self, angle: float) -> bool:
         """Check if angle is the uncrossed position (near 90 deg)."""
         return abs(abs(angle) - 90.0) < self.UNCROSSED_TOLERANCE
 
-    def check_tile(self, sat_result, angle, tile_idx, filename, stage_x=None, stage_y=None):
+    def check_tile(self, sat_result, angle, tile_idx, filename,
+                   stage_x=None, stage_y=None, stage_z=None):
         """Record saturation for a tile and determine if acquisition should abort.
 
         Args:
@@ -194,6 +195,7 @@ class SaturationMonitor:
             filename: Tile filename for logging
             stage_x: Optional stage X position in microns (for saturation report)
             stage_y: Optional stage Y position in microns (for saturation report)
+            stage_z: Optional stage Z position in microns (for saturation report)
 
         Returns:
             True if acquisition should abort due to excessive saturation,
@@ -219,6 +221,7 @@ class SaturationMonitor:
                 "worst_pct": round(worst, 1),
                 "stage_x": round(stage_x, 2) if stage_x is not None else None,
                 "stage_y": round(stage_y, 2) if stage_y is not None else None,
+                "stage_z": round(stage_z, 2) if stage_z is not None else None,
             })
         self._worst_seen[angle] = max(self._worst_seen.get(angle, 0.0), worst)
 
@@ -3674,7 +3677,9 @@ def _acquisition_workflow(
 
                         if sat_monitor.check_tile(
                             sat_result, angle, pos_idx, filename,
-                            stage_x=current_stage_pos.x, stage_y=current_stage_pos.y
+                            stage_x=current_stage_pos.x,
+                            stage_y=current_stage_pos.y,
+                            stage_z=current_stage_pos.z,
                         ):
                             # Saturation abort triggered -- save what we have and stop
                             logger.error(
