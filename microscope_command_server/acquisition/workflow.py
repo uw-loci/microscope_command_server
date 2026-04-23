@@ -5959,7 +5959,11 @@ def simple_background_collection(
                         f"gain={unified_gain:.2f}, target={target_intensity:.1f}"
                     )
 
-                    # Iterative scaling: snap image, measure, scale all channels uniformly
+                    # Iterative scaling: snap image, measure, scale all channels uniformly.
+                    # When pixels are clipped (median >= 254), ratio scaling is useless
+                    # because the measured value is a lower bound on the real signal.
+                    # Use exponential backoff (halve) until out of saturation, then
+                    # switch to ratio scaling for fine convergence.
                     scale = 1.0
                     tolerance = 2.5
                     max_iter = 8
@@ -5974,16 +5978,23 @@ def simple_background_collection(
                         if image is None:
                             raise RuntimeError("Failed to acquire image")
                         measured = float(np.median(image))
+                        # Check clipped pixel fraction for saturation detection
+                        clipped_frac = float(np.mean(image >= 254)) if image.dtype == np.uint8 else 0.0
                         logger.info(
                             f"  Iteration {iteration}: scale={scale:.3f}, "
                             f"R={exp_r:.1f}ms G={exp_g:.1f}ms B={exp_b:.1f}ms, "
-                            f"median={measured:.1f} (target={target_intensity:.1f})"
+                            f"median={measured:.1f} (target={target_intensity:.1f}), "
+                            f"clipped={clipped_frac:.1%}"
                         )
                         if abs(measured - target_intensity) <= tolerance:
                             logger.info(f"  Converged at iteration {iteration}")
                             break
                         if measured < 1.0:
                             scale *= 5.0  # Very dark, big jump
+                        elif clipped_frac > 0.05 or measured >= 254:
+                            # Saturated: ratio scaling is meaningless. Halve exposure.
+                            scale *= 0.5
+                            logger.info(f"  Clipped -- exponential backoff to scale={scale:.3f}")
                         else:
                             scale *= target_intensity / measured
 
@@ -6000,7 +6011,12 @@ def simple_background_collection(
                         f"Simple WB background: shape={image.shape}, "
                         f"median={actual_intensity:.1f}, scale={scale:.3f}"
                     )
-                    _check_saturation(image, f"simple WB angle={angle}", logger)
+                    # Warn if background is still saturated after adaptive loop
+                    sat_frac = float(np.mean(image >= 254)) if image.dtype == np.uint8 else 0.0
+                    if sat_frac > 0.05:
+                        logger.warning(
+                            "SATURATION WARNING: simple WB angle=%s has %.1f%% clipped pixels",
+                            angle, sat_frac * 100)
 
                     # Store reference for biref pair matching
                     if angle > 0 and angle != 90:
@@ -6083,7 +6099,22 @@ def simple_background_collection(
                                 logger.info(
                                     f"Acquired background: shape={image.shape}, median={actual_intensity:.1f}"
                                 )
-                            _check_saturation(image, f"per-angle WB angle={angle}", logger)
+
+                            # Per-angle mode uses calibrated exposures verbatim --
+                            # if calibration is stale (wrong lamp, wrong objective),
+                            # the image can be fully saturated. Detect and abort
+                            # rather than silently saving a useless background.
+                            sat_frac = float(np.mean(image >= 254)) if image.dtype == np.uint8 else 0.0
+                            if sat_frac > 0.50:
+                                raise RuntimeError(
+                                    f"Per-angle background at {angle} deg is {sat_frac:.0%} saturated. "
+                                    f"Calibration may be stale (captured at different lamp/objective). "
+                                    f"Recalibrate white balance before collecting backgrounds."
+                                )
+                            elif sat_frac > 0.05:
+                                logger.warning(
+                                    "SATURATION WARNING: per-angle WB angle=%s has %.1f%% clipped pixels",
+                                    angle, sat_frac * 100)
 
                             # Store reference for biref pair matching
                             if angle > 0 and angle != 90:
