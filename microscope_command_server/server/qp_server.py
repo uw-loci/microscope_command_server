@@ -303,7 +303,6 @@ else:
                 "z_um": {"low": -20000, "high": 20000}
             }
         },
-        "ppm_optics": "NA",
         "modalities": {},
         "hardware": {},
         "id_stage": {},
