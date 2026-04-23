@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import time
+from dataclasses import dataclass, field
 from typing import Callable, List, Tuple, Optional, Dict, Any
 from pathlib import Path
 import shutil
@@ -2007,6 +2008,110 @@ def get_angles_wb_from_settings(
     return angles_wb
 
 
+class _AcquisitionCancelled(Exception):
+    """Raised inside extracted functions when is_cancelled() returns True."""
+
+
+@dataclass
+class AcquisitionContext:
+    """Bundles all state needed across the acquisition workflow phases.
+
+    Created by _prepare_acquisition(), then passed to all subsequent functions.
+    Autofocus and infrastructure fields are populated by _configure_autofocus()
+    and _initialize_loop_infrastructure() respectively.
+    """
+
+    # -- Core --
+    params: Dict[str, Any]
+    hardware: PycromanagerHardware
+    config_manager: Any
+    logger: Any  # logging.Logger
+    client_addr: Any
+    output_path: Path
+    modality: str
+    mod_config: Any  # ModalityConfig from get_modality_config()
+    ppm_settings: dict
+
+    # -- Tile positions --
+    positions: List[Tuple[Any, str]]  # [(Position, filename), ...]
+    xy_positions: List[Tuple[float, float]]
+    total_images: int = 0
+
+    # -- Background correction --
+    background_correction_enabled: bool = False
+    background_correction_method: str = "divide"
+    background_disabled_angles: list = field(default_factory=list)
+    background_images: dict = field(default_factory=dict)
+    background_scaling_factors: dict = field(default_factory=dict)
+    channel_background_images: dict = field(default_factory=dict)
+
+    # -- White balance --
+    white_balance_enabled: bool = True
+    white_balance_per_angle: bool = False
+    wb_mode: str = "off"
+    angles_wb: dict = field(default_factory=dict)
+    jai_calibration: Optional[dict] = None
+    simple_wb_data: Optional[dict] = None
+    camera_awb_gains: dict = field(default_factory=dict)
+    is_jai_camera: bool = False
+    simple_wb_analog_red: float = 1.0
+    simple_wb_analog_blue: float = 1.0
+
+    # -- Z-stack --
+    z_stack_enabled: bool = False
+    z_offsets: list = field(default_factory=lambda: [0.0])
+    projection_fn: Optional[Callable] = None
+    save_raw_tiles: bool = False
+
+    # -- Autofocus (populated by _configure_autofocus) --
+    af_n_tiles: int = 5
+    af_n_steps: int = 11
+    af_search_range: float = 50.0
+    af_interp_strength: float = 100.0
+    af_interp_kind: str = "quadratic"
+    af_score_metric: Optional[Callable] = None
+    af_score_metric_name: str = "normalized_variance"
+    af_sweep_range_um: float = 10.0
+    af_sweep_n_steps: int = 5
+    af_edge_retries: int = 2
+    af_gap_index_multiplier: int = 3
+    af_gap_spatial_multiplier: float = 2.0
+    af_strategy: Any = None
+    af_strategy_name: Optional[str] = None
+    af_focus_channel: Optional[str] = None
+    af_positions: list = field(default_factory=list)
+    af_min_distance: float = 0.0
+    exposure_90: float = 0.0  # mutable: doubled during brightness checks
+    hint_z: Optional[float] = None
+    metadata_txt_for_positions: Optional[Path] = None
+
+    # -- Infrastructure (populated by _initialize_loop_infrastructure) --
+    sat_monitor: Any = None  # SaturationMonitor
+    write_pool: Any = None  # _TileWritePool
+    channel_preset_cache: dict = field(default_factory=dict)
+
+    # -- Callbacks --
+    update_progress: Optional[Callable] = None
+    set_state: Optional[Callable] = None
+    is_cancelled: Optional[Callable] = None
+    request_manual_focus: Optional[Callable] = None
+    request_hardware_error_recovery: Optional[Callable] = None
+
+    # -- Mutable loop state --
+    image_count: int = 0
+    dynamic_af_positions: set = field(default_factory=set)
+    deferred_af_positions: set = field(default_factory=set)
+    completed_af_positions: list = field(default_factory=list)
+    first_tissue_autofocus_done: bool = False
+    last_af_pos_idx: int = -1
+    tile_measurements: list = field(default_factory=list)
+    tile_measurements_stream: Any = None  # file handle
+    stage_positions_collected: list = field(default_factory=list)
+    starting_position: Any = None  # Position or None
+    channel_consecutive_saturated: dict = field(default_factory=dict)
+    progress_warning_fired: bool = False
+
+
 def _acquisition_workflow(
     message: str,
     client_addr,
@@ -2041,2457 +2146,2205 @@ def _acquisition_workflow(
         connection_config_path: Optional path to config from initial CONFIG command,
                                used to warn if ACQUIRE uses different config.
     """
-
-    logger.info(f"=== ACQUISITION WORKFLOW STARTED for client {client_addr} ===")
-
+    ctx = None
     try:
-        # Stop live mode if running - JAI camera properties cannot be changed during live streaming
-        try:
-            hardware.camera.stop_if_streaming()
-            logger.info("Ensured camera not streaming before acquisition")
-        except Exception as e:
-            logger.warning(f"Could not stop live/sequence mode: {e}")
-
-        # Invalidate camera settings state so first apply_settings() writes
-        # all properties to hardware (defensive -- state may be stale from
-        # live mode or manual adjustments).
-        hardware.camera.invalidate_settings_state()
-
-        # Parse the acquisition parameters
-        params = parse_acquisition_message(message)
-
-        logger.info("Acquisition parameters:")
-        logger.info(f"  Client: {client_addr}")
-        logger.info(f"  Sample label: {params['sample_label']}")
-        logger.info(f"  Scan type: {params['scan_type']}")
-        logger.info(f"  Region: {params['region_name']}")
-        # Channel-based and angle-based acquisitions are mutually exclusive; log
-        # whichever axis actually carries data so the operator doesn't see a
-        # confusing "Angles: []" line on a widefield IF run.
-        if params.get("channels"):
-            logger.info(f"  Channels: {params['channels']}")
-            logger.info(f"  Channel exposures: {params['channel_exposures']} ms")
-            if params.get("channel_intensities"):
-                logger.info(f"  Channel intensity overrides: {params['channel_intensities']}")
-        else:
-            logger.info(f"  Angles: {params['angles']} degrees")
-            logger.info(f"  Exposures: {params['exposures']} ms")
-
-        # Load the yaml file
-        if not params["yaml_file_path"]:
-            raise ValueError("YAML file path is required")
-        if not Path(params["yaml_file_path"]).exists():
-            raise FileNotFoundError(f"YAML file {params['yaml_file_path']} does not exist")
-
-        # Load configuration using the config manager
-        ppm_settings = config_manager.load_config_file(params["yaml_file_path"])
-        loci_rsc_file = str(
-            Path(params["yaml_file_path"]).parent / "resources" / "resources_LOCI.yml"
-        )
-        loci_resources = config_manager.load_config_file(loci_rsc_file)
-        ppm_settings.update(loci_resources)
-        hardware.settings = ppm_settings
-
-        # SAFETY WARNING: Check if ACQUIRE yaml differs from CONFIG
-        if connection_config_path:
-            acquire_yaml = Path(params["yaml_file_path"]).resolve()
-            connection_yaml = Path(connection_config_path).resolve()
-            if acquire_yaml != connection_yaml:
-                logger.warning("=" * 80)
-                logger.warning("CONFIG MISMATCH WARNING")
-                logger.warning(f"Connection CONFIG:  {connection_yaml}")
-                logger.warning(f"ACQUIRE --yaml:     {acquire_yaml}")
-                logger.warning("ACQUIRE yaml has overridden connection config for this acquisition")
-                logger.warning("This may cause unexpected behavior or hardware misconfiguration!")
-                logger.warning("=" * 80)
-
-        # Re-initialize microscope-specific methods with updated settings
-        # This is critical for PPM rotation to work correctly and to ensure
-        # correct focus device configuration for autofocus
-        if hasattr(hardware, "_initialize_microscope_methods"):
-            hardware._initialize_microscope_methods()
-            logger.info("Re-initialized hardware methods with updated settings")
-
-        # Apply acquisition profile mode setup (MM ConfigGroup presets,
-        # illumination, camera switching, mode positions).
-        # The scan_type maps to a key in acquisition_profiles.
-        scan_type = params.get("scan_type", "")
-        if hasattr(hardware, "apply_mode_setup"):
-            hardware.apply_mode_setup(scan_type)
-
-        # Try to load and apply JAI white balance settings if available
-        # Settings are stored in calibration folder after running WBCALIBRATE command
-        wb_calibration_folder = params.get("white_balance_calibration_folder")
-        if wb_calibration_folder:
-            # Use modality config for WB key, and explicit objective/detector
-            # from params (sent by Java extension) instead of parsing scan_type
-            mod_config = get_modality_config(params.get("scan_type", ""))
-            wb_modality = mod_config.wb_settings_key or params.get("scan_type", "").split("_")[0].lower()
-            wb_objective = params.get("objective", "default")
-            wb_detector = params.get("detector", "default")
-
-            load_and_apply_white_balance_settings(
-                hardware=hardware,
-                calibration_folder=wb_calibration_folder,
-                detector=wb_detector,
-                modality=wb_modality,
-                objective=wb_objective,
-                logger=logger,
-            )
-
-        # Home rot-stage
-        # hardware.home_psg()
-
-        # Extract modality from scan type
-        modality = BackgroundCorrectionUtils.get_modality_from_scan_type(params["scan_type"])
-        logger.info(f"Using modality: {modality}")
-
-        # Get processing settings from parameters
-        background_correction_enabled = params.get("background_correction_enabled", False)
-        background_correction_method = params.get("background_correction_method", "divide")
-        background_disabled_angles = params.get("background_disabled_angles", [])
-        white_balance_enabled = params.get("white_balance_enabled", True)
-        save_raw_tiles = params.get("save_raw", False)
-        logger.info(f"Save raw tiles: {save_raw_tiles}")
-
-        # Z-stack parameters
-        z_stack_enabled = params.get("z_stack", False)
-        z_offsets = [0.0]  # Default: single plane (2D mode)
-        projection_fn = None
-        if z_stack_enabled:
-            z_range = params.get("z_start")  # Reinterpret: z_start = total range
-            z_step = params.get("z_step")
-            z_pixel_size = params.get("z_pixel_size_um")
-            z_start_abs = params.get("z_start")
-            z_end_abs = params.get("z_end")
-
-            if z_start_abs is not None and z_end_abs is not None and z_step is not None:
-                # Compute range from absolute start/end
-                z_total_range = abs(z_end_abs - z_start_abs)
-            elif z_step is not None:
-                z_total_range = 0
-            else:
-                z_total_range = 0
-
-            if z_step is None or z_step <= 0:
-                logger.warning(
-                    "Z-stack enabled but z_step is missing or invalid (step=%s). "
-                    "Continuing in 2D mode.", z_step
-                )
-                z_stack_enabled = False
-            elif z_total_range <= 0:
-                logger.warning(
-                    "Z-stack range is zero or negative (start=%s, end=%s). "
-                    "Continuing in 2D mode.", z_start_abs, z_end_abs
-                )
-                z_stack_enabled = False
-            else:
-                from microscope_command_server.acquisition.projections import (
-                    generate_z_offsets, get_projection,
-                )
-                z_offsets = generate_z_offsets(z_total_range, z_step)
-                projection_name = params.get("z_projection", "max")
-                try:
-                    projection_fn = get_projection(projection_name)
-                except KeyError as e:
-                    logger.error("Invalid z_projection: %s. Falling back to 'max'.", e)
-                    projection_fn = get_projection("max")
-                    projection_name = "max"
-                logger.info(
-                    "Z-stack: %d planes over +/-%.1f um (step=%.1f), projection=%s",
-                    len(z_offsets), z_total_range / 2, z_step, projection_name
-                )
-
-        # Log background correction configuration
-        if background_correction_enabled:
-            logger.info(
-                f"Background correction enabled with method: {background_correction_method}"
-            )
-            if background_disabled_angles:
-                logger.info(
-                    f"Background correction will be disabled for angles: {background_disabled_angles}"
-                )
-        else:
-            logger.info("Background correction disabled")
-
-        # Background correction (flat-field) and white balance are complementary:
-        # - WB corrects per-channel color balance (R~=G~=B on neutral target)
-        # - Background correction removes spatial non-uniformity (vignetting)
-        # They work together as long as backgrounds are captured with the SAME
-        # WB mode/settings that will be used for acquisition.
-        if background_correction_enabled and white_balance_enabled:
-            logger.info(
-                "Both background correction and white balance enabled "
-                "(backgrounds must be captured with matching WB settings)"
-            )
-
-        # ======= BACKGROUND CORRECTION SETUP =======
-        background_images = {}
-        background_scaling_factors = {}
-        background_wb_coeffs = {}
-        # Per-channel backgrounds for multi-channel widefield IF. Keyed by channel id.
-        # Loaded opportunistically below if the background folder has per-channel
-        # subdirectories; empty dict means "no per-channel BG available, skip correction".
-        channel_background_images: Dict[str, Any] = {}
-
-        if background_correction_enabled:
-            background_dir = None
-
-            # Priority 1: Message parameter
-            if "background_folder" in params:
-                background_dir = Path(params["background_folder"])
-                logger.info(f"Using background folder from message: {background_dir}")
-            else:
-                # Priority 2: YAML configuration from imageprocessing config file
-                # Try to load imageprocessing config (e.g., imageprocessing_PPM.yml)
-                config_path = Path(params["yaml_file_path"])
-                imageprocessing_path = config_path.parent / f"imageprocessing_{config_path.stem.replace('config_', '')}.yml"
-
-                bc_settings = None
-                if imageprocessing_path.exists():
-                    try:
-                        imageprocessing_config = config_manager.load_config_file(str(imageprocessing_path))
-                        bc_config = imageprocessing_config.get("background_correction", {})
-                        bc_settings = bc_config.get(modality, {})
-                        logger.info(f"Loaded background correction settings from: {imageprocessing_path}")
-                    except Exception as e:
-                        logger.warning(f"Failed to load imageprocessing config: {e}")
-                else:
-                    logger.warning(f"Imageprocessing config not found at: {imageprocessing_path}")
-
-                if bc_settings and bc_settings.get("enabled") and bc_settings.get("base_folder"):
-                    # For YAML config, construct path with modality subdirectory
-                    background_dir = Path(bc_settings["base_folder"]) / modality
-                    logger.info(f"Using background folder from YAML config: {background_dir}")
-
-            # Load background images if directory is valid
-            if background_dir and background_dir.exists():
-                logger.info(f"Loading background images from: {background_dir}")
-                # Non-rotation modalities (brightfield, fluorescence, monochrome)
-                # send angles=[] but still need to load a single background image.
-                # Pass [0.0] as a sentinel so the loader searches the directory --
-                # it will find either background.tif (new name) or 0.0.tif (legacy).
-                # The sentinel key 0.0 matches what the acquisition loop uses at
-                # the non-rotation branch (see bg_key = 0.0 below).
-                bg_load_angles = params["angles"] if params["angles"] else [0.0]
-                background_images, background_scaling_factors, background_wb_coeffs = (
-                    BackgroundCorrectionUtils.load_background_images(
-                        background_dir, bg_load_angles, logger
-                    )
-                )
-
-                if background_images:
-                    logger.info(f"Loaded {len(background_images)} background images")
-                else:
-                    logger.warning("No background images found - disabling background correction")
-                    background_correction_enabled = False
-
-                # Opt-in per-channel background loading for multi-channel widefield IF.
-                # Layout: {background_dir}/{channel_id}/background.tif (or {channel_id}.tif).
-                # Missing files are skipped silently -- the channel acquisition branch
-                # only applies correction for channels where a background is found.
-                if params.get("channels"):
-                    try:
-                        import skimage.io as _skio
-                        for cid in params["channels"]:
-                            candidates = [
-                                background_dir / cid / "background.tif",
-                                background_dir / f"{cid}.tif",
-                                background_dir / f"{cid}.tiff",
-                            ]
-                            for candidate in candidates:
-                                if candidate.exists():
-                                    try:
-                                        channel_background_images[cid] = _skio.imread(str(candidate))
-                                        logger.info(
-                                            "Loaded channel background for %s from %s",
-                                            cid,
-                                            candidate,
-                                        )
-                                        break
-                                    except Exception as load_e:
-                                        logger.warning(
-                                            "Failed to load channel background %s: %s",
-                                            candidate,
-                                            load_e,
-                                        )
-                        if channel_background_images:
-                            logger.info(
-                                "Loaded %d per-channel backgrounds for widefield IF "
-                                "(missing channels will acquire uncorrected)",
-                                len(channel_background_images),
-                            )
-                        else:
-                            logger.info(
-                                "No per-channel backgrounds found under %s -- "
-                                "channel acquisition will run without flat-field correction",
-                                background_dir,
-                            )
-                    except Exception as e:
-                        logger.warning("Per-channel background load failed: %s", e)
-            else:
-                logger.warning(f"Background directory not found: {background_dir}")
-                logger.warning("Disabling background correction")
-                background_correction_enabled = False
-
-        # ======= WHITE BALANCE SETUP =======
-        angles_wb = {}
-
-        # Resolve wb_mode from --wb-mode flag (REQUIRED).
-        # Multiple WB calibrations may coexist in the config; the user's explicit
-        # choice must be respected -- never silently pick a mode for them.
-        wb_mode = params.get("wb_mode")
-        if wb_mode is None:
-            # Backward compatibility: derive from old boolean flags
-            wb_enabled = params.get("white_balance_enabled", True)
-            wb_per_angle = params.get("white_balance_per_angle", False)
-            if not wb_enabled:
-                wb_mode = "off"
-            elif wb_per_angle:
-                wb_mode = "per_angle"
-            else:
-                raise ValueError(
-                    "No --wb-mode specified in acquisition request. "
-                    "White balance mode must be explicitly chosen by the user: "
-                    "camera_awb, simple, or per_angle. "
-                    "Update the client to always send --wb-mode."
-                )
-        logger.info(f"White balance mode: {wb_mode}")
-
-        # Check if the modality supports white balance. Monochrome modalities
-        # (SHG, 2P, brightfield with monochrome camera) have wb_settings_key=None
-        # and should not attempt RGB white balance on grayscale images.
-        _wb_mod_check = get_modality_config(params.get("scan_type", ""))
-        if wb_mode != "off" and _wb_mod_check.wb_settings_key is None:
-            logger.info(
-                "White balance mode '%s' requested but modality has no WB settings key "
-                "(monochrome or single-channel modality). Forcing wb_mode='off'.",
-                wb_mode,
-            )
-            wb_mode = "off"
-
-        # Keep white_balance_enabled and white_balance_per_angle in sync for
-        # downstream code that still references them (software WB, etc.)
-        white_balance_enabled = wb_mode != "off"
-        white_balance_per_angle = wb_mode == "per_angle"
-
-        # Auto-detect JAI camera - JAI requires per-channel exposures for correct color
-        # Use "Core.Camera" property - this reliably contains "JAI" for JAI cameras
-        # Note: get_property(camera_device, "Description") does NOT work reliably
-        is_jai_camera = False
-        try:
-            camera_name = hardware.get_camera_name()
-            is_jai_camera = hardware.camera.supports_per_channel_exposure()
-            if is_jai_camera:
-                logger.info(f"Per-channel camera detected: {camera_name}")
-        except Exception as e:
-            logger.debug(f"Could not detect camera type: {e}")
-
-        # Load JAI hardware white balance calibration (per-channel exposures)
-        # This is separate from software white balance (RGB multipliers applied post-capture)
-        jai_calibration = None
-        simple_wb_data = None  # Mode 2 pre-computed per-angle scaled exposures
-        # Use modality config wb_settings_key (e.g. "ppm") for WB calibration
-        # lookup. Falls back to first part of scan_type for legacy configs.
-        _wb_mod_config = get_modality_config(params.get("scan_type", ""))
-        base_modality = _wb_mod_config.wb_settings_key or params["scan_type"].split("_")[0].lower()
-
-        if wb_mode == "camera_awb":
-            # Camera AWB must be set manually in MicroManager's Device Property
-            # Browser BEFORE acquisition. Cannot be controlled programmatically.
-            # To clear AWB: restart MicroManager and wait ~30 seconds.
-            logger.info(
-                "Camera AWB mode: ensure AWB was configured in MicroManager's "
-                "Device Property Browser before starting acquisition."
-            )
-            # Camera AWB mode: no per-channel calibration needed.
-            # Camera handles color internally. Load per-angle unified gains
-            # from Mode 3 data for brightness boosting at dim angles.
-            jai_calibration = load_jai_calibration_from_imageprocessing(
-                config_path=Path(params["yaml_file_path"]),
-                per_angle=True,
-                modality=base_modality,
-                objective=params.get("objective"),
-                detector=params.get("detector"),
-                logger=logger,
-            )
-            # Explicitly disable individual exposure/gain mode for camera AWB
-            if is_jai_camera:
-                try:
-                    hardware.camera.disable_individual_exposure()
-                    hardware.camera.disable_individual_gain()
-                    # NOTE: Do NOT reset analog gains here -- AWB corrections are stored in
-                    # Gain_AnalogRed/Gain_AnalogBlue and must be preserved for camera_awb mode.
-                    logger.info("Camera AWB mode: disabled per-channel exposure/gain (preserving AWB analog gains)")
-                except Exception as e:
-                    logger.warning(f"Could not configure camera AWB mode: {e}")
-            if jai_calibration:
-                logger.info(f"Camera AWB: loaded unified gains from calibration for brightness control")
-            else:
-                logger.info("Camera AWB: no calibration data found, using client exposures only")
-            # Set jai_calibration to None so per-angle loop doesn't apply per-channel
-            # We extracted unified gains; store them separately.
-            camera_awb_gains = {}
-            if jai_calibration and "angles" in jai_calibration:
-                for angle_name, angle_data in jai_calibration["angles"].items():
-                    gains = angle_data.get("gains", {})
-                    camera_awb_gains[angle_name] = gains.get("unified_gain", 1.0)
-                logger.info(f"Camera AWB unified gains: {camera_awb_gains}")
-            jai_calibration = None  # Don't use per-channel calibration in acquisition loop
-
-        elif wb_mode == "simple":
-            # Clear any lingering AWB corrections before simple WB setup.
-            # Simple mode sets explicit per-channel exposures + analog gains per tile;
-            # residual AWB analog gain corrections would compound incorrectly.
-            # Also disable individual exposure/gain mode to ensure clean state.
-            if is_jai_camera:
-                try:
-                    hardware.camera.clear_awb_corrections()
-                    hardware.camera.disable_individual_exposure()
-                    hardware.camera.disable_individual_gain()
-                    logger.info("Simple WB: cleared AWB + disabled individual mode")
-                except Exception as e:
-                    logger.warning(f"Could not clear AWB corrections before simple WB: {e}")
-            # Simple WB mode: load 90deg R:G:B ratios from Mode 3 calibration,
-            # then load pre-computed simple_wb section if available
-            simple_wb_analog_red = 1.0
-            simple_wb_analog_blue = 1.0
-            jai_calibration = load_jai_calibration_from_imageprocessing(
-                config_path=Path(params["yaml_file_path"]),
-                per_angle=True,
-                modality=base_modality,
-                objective=params.get("objective"),
-                detector=params.get("detector"),
-                logger=logger,
-            )
-            if jai_calibration:
-                logger.info("Simple WB: loaded per-angle calibration as base for ratio-scaling")
-                # Extract analog gains from uncrossed (90 deg) calibration.
-                # Phase 2 of calibration fine-tunes R/B analog gains to correct
-                # the camera's spectral bias. These must be applied during
-                # acquisition (same values used in background collection).
-                uncrossed_gains = (
-                    jai_calibration.get("angles", {})
-                    .get("uncrossed", {})
-                    .get("gains", {})
-                )
-                simple_wb_analog_red = uncrossed_gains.get("analog_red", 1.0)
-                simple_wb_analog_blue = uncrossed_gains.get("analog_blue", 1.0)
-                logger.info(
-                    f"Simple WB: analog gains from uncrossed calibration: "
-                    f"R={simple_wb_analog_red:.3f}, B={simple_wb_analog_blue:.3f}"
-                )
-                # Also load simple_wb section from YAML if it exists
-                simple_wb_data = load_simple_wb_from_imageprocessing(
-                    config_path=Path(params["yaml_file_path"]),
-                    modality=base_modality,
-                    objective=params.get("objective"),
-                    detector=params.get("detector"),
-                    logger=logger,
-                )
-                if simple_wb_data:
-                    logger.info(f"Simple WB: loaded pre-computed scales for {len(simple_wb_data.get('angles', {}))} angles")
-                else:
-                    logger.info("Simple WB: no pre-computed data, will use uncrossed ratios with exposure_scale")
-            else:
-                logger.warning(
-                    "Simple WB mode requested but no Mode 3 calibration found! "
-                    "Run 'PPM White Balance Calibration' first."
-                )
-
-        elif wb_mode == "per_angle":
-            # Clear any lingering AWB corrections before per-angle WB setup.
-            # Per-angle mode sets explicit per-channel exposures + analog gains per tile;
-            # residual AWB analog gain corrections would compound incorrectly.
-            # Also disable individual exposure/gain mode -- WBPPM calibration and
-            # the previous mode's acquisition leave individual mode enabled, which
-            # causes set_exposure() calls to be silently ignored.
-            if is_jai_camera:
-                try:
-                    hardware.camera.clear_awb_corrections()
-                    hardware.camera.disable_individual_exposure()
-                    hardware.camera.disable_individual_gain()
-                    logger.info("Per-angle WB: cleared AWB + disabled individual mode")
-                except Exception as e:
-                    logger.warning(f"Could not clear AWB corrections before per-angle WB: {e}")
-            # Per-angle WB mode (Mode 3): existing behavior
-            jai_calibration = load_jai_calibration_from_imageprocessing(
-                config_path=Path(params["yaml_file_path"]),
-                per_angle=True,
-                modality=base_modality,
-                objective=params.get("objective"),
-                detector=params.get("detector"),
-                logger=logger,
-            )
-            if jai_calibration:
-                logger.info(
-                    f"Per-angle WB: loaded calibration "
-                    f"for {base_modality}/{params.get('objective')}/{params.get('detector')}"
-                )
-            else:
-                if is_jai_camera:
-                    logger.warning(
-                        "JAI camera detected but no calibration found! "
-                        "Run 'White Balance Calibration' for proper color balance."
-                    )
-                logger.info("No JAI calibration found - using software white balance")
-
-        else:
-            # wb_mode == "off" or unknown
-            logger.info("White balance disabled (wb_mode=%s)", wb_mode)
-
-        if white_balance_enabled:
-            # Load software white balance settings from configuration (RGB multipliers)
-            angles_wb = get_angles_wb_from_settings(ppm_settings, modality=modality)
-
-            # If config had no WB settings (all neutral), use background-derived
-            # coefficients as fallback. These are computed from the mean R/G/B of each
-            # background image and represent the correction needed to equalize channels.
-            all_neutral = all(
-                v == [1.0, 1.0, 1.0] for v in angles_wb.values()
-            )
-            if all_neutral and background_wb_coeffs:
-                logger.info(
-                    "No WB settings in config - using background-derived "
-                    "coefficients for %d angles", len(background_wb_coeffs)
-                )
-                angles_wb = {
-                    angle: list(coeffs)
-                    for angle, coeffs in background_wb_coeffs.items()
-                }
-
-            if white_balance_per_angle:
-                # Use per-angle white balance profiles (PPM mode)
-                logger.info(f"Using per-angle white balance for {len(angles_wb)} angles")
-            else:
-                # Use single white balance profile (uncrossed/90deg) for all angles
-                # This is the default for non-PPM or when per-angle is disabled
-                uncrossed_profile = angles_wb.get(90.0, [1.0, 1.0, 1.0])
-                logger.info(f"Using single white balance profile for all angles: {uncrossed_profile}")
-                # Apply uncrossed profile to all angles that will be acquired
-                for angle in params.get("angles", []):
-                    angles_wb[angle] = uncrossed_profile
-
-        # Save starting position before any tile loading or acquisition so
-        # the finally block can always return the stage to where it started.
-        starting_position = hardware.get_current_position()
-
-        # Set up output paths
-        project_path = Path(params["projects_folder_path"]) / params["sample_label"]
-        output_path = project_path / params["scan_type"] / params["region_name"]
-        if not output_path.exists():
-            output_path.mkdir(parents=True, exist_ok=True)
-            logger.info(f"Created output directory: {output_path}")
-
-        # Read tile positions
-        tile_config_path = output_path / "TileConfiguration.txt"
-        positions = TileConfigUtils.read_tile_config(tile_config_path, hardware.core)
-
-        if not positions:
-            logger.error(f"No positions found in {tile_config_path}")
-            set_state("FAILED", f"No tile positions found in {tile_config_path}")
-            return
-
-        xy_positions = [(pos.x, pos.y) for pos, filename in positions]
-
-        # Create angle subdirectories
-        if params["angles"]:
-            for angle in params["angles"]:
-                angle_dir = output_path / str(angle)
-                angle_dir.mkdir(exist_ok=True)
-                shutil.copy2(tile_config_path, angle_dir / "TileConfiguration.txt")
-
-        # Create channel subdirectories (widefield IF, BF+IF). Mirrors the angle
-        # pattern so the Java-side stitcher can do per-channel directory isolation
-        # without any knowledge of the channel naming scheme. Each subdir gets its
-        # own copy of TileConfiguration.txt with the plain tile filenames the
-        # stitcher expects.
-        if params.get("channels"):
-            for cid in params["channels"]:
-                channel_dir = output_path / str(cid)
-                channel_dir.mkdir(exist_ok=True)
-                shutil.copy2(tile_config_path, channel_dir / "TileConfiguration.txt")
-
-        # Calculate total images and update progress
-        n_z_planes = len(z_offsets)
-        # Channel-based acquisitions write one image per selected channel per tile
-        # (and per z plane). Angle-based acquisitions write one image per angle per
-        # tile. They are mutually exclusive upstream, so pick whichever is active.
-        n_channels = len(params.get("channels", []) or [])
-        if n_channels > 0:
-            n_steps_per_tile = n_channels
-        elif params.get("angles"):
-            n_steps_per_tile = len(params["angles"])
-        else:
-            n_steps_per_tile = 1
-        n_angles = len(params["angles"]) if params["angles"] else 1
-        total_images = len(positions) * n_z_planes * n_steps_per_tile
-
-        update_progress(0, total_images)
-        logger.info(
-            f"Starting acquisition of {total_images} total images "
-            f"({len(positions)} positions x {n_z_planes} Z-planes x {n_angles} angles)"
-        )
-
-        image_count = 0
-
-        # Collect stage positions for TileConfiguration_Stage.txt
-        # Format: list of (filename, x, y, z) tuples
-        stage_positions_collected = []
-
-        # Find autofocus positions
-        fov = hardware.get_fov()
-
-        # Load autofocus settings from separate autofocus_{microscope}.yml file
-        af_n_tiles = 5  # default
-        af_search_range = 50  # default
-        af_n_steps = 11  # default
-        af_interp_strength = 100  # default
-        af_interp_kind = "quadratic"  # default
-        af_score_metric_name = "normalized_variance"  # default
-        af_texture_threshold = 0.005  # default - tissue detection sensitivity
-        af_tissue_area_threshold = 0.2  # default - minimum tissue coverage
-        af_rgb_brightness_threshold = 240.0  # default - maximum RGB brightness for tissue (blank rejection)
-        # Sweep drift check parameters
-        af_sweep_range_um = 10.0  # default - total Z range for sweep (+/-5um)
-        af_sweep_n_steps = 5  # default - number of Z positions to sample
-        af_edge_retries = 2  # default - additional sweep attempts on boundary peaks
-        # Safety net multipliers for gap detection
-        af_gap_index_multiplier = 3  # default - force AF after this many x n_tiles without AF
-        af_gap_spatial_multiplier = 2.0  # default - force AF when distance > this x af_min_distance
-
-        # Get objective from acquisition parameters (passed via command line)
-        current_objective = params.get("objective", "")
-
-        # Track whether autofocus settings were found for the objective
-        af_settings_found = False
-
-        try:
-            # Derive autofocus config path from main config path
-            # e.g., "config_PPM.yml" -> "autofocus_PPM.yml"
-            config_path = Path(params["yaml_file_path"])
-            config_name = config_path.stem  # "config_PPM"
-            microscope_name = config_name.replace("config_", "")  # "PPM"
-            autofocus_file = config_path.parent / f"autofocus_{microscope_name}.yml"
-
-            if not autofocus_file.exists():
-                error_msg = (
-                    f"Autofocus configuration file not found: {autofocus_file}\n"
-                    f"Cannot proceed with acquisition - autofocus settings are required for objective '{current_objective}'.\n"
-                    f"Please create the autofocus configuration file with settings for your objectives."
-                )
-                logger.error(error_msg)
-                set_state("FAILED", error_msg)
-                return
-
-            with open(autofocus_file, "r") as f:
-                autofocus_config = yaml.safe_load(f)
-
-            # Find settings for current objective
-            af_settings_list = autofocus_config.get("autofocus_settings", [])
-            for af_setting in af_settings_list:
-                if af_setting.get("objective") == current_objective:
-                    af_n_tiles = af_setting.get("n_tiles", af_n_tiles)
-                    af_search_range = af_setting.get("search_range_um", af_search_range)
-                    af_n_steps = af_setting.get("n_steps", af_n_steps)
-                    af_interp_strength = af_setting.get("interp_strength", af_interp_strength)
-                    af_interp_kind = af_setting.get("interp_kind", af_interp_kind)
-                    af_score_metric_name = af_setting.get("score_metric", af_score_metric_name)
-                    af_texture_threshold = af_setting.get("texture_threshold", af_texture_threshold)
-                    af_tissue_area_threshold = af_setting.get("tissue_area_threshold", af_tissue_area_threshold)
-                    af_rgb_brightness_threshold = af_setting.get("rgb_brightness_threshold", af_rgb_brightness_threshold)
-                    af_sweep_range_um = af_setting.get("sweep_range_um", af_sweep_range_um)
-                    af_sweep_n_steps = af_setting.get("sweep_n_steps", af_sweep_n_steps)
-                    af_edge_retries = af_setting.get("edge_retries", af_edge_retries)
-                    af_gap_index_multiplier = af_setting.get("gap_index_multiplier", af_gap_index_multiplier)
-                    af_gap_spatial_multiplier = af_setting.get("gap_spatial_multiplier", af_gap_spatial_multiplier)
-                    # Legacy support: old adaptive_initial_step_um -> sweep_range_um
-                    if "adaptive_initial_step_um" in af_setting and "sweep_range_um" not in af_setting:
-                        af_sweep_range_um = af_setting["adaptive_initial_step_um"] * 2
-                    logger.info(
-                        f"Loaded autofocus settings for {current_objective}: "
-                        f"n_steps={af_n_steps}, search_range={af_search_range}um, n_tiles={af_n_tiles}, "
-                        f"interp_strength={af_interp_strength}, interp_kind={af_interp_kind}, "
-                        f"score_metric={af_score_metric_name}, "
-                        f"texture_threshold={af_texture_threshold}, tissue_area_threshold={af_tissue_area_threshold}, "
-                        f"rgb_brightness_threshold={af_rgb_brightness_threshold}, "
-                        f"sweep: range={af_sweep_range_um}um, n_steps={af_sweep_n_steps}, "
-                        f"edge_retries={af_edge_retries}, "
-                        f"gap_index_mult={af_gap_index_multiplier}, gap_spatial_mult={af_gap_spatial_multiplier}"
-                    )
-                    af_settings_found = True
-                    break
-
-            # Validate that settings were found for the objective
-            if not af_settings_found:
-                available_objectives = [s.get("objective", "unknown") for s in af_settings_list]
-                error_msg = (
-                    f"No autofocus settings found for objective '{current_objective}' in {autofocus_file}\n"
-                    f"Available objectives in config: {available_objectives}\n"
-                    f"Cannot proceed with acquisition - please add autofocus settings for '{current_objective}' "
-                    f"or verify the objective name matches the configuration."
-                )
-                logger.error(error_msg)
-                set_state("FAILED", error_msg)
-                return
-
-            # Check that autofocus settings have been explicitly calibrated.
-            # The Setup Wizard generates settings with calibrated: false to
-            # prevent uncalibrated search ranges from damaging hardware.
-            af_calibrated = af_setting.get("calibrated", True)  # Legacy configs assumed calibrated
-            if af_calibrated is False:
-                error_msg = (
-                    f"Autofocus settings for objective '{current_objective}' have not been calibrated!\n"
-                    f"The autofocus configuration file was generated with default placeholder values "
-                    f"that may not be safe for your hardware.\n"
-                    f"\n"
-                    f"To fix this:\n"
-                    f"  1. Open {autofocus_file}\n"
-                    f"  2. Adjust search_range_um and n_steps for your objective\n"
-                    f"  3. Set 'calibrated: true' for this objective\n"
-                    f"  4. Or run the Autofocus Benchmark utility from the QP Scope menu\n"
-                    f"\n"
-                    f"CRITICAL: An incorrect search_range_um can crash the objective into the sample!"
-                )
-                logger.error(error_msg)
-                set_state("FAILED", error_msg)
-                return
-
-        except Exception as e:
-            error_msg = f"Error loading autofocus settings: {e}"
-            logger.error(error_msg, exc_info=True)
-            set_state("FAILED", error_msg)
-            return
-
-        # -------- Schema v2 strategy resolution --------
-        # If autofocus_<scope>.yml declares schema_version: 2 and a strategies/
-        # modalities section, resolve the per-modality strategy now. The
-        # strategy object encapsulates validity check + focus score + a
-        # per-strategy brightness check, so the sparse-fluorescence case
-        # does NOT trip the dim-image exposure-doubling loop that would
-        # otherwise saturate bright sparse spots.
-        #
-        # If schema_version is absent or < 2, or no strategies section is
-        # present, build a DenseTextureStrategy from the flat v1 fields as
-        # a drop-in compatibility shim so existing autofocus_<scope>.yml
-        # files keep working without edits. Same goes for any modality
-        # without a binding in the v2 table.
-        #
-        # The strategy object is not yet consumed by the AF call sites --
-        # they still use has_sufficient_tissue directly. A follow-up commit
-        # swaps those calls to strategy.is_valid() / strategy.brightness_
-        # acceptable() / strategy.score(). This commit only plumbs the
-        # strategy object through the loader so it's ready.
-        from microscope_control.autofocus.strategies import (
-            build_strategy,
-            StrategyFailureMode,
-        )
-
-        af_strategy = None
-        af_strategy_name = None
-        af_focus_channel = params.get("focus_channel")  # None for angle-based / single-channel
-        try:
-            schema_version = (
-                autofocus_config.get("schema_version", 1) if isinstance(autofocus_config, dict) else 1
-            )
-            strategies_library = autofocus_config.get("strategies", {}) if isinstance(autofocus_config, dict) else {}
-            modality_bindings = autofocus_config.get("modalities", {}) if isinstance(autofocus_config, dict) else {}
-
-            if schema_version >= 2 and strategies_library:
-                # Resolve the modality binding: longest-prefix-wins, case-
-                # insensitive, matching ModalityRegistry on the Java side.
-                # Reuse the modality already extracted from scan_type above;
-                # params has no "modality" key.
-                current_modality = modality or ""
-                current_modality_lower = current_modality.lower()
-                best_match = None
-                best_len = 0
-                for mod_key in modality_bindings.keys():
-                    mod_key_str = str(mod_key).lower()
-                    if current_modality_lower.startswith(mod_key_str) and len(mod_key_str) > best_len:
-                        best_match = mod_key
-                        best_len = len(mod_key_str)
-
-                if best_match is not None:
-                    binding = modality_bindings[best_match]
-                    strategy_name = binding.get("strategy", "dense_texture")
-                    # Start from the named strategy's library defaults,
-                    # then merge in per-modality overrides. overrides is a
-                    # nested dict: {validity_params: {...}, on_failure: ...}
-                    library_entry = strategies_library.get(strategy_name, {})
-                    resolved_params = dict(library_entry)  # shallow copy
-                    overrides_block = binding.get("overrides", {}) or {}
-                    if "validity_params" in overrides_block and isinstance(
-                        overrides_block["validity_params"], dict
-                    ):
-                        merged_vp = dict(library_entry.get("validity_params", {}) or {})
-                        merged_vp.update(overrides_block["validity_params"])
-                        resolved_params = dict(library_entry)
-                        resolved_params["validity_params"] = merged_vp
-                    if "on_failure" in overrides_block:
-                        resolved_params["on_failure"] = overrides_block["on_failure"]
-
-                    af_strategy_name = strategy_name
-                    af_strategy = build_strategy(strategy_name, resolved_params)
-                    logger.info(
-                        "Autofocus strategy resolved: modality='%s' -> binding '%s' -> strategy '%s' (on_failure=%s)",
-                        current_modality,
-                        best_match,
-                        strategy_name,
-                        af_strategy.on_failure.value,
-                    )
-                else:
-                    logger.info(
-                        "No v2 modality binding found for '%s'; using v1 dense_texture compatibility",
-                        current_modality,
-                    )
-
-            # Per-acquisition override: --af-strategy CLI flag wins over YAML.
-            cli_strategy_override = params.get("af_strategy")
-            if cli_strategy_override:
-                library_entry = strategies_library.get(cli_strategy_override, {}) if strategies_library else {}
-                af_strategy = build_strategy(cli_strategy_override, library_entry)
-                af_strategy_name = cli_strategy_override
-                logger.info(
-                    "Autofocus strategy overridden by --af-strategy CLI flag: '%s' (on_failure=%s)",
-                    cli_strategy_override,
-                    af_strategy.on_failure.value,
-                )
-
-            # Fallback: build a DenseTextureStrategy from the flat v1 fields
-            # so every acquisition has a strategy object available. This is a
-            # zero-behavior-change shim: the params come straight from the
-            # current loader locals, so it matches what has_sufficient_tissue
-            # would have been called with.
-            if af_strategy is None:
-                af_strategy = build_strategy(
-                    "dense_texture",
-                    {
-                        "validity_params": {
-                            "texture_threshold": af_texture_threshold,
-                            "tissue_area_threshold": af_tissue_area_threshold,
-                            "rgb_brightness_threshold": af_rgb_brightness_threshold,
-                        },
-                    },
-                )
-                af_strategy_name = "dense_texture (v1 compat)"
-                logger.info(
-                    "Autofocus strategy: v1 compatibility dense_texture built from flat fields"
-                )
-        except Exception as strat_err:
-            # If anything in the strategy resolution fails, keep the v1 flow
-            # working by building a default dense strategy and logging loudly.
-            logger.warning(
-                "Autofocus strategy resolution failed (%s); falling back to dense_texture default",
-                strat_err,
-                exc_info=True,
-            )
-            af_strategy = build_strategy("dense_texture", {})
-            af_strategy_name = "dense_texture (fallback)"
-
-        if af_focus_channel:
-            logger.info("Autofocus focus channel: %s", af_focus_channel)
-
-        # Validate af_n_tiles >= 1.
-        # This invariant is required by the overlapped I/O system: pending TIFF
-        # writes are drained at each autofocus check position, so there must
-        # always be at least one AF position per acquisition.
-        if af_n_tiles < 1:
-            logger.warning(
-                f"af_n_tiles={af_n_tiles} is below minimum (1), clamping to 1. "
-                f"At least 1 AF position is required for overlapped I/O drain."
-            )
-            af_n_tiles = max(1, af_n_tiles)
-
-        # Map score metric name to function
-        score_metric_map = {
-            "laplacian_variance": AutofocusUtils.autofocus_profile_laplacian_variance,
-            "sobel": AutofocusUtils.autofocus_profile_sobel,
-            "brenner_gradient": AutofocusUtils.autofocus_profile_brenner_gradient,
-            "robust_sharpness": AutofocusUtils.autofocus_profile_robust_sharpness_metric,
-            "hybrid_sharpness": AutofocusUtils.autofocus_profile_hybrid_sharpness_metric,
-        }
-        af_score_metric = score_metric_map.get(
-            af_score_metric_name, AutofocusUtils.autofocus_profile_laplacian_variance
-        )
-
-        # Calculate timing window size for progress estimation (3x autofocus n_tiles)
-        # Use n_tiles (number of AF positions) not n_steps (Z-positions per AF)
-        # This ensures we collect enough tiles to see the AF timing pattern
-        # TODO: Move timing window multiplier (3) to settings/preferences instead of hardcoding
-        timing_window_size = max(10, 3 * af_n_tiles)  # Minimum 10 tiles
-        logger.info(f"Timing window size for progress estimation: {timing_window_size} tiles (3 x {af_n_tiles} AF positions, min 10)")
-
-        # Write timing window to file for Java progress dialog
-        # Include all information needed for accurate time estimation:
-        preferred_af_tile = params.get("preferred_af_tile")
-        af_positions, af_min_distance = AutofocusUtils.get_autofocus_positions(
-            fov, xy_positions, n_tiles=af_n_tiles,
-            preferred_first_af=preferred_af_tile,
-        )
-
-        small_grid_override = (len(xy_positions) <= 9)
-        if small_grid_override:
-            logger.info(
-                f"Small grid override: {len(xy_positions)} tiles <= 9, "
-                f"autofocus at ALL positions: {af_positions} (min_distance={af_min_distance})"
-            )
-        else:
-            pref_msg = f" (preferred tile {preferred_af_tile} from WSI)" if preferred_af_tile is not None else ""
-            logger.info(
-                f"Autofocus positions ({len(af_positions)}/{len(xy_positions)} tiles): "
-                f"{af_positions} (min_distance={af_min_distance:.1f}){pref_msg}"
-            )
-
-        # Write timing metadata AFTER computing AF positions so we can
-        # include the actual count (not just the interval).
-        # - timing_window_size: how many tiles to use for rolling average
-        # - af_n_tiles: actual number of AF positions in this annotation
-        #   (NOT the interval -- Java uses this to estimate remaining AF ops)
-        # - total_tiles: total number of images (positions * angles)
-        timing_metadata_path = output_path / "acquisition_metadata.txt"
-        with open(timing_metadata_path, "w") as f:
-            f.write(f"timing_window_size={timing_window_size}\n")
-            f.write(f"af_n_tiles={len(af_positions)}\n")
-            f.write(f"total_tiles={total_images}\n")
-            f.write(f"af_n_steps={af_n_steps}\n")
-            f.write(f"objective={current_objective}\n")
-        logger.debug(f"Wrote timing metadata to {timing_metadata_path}: "
-                     f"window={timing_window_size}, af_positions={len(af_positions)}, tiles={total_images}")
-
-        # Create dynamic autofocus positions set (can be modified during acquisition)
-        dynamic_af_positions = set(af_positions)
-        deferred_af_positions = set()  # Track positions where AF was deferred
-
-        # Track whether we've performed the first successful autofocus with tissue
-        # Use standard autofocus on first tissue, then adaptive for speed on subsequent
-        first_tissue_autofocus_done = False
-
-        # Track all completed AF positions as (x, y, z) for nearest-spatial
-        # Z propagation and spatial gap detection. Initialized here (before
-        # pre-acquisition AF) so the initial AF can append to it.
-        completed_af_positions = []
-
-        metadata_txt_for_positions = output_path / "image_positions_metadata.txt"
-
-        # Apply Z-focus hint if provided (predicted from tilt correction model)
-        hint_z = params.get("hint_z")
-        if hint_z is not None:
-            current_z = hardware.get_current_position().z
-            logger.info(f"Z-focus hint received: {hint_z:.2f} um (current Z: {current_z:.2f} um)")
-            logger.info(f"Moving to predicted Z position before acquisition...")
-            hardware.move_to_position(Position(z=hint_z))
-            logger.info(f"Moved to predicted Z: {hint_z:.2f} um")
-
-        # CRITICAL: Run autofocus BEFORE acquiring any tiles
-        # Use the diagonal position (af_positions[0]) which is 1 FOV inward from the
-        # corner to avoid focusing on buffer regions outside tissue.
-        # The hint_z serves as a starting point for the autofocus search.
-        if len(positions) > 0 and len(af_positions) > 0:
-            # Get the first autofocus position (diagonal offset for large grids)
-            first_af_idx = af_positions[0]
-            first_af_pos, first_af_filename = positions[first_af_idx]
-            logger.info(f"=== PRE-ACQUISITION AUTOFOCUS at position {first_af_idx} ===")
-            logger.info(f"Using diagonal autofocus position: X={first_af_pos.x}, Y={first_af_pos.y}")
-
-            # For rotation modalities, set rotation to autofocus angle
-            mod_config = get_modality_config(modality)
-            if mod_config.autofocus_angle is not None and hasattr(hardware, "set_psg_ticks"):
-                af_angle = mod_config.autofocus_angle
-                hardware.set_psg_ticks(af_angle)
-                logger.info("Set rotation to %.0f deg for initial autofocus", af_angle)
-
-                # Get autofocus-angle exposure from the current WB mode's calibration.
-                # Every WB mode (simple, per_angle, camera_awb) must have a
-                # calibrated exposure for this angle -- do not guess a default.
-                if af_angle not in params["angles"]:
-                    raise ValueError(
-                        f"No {af_angle}-degree angle in WB calibration parameters. "
-                        "Cannot determine autofocus exposure. Re-run WB calibration."
-                    )
-                angle_idx = params["angles"].index(af_angle)
-                if angle_idx >= len(params["exposures"]):
-                    raise ValueError(
-                        f"{af_angle}-degree angle found but no corresponding exposure value. "
-                        "Cannot determine autofocus exposure. Re-run WB calibration."
-                    )
-                exposure_90 = params["exposures"][angle_idx]
-
-                # Disable per-channel exposure/gain mode before autofocus.
-                # Camera may have per-channel mode active from calibration
-                # or a previous acquisition, which causes set_exposure() to
-                # be ignored. This must run for ALL WB modes.
-                # For simple/per_angle, also apply the uncrossed calibration
-                # analog gains so the AF sees a properly white-balanced image.
-                # For camera_AWB, gains are already set from AWB -- don't touch.
-                if is_jai_camera:
-                    try:
-                        hardware.camera.disable_individual_exposure()
-                        hardware.camera.disable_individual_gain()
-                        if jai_calibration is not None:
-                            uncrossed_gains = (
-                                jai_calibration.get("angles", {})
-                                .get("uncrossed", {})
-                                .get("gains", {})
-                            )
-                            # Reset unified gain to uncrossed value (typically 1.0).
-                            # Previous angle may have set gain to 2.0x+ which persists
-                            # after disable_individual_gain(), causing saturation.
-                            af_unified_gain = uncrossed_gains.get("unified_gain", 1.0)
-                            hardware.camera.set_unified_gain(af_unified_gain)
-                            af_analog_red = uncrossed_gains.get("analog_red", 1.0)
-                            af_analog_blue = uncrossed_gains.get("analog_blue", 1.0)
-                            hardware.camera.set_rb_analog_gains(
-                                analog_red=af_analog_red, analog_blue=af_analog_blue
-                            )
-                            logger.info(
-                                "Applied uncrossed calibration for AF: "
-                                f"gain={af_unified_gain:.2f}x, "
-                                f"R={af_analog_red:.3f}, B={af_analog_blue:.3f}"
-                            )
-                    except Exception as e:
-                        logger.warning(f"Could not configure camera for AF: {e}")
-
-                hardware.set_exposure(exposure_90)
-                logger.info(f"Set exposure to {exposure_90}ms for initial autofocus")
-
-            # Calculate direction toward center for tissue search loop
-            start_pos = np.array([first_af_pos.x, first_af_pos.y])
-            center_pos = np.mean(xy_positions, axis=0)
-            direction = center_pos - start_pos
-            if np.linalg.norm(direction) > 0:
-                direction = direction / np.linalg.norm(direction)
-
-            # Tissue detection loop: try current position, then move 1 FOV toward center
-            # After 3 attempts with no tissue, show manual dialog
-            max_tissue_search_attempts = 3
-            tissue_found = False
-            search_pos = Position(first_af_pos.x, first_af_pos.y, hardware.get_current_position().z)
-            fov_diagonal = np.sqrt(fov[0]**2 + fov[1]**2)
-
-            for attempt in range(max_tissue_search_attempts):
-                # Move to search position
-                hardware.move_to_position(search_pos)
-                logger.info(f"Tissue search attempt {attempt + 1}/{max_tissue_search_attempts}: "
-                            f"X={search_pos.x:.1f}, Y={search_pos.y:.1f}")
-
-                # Take test image for tissue detection
-                test_img, _ = hardware.snap_image()
-
-                # Ensure consistent format for tissue detection
-                if test_img.dtype in [np.float32, np.float64]:
-                    if test_img.max() <= 1.0 and test_img.min() >= 0.0:
-                        test_img = (test_img * 255).astype(np.uint8)
-                    else:
-                        test_img = np.clip(test_img, 0, 255).astype(np.uint8)
-
-                # Brightness safety check: dispatched through the active AF
-                # strategy so sparse bright samples do NOT get their exposure
-                # bumped. DenseTextureStrategy uses a median floor (matches
-                # the old behavior); SparseSignalStrategy uses a dynamic-range
-                # check so dark-background sparse spots pass through without
-                # triggering exposure doubling that would saturate the spots.
-                af_brightness_attempts = 0
-                while af_brightness_attempts < 4:
-                    bright_ok, bright_stats = af_strategy.brightness_acceptable(test_img)
-                    if bright_ok:
-                        break
-                    exposure_90 *= 2.0
-                    hardware.set_exposure(exposure_90)
-                    logger.warning(
-                        f"AF test image brightness_check failed ({bright_stats}), "
-                        f"doubling exposure to {exposure_90:.2f}ms"
-                    )
-                    test_img, _ = hardware.snap_image()
-                    if test_img.dtype in [np.float32, np.float64]:
-                        if test_img.max() <= 1.0 and test_img.min() >= 0.0:
-                            test_img = (test_img * 255).astype(np.uint8)
-                        else:
-                            test_img = np.clip(test_img, 0, 255).astype(np.uint8)
-                    af_brightness_attempts += 1
-                if af_brightness_attempts > 0:
-                    logger.info(
-                        f"AF exposure adjusted to {exposure_90:.2f}ms "
-                        f"(strategy={af_strategy_name})"
-                    )
-
-                # Strategy-aware validity check. Replaces the old
-                # has_sufficient_tissue call: each strategy defines its own
-                # "is there enough signal?" gate (dense=texture+area,
-                # sparse=bright-spot-count, dark=total-gradient-energy).
-                signal_valid, strategy_stats = af_strategy.is_valid(test_img, logger_=logger)
-
-                if signal_valid:
-                    logger.info(
-                        f"Signal valid at attempt {attempt + 1} (strategy={af_strategy_name})"
-                    )
-                    tissue_found = True
-                    break
-
-                # Validity failed -- dispatch on the strategy's failure mode.
-                # DEFER: retry at next position (dense behavior).
-                # PROCEED: break out of the search loop and run AF anyway
-                #   (sparse samples often focus fine even when spot count is
-                #   borderline; searching more blank tiles is wasted time).
-                # MANUAL: break out and let the post-loop autofocus dispatch
-                #   fall through to the manual dialog (manual_only strategy).
-                failure_mode = af_strategy.on_failure
-                logger.warning(
-                    f"Signal check failed at attempt {attempt + 1} "
-                    f"(strategy={af_strategy_name}, on_failure={failure_mode.value}, "
-                    f"stats={strategy_stats})"
-                )
-                if failure_mode is StrategyFailureMode.PROCEED:
-                    logger.info(
-                        "Strategy failure_mode=PROCEED: breaking search loop and running AF anyway"
-                    )
-                    tissue_found = True  # treat as found so post-loop AF uses the normal path
-                    break
-                if failure_mode is StrategyFailureMode.MANUAL:
-                    logger.info(
-                        "Strategy failure_mode=MANUAL: breaking search loop to pop manual dialog"
-                    )
-                    break
-
-                # DEFER: fall through to next search position.
-                if attempt < max_tissue_search_attempts - 1:
-                    # Move one FOV diagonal toward center for next attempt
-                    new_xy = np.array([search_pos.x, search_pos.y]) + direction * fov_diagonal
-                    search_pos = Position(new_xy[0], new_xy[1], search_pos.z)
-                    logger.info(f"Moving 1 FOV diagonal toward center for next attempt")
-
-            # Run autofocus (with manual fallback if no tissue found)
-            try:
-                if tissue_found:
-                    # Standard autofocus with manual fallback - tissue was found
-                    logger.info("Tissue found - running autofocus with manual fallback")
-                    initial_z = autofocus_with_manual_fallback(
-                        hardware=hardware,
-                        request_manual_focus=request_manual_focus,
-                        max_retries=3,
-                        fallback_z=hint_z,
-                        n_steps=af_n_steps,
-                        search_range=af_search_range,
-                        score_metric=af_score_metric,
-                        diagnostic_output_path=str(output_path),
-                        logger=logger,
-                    )
-                else:
-                    # No tissue found after all search attempts - try autofocus anyway
-                    # but with max_retries=0 so it goes immediately to manual dialog
-                    # if autofocus fails (which it likely will on blank area)
-                    logger.warning(f"No tissue found after {max_tissue_search_attempts} search attempts")
-                    logger.warning("Attempting autofocus anyway - will go to manual dialog if it fails")
-                    initial_z = autofocus_with_manual_fallback(
-                        hardware=hardware,
-                        request_manual_focus=request_manual_focus,
-                        max_retries=0,  # No retries - go straight to manual if AF fails
-                        fallback_z=hint_z,
-                        n_steps=af_n_steps,
-                        search_range=af_search_range,
-                        score_metric=af_score_metric,
-                        diagnostic_output_path=str(output_path),
-                        logger=logger,
-                    )
-
-                logger.info(f"Initial autofocus completed: Z={initial_z:.2f} um")
-                first_tissue_autofocus_done = True
-                last_af_pos_idx = first_af_idx
-                # Record initial AF result for nearest-spatial Z propagation
-                completed_af_positions.append((first_af_pos.x, first_af_pos.y, initial_z))
-
-                # Remove this position from dynamic_af_positions since we already did it
-                dynamic_af_positions.discard(first_af_idx)
-
-            except RuntimeError as e:
-                logger.error(f"Initial autofocus failed: {e}")
-                # Continue anyway - user may have chosen to skip or acquisition was cancelled
-                if "cancelled" in str(e).lower():
-                    set_state("CANCELLED")
-                    return
-
-            logger.info(f"=== Starting main acquisition loop ===")
-
-        # Initialize saturation monitor for adaptive abort/rate-limiting
-        # Read threshold from config YAML if available, otherwise use default (5%)
-        sat_threshold = None
-        try:
-            sat_threshold = config_manager.get(
-                "acquisition_settings", "saturation_abort_threshold_pct")
-            if sat_threshold is not None:
-                sat_threshold = float(sat_threshold)
-                logger.info(f"Saturation abort threshold from config: {sat_threshold}%")
-        except Exception:
-            pass
-        sat_monitor = SaturationMonitor(
-            angles=params.get("angles", []),
+        # Phase 1-6: Parse message, load configs, setup BG/WB/Z-stack, create dirs
+        ctx = _prepare_acquisition(
+            message=message,
+            client_addr=client_addr,
+            hardware=hardware,
+            config_manager=config_manager,
             logger=logger,
-            biref_abort_threshold_pct=sat_threshold,
+            update_progress=update_progress,
+            set_state=set_state,
+            is_cancelled=is_cancelled,
+            request_manual_focus=request_manual_focus,
+            request_hardware_error_recovery=request_hardware_error_recovery,
+            connection_config_path=connection_config_path,
         )
 
-        # Initialize background write pool for overlapped I/O.
-        # TIFF writes are submitted here and execute in parallel with hardware ops.
-        # Pending writes are drained at each autofocus check (every af_n_tiles tiles),
-        # which runs in-memory (no disk I/O), giving writes full disk bandwidth.
-        write_pool = _TileWritePool(max_workers=2)
+        # Phase 7: Load AF settings, resolve strategy, compute positions
+        _configure_autofocus(ctx)
 
-        # Track last position index where AF was performed (for gap detection)
-        last_af_pos_idx = -1
+        # Phase 8: Initial autofocus at first tissue position
+        _run_pre_acquisition_autofocus(ctx)
 
-        # Collect per-tile measurements for post-acquisition analysis
-        tile_measurements = []
+        # Phase 9: Create saturation monitor, write pool, NDJSON stream
+        _initialize_loop_infrastructure(ctx)
 
-        # Open NDJSON stream for live Java-side tile updates.
-        # One JSON object per line, flushed after each write. The final
-        # tile_measurements.json is still written at the end as the
-        # authoritative source; this stream exists so the QuPath extension
-        # can attach per-tile measurements to detection objects as tiles
-        # complete rather than waiting for the whole acquisition to finish.
-        # Close is best-effort (GC reclaims on function exit for error paths).
-        tile_measurements_ndjson_path = output_path / "tile_measurements.ndjson"
-        try:
-            tile_measurements_stream = open(
-                tile_measurements_ndjson_path, "w", encoding="utf-8"
-            )
-            logger.info(
-                "Streaming per-tile measurements to %s", tile_measurements_ndjson_path
-            )
-        except Exception as e:
-            logger.warning("Could not open tile measurements NDJSON stream: %s", e)
-            tile_measurements_stream = None
-
-        # Per-acquisition ConfigGroup preset cache. Shared across all tiles so
-        # apply_channel_hardware_state skips redundant MMCore set_config calls
-        # when consecutive channels target the same group preset (e.g. the
-        # filter turret on OWS3 never changes between channels). Reset to empty
-        # so each acquisition re-applies presets from scratch.
-        channel_preset_cache: Dict[str, str] = {}
-
-        # Per-channel consecutive-saturation counter. When a channel produces
-        # N tiles in a row with worst-channel saturation above CHANNEL_SAT_PCT,
-        # emit a prominent warning so downstream UI can surface it. The goal is
-        # to catch runaway intensity settings early before wasting imaging time.
-        # TODO #17: the actual mid-acquisition dialog requires adding a socket
-        # notification channel from Python -> Java; for now we just write the
-        # warning to the server log and to tile_measurements.json.
-        CHANNEL_SAT_RUNAWAY_N = 3
-        CHANNEL_SAT_PCT_THRESHOLD = 5.0
-        channel_consecutive_saturated: Dict[str, int] = {}
-
-        # One-shot flag for the sparse-sample-aware progress sanity check.
-        # Fires at most once per acquisition so we don't spam the log. See
-        # TODO #5 / C6.
-        progress_warning_fired = False
-
-        # Main acquisition loop
-        for pos_idx, (pos, filename) in enumerate(positions):
-            # Check for cancellation
-            if is_cancelled():
+        # Phase 10: Main acquisition loop
+        for pos_idx, (pos, filename) in enumerate(ctx.positions):
+            if ctx.is_cancelled():
                 logger.warning(f"Acquisition cancelled by client {client_addr}")
-                set_state("CANCELLED")
+                ctx.set_state("CANCELLED")
                 return
 
-            logger.info(f"Position {pos_idx + 1}/{len(positions)}: {filename}")
-
-            # Start timing for this tile
+            logger.info(f"Position {pos_idx + 1}/{len(ctx.positions)}: {filename}")
             tile_start = time.perf_counter()
 
-            # Per-tile measurement tracking (reset each iteration)
-            af_type_for_this_tile = "none"
-            drift_for_this_tile = 0.0
-            af_failed_for_this_tile = False
+            # AF decision + stage move + autofocus execution
+            needs_af, af_type, drift, af_failed, xy_move_pending = (
+                _handle_tile_autofocus(ctx, pos_idx, pos, filename)
+            )
 
-            # Determine the best Z for this tile position.
-            # AF tiles will autofocus after moving, so just use current Z.
-            # Non-AF tiles use the Z from the spatially NEAREST completed
-            # AF position (not just the most recent in scan order) to avoid
-            # horizontal Z bands in serpentine scans.
-            needs_af = pos_idx in dynamic_af_positions
+            # User chose to skip this tile during hardware error recovery
+            if af_type == "skipped":
+                continue
 
-            # Safety net 1: index gap check (softened).
-            # Force AF if too many tiles in scan order have passed without
-            # any AF. gap_index_multiplier (default 3) x n_tiles avoids
-            # the vertical pillar pattern that 1x caused.
-            index_gap_threshold = af_gap_index_multiplier * af_n_tiles
-            if not needs_af and last_af_pos_idx >= 0:
-                gap = pos_idx - last_af_pos_idx
-                if gap > index_gap_threshold:
-                    needs_af = True
-                    logger.info(
-                        "  Forcing AF: index gap of %d positions since last AF "
-                        "(threshold: %d = %dx%d)",
-                        gap, index_gap_threshold,
-                        af_gap_index_multiplier, af_n_tiles,
-                    )
-
-            # Safety net 2: spatial gap check for disconnected fragments.
-            # gap_spatial_multiplier (default 2.0) x af_min_distance catches
-            # truly disconnected tissue, not normal inter-row spacing.
-            spatial_gap_threshold = af_gap_spatial_multiplier * af_min_distance
-            if not needs_af and completed_af_positions:
-                tile_xy = np.array([[pos.x, pos.y]])
-                af_xy = np.array([(ax, ay) for ax, ay, _ in completed_af_positions])
-                nearest_af_dist = float(np.min(_cdist_scipy(tile_xy, af_xy)))
-                if nearest_af_dist > spatial_gap_threshold:
-                    needs_af = True
-                    logger.info(
-                        "  Forcing AF: spatial distance %.0f um to nearest AF "
-                        "exceeds threshold %.0f um (%.1fx af_min_distance)",
-                        nearest_af_dist, spatial_gap_threshold,
-                        af_gap_spatial_multiplier,
-                    )
-
-            # For non-AF tiles, move Z to the spatially nearest AF's Z.
-            # Without this, non-AF tiles inherit the LAST AF's Z (most-recent
-            # in scan order), which in a serpentine scan may be on the opposite
-            # side of the tissue -- producing horizontal Z bands in the focus
-            # map and degraded image quality.
-            if not needs_af and completed_af_positions:
-                tile_xy = np.array([[pos.x, pos.y]])
-                af_xy = np.array([(ax, ay) for ax, ay, _ in completed_af_positions])
-                nearest_idx = int(np.argmin(_cdist_scipy(tile_xy, af_xy)[0]))
-                nearest_z = completed_af_positions[nearest_idx][2]
-                current_z = hardware.get_current_position().z
-                if abs(nearest_z - current_z) > 0.1:
-                    hardware.move_to_position(Position(z=nearest_z))
-                    logger.debug(
-                        "  Nearest-AF Z correction: %.2f -> %.2f um "
-                        "(nearest AF at X=%.0f, Y=%.0f, dist=%.0f um)",
-                        current_z, nearest_z,
-                        completed_af_positions[nearest_idx][0],
-                        completed_af_positions[nearest_idx][1],
-                        float(_cdist_scipy(tile_xy, [af_xy[nearest_idx]])[0][0]),
-                    )
-                pos.z = nearest_z
-            else:
-                pos.z = hardware.get_current_position().z
-
-            logger.debug(f"Moving to position: X={pos.x}, Y={pos.y}, Z={pos.z}")
-            t0 = time.perf_counter()
-
-            # Stage move with retry on serial errors. Retries twice (2s delay),
-            # then pauses acquisition for user intervention if still failing.
-            move_succeeded = False
-            last_move_error = None
-            for move_attempt in range(3):
-                try:
-                    if needs_af:
-                        hardware.move_to_position(pos)
-                    else:
-                        hardware.move_xy_no_wait(pos.x, pos.y)
-                    move_succeeded = True
-                    break
-                except Exception as move_err:
-                    last_move_error = move_err
-                    if move_attempt < 2:
-                        logger.warning(
-                            f"Stage move failed (attempt {move_attempt + 1}/3): {move_err} "
-                            f"-- retrying in 2s")
-                        time.sleep(2.0)
-                    else:
-                        logger.error(
-                            f"Stage move failed after 3 attempts: {move_err} "
-                            f"-- requesting user intervention")
-
-            if not move_succeeded:
-                # All retries exhausted -- pause for user to fix hardware
-                if request_hardware_error_recovery is not None:
-                    error_detail = str(last_move_error) if last_move_error else "Stage move failed after 3 attempts"
-                    logger.info("Pausing acquisition for user to resolve stage error")
-                    user_choice = request_hardware_error_recovery(error_detail)
-                    if user_choice == "cancel":
-                        logger.warning("User cancelled acquisition during stage error recovery")
-                        set_state("CANCELLED")
-                        return
-                    elif user_choice == "skip":
-                        logger.info(f"User chose to skip position {pos_idx}")
-                        continue  # Skip this tile entirely
-                    # "retry" -- try one more time after user intervention
-                    try:
-                        if needs_af:
-                            hardware.move_to_position(pos)
-                        else:
-                            hardware.move_xy_no_wait(pos.x, pos.y)
-                    except Exception as final_err:
-                        logger.error(f"Stage move still failing after user intervention: {final_err}")
-                        set_state("FAILED", str(final_err))
-                        return
-                else:
-                    # No hardware error recovery callback -- fail acquisition
-                    set_state("FAILED", f"Stage move failed after 3 attempts")
-                    return
-
-            xy_move_pending = not needs_af
-            t0 = log_timing(logger, "Stage XY movement command", t0)
-
-            # Perform autofocus if needed (with tissue detection)
-            if needs_af:
-                logger.info(
-                    f"Checking for autofocus at position {pos_idx}: X={pos.x}, Y={pos.y}, Z={pos.z}"
-                )
-
-                # For rotation modalities, always autofocus at the configured angle
-                # (brightest orientation for consistent, fast autofocus)
-                if mod_config.autofocus_angle is not None and hasattr(hardware, "set_psg_ticks"):
-                    af_angle = mod_config.autofocus_angle
-                    t_rot = time.perf_counter()
-                    hardware.set_psg_ticks(af_angle)
-                    t_rot = log_timing(logger, "Rotation to %.0fdeg for autofocus" % af_angle, t_rot)
-                    logger.info("Set rotation to %.0f deg for autofocus", af_angle)
-                    # Use the autofocus-angle exposure from the current WB mode's
-                    # calibration (same value as the initial AF block).
-                    # exposure_90 was validated during pre-acquisition AF.
-                    if af_angle in params["angles"]:
-                        angle_idx = params["angles"].index(af_angle)
-                        if angle_idx < len(params["exposures"]):
-                            exposure_90 = params["exposures"][angle_idx]
-
-                    # Disable per-channel mode and apply analog gains
-                    # (see initial AF block for full rationale).
-                    if is_jai_camera:
-                        try:
-                            hardware.camera.disable_individual_exposure()
-                            hardware.camera.disable_individual_gain()
-                            if jai_calibration is not None:
-                                uncrossed_gains = (
-                                    jai_calibration.get("angles", {})
-                                    .get("uncrossed", {})
-                                    .get("gains", {})
-                                )
-                                # Reset unified gain to uncrossed value (typically 1.0).
-                                # Previous angle leaves gain at 2.0x+, causing saturation.
-                                af_unified_gain = uncrossed_gains.get("unified_gain", 1.0)
-                                hardware.camera.set_unified_gain(af_unified_gain)
-                                hardware.camera.set_rb_analog_gains(
-                                    analog_red=uncrossed_gains.get("analog_red", 1.0),
-                                    analog_blue=uncrossed_gains.get("analog_blue", 1.0),
-                                )
-                        except Exception as e:
-                            logger.warning(f"Could not configure camera for AF: {e}")
-
-                    t_exp = time.perf_counter()
-                    hardware.set_exposure(exposure_90)
-                    t_exp = log_timing(logger, "Set exposure for tissue detection", t_exp)
-                    logger.info(f"Set exposure to {exposure_90}ms for 90 deg tissue detection")
-                # Take a quick image to assess tissue content
-                t_snap = time.perf_counter()
-                test_img, _ = hardware.snap_image()
-                t_snap = log_timing(logger, "Snap test image for tissue detection", t_snap)
-
-                # Ensure consistent format for tissue detection
-                if test_img.dtype in [np.float32, np.float64]:
-                    if test_img.max() <= 1.0 and test_img.min() >= 0.0:
-                        test_img = (test_img * 255).astype(np.uint8)
-                    else:
-                        test_img = np.clip(test_img, 0, 255).astype(np.uint8)
-
-                # Brightness safety check (strategy-aware, same as initial AF block).
-                af_brightness_attempts = 0
-                while af_brightness_attempts < 4:
-                    bright_ok, bright_stats = af_strategy.brightness_acceptable(test_img)
-                    if bright_ok:
-                        break
-                    exposure_90 *= 2.0
-                    hardware.set_exposure(exposure_90)
-                    logger.warning(
-                        f"AF drift-check image brightness_check failed ({bright_stats}), "
-                        f"doubling exposure to {exposure_90:.2f}ms"
-                    )
-                    test_img, _ = hardware.snap_image()
-                    if test_img.dtype in [np.float32, np.float64]:
-                        if test_img.max() <= 1.0 and test_img.min() >= 0.0:
-                            test_img = (test_img * 255).astype(np.uint8)
-                        else:
-                            test_img = np.clip(test_img, 0, 255).astype(np.uint8)
-                    af_brightness_attempts += 1
-                if af_brightness_attempts > 0:
-                    logger.info(
-                        f"AF drift-check exposure adjusted to {exposure_90:.2f}ms "
-                        f"(strategy={af_strategy_name})"
-                    )
-
-                # Strategy-aware validity check (replaces has_sufficient_tissue).
-                signal_valid, strategy_stats = af_strategy.is_valid(test_img, logger_=logger)
-
-                # PROCEED strategies (sparse/dark-field) run AF even when the
-                # validity gate is borderline; only DEFER/MANUAL modes defer.
-                failure_mode = af_strategy.on_failure
-                should_run_af = signal_valid or failure_mode is StrategyFailureMode.PROCEED
-
-                if should_run_af:
-                    logger.info(
-                        f"Running drift-check AF (strategy={af_strategy_name}, "
-                        f"valid={signal_valid}, stats={strategy_stats})"
-                    )
-
-                    # Use STANDARD autofocus on first tissue position for accuracy
-                    # Then use ADAPTIVE autofocus on subsequent positions for speed
-                    if not first_tissue_autofocus_done:
-                        logger.info(f"  First tissue position - using STANDARD autofocus for accuracy")
-                        t_af = time.perf_counter()
-                        new_z = autofocus_with_manual_fallback(
-                            hardware=hardware,
-                            logger=logger,
-                            request_manual_focus=request_manual_focus,
-                            max_retries=3,
-                            fallback_z=hint_z,
-                            move_stage_to_estimate=True,
-                            n_steps=af_n_steps,
-                            search_range=af_search_range,
-                            interp_strength=af_interp_strength,
-                            interp_kind=af_interp_kind,
-                            score_metric=af_score_metric,
-                            diagnostic_output_path=output_path,
-                            position_index=pos_idx,
-                        )
-                        t_af = log_timing(logger, "STANDARD autofocus", t_af)
-                        first_tissue_autofocus_done = True
-                        af_type_for_this_tile = "standard"
-                        logger.info(f"  Standard autofocus :: New Z {new_z}")
-                    else:
-                        # Small-grid drift-check skip: for tiny acquisitions
-                        # (<= SMALL_GRID_SKIP_DRIFT_MAX_TILES tiles), the
-                        # ~5-9s per-tile sweep drift check dominates wall-
-                        # clock time and rarely finds meaningful drift. Reuse
-                        # the most recently computed Z from completed_af_positions
-                        # instead. TODO #6 from the 2026-04-14 optimization
-                        # list. Safe to ship independently of the strategy
-                        # system. Disable by setting SMALL_GRID_SKIP_DRIFT_MAX_TILES
-                        # to 0, or make this configurable per-scope in
-                        # autofocus_<scope>.yml in a follow-up.
-                        SMALL_GRID_SKIP_DRIFT_MAX_TILES = 9
-                        if len(positions) <= SMALL_GRID_SKIP_DRIFT_MAX_TILES:
-                            z_before_adaptive = hardware.get_current_position().z
-                            logger.info(
-                                "  Small grid (%d tiles <= %d) - skipping sweep drift check, "
-                                "reusing Z=%.2f um from initial AF",
-                                len(positions),
-                                SMALL_GRID_SKIP_DRIFT_MAX_TILES,
-                                z_before_adaptive,
-                            )
-                            new_z = z_before_adaptive
-                            af_type_for_this_tile = "skip_small_grid"
-                            drift_for_this_tile = 0.0
-                        else:
-                            # Get Z position before adaptive autofocus for drift detection
-                            z_before_adaptive = hardware.get_current_position().z
-
-                            logger.info(f"  Subsequent tissue position - using SWEEP drift check for speed")
-                            t_af = time.perf_counter()
-                            new_z = hardware.autofocus_sweep_drift_check(
-                                range_um=af_sweep_range_um,
-                                n_steps=af_sweep_n_steps,
-                                score_metric=af_score_metric_name,
-                                max_retries=af_edge_retries,
-                            )
-                            t_af = log_timing(logger, "SWEEP drift check", t_af)
-
-                            drift = new_z - z_before_adaptive
-                            af_type_for_this_tile = "sweep"
-                            drift_for_this_tile = drift
-                            logger.info(f"  Sweep drift check :: New Z {new_z} (drift: {drift:+.2f} um)")
-
-                    # Track this position as the last AF position (for gap detection)
-                    last_af_pos_idx = pos_idx
-                    # Record the AF result for nearest-spatial Z propagation,
-                    # but only if the sweep actually found a valid focus.
-                    # Zero-drift sweeps failed to find a peak and recording
-                    # their stale Z propagates bad values to neighboring
-                    # tiles via nearest-neighbor lookup.
-                    af_z = hardware.get_current_position().z
-                    if af_type_for_this_tile == "sweep" and abs(drift_for_this_tile) < 0.05:
-                        logger.info(
-                            "  Sweep produced no drift -- not recording "
-                            "in AF map (prevents stale Z propagation)")
-                    else:
-                        completed_af_positions.append((pos.x, pos.y, af_z))
-                else:
-                    # Strategy validity check failed with DEFER or MANUAL mode.
-                    # (PROCEED strategies took the should_run_af=True branch.)
-                    af_failed_for_this_tile = True
-                    logger.warning(
-                        f"Strategy {af_strategy_name} rejected tile {pos_idx} "
-                        f"(on_failure={failure_mode.value}, stats={strategy_stats}) - deferring autofocus"
-                    )
-
-                    # Remove this position from autofocus list
-                    dynamic_af_positions.discard(pos_idx)
-                    deferred_af_positions.add(pos_idx)
-
-                    # Try to find next suitable position for autofocus
-                    next_af_pos = AutofocusUtils.defer_autofocus_to_next_tile(
-                        current_pos_idx=pos_idx,
-                        original_af_positions=af_positions,
-                        total_positions=len(positions),
-                        af_min_distance=af_min_distance,
-                        positions=xy_positions,
-                        logger=logger,
-                    )
-
-                    if next_af_pos is not None and next_af_pos < len(positions):
-                        dynamic_af_positions.add(next_af_pos)
-                        logger.info(f"Added position {next_af_pos} to autofocus queue")
-                    else:
-                        logger.warning(f"Could not find suitable position to defer autofocus to")
-
-                # Drain pending background TIFF writes. Autofocus runs entirely
-                # in memory (snap + focus score), so pending writes had full disk
-                # bandwidth during the 1-5s AF operation. Drain is usually instant.
-                if write_pool.pending_count > 0:
-                    t_drain = time.perf_counter()
-                    n_drained = write_pool.pending_count
-                    failed = write_pool.drain()
-                    t_drain = log_timing(logger, f"Drain {n_drained} pending writes ({failed} failed)", t_drain)
-
-                # Restore per-channel exposure/gain mode after autofocus.
-                # Autofocus disabled per-channel mode to use unified exposure.
-                # Only needed for per_angle WB mode (PPM WB), which uses per-channel
-                # JAI calibration. Simple WB and camera_awb modes set exposures
-                # differently in the angle loop -- no restore needed.
-                if (wb_mode == "per_angle"
-                        and jai_calibration is not None
-                        and params["angles"]):
-                    first_angle = params["angles"][0]
-                    logger.debug(f"Restoring per-channel WB mode after autofocus (first angle: {first_angle})")
-                    applied, _ = apply_jai_calibration_for_angle(
-                        hardware=hardware,
-                        jai_calibration=jai_calibration,
-                        angle=first_angle,
-                        per_angle=white_balance_per_angle,
-                        logger=logger,
-                    )
-                    if not applied:
-                        logger.warning("Failed to restore per-channel mode after autofocus")
-
-            # Collect stage position for this tile (after autofocus, before acquiring angles)
-            # This captures the actual XYZ used for acquisition
+            # Collect stage position for this tile
             current_stage_pos = hardware.get_current_position()
-            stage_positions_collected.append((
+            ctx.stage_positions_collected.append((
                 filename,
                 current_stage_pos.x,
                 current_stage_pos.y,
-                current_stage_pos.z
+                current_stage_pos.z,
             ))
 
-            # Worst saturation across all angles (must be initialized before
-            # the angles branch so it's available for tile_measurements later)
+            # Dispatch by modality
             tile_worst_sat = {"R": 0.0, "G": 0.0, "B": 0.0}
-
-            if params["angles"]:
-                # Z-stack: record center Z from autofocus, generate absolute Z positions
-                center_z = current_stage_pos.z
-                z_stack_images = {}  # angle -> [z0_img, z1_img, ...] (only used when z_stack_enabled)
-                angle_images = {}  # For 2D: stores last plane's images; For Z-stack: stores projected images
-
-                for z_idx, z_offset in enumerate(z_offsets):
-                    # Move Z if doing Z-stack (skip for single-plane 2D)
-                    if z_stack_enabled and z_offset != 0.0:
-                        target_z = center_z + z_offset
-                        hardware.move_to_position(Position(z=target_z))
-                        logger.debug(
-                            "Z-stack: plane %d/%d, Z=%.2f (offset=%+.1f)",
-                            z_idx + 1, len(z_offsets), target_z, z_offset,
-                        )
-
-                    # Multi-angle acquisition at this Z plane
-                    for angle_idx, angle in enumerate(params["angles"]):
-                        # Check for cancellation
-                        if is_cancelled():
-                            logger.warning(f"Acquisition cancelled by client {client_addr}")
-                            set_state("CANCELLED")
-                            return
-
-                        # Start timing for this angle
-                        angle_start = time.perf_counter()
-
-                        # Start rotation (non-blocking) -- the stage begins moving
-                        # immediately while we set camera exposure in parallel.
-                        t_rot = time.perf_counter()
-                        hardware.set_psg_ticks_no_wait(angle)
-
-                        # Set exposure time based on wb_mode.
-                        # This runs IN PARALLEL with the rotation stage movement.
-                        t_exp = time.perf_counter()
-
-                        if wb_mode == "camera_awb":
-                            # Camera AWB mode: unified exposure only, no per-channel.
-                            # Camera handles color balance internally.
-                            if angle_idx < len(params["exposures"]):
-                                exposure_ms = params["exposures"][angle_idx]
-                                hardware.set_exposure(exposure_ms)
-                            # Apply unified gain for brightness at dim angles
-                            angle_name = angle_to_name(angle, modality=modality)
-                            if camera_awb_gains and angle_name in camera_awb_gains:
-                                try:
-                                    gain_val = camera_awb_gains[angle_name]
-                                    hardware.camera.set_unified_gain(gain_val)
-                                    logger.info(f"  Camera AWB: unified gain={gain_val:.2f} for {angle_name}")
-                                except Exception as e:
-                                    logger.debug(f"Could not set unified gain: {e}")
-
-                        elif wb_mode == "simple" and simple_wb_data:
-                            # Simple WB mode: use simple_wb.angles (written during WBSIMPLE calibration).
-                            # These values are the source of truth for Simple WB acquisition and are
-                            # NOT overwritten by PPM WB or background collection.
-                            # For small angles, all channels have the same exposure (unified mode).
-                            angle_name = angle_to_name(angle, modality=modality)
-                            sw_angles = simple_wb_data.get("angles", {})
-                            if angle_name in sw_angles:
-                                angle_sw = sw_angles[angle_name]
-                                try:
-                                    exp_r = angle_sw["r"]
-                                    exp_g = angle_sw["g"]
-                                    exp_b = angle_sw["b"]
-                                    is_unified = abs(exp_r - exp_g) < 0.01 and abs(exp_g - exp_b) < 0.01
-                                    sw_gain = angle_sw.get("unified_gain", 1.0)
-
-                                    # Apply all settings atomically
-                                    hardware.camera.apply_settings(
-                                        exposures=({"all": exp_g} if is_unified
-                                                   else {"r": exp_r, "g": exp_g, "b": exp_b}),
-                                        unified_gain=sw_gain,
-                                        analog_red=simple_wb_analog_red,
-                                        analog_blue=simple_wb_analog_blue,
-                                        individual_exposure=not is_unified,
-                                    )
-                                    logger.debug(
-                                        "  Simple WB: R=%.1fms, G=%.1fms, B=%.1fms "
-                                        "(scale=%sx, gain=%.2f, aR=%.3f, aB=%.3f)",
-                                        exp_r, exp_g, exp_b,
-                                        angle_sw.get("scale", "?"), sw_gain,
-                                        simple_wb_analog_red, simple_wb_analog_blue,
-                                    )
-                                except Exception as e:
-                                    logger.warning(f"Simple WB failed for {angle_name}: {e}")
-                                    if angle_idx < len(params["exposures"]):
-                                        hardware.set_exposure(params["exposures"][angle_idx])
-                            else:
-                                # Angle not in simple_wb data - fall back to base ratio
-                                # with exposure_scale from calibration
-                                logger.info(f"  Simple WB: no data for {angle_name}, using calibration with scale")
-                                if jai_calibration is not None:
-                                    applied, _ = apply_jai_calibration_for_angle(
-                                        hardware=hardware,
-                                        jai_calibration=jai_calibration,
-                                        angle=angle,
-                                        per_angle=False,
-                                        logger=logger,
-                                    )
-                                    if not applied and angle_idx < len(params["exposures"]):
-                                        hardware.set_exposure(params["exposures"][angle_idx])
-                                elif angle_idx < len(params["exposures"]):
-                                    hardware.set_exposure(params["exposures"][angle_idx])
-
-                        elif wb_mode == "simple" and jai_calibration is not None:
-                            # Simple WB mode without pre-computed data: use uncrossed
-                            # ratio from Mode 3 calibration with uniform scaling
-                            applied, _ = apply_jai_calibration_for_angle(
-                                hardware=hardware,
-                                jai_calibration=jai_calibration,
-                                angle=angle,
-                                per_angle=False,
-                                logger=logger,
-                            )
-                            if not applied and angle_idx < len(params["exposures"]):
-                                hardware.set_exposure(params["exposures"][angle_idx])
-
-                        elif jai_calibration is not None:
-                            # Per-angle WB mode (Mode 3): apply full per-angle calibration
-                            applied, _ = apply_jai_calibration_for_angle(
-                                hardware=hardware,
-                                jai_calibration=jai_calibration,
-                                angle=angle,
-                                per_angle=white_balance_per_angle,
-                                logger=logger,
-                            )
-                            if not applied and angle_idx < len(params["exposures"]):
-                                # Fall back to single exposure if JAI calibration failed.
-                                # Must disable per-channel mode first - a previous angle's
-                                # successful apply_jai_calibration_for_angle may have enabled it,
-                                # which would cause this set_exposure() to be silently ignored.
-                                try:
-                                    hardware.camera.disable_individual_exposure()
-                                    hardware.camera.disable_individual_gain()
-                                    hardware.camera.set_rb_analog_gains(analog_red=1.0, analog_blue=1.0)
-                                except Exception:
-                                    pass
-                                exposure_ms = params["exposures"][angle_idx]
-                                hardware.set_exposure(exposure_ms)
-                                logger.info(f"  JAI calibration failed, using single exposure: {exposure_ms}ms")
-                        elif angle_idx < len(params["exposures"]):
-                            # No JAI calibration - use single exposure from params
-                            exposure_ms = params["exposures"][angle_idx]
-                            hardware.set_exposure(exposure_ms)
-                        t_exp = log_timing(logger, f"Set exposure for angle {angle}deg", t_exp)
-
-                        # Wait for rotation to complete before snapping.
-                        # If exposure setting took longer than the rotation (~1s vs
-                        # ~700ms), this wait returns immediately (0ms).
-                        hardware.wait_for_rotation()
-                        t_rot = log_timing(logger, f"Rotation to {angle}deg", t_rot)
-
-                        # If XY move is still pending (non-blocking move for non-AF
-                        # tiles), wait for it now before the first snap.
-                        if xy_move_pending:
-                            hardware.wait_for_xy()
-                            xy_move_pending = False
-
-                        # Acquire image
-                        t_snap = time.perf_counter()
-                        image, metadata = hardware.snap_image(debayering=False)
-                        t_snap = log_timing(logger, f"Snap image at {angle}deg (includes camera+USB+internal processing)", t_snap)
-
-                        if image is None:
-                            logger.error(f"Failed to acquire image at angle {angle}")
-                            continue
-
-                        # Calculate image stats (numpy operation)
-                        t_stats = time.perf_counter()
-                        img_mean = image.mean((0,1))
-                        t_stats = log_timing(logger, f"Calculate image stats at {angle}deg", t_stats)
-                        logger.debug(f"  Image shape: {image.shape}, mean: {img_mean}")
-                        # For uncrossed angles, suppress per-tile SATURATION WARNING
-                        # after the first occurrence -- the monitor handles rate-limiting
-                        sat_warn_threshold = (
-                            101.0 if sat_monitor.should_suppress_warnings(angle) else 1.0
-                        )
-                        sat_result = _check_saturation(
-                            image, f"tile {filename} at {angle}deg", logger,
-                            threshold_pct=sat_warn_threshold,
-                        )
-                        # Track worst per-channel saturation across all angles for this tile
-                        if sat_result:
-                            for ch in ("R", "G", "B"):
-                                if sat_result.get(ch, 0) > tile_worst_sat[ch]:
-                                    tile_worst_sat[ch] = sat_result[ch]
-
-                        if sat_monitor.check_tile(
-                            sat_result, angle, pos_idx, filename,
-                            stage_x=current_stage_pos.x,
-                            stage_y=current_stage_pos.y,
-                            stage_z=current_stage_pos.z,
-                        ):
-                            # Saturation abort triggered -- save what we have and stop
-                            logger.error(
-                                f"Stopping acquisition at position {pos_idx + 1}/"
-                                f"{len(positions)} due to saturation abort"
-                            )
-                            sat_monitor.log_summary()
-                            set_state("FAILED", sat_monitor.abort_reason)
-                            return
-
-                        # Save raw (unprocessed) image for comparison (only if enabled)
-                        if save_raw_tiles:
-                            raw_output_path = output_path.parent / "Raw" / output_path.name
-                            raw_image_path = raw_output_path / str(angle) / filename
-
-                            t_mkdir = time.perf_counter()
-                            if not raw_image_path.parent.exists():
-                                raw_image_path.parent.mkdir(parents=True, exist_ok=True)
-                            t_mkdir = log_timing(logger, f"Create directories at {angle}deg", t_mkdir)
-
-                            try:
-                                # Write position metadata synchronously (reads hardware state)
-                                write_position_metadata(
-                                    metadata_txt_for_positions, raw_image_path, hardware, modality
-                                )
-                                # Submit raw TIFF write to background pool.
-                                # Safe: apply_flat_field_correction creates a NEW array,
-                                # so the raw `image` array is never modified after this point.
-                                raw_pixel_size = hardware.get_pixel_size_um()
-                                write_pool.submit(
-                                    ome_tiff_writer,
-                                    filename=str(raw_image_path),
-                                    pixel_size_um=raw_pixel_size,
-                                    data=image,
-                                )
-                                logger.info(f"  Queued raw image write: {raw_image_path}")
-                            except Exception as e:
-                                logger.warning(f"  Failed to queue raw image: {e}")
-
-                        # ======= APPLY BACKGROUND CORRECTION (STEP 1) =======
-                        # Check if background correction is enabled, background exists, and angle is not disabled
-                        if (
-                            background_correction_enabled
-                            and angle in background_images
-                            and angle not in background_disabled_angles
-                        ):
-                            bg_img = background_images[angle]
-                            logger.debug(f"  Applying background correction for {angle} degrees")
-                            logger.debug(
-                                f"    Background stats: mean={bg_img.mean():.1f}, std={bg_img.std():.1f}"
-                            )
-
-                            t_bg = time.perf_counter()
-                            image = BackgroundCorrectionUtils.apply_flat_field_correction(
-                                image,
-                                background_images[angle],
-                                background_scaling_factors[angle],
-                                method=background_correction_method,
-                            )
-                            t_bg = log_timing(logger, f"Background correction at {angle}deg", t_bg)
-                            logger.debug(
-                                f"    Correction applied with method: {background_correction_method}"
-                            )
-                            logger.debug(f"    Post-correction RGB means: {image.mean(axis=(0,1))}")
-                            # Use higher threshold for post-correction to reduce noise;
-                            # the raw check + monitor already handles abort decisions
-                            if not sat_monitor._is_uncrossed(angle):
-                                _check_saturation(image, f"post-correction tile {filename} at {angle}deg", logger)
-                        elif background_correction_enabled and angle in background_disabled_angles:
-                            logger.info(
-                                f"  Background correction SKIPPED for {angle} deg (disabled by acquisition parameters - exposure mismatch or missing background)"
-                            )
-                        elif background_correction_enabled and angle not in background_images:
-                            logger.info(
-                                f"  Background correction SKIPPED for {angle} deg (no background image available)"
-                            )
-
-                        # ======= APPLY WHITE BALANCE (STEP 2) =======
-                        # Skip software WB when hardware WB (JAI per-channel exposures) is active.
-                        # Hardware WB already balances the channels via different exposure times;
-                        # applying software RGB multipliers on top would double-correct.
-                        if white_balance_enabled and jai_calibration is None and wb_mode not in ("camera_awb", "simple"):
-                            # Use pre-configured white balance values (software-only mode)
-                            if angle in angles_wb:
-                                wb_profile = angles_wb[angle]
-                            else:
-                                # Default neutral if angle not found
-                                wb_profile = [1.0, 1.0, 1.0]
-                                logger.warning(
-                                    f"    No white balance profile for {angle} deg, using neutral"
-                                )
-
-                            t_wb = time.perf_counter()
-                            gain = calculate_luminance_gain(*wb_profile)
-                            image = hardware.white_balance(
-                                image, white_balance_profile=wb_profile, gain=gain
-                            )
-                            t_wb = log_timing(logger, f"White balance at {angle}deg", t_wb)
-                            logger.info(
-                                f"  Applied software white balance: R={wb_profile[0]:.2f}, G={wb_profile[1]:.2f}, B={wb_profile[2]:.2f}"
-                            )
-                        elif white_balance_enabled and (jai_calibration is not None or wb_mode in ("camera_awb", "simple")):
-                            logger.debug(
-                                f"  Software WB skipped (hardware WB active for {angle} deg, mode={wb_mode})"
-                            )
-
-                        # Save or accumulate image depending on Z-stack mode
-                        if not z_stack_enabled:
-                            # 2D mode: save directly (existing behavior)
-                            image_path = output_path / str(angle) / filename
-
-                            if image_path.parent.exists():
-                                # Submit processed TIFF write to background pool.
-                                # Safe: `image` is a new array from background correction / white
-                                # balance (both return new arrays). The next angle's snap_image()
-                                # creates yet another new array, so no mutation risk.
-                                proc_pixel_size = hardware.get_pixel_size_um()
-                                write_pool.submit(
-                                    ome_tiff_writer,
-                                    filename=str(image_path),
-                                    pixel_size_um=proc_pixel_size,
-                                    data=image,
-                                )
-
-                                # Store image for birefringence calculation.
-                                # Concurrent read by biref + TIFF writer is safe (both read-only).
-                                angle_images[angle] = image
-                            else:
-                                logger.error(f"Failed to save {image_path} - parent directory missing")
-                        else:
-                            # Z-stack mode: accumulate for projection
-                            z_stack_images.setdefault(angle, []).append(image)
-                            # Optionally save raw Z planes
-                            if save_raw_tiles:
-                                z_plane_path = output_path / str(angle) / f"z{z_idx:03d}" / filename
-                                z_plane_path.parent.mkdir(parents=True, exist_ok=True)
-                                write_pool.submit(
-                                    ome_tiff_writer,
-                                    filename=str(z_plane_path),
-                                    pixel_size_um=hardware.get_pixel_size_um(),
-                                    data=image,
-                                )
-
-                        image_count += 1
-                        update_progress(image_count, total_images)
-
-                        # Log total time for this angle
-                        angle_elapsed_ms = (time.perf_counter() - angle_start) * 1000
-                        logger.debug(f"  [TIMING] Total for angle {angle}deg: {angle_elapsed_ms:.1f}ms")
-
-                # -- end of z_offsets loop --
-
-                # Z-stack projection: reduce Z planes to single 2D image per angle
-                if z_stack_enabled and projection_fn is not None:
-                    for angle in params["angles"]:
-                        if angle in z_stack_images and len(z_stack_images[angle]) > 0:
-                            projected = projection_fn(z_stack_images[angle])
-                            angle_images[angle] = projected  # For birefringence
-                            # Save projected image as the tile for stitching
-                            image_path = output_path / str(angle) / filename
-                            if image_path.parent.exists():
-                                write_pool.submit(
-                                    ome_tiff_writer,
-                                    filename=str(image_path),
-                                    pixel_size_um=hardware.get_pixel_size_um(),
-                                    data=projected,
-                                )
-                    logger.info(
-                        "Z-stack projection (%s) computed for %d angles at position %d",
-                        params.get("z_projection", "max"), len(z_stack_images), pos_idx + 1,
-                    )
-
-                    # Return Z to center position for next tile
-                    hardware.move_to_position(Position(z=center_z))
-
-                # Create birefringence image for this tile after all angles acquired
-                positive_angles = [a for a in angle_images.keys() if a > 0 and a != 90]
-                negative_angles = [a for a in angle_images.keys() if a < 0]
-                logger.debug(
-                    f"Biref check: angle_images keys={list(angle_images.keys())}, "
-                    f"positive={positive_angles}, negative={negative_angles}"
+            if ctx.params["angles"]:
+                tile_worst_sat, xy_move_pending = _acquire_tile_angles(
+                    ctx, pos_idx, pos, filename, current_stage_pos, xy_move_pending
                 )
-
-                if positive_angles and negative_angles:
-                    pos_angle = min(positive_angles)
-                    neg_angle = max(negative_angles)
-
-                    # Set up birefringence directory and tile config source
-                    biref_dir = output_path / f"{pos_angle}.biref"
-                    tile_config_source = output_path / str(pos_angle) / "TileConfiguration.txt"
-
-                    # Submit birefringence compute+save to background pool.
-                    # Reads angle_images arrays concurrently with pending processed
-                    # writes -- both are read-only, so this is safe.
-                    from ppm_library.imaging.writer import TifWriterUtils as PpmWriterUtils
-                    biref_pixel_size = hardware.get_pixel_size_um()
-                    biref_pos_img = angle_images[pos_angle]
-                    biref_neg_img = angle_images[neg_angle]
-                    write_pool.submit(
-                        PpmWriterUtils.create_normalized_birefringence_tile,
-                        pos_image=biref_pos_img,
-                        neg_image=biref_neg_img,
-                        output_dir=biref_dir,
-                        filename=filename,
-                        pixel_size_um=biref_pixel_size,
-                        tile_config_source=tile_config_source,
-                        logger=logger,
-                        min_intensity=params.get("biref_min_intensity", 0),
-                    )
-                else:
-                    logger.warning(
-                        f"Skipping birefringence for tile {filename}: "
-                        f"need both positive (>0, !=90) and negative (<0) angles "
-                        f"but got angles={list(angle_images.keys())}"
-                    )
-
-                # # Create sum image alongside birefringence image
-                # sum_dir = output_path / f"{pos_angle}.sum"
-                # PpmWriterUtils.create_sum_tile(
-                #     pos_image=angle_images[pos_angle],
-                #     neg_image=angle_images[neg_angle],
-                #     output_dir=sum_dir,
-                #     filename=filename,
-                #     pixel_size_um=hardware.get_pixel_size_um(),
-                #     tile_config_source=tile_config_source,
-                #     logger=logger,
-                # )
-
             else:
-                # Single image acquisition: no rotation angles (BF, fluorescence, etc.)
-
-                # Wait for non-blocking XY move to complete before snapping.
-                # The multi-angle path has this inside the angles loop; for
-                # single-image we must do it here to avoid capturing a tile
-                # while the stage is still settling.
+                # Wait for non-blocking XY move before single-image/channel snap
                 if xy_move_pending:
-                    hardware.wait_for_xy()
-                    xy_move_pending = False
+                    ctx.hardware.wait_for_xy()
 
-                # Channel-based branch: widefield immunofluorescence and similar
-                # multi-channel modalities. Acquire one image per selected channel,
-                # applying the channel's mm_setup_presets and device_properties
-                # before each snap, and save with a "_{channel_id}" suffix so
-                # stitching can pair tiles by position later.
+                # Try channel-based acquisition first
                 channel_plan = resolve_channel_plan(
-                    ppm_settings,
-                    params.get("scan_type", ""),
-                    params.get("channels", []) or [],
-                    params.get("channel_exposures", []) or [],
-                    channel_intensity_overrides=params.get("channel_intensities") or None,
+                    ctx.ppm_settings,
+                    ctx.params.get("scan_type", ""),
+                    ctx.params.get("channels", []) or [],
+                    ctx.params.get("channel_exposures", []) or [],
+                    channel_intensity_overrides=ctx.params.get("channel_intensities") or None,
                 )
                 if channel_plan:
-                    for ch_entry in channel_plan:
-                        apply_channel_hardware_state(
-                            hardware, ch_entry, logger, preset_cache=channel_preset_cache
-                        )
-                        exposure_ms = float(ch_entry.get("exposure_ms") or 0)
-                        if exposure_ms > 0:
-                            hardware.set_exposure(exposure_ms)
-                            logger.debug(
-                                "Channel %s: set exposure to %.2f ms",
-                                ch_entry["id"],
-                                exposure_ms,
-                            )
-                        image, metadata = hardware.snap_image()
+                    tile_worst_sat = _acquire_tile_channels(ctx, pos, filename, current_stage_pos)
+                else:
+                    tile_worst_sat = _acquire_tile_single(ctx, pos, filename, current_stage_pos)
 
-                        # Per-channel flat-field correction (opt-in): if a background
-                        # was loaded for this channel id, apply it. Matches the angle-
-                        # based path in spirit but keyed by channel id rather than angle.
-                        if channel_background_images and ch_entry["id"] in channel_background_images:
-                            try:
-                                image = BackgroundCorrectionUtils.apply_flat_field_correction(
-                                    image,
-                                    channel_background_images[ch_entry["id"]],
-                                    scaling_factor=1.0,
-                                    method=background_correction_method or "divide",
-                                )
-                                logger.debug(
-                                    "  Applied %s background for channel %s",
-                                    background_correction_method or "divide",
-                                    ch_entry["id"],
-                                )
-                            except Exception as bg_e:
-                                logger.warning(
-                                    "  Channel %s background correction failed: %s",
-                                    ch_entry["id"],
-                                    bg_e,
-                                )
-
-                        sat_result = _check_saturation(image, f"tile[{ch_entry['id']}]", logger)
-                        if sat_result:
-                            for ch_key, pct in sat_result.items():
-                                key = f"{ch_entry['id']}/{ch_key}"
-                                if pct > tile_worst_sat.get(key, 0):
-                                    tile_worst_sat[key] = pct
-                            # Per-channel consecutive-saturation runaway detection.
-                            worst_channel_sat = max(sat_result.values(), default=0.0)
-                            ch_id = ch_entry["id"]
-                            if worst_channel_sat > CHANNEL_SAT_PCT_THRESHOLD:
-                                channel_consecutive_saturated[ch_id] = (
-                                    channel_consecutive_saturated.get(ch_id, 0) + 1
-                                )
-                                if channel_consecutive_saturated[ch_id] == CHANNEL_SAT_RUNAWAY_N:
-                                    logger.error(
-                                        "CHANNEL SATURATION RUNAWAY: channel %s has "
-                                        "exceeded %.1f%% worst-channel saturation on "
-                                        "%d consecutive tiles (current: %.1f%%). "
-                                        "Consider cancelling and lowering the %s "
-                                        "intensity before more imaging time is wasted.",
-                                        ch_id,
-                                        CHANNEL_SAT_PCT_THRESHOLD,
-                                        CHANNEL_SAT_RUNAWAY_N,
-                                        worst_channel_sat,
-                                        ch_id,
-                                    )
-                            else:
-                                # Reset consecutive counter on first non-saturated tile.
-                                channel_consecutive_saturated[ch_id] = 0
-
-                        # Write to {output_path}/{channel_id}/{filename} -- plain tile
-                        # filename inside the channel subdirectory. Mirrors the PPM
-                        # per-angle layout so the stitcher can isolate each channel.
-                        image_path = output_path / str(ch_entry["id"]) / filename
-                        if image_path.parent.exists():
-                            bf_pixel_size = hardware.get_pixel_size_um()
-                            write_pool.submit(
-                                ome_tiff_writer,
-                                filename=str(image_path),
-                                pixel_size_um=bf_pixel_size,
-                                data=image,
-                            )
-                            image_count += 1
-                            update_progress(image_count, total_images)
-
-                        try:
-                            write_position_metadata(
-                                metadata_txt_for_positions, image_path, hardware, modality
-                            )
-                        except Exception as e:
-                            logger.warning(
-                                f"  Failed to write position text {metadata_txt_for_positions}: {e}"
-                            )
-                    # Skip the single-snap path below; the channel loop handled it.
-                    tile_elapsed_ms = (time.perf_counter() - tile_start) * 1000
-                    logger.info(
-                        "Tile %d/%d (channels=%d): %.1fs",
-                        pos_idx + 1,
-                        len(positions),
-                        len(channel_plan),
-                        tile_elapsed_ms / 1000,
-                    )
-                    continue
-
-                # Set the exposure explicitly from params. Without this, the
-                # camera keeps whatever residual exposure was left by the last
-                # operation (autofocus, background collection, WB calibration),
-                # which is typically much shorter than what the user configured
-                # and produces severely underexposed tiles (OWS3 2026-04-09).
-                if params.get("exposures"):
-                    exposure_ms = float(params["exposures"][0])
-                    hardware.set_exposure(exposure_ms)
-                    logger.debug("Single-image path: set exposure to %.2f ms", exposure_ms)
-
-                image, metadata = hardware.snap_image()
-
-                # Background correction (flat-field division)
-                if background_correction_enabled and background_images:
-                    bg_key = 0.0  # Non-rotation uses angle key 0.0
-                    if bg_key in background_images:
-                        try:
-                            # apply_flat_field_correction requires scaling_factor;
-                            # use 1.0 for single-image (no cross-tile scaling).
-                            bg_scale = background_scaling_factors.get(bg_key, 1.0) \
-                                if background_scaling_factors else 1.0
-                            image = BackgroundCorrectionUtils.apply_flat_field_correction(
-                                image, background_images[bg_key],
-                                scaling_factor=bg_scale,
-                                method=background_correction_method)
-                            logger.info(
-                                "  Applied %s background correction (median=%.0f)",
-                                background_correction_method, float(np.median(image)),
-                            )
-                        except Exception as e:
-                            logger.warning("  Background correction failed: %s", e)
-
-                # Saturation check (works for both mono and RGB)
-                sat_result = _check_saturation(image, "tile", logger)
-                if sat_result:
-                    for ch_key, pct in sat_result.items():
-                        if pct > tile_worst_sat.get(ch_key, 0):
-                            tile_worst_sat[ch_key] = pct
-
-                image_path = output_path / filename
-
-                if image_path.parent.exists():
-                    bf_pixel_size = hardware.get_pixel_size_um()
-                    write_pool.submit(
-                        ome_tiff_writer,
-                        filename=str(image_path),
-                        pixel_size_um=bf_pixel_size,
-                        data=image,
-                    )
-                    image_count += 1
-                    update_progress(image_count, total_images)
-
-                try:
-                    write_position_metadata(
-                        metadata_txt_for_positions, image_path, hardware, modality
-                    )
-                except Exception as e:
-                    logger.warning(
-                        f"  Failed to write position text {metadata_txt_for_positions}: {e}"
-                    )
-
-            # Log total time for this tile/position
-            tile_elapsed_ms = (time.perf_counter() - tile_start) * 1000
-            logger.info(
-                "Tile %d/%d: %.1fs (%s)",
-                pos_idx + 1, len(positions), tile_elapsed_ms / 1000,
-                "AF" if needs_af else "no-AF",
+            # Record per-tile measurements
+            _record_tile_measurement(
+                ctx, pos_idx, filename, tile_start,
+                needs_af, af_type, drift, af_failed,
+                tile_worst_sat, current_stage_pos,
             )
 
-            # Sparse-sample-aware progress sanity check. If the running
-            # average tile time suddenly spikes to >= 3x the first tile's
-            # time, warn loudly once per acquisition so the user notices a
-            # bad AF strategy choice early (e.g. dense_texture applied to a
-            # sparse IF sample spends a long time searching blank areas).
-            # See TODO #5 / C6. Only fires after the first 3 tiles (window
-            # to establish a baseline) and only once per acquisition.
-            if len(tile_measurements) >= 3 and not progress_warning_fired:
-                completed_tile_times_ms = [m["tile_time_ms"] for m in tile_measurements[-10:]]
-                avg_recent_ms = sum(completed_tile_times_ms) / len(completed_tile_times_ms)
-                baseline_ms = tile_measurements[0]["tile_time_ms"]
-                if baseline_ms > 0 and avg_recent_ms > 3.0 * baseline_ms:
-                    logger.error(
-                        "PROGRESS SANITY CHECK: average tile time over last %d tiles is "
-                        "%.1fs, which is %.1fx the first tile's %.1fs. This usually means "
-                        "the autofocus strategy is a poor match for the sample (e.g. "
-                        "dense_texture applied to sparse IF). Current strategy: %s. "
-                        "Consider cancelling and picking a different strategy from the "
-                        "Advanced panel dropdown.",
-                        len(completed_tile_times_ms),
-                        avg_recent_ms / 1000.0,
-                        avg_recent_ms / baseline_ms,
-                        baseline_ms / 1000.0,
-                        af_strategy_name,
-                    )
-                    progress_warning_fired = True
+        # Phase 11: Post-acquisition finalization
+        _finalize_acquisition(ctx)
 
-            # Periodic progress summary (every 100 tiles)
-            if (pos_idx + 1) % 100 == 0 and pos_idx > 0:
-                completed = pos_idx + 1
-                elapsed_total_s = sum(
-                    m["tile_time_ms"] for m in tile_measurements
-                ) / 1000 + tile_elapsed_ms / 1000
-                avg_s = elapsed_total_s / completed
-                remaining = len(positions) - completed
-                eta_s = remaining * avg_s
-                eta_h = eta_s / 3600
-                throughput = completed / (elapsed_total_s / 3600) if elapsed_total_s > 0 else 0
-                logger.info(
-                    "[PROGRESS] %d/%d (%.1f%%) | avg %.1fs/tile | ETA %.1fh | %.0f tiles/hr",
-                    completed, len(positions),
-                    100 * completed / len(positions),
-                    avg_s, eta_h, throughput,
-                )
-
-            # Record per-tile measurement data
-            # Use current_stage_pos.z (captured after autofocus) for the actual Z
-            tile_measurement_entry = {
-                "position_index": pos_idx,
-                "filename": filename,
-                "z_um": round(current_stage_pos.z, 2),
-                "af_performed": needs_af,
-                "af_type": af_type_for_this_tile,
-                "af_strategy": af_strategy_name,
-                "af_drift_um": round(drift_for_this_tile, 2),
-                "af_failed": af_failed_for_this_tile,
-                "tile_time_ms": round(tile_elapsed_ms, 0),
-                "saturation_R_pct": round(tile_worst_sat.get("R", tile_worst_sat.get("Gray", 0)), 1),
-                "saturation_G_pct": round(tile_worst_sat.get("G", tile_worst_sat.get("Gray", 0)), 1),
-                "saturation_B_pct": round(tile_worst_sat.get("B", tile_worst_sat.get("Gray", 0)), 1),
-                "saturation_worst_pct": round(max(tile_worst_sat.values()), 1),
-            }
-            tile_measurements.append(tile_measurement_entry)
-
-            # Stream to NDJSON for live Java-side updates (best effort)
-            if tile_measurements_stream is not None:
-                try:
-                    tile_measurements_stream.write(
-                        json.dumps(tile_measurement_entry) + "\n"
-                    )
-                    tile_measurements_stream.flush()
-                except Exception as e:
-                    logger.debug(
-                        "Failed to stream NDJSON entry for tile %d: %s", pos_idx, e
-                    )
-
-        # Close NDJSON stream now that the loop has finished normally
-        if tile_measurements_stream is not None:
-            try:
-                tile_measurements_stream.close()
-            except Exception as e:
-                logger.debug("Error closing tile measurements NDJSON stream: %s", e)
-            tile_measurements_stream = None
-
-        # Drain any remaining background writes before finalizing
-        if write_pool.pending_count > 0:
-            t_drain = time.perf_counter()
-            n_remaining = write_pool.pending_count
-            logger.info(f"Draining {n_remaining} remaining background writes...")
-            failed = write_pool.drain()
-            t_drain = log_timing(logger, f"Final drain of {n_remaining} writes ({failed} failed)", t_drain)
-        if write_pool.total_failed > 0:
-            logger.warning(f"Total background write failures during acquisition: {write_pool.total_failed}")
-
-        # Save device properties
-        current_props = hardware.get_device_properties()
-        props_path = output_path / "MMproperties.txt"
-        with open(props_path, "w") as fid:
-            from pprint import pprint as dict_printer
-
-            dict_printer(current_props, stream=fid)
-
-        # Write TileConfiguration with stage coordinates including Z
-        if stage_positions_collected:
-            TileConfigUtils.write_tileconfig_stage(output_path, stage_positions_collected)
-
-        # Write consolidated tile manifest (intended vs actual positions)
-        try:
-            manifest_path = output_path / "tile_manifest.csv"
-            with open(manifest_path, "w") as mf:
-                mf.write("filename,intended_x_um,intended_y_um,actual_x_um,actual_y_um,actual_z_um,dx_um,dy_um\n")
-                # Build lookup from intended positions
-                intended = {fn: (pos.x, pos.y) for pos, fn in positions}
-                for entry in stage_positions_collected:
-                    fn, ax, ay, az = entry
-                    ix, iy = intended.get(fn, (float('nan'), float('nan')))
-                    dx = ax - ix if ix == ix else float('nan')
-                    dy = ay - iy if iy == iy else float('nan')
-                    mf.write(f"{fn},{ix:.3f},{iy:.3f},{ax:.3f},{ay:.3f},{az:.3f},{dx:.3f},{dy:.3f}\n")
-            logger.info("Wrote tile manifest: %s (%d tiles)", manifest_path, len(stage_positions_collected))
-        except Exception as e:
-            logger.warning("Failed to write tile manifest: %s", e)
-
-        # Write saturation report file (per-tile details for Java UI)
-        sat_monitor.write_saturation_report(output_path)
-
-        # Write per-tile measurements JSON for Java-side analysis
-        try:
-            measurements_path = output_path / "tile_measurements.json"
-            with open(measurements_path, "w") as f:
-                json.dump(tile_measurements, f, indent=2)
-            logger.info(
-                "Wrote per-tile measurements to %s (%d tiles)",
-                measurements_path, len(tile_measurements)
-            )
-        except Exception as e:
-            logger.warning("Failed to write tile measurements: %s", e)
-
-        # Write structured acquisition metadata (FAIR / 4DN-BINA-OME Phase 1)
-        write_acquisition_metadata(
-            output_path, params, tile_measurements, sat_monitor)
-
-        # Post-acquisition timing report
-        if tile_measurements:
-            all_times = [m["tile_time_ms"] for m in tile_measurements]
-            af_tiles = [m for m in tile_measurements if m["af_performed"]]
-            non_af_tiles = [m for m in tile_measurements if not m["af_performed"]]
-            total_wall_s = sum(all_times) / 1000
-            avg_all = sum(all_times) / len(all_times)
-            avg_af = sum(m["tile_time_ms"] for m in af_tiles) / len(af_tiles) if af_tiles else 0
-            avg_non_af = sum(m["tile_time_ms"] for m in non_af_tiles) / len(non_af_tiles) if non_af_tiles else 0
-            throughput = len(all_times) / (total_wall_s / 3600) if total_wall_s > 0 else 0
-            logger.info("=== ACQUISITION TIMING REPORT ===")
-            logger.info("  Total tiles: %d, wall time: %.1fh", len(all_times), total_wall_s / 3600)
-            logger.info("  Average: %.1fms/tile (%.1fs)", avg_all, avg_all / 1000)
-            logger.info("  AF tiles: %d (avg %.1fms), non-AF: %d (avg %.1fms)",
-                        len(af_tiles), avg_af, len(non_af_tiles), avg_non_af)
-            logger.info("  Throughput: %.0f tiles/hr", throughput)
-
-        # Get final Z position for tilt correction model
-        final_z = hardware.get_current_position().z
-        sat_summary = sat_monitor.get_summary_string()
-        set_state("COMPLETED", final_z=final_z, saturation_summary=sat_summary)
-        logger.info("=== ACQUISITION COMPLETED SUCCESSFULLY ===")
-        sat_monitor.log_summary()
-        logger.info(f"Final Z position: {final_z:.2f} um")
-        logger.info(f"Total images saved: {image_count}/{total_images}")
-        logger.info(f"Output directory: {output_path}")
-
-        # Report autofocus activity
-        if deferred_af_positions:
-            logger.info(
-                f"Autofocus deferred at {len(deferred_af_positions)} positions due to insufficient tissue: {sorted(deferred_af_positions)}"
-            )
-
+    except _AcquisitionCancelled:
+        logger.warning(f"Acquisition cancelled by client {client_addr}")
+        set_state("CANCELLED")
     except Exception as e:
         logger.error("=== ACQUISITION FAILED ===")
         logger.error(f"Error: {str(e)}", exc_info=True)
         set_state("FAILED", str(e))
     finally:
-        # Shut down background write pool (drains any remaining writes)
-        try:
-            write_pool.shutdown()
-        except NameError:
-            pass  # write_pool was never created (early failure)
-        except Exception as e:
-            logger.warning(f"Error shutting down write pool: {e}")
+        if ctx is not None:
+            _cleanup_acquisition(ctx)
 
-        # Return XY to starting position (preserve Z from last autofocus so the
-        # next annotation's Z-hint starts near the actual focal plane rather than
-        # resetting to the user's initial Z).
+
+##############################################################################
+# Extracted acquisition workflow functions
+# These were split from _acquisition_workflow() to improve readability and
+# testability. Each function receives an AcquisitionContext and operates on it.
+##############################################################################
+
+
+def _finalize_acquisition(ctx: AcquisitionContext) -> None:
+    """Post-acquisition: close streams, write metadata files, set COMPLETED state."""
+    logger = ctx.logger
+
+    # Close NDJSON stream now that the loop has finished normally
+    if ctx.tile_measurements_stream is not None:
         try:
-            logger.info("Returning to starting XY position (preserving Z)")
-            hardware.move_to_position(
-                Position(x=starting_position.x, y=starting_position.y)
-            )
-        except NameError:
-            logger.warning("Could not return to starting position (position was not captured)")
+            ctx.tile_measurements_stream.close()
         except Exception as e:
-            logger.warning(f"Failed to return to starting position: {e}")
+            logger.debug("Error closing tile measurements NDJSON stream: %s", e)
+        ctx.tile_measurements_stream = None
+
+    # Drain any remaining background writes before finalizing
+    if ctx.write_pool.pending_count > 0:
+        t_drain = time.perf_counter()
+        n_remaining = ctx.write_pool.pending_count
+        logger.info(f"Draining {n_remaining} remaining background writes...")
+        failed = ctx.write_pool.drain()
+        log_timing(logger, f"Final drain of {n_remaining} writes ({failed} failed)", t_drain)
+    if ctx.write_pool.total_failed > 0:
+        logger.warning(
+            f"Total background write failures during acquisition: {ctx.write_pool.total_failed}"
+        )
+
+    # Save device properties
+    current_props = ctx.hardware.get_device_properties()
+    props_path = ctx.output_path / "MMproperties.txt"
+    with open(props_path, "w") as fid:
+        from pprint import pprint as dict_printer
+        dict_printer(current_props, stream=fid)
+
+    # Write TileConfiguration with stage coordinates including Z
+    if ctx.stage_positions_collected:
+        TileConfigUtils.write_tileconfig_stage(ctx.output_path, ctx.stage_positions_collected)
+
+    # Write consolidated tile manifest (intended vs actual positions)
+    try:
+        manifest_path = ctx.output_path / "tile_manifest.csv"
+        with open(manifest_path, "w") as mf:
+            mf.write("filename,intended_x_um,intended_y_um,actual_x_um,actual_y_um,actual_z_um,dx_um,dy_um\n")
+            intended = {fn: (pos.x, pos.y) for pos, fn in ctx.positions}
+            for entry in ctx.stage_positions_collected:
+                fn, ax, ay, az = entry
+                ix, iy = intended.get(fn, (0.0, 0.0))
+                mf.write(f"{fn},{ix:.2f},{iy:.2f},{ax:.2f},{ay:.2f},{az:.2f},{ax - ix:.2f},{ay - iy:.2f}\n")
+        logger.info(f"Wrote tile manifest: {manifest_path}")
+    except Exception as e:
+        logger.warning(f"Failed to write tile manifest: {e}")
+
+    # Write saturation report
+    ctx.sat_monitor.write_saturation_report(ctx.output_path)
+
+    # Write per-tile measurements JSON (authoritative copy)
+    try:
+        measurements_path = ctx.output_path / "tile_measurements.json"
+        with open(measurements_path, "w") as f:
+            json.dump(ctx.tile_measurements, f, indent=2)
+        logger.info(f"Wrote tile measurements: {measurements_path}")
+    except Exception as e:
+        logger.warning(f"Failed to write tile measurements: {e}")
+
+    # Write FAIR/4DN-BINA-OME acquisition metadata
+    try:
+        write_acquisition_metadata(
+            output_path=ctx.output_path,
+            params=ctx.params,
+            tile_measurements=ctx.tile_measurements,
+            sat_monitor=ctx.sat_monitor,
+        )
+    except Exception as e:
+        logger.warning(f"Failed to write acquisition metadata: {e}")
+
+    # Post-acquisition timing report
+    all_times = [m["tile_time_ms"] for m in ctx.tile_measurements]
+    if all_times:
+        af_tiles = [m for m in ctx.tile_measurements if m["af_performed"]]
+        non_af_tiles = [m for m in ctx.tile_measurements if not m["af_performed"]]
+        total_wall_s = sum(all_times) / 1000
+        avg_all = sum(all_times) / len(all_times)
+        avg_af = sum(m["tile_time_ms"] for m in af_tiles) / len(af_tiles) if af_tiles else 0
+        avg_non_af = sum(m["tile_time_ms"] for m in non_af_tiles) / len(non_af_tiles) if non_af_tiles else 0
+        throughput = len(all_times) / (total_wall_s / 3600) if total_wall_s > 0 else 0
+        logger.info("=== ACQUISITION TIMING REPORT ===")
+        logger.info("  Total tiles: %d, wall time: %.1fh", len(all_times), total_wall_s / 3600)
+        logger.info("  Average: %.1fms/tile (%.1fs)", avg_all, avg_all / 1000)
+        logger.info(
+            "  AF tiles: %d (avg %.1fms), non-AF: %d (avg %.1fms)",
+            len(af_tiles), avg_af, len(non_af_tiles), avg_non_af,
+        )
+        logger.info("  Throughput: %.0f tiles/hr", throughput)
+
+    # Get final Z position for tilt correction model
+    final_z = ctx.hardware.get_current_position().z
+    sat_summary = ctx.sat_monitor.get_summary_string()
+    ctx.set_state("COMPLETED", final_z=final_z, saturation_summary=sat_summary)
+    logger.info("=== ACQUISITION COMPLETED SUCCESSFULLY ===")
+    ctx.sat_monitor.log_summary()
+    logger.info(f"Final Z position: {final_z:.2f} um")
+    logger.info(f"Total images saved: {ctx.image_count}/{ctx.total_images}")
+    logger.info(f"Output directory: {ctx.output_path}")
+
+    # Report autofocus activity
+    if ctx.deferred_af_positions:
+        logger.info(
+            f"Autofocus deferred at {len(ctx.deferred_af_positions)} positions "
+            f"due to insufficient tissue: {sorted(ctx.deferred_af_positions)}"
+        )
+
+
+def _cleanup_acquisition(ctx: AcquisitionContext) -> None:
+    """Guaranteed cleanup: shutdown write pool, return stage to start."""
+    # Shut down background write pool (drains any remaining writes)
+    if ctx.write_pool is not None:
+        try:
+            ctx.write_pool.shutdown()
+        except Exception as e:
+            ctx.logger.warning(f"Error shutting down write pool: {e}")
+
+    # Close NDJSON stream if still open (error path)
+    if ctx.tile_measurements_stream is not None:
+        try:
+            ctx.tile_measurements_stream.close()
+        except Exception:
+            pass
+        ctx.tile_measurements_stream = None
+
+    # Return XY to starting position (preserve Z from last autofocus so the
+    # next annotation's Z-hint starts near the actual focal plane rather than
+    # resetting to the user's initial Z).
+    if ctx.starting_position is not None:
+        try:
+            ctx.logger.info("Returning to starting XY position (preserving Z)")
+            ctx.hardware.move_to_position(
+                Position(x=ctx.starting_position.x, y=ctx.starting_position.y)
+            )
+        except Exception as e:
+            ctx.logger.warning(f"Failed to return to starting position: {e}")
+
+
+def _initialize_loop_infrastructure(ctx: AcquisitionContext) -> None:
+    """Create saturation monitor, write pool, NDJSON stream, and tracking vars."""
+    logger = ctx.logger
+
+    # Initialize saturation monitor for adaptive abort/rate-limiting
+    sat_threshold = None
+    try:
+        sat_threshold = ctx.config_manager.get(
+            "acquisition_settings", "saturation_abort_threshold_pct"
+        )
+        if sat_threshold is not None:
+            sat_threshold = float(sat_threshold)
+            logger.info(f"Saturation abort threshold from config: {sat_threshold}%")
+    except Exception:
+        pass
+    ctx.sat_monitor = SaturationMonitor(
+        angles=ctx.params.get("angles", []),
+        logger=logger,
+        biref_abort_threshold_pct=sat_threshold,
+    )
+
+    # Initialize background write pool for overlapped I/O.
+    ctx.write_pool = _TileWritePool(max_workers=2)
+
+    # Reset AF position tracking (may have been set during pre-acquisition AF)
+    if ctx.last_af_pos_idx < 0:
+        ctx.last_af_pos_idx = -1
+
+    # Open NDJSON stream for live Java-side tile updates.
+    tile_measurements_ndjson_path = ctx.output_path / "tile_measurements.ndjson"
+    try:
+        ctx.tile_measurements_stream = open(
+            tile_measurements_ndjson_path, "w", encoding="utf-8"
+        )
+        logger.info("Streaming per-tile measurements to %s", tile_measurements_ndjson_path)
+    except Exception as e:
+        logger.warning("Could not open tile measurements NDJSON stream: %s", e)
+        ctx.tile_measurements_stream = None
+
+
+def _prepare_acquisition(
+    message: str,
+    client_addr,
+    hardware: PycromanagerHardware,
+    config_manager,
+    logger,
+    update_progress: Callable,
+    set_state: Callable,
+    is_cancelled: Callable,
+    request_manual_focus: Optional[Callable] = None,
+    request_hardware_error_recovery: Optional[Callable] = None,
+    connection_config_path: Optional[str] = None,
+) -> AcquisitionContext:
+    """Parse message, load configs, setup BG/WB/Z-stack, create output dirs.
+
+    Returns a populated AcquisitionContext. Raises on any setup failure.
+    """
+    logger.info(f"=== ACQUISITION WORKFLOW STARTED for client {client_addr} ===")
+
+    # Stop live mode if running - JAI camera properties cannot be changed during live streaming
+    try:
+        hardware.camera.stop_if_streaming()
+        logger.info("Ensured camera not streaming before acquisition")
+    except Exception as e:
+        logger.warning(f"Could not stop live/sequence mode: {e}")
+
+    # Invalidate camera settings state so first apply_settings() writes
+    # all properties to hardware (defensive -- state may be stale from
+    # live mode or manual adjustments).
+    hardware.camera.invalidate_settings_state()
+
+    # Parse the acquisition parameters
+    params = parse_acquisition_message(message)
+
+    logger.info("Acquisition parameters:")
+    logger.info(f"  Client: {client_addr}")
+    logger.info(f"  Sample label: {params['sample_label']}")
+    logger.info(f"  Scan type: {params['scan_type']}")
+    logger.info(f"  Region: {params['region_name']}")
+    if params.get("channels"):
+        logger.info(f"  Channels: {params['channels']}")
+        logger.info(f"  Channel exposures: {params['channel_exposures']} ms")
+        if params.get("channel_intensities"):
+            logger.info(f"  Channel intensity overrides: {params['channel_intensities']}")
+    else:
+        logger.info(f"  Angles: {params['angles']} degrees")
+        logger.info(f"  Exposures: {params['exposures']} ms")
+
+    # Load the yaml file
+    if not params["yaml_file_path"]:
+        raise ValueError("YAML file path is required")
+    if not Path(params["yaml_file_path"]).exists():
+        raise FileNotFoundError(f"YAML file {params['yaml_file_path']} does not exist")
+
+    # Load configuration using the config manager
+    ppm_settings = config_manager.load_config_file(params["yaml_file_path"])
+    loci_rsc_file = str(
+        Path(params["yaml_file_path"]).parent / "resources" / "resources_LOCI.yml"
+    )
+    loci_resources = config_manager.load_config_file(loci_rsc_file)
+    ppm_settings.update(loci_resources)
+    hardware.settings = ppm_settings
+
+    # SAFETY WARNING: Check if ACQUIRE yaml differs from CONFIG
+    if connection_config_path:
+        acquire_yaml = Path(params["yaml_file_path"]).resolve()
+        connection_yaml = Path(connection_config_path).resolve()
+        if acquire_yaml != connection_yaml:
+            logger.warning("=" * 80)
+            logger.warning("CONFIG MISMATCH WARNING")
+            logger.warning(f"Connection CONFIG:  {connection_yaml}")
+            logger.warning(f"ACQUIRE --yaml:     {acquire_yaml}")
+            logger.warning("ACQUIRE yaml has overridden connection config for this acquisition")
+            logger.warning("This may cause unexpected behavior or hardware misconfiguration!")
+            logger.warning("=" * 80)
+
+    # Re-initialize microscope-specific methods with updated settings
+    if hasattr(hardware, "_initialize_microscope_methods"):
+        hardware._initialize_microscope_methods()
+        logger.info("Re-initialized hardware methods with updated settings")
+
+    # Apply acquisition profile mode setup
+    scan_type = params.get("scan_type", "")
+    if hasattr(hardware, "apply_mode_setup"):
+        hardware.apply_mode_setup(scan_type)
+
+    # Try to load and apply JAI white balance settings if available
+    wb_calibration_folder = params.get("white_balance_calibration_folder")
+    if wb_calibration_folder:
+        mod_cfg = get_modality_config(params.get("scan_type", ""))
+        wb_modality = mod_cfg.wb_settings_key or params.get("scan_type", "").split("_")[0].lower()
+        wb_objective = params.get("objective", "default")
+        wb_detector = params.get("detector", "default")
+        load_and_apply_white_balance_settings(
+            hardware=hardware,
+            calibration_folder=wb_calibration_folder,
+            detector=wb_detector,
+            modality=wb_modality,
+            objective=wb_objective,
+            logger=logger,
+        )
+
+    # Extract modality from scan type
+    modality = BackgroundCorrectionUtils.get_modality_from_scan_type(params["scan_type"])
+    mod_config = get_modality_config(params.get("scan_type", ""))
+    logger.info(f"Using modality: {modality}")
+
+    # Get processing settings from parameters
+    background_correction_enabled = params.get("background_correction_enabled", False)
+    background_correction_method = params.get("background_correction_method", "divide")
+    background_disabled_angles = params.get("background_disabled_angles", [])
+    white_balance_enabled = params.get("white_balance_enabled", True)
+    save_raw_tiles = params.get("save_raw", False)
+    logger.info(f"Save raw tiles: {save_raw_tiles}")
+
+    # Z-stack parameters
+    z_stack_enabled = params.get("z_stack", False)
+    z_offsets = [0.0]
+    projection_fn = None
+    if z_stack_enabled:
+        z_start_abs = params.get("z_start")
+        z_end_abs = params.get("z_end")
+        z_step = params.get("z_step")
+
+        if z_start_abs is not None and z_end_abs is not None and z_step is not None:
+            z_total_range = abs(z_end_abs - z_start_abs)
+        elif z_step is not None:
+            z_total_range = 0
+        else:
+            z_total_range = 0
+
+        if z_step is None or z_step <= 0:
+            logger.warning(
+                "Z-stack enabled but z_step is missing or invalid (step=%s). "
+                "Continuing in 2D mode.", z_step
+            )
+            z_stack_enabled = False
+        elif z_total_range <= 0:
+            logger.warning(
+                "Z-stack range is zero or negative (start=%s, end=%s). "
+                "Continuing in 2D mode.", z_start_abs, z_end_abs
+            )
+            z_stack_enabled = False
+        else:
+            from microscope_command_server.acquisition.projections import (
+                generate_z_offsets, get_projection,
+            )
+            z_offsets = generate_z_offsets(z_total_range, z_step)
+            projection_name = params.get("z_projection", "max")
+            try:
+                projection_fn = get_projection(projection_name)
+            except KeyError as e:
+                logger.error("Invalid z_projection: %s. Falling back to 'max'.", e)
+                projection_fn = get_projection("max")
+                projection_name = "max"
+            logger.info(
+                "Z-stack: %d planes over +/-%.1f um (step=%.1f), projection=%s",
+                len(z_offsets), z_total_range / 2, z_step, projection_name
+            )
+
+    # Log background correction configuration
+    if background_correction_enabled:
+        logger.info(f"Background correction enabled with method: {background_correction_method}")
+        if background_disabled_angles:
+            logger.info(f"Background correction will be disabled for angles: {background_disabled_angles}")
+    else:
+        logger.info("Background correction disabled")
+
+    if background_correction_enabled and white_balance_enabled:
+        logger.info(
+            "Both background correction and white balance enabled "
+            "(backgrounds must be captured with matching WB settings)"
+        )
+
+    # ======= BACKGROUND CORRECTION SETUP =======
+    background_images = {}
+    background_scaling_factors = {}
+    background_wb_coeffs = {}
+    channel_background_images: Dict[str, Any] = {}
+
+    if background_correction_enabled:
+        background_dir = None
+
+        # Priority 1: Message parameter
+        if "background_folder" in params:
+            background_dir = Path(params["background_folder"])
+            logger.info(f"Using background folder from message: {background_dir}")
+        else:
+            # Priority 2: YAML configuration from imageprocessing config file
+            config_path = Path(params["yaml_file_path"])
+            imageprocessing_path = config_path.parent / f"imageprocessing_{config_path.stem.replace('config_', '')}.yml"
+
+            bc_settings = None
+            if imageprocessing_path.exists():
+                try:
+                    imageprocessing_config = config_manager.load_config_file(str(imageprocessing_path))
+                    bc_config = imageprocessing_config.get("background_correction", {})
+                    bc_settings = bc_config.get(modality, {})
+                    logger.info(f"Loaded background correction settings from: {imageprocessing_path}")
+                except Exception as e:
+                    logger.warning(f"Failed to load imageprocessing config: {e}")
+            else:
+                logger.warning(f"Imageprocessing config not found at: {imageprocessing_path}")
+
+            if bc_settings and bc_settings.get("enabled") and bc_settings.get("base_folder"):
+                background_dir = Path(bc_settings["base_folder"]) / modality
+                logger.info(f"Using background folder from YAML config: {background_dir}")
+
+        # Load background images if directory is valid
+        if background_dir and background_dir.exists():
+            logger.info(f"Loading background images from: {background_dir}")
+            bg_load_angles = params["angles"] if params["angles"] else [0.0]
+            background_images, background_scaling_factors, background_wb_coeffs = (
+                BackgroundCorrectionUtils.load_background_images(
+                    background_dir, bg_load_angles, logger
+                )
+            )
+
+            if background_images:
+                logger.info(f"Loaded {len(background_images)} background images")
+            else:
+                logger.warning("No background images found - disabling background correction")
+                background_correction_enabled = False
+
+            # Opt-in per-channel background loading for multi-channel widefield IF
+            if params.get("channels"):
+                try:
+                    import skimage.io as _skio
+                    for cid in params["channels"]:
+                        candidates = [
+                            background_dir / cid / "background.tif",
+                            background_dir / f"{cid}.tif",
+                            background_dir / f"{cid}.tiff",
+                        ]
+                        for candidate in candidates:
+                            if candidate.exists():
+                                try:
+                                    channel_background_images[cid] = _skio.imread(str(candidate))
+                                    logger.info("Loaded channel background for %s from %s", cid, candidate)
+                                    break
+                                except Exception as load_e:
+                                    logger.warning("Failed to load channel background %s: %s", candidate, load_e)
+                    if channel_background_images:
+                        logger.info(
+                            "Loaded %d per-channel backgrounds for widefield IF "
+                            "(missing channels will acquire uncorrected)",
+                            len(channel_background_images),
+                        )
+                    else:
+                        logger.info(
+                            "No per-channel backgrounds found under %s -- "
+                            "channel acquisition will run without flat-field correction",
+                            background_dir,
+                        )
+                except Exception as e:
+                    logger.warning("Per-channel background load failed: %s", e)
+        else:
+            logger.warning(f"Background directory not found: {background_dir}")
+            logger.warning("Disabling background correction")
+            background_correction_enabled = False
+
+    # ======= WHITE BALANCE SETUP =======
+    angles_wb = {}
+
+    wb_mode = params.get("wb_mode")
+    if wb_mode is None:
+        wb_enabled = params.get("white_balance_enabled", True)
+        wb_per_angle = params.get("white_balance_per_angle", False)
+        if not wb_enabled:
+            wb_mode = "off"
+        elif wb_per_angle:
+            wb_mode = "per_angle"
+        else:
+            raise ValueError(
+                "No --wb-mode specified in acquisition request. "
+                "White balance mode must be explicitly chosen by the user: "
+                "camera_awb, simple, or per_angle. "
+                "Update the client to always send --wb-mode."
+            )
+    logger.info(f"White balance mode: {wb_mode}")
+
+    _wb_mod_check = get_modality_config(params.get("scan_type", ""))
+    if wb_mode != "off" and _wb_mod_check.wb_settings_key is None:
+        logger.info(
+            "White balance mode '%s' requested but modality has no WB settings key "
+            "(monochrome or single-channel modality). Forcing wb_mode='off'.",
+            wb_mode,
+        )
+        wb_mode = "off"
+
+    white_balance_enabled = wb_mode != "off"
+    white_balance_per_angle = wb_mode == "per_angle"
+
+    # Auto-detect JAI camera
+    is_jai_camera = False
+    try:
+        camera_name = hardware.get_camera_name()
+        is_jai_camera = hardware.camera.supports_per_channel_exposure()
+        if is_jai_camera:
+            logger.info(f"Per-channel camera detected: {camera_name}")
+    except Exception as e:
+        logger.debug(f"Could not detect camera type: {e}")
+
+    # Load JAI hardware white balance calibration
+    jai_calibration = None
+    simple_wb_data = None
+    simple_wb_analog_red = 1.0
+    simple_wb_analog_blue = 1.0
+    camera_awb_gains = {}
+    _wb_mod_config = get_modality_config(params.get("scan_type", ""))
+    base_modality = _wb_mod_config.wb_settings_key or params["scan_type"].split("_")[0].lower()
+
+    if wb_mode == "camera_awb":
+        logger.info(
+            "Camera AWB mode: ensure AWB was configured in MicroManager's "
+            "Device Property Browser before starting acquisition."
+        )
+        jai_calibration = load_jai_calibration_from_imageprocessing(
+            config_path=Path(params["yaml_file_path"]),
+            per_angle=True,
+            modality=base_modality,
+            objective=params.get("objective"),
+            detector=params.get("detector"),
+            logger=logger,
+        )
+        if is_jai_camera:
+            try:
+                hardware.camera.disable_individual_exposure()
+                hardware.camera.disable_individual_gain()
+                logger.info("Camera AWB mode: disabled per-channel exposure/gain (preserving AWB analog gains)")
+            except Exception as e:
+                logger.warning(f"Could not configure camera AWB mode: {e}")
+        if jai_calibration:
+            logger.info("Camera AWB: loaded unified gains from calibration for brightness control")
+        else:
+            logger.info("Camera AWB: no calibration data found, using client exposures only")
+        if jai_calibration and "angles" in jai_calibration:
+            for angle_name, angle_data in jai_calibration["angles"].items():
+                gains = angle_data.get("gains", {})
+                camera_awb_gains[angle_name] = gains.get("unified_gain", 1.0)
+            logger.info(f"Camera AWB unified gains: {camera_awb_gains}")
+        jai_calibration = None  # Don't use per-channel calibration in acquisition loop
+
+    elif wb_mode == "simple":
+        if is_jai_camera:
+            try:
+                hardware.camera.clear_awb_corrections()
+                hardware.camera.disable_individual_exposure()
+                hardware.camera.disable_individual_gain()
+                logger.info("Simple WB: cleared AWB + disabled individual mode")
+            except Exception as e:
+                logger.warning(f"Could not clear AWB corrections before simple WB: {e}")
+        jai_calibration = load_jai_calibration_from_imageprocessing(
+            config_path=Path(params["yaml_file_path"]),
+            per_angle=True,
+            modality=base_modality,
+            objective=params.get("objective"),
+            detector=params.get("detector"),
+            logger=logger,
+        )
+        if jai_calibration:
+            logger.info("Simple WB: loaded per-angle calibration as base for ratio-scaling")
+            uncrossed_gains = (
+                jai_calibration.get("angles", {})
+                .get("uncrossed", {})
+                .get("gains", {})
+            )
+            simple_wb_analog_red = uncrossed_gains.get("analog_red", 1.0)
+            simple_wb_analog_blue = uncrossed_gains.get("analog_blue", 1.0)
+            logger.info(
+                f"Simple WB: analog gains from uncrossed calibration: "
+                f"R={simple_wb_analog_red:.3f}, B={simple_wb_analog_blue:.3f}"
+            )
+            simple_wb_data = load_simple_wb_from_imageprocessing(
+                config_path=Path(params["yaml_file_path"]),
+                modality=base_modality,
+                objective=params.get("objective"),
+                detector=params.get("detector"),
+                logger=logger,
+            )
+            if simple_wb_data:
+                logger.info(f"Simple WB: loaded pre-computed scales for {len(simple_wb_data.get('angles', {}))} angles")
+            else:
+                logger.info("Simple WB: no pre-computed data, will use uncrossed ratios with exposure_scale")
+        else:
+            logger.warning(
+                "Simple WB mode requested but no Mode 3 calibration found! "
+                "Run 'PPM White Balance Calibration' first."
+            )
+
+    elif wb_mode == "per_angle":
+        if is_jai_camera:
+            try:
+                hardware.camera.clear_awb_corrections()
+                hardware.camera.disable_individual_exposure()
+                hardware.camera.disable_individual_gain()
+                logger.info("Per-angle WB: cleared AWB + disabled individual mode")
+            except Exception as e:
+                logger.warning(f"Could not clear AWB corrections before per-angle WB: {e}")
+        jai_calibration = load_jai_calibration_from_imageprocessing(
+            config_path=Path(params["yaml_file_path"]),
+            per_angle=True,
+            modality=base_modality,
+            objective=params.get("objective"),
+            detector=params.get("detector"),
+            logger=logger,
+        )
+        if jai_calibration:
+            logger.info(
+                f"Per-angle WB: loaded calibration "
+                f"for {base_modality}/{params.get('objective')}/{params.get('detector')}"
+            )
+        else:
+            if is_jai_camera:
+                logger.warning(
+                    "JAI camera detected but no calibration found! "
+                    "Run 'White Balance Calibration' for proper color balance."
+                )
+            logger.info("No JAI calibration found - using software white balance")
+    else:
+        logger.info("White balance disabled (wb_mode=%s)", wb_mode)
+
+    if white_balance_enabled:
+        angles_wb = get_angles_wb_from_settings(ppm_settings, modality=modality)
+        all_neutral = all(v == [1.0, 1.0, 1.0] for v in angles_wb.values())
+        if all_neutral and background_wb_coeffs:
+            logger.info(
+                "No WB settings in config - using background-derived "
+                "coefficients for %d angles", len(background_wb_coeffs)
+            )
+            angles_wb = {angle: list(coeffs) for angle, coeffs in background_wb_coeffs.items()}
+
+        if white_balance_per_angle:
+            logger.info(f"Using per-angle white balance for {len(angles_wb)} angles")
+        else:
+            uncrossed_profile = angles_wb.get(90.0, [1.0, 1.0, 1.0])
+            logger.info(f"Using single white balance profile for all angles: {uncrossed_profile}")
+            for angle in params.get("angles", []):
+                angles_wb[angle] = uncrossed_profile
+
+    # Save starting position
+    starting_position = hardware.get_current_position()
+
+    # Set up output paths
+    project_path = Path(params["projects_folder_path"]) / params["sample_label"]
+    output_path = project_path / params["scan_type"] / params["region_name"]
+    if not output_path.exists():
+        output_path.mkdir(parents=True, exist_ok=True)
+        logger.info(f"Created output directory: {output_path}")
+
+    # Read tile positions
+    tile_config_path = output_path / "TileConfiguration.txt"
+    positions = TileConfigUtils.read_tile_config(tile_config_path, hardware.core)
+
+    if not positions:
+        raise RuntimeError(f"No tile positions found in {tile_config_path}")
+
+    xy_positions = [(pos.x, pos.y) for pos, filename in positions]
+
+    # Create angle subdirectories
+    if params["angles"]:
+        for angle in params["angles"]:
+            angle_dir = output_path / str(angle)
+            angle_dir.mkdir(exist_ok=True)
+            shutil.copy2(tile_config_path, angle_dir / "TileConfiguration.txt")
+
+    # Create channel subdirectories
+    if params.get("channels"):
+        for cid in params["channels"]:
+            channel_dir = output_path / str(cid)
+            channel_dir.mkdir(exist_ok=True)
+            shutil.copy2(tile_config_path, channel_dir / "TileConfiguration.txt")
+
+    # Calculate total images and update progress
+    n_z_planes = len(z_offsets)
+    n_channels = len(params.get("channels", []) or [])
+    if n_channels > 0:
+        n_steps_per_tile = n_channels
+    elif params.get("angles"):
+        n_steps_per_tile = len(params["angles"])
+    else:
+        n_steps_per_tile = 1
+    n_angles = len(params["angles"]) if params["angles"] else 1
+    total_images = len(positions) * n_z_planes * n_steps_per_tile
+
+    update_progress(0, total_images)
+    logger.info(
+        f"Starting acquisition of {total_images} total images "
+        f"({len(positions)} positions x {n_z_planes} Z-planes x {n_angles} angles)"
+    )
+
+    metadata_txt_for_positions = output_path / "image_positions_metadata.txt"
+
+    # Build and return context
+    return AcquisitionContext(
+        params=params,
+        hardware=hardware,
+        config_manager=config_manager,
+        logger=logger,
+        client_addr=client_addr,
+        output_path=output_path,
+        modality=modality,
+        mod_config=mod_config,
+        ppm_settings=ppm_settings,
+        positions=positions,
+        xy_positions=xy_positions,
+        total_images=total_images,
+        background_correction_enabled=background_correction_enabled,
+        background_correction_method=background_correction_method,
+        background_disabled_angles=background_disabled_angles,
+        background_images=background_images,
+        background_scaling_factors=background_scaling_factors,
+        channel_background_images=channel_background_images,
+        white_balance_enabled=white_balance_enabled,
+        white_balance_per_angle=white_balance_per_angle,
+        wb_mode=wb_mode,
+        angles_wb=angles_wb,
+        jai_calibration=jai_calibration,
+        simple_wb_data=simple_wb_data,
+        camera_awb_gains=camera_awb_gains,
+        is_jai_camera=is_jai_camera,
+        simple_wb_analog_red=simple_wb_analog_red,
+        simple_wb_analog_blue=simple_wb_analog_blue,
+        z_stack_enabled=z_stack_enabled,
+        z_offsets=z_offsets,
+        projection_fn=projection_fn,
+        save_raw_tiles=save_raw_tiles,
+        hint_z=params.get("hint_z"),
+        metadata_txt_for_positions=metadata_txt_for_positions,
+        update_progress=update_progress,
+        set_state=set_state,
+        is_cancelled=is_cancelled,
+        request_manual_focus=request_manual_focus,
+        request_hardware_error_recovery=request_hardware_error_recovery,
+        starting_position=starting_position,
+    )
+
+
+def _configure_autofocus(ctx: AcquisitionContext) -> None:
+    """Load AF settings from YAML, resolve strategy, compute AF positions.
+
+    Mutates ctx autofocus fields in-place.
+    """
+    logger = ctx.logger
+    params = ctx.params
+
+    fov = ctx.hardware.get_fov()
+
+    # Load autofocus settings from separate autofocus_{microscope}.yml file
+    af_n_tiles = 5
+    af_search_range = 50
+    af_n_steps = 11
+    af_interp_strength = 100
+    af_interp_kind = "quadratic"
+    af_score_metric_name = "normalized_variance"
+    af_texture_threshold = 0.005
+    af_tissue_area_threshold = 0.2
+    af_rgb_brightness_threshold = 240.0
+    af_sweep_range_um = 10.0
+    af_sweep_n_steps = 5
+    af_edge_retries = 2
+    af_gap_index_multiplier = 3
+    af_gap_spatial_multiplier = 2.0
+
+    current_objective = params.get("objective", "")
+    af_settings_found = False
+
+    # Derive autofocus config path from main config path
+    config_path = Path(params["yaml_file_path"])
+    config_name = config_path.stem
+    microscope_name = config_name.replace("config_", "")
+    autofocus_file = config_path.parent / f"autofocus_{microscope_name}.yml"
+
+    if not autofocus_file.exists():
+        raise RuntimeError(
+            f"Autofocus configuration file not found: {autofocus_file}\n"
+            f"Cannot proceed with acquisition - autofocus settings are required for objective '{current_objective}'.\n"
+            f"Please create the autofocus configuration file with settings for your objectives."
+        )
+
+    with open(autofocus_file, "r") as f:
+        autofocus_config = yaml.safe_load(f)
+
+    # Find settings for current objective
+    af_settings_list = autofocus_config.get("autofocus_settings", [])
+    af_setting = None
+    for _af_setting in af_settings_list:
+        if _af_setting.get("objective") == current_objective:
+            af_setting = _af_setting
+            af_n_tiles = af_setting.get("n_tiles", af_n_tiles)
+            af_search_range = af_setting.get("search_range_um", af_search_range)
+            af_n_steps = af_setting.get("n_steps", af_n_steps)
+            af_interp_strength = af_setting.get("interp_strength", af_interp_strength)
+            af_interp_kind = af_setting.get("interp_kind", af_interp_kind)
+            af_score_metric_name = af_setting.get("score_metric", af_score_metric_name)
+            af_texture_threshold = af_setting.get("texture_threshold", af_texture_threshold)
+            af_tissue_area_threshold = af_setting.get("tissue_area_threshold", af_tissue_area_threshold)
+            af_rgb_brightness_threshold = af_setting.get("rgb_brightness_threshold", af_rgb_brightness_threshold)
+            af_sweep_range_um = af_setting.get("sweep_range_um", af_sweep_range_um)
+            af_sweep_n_steps = af_setting.get("sweep_n_steps", af_sweep_n_steps)
+            af_edge_retries = af_setting.get("edge_retries", af_edge_retries)
+            af_gap_index_multiplier = af_setting.get("gap_index_multiplier", af_gap_index_multiplier)
+            af_gap_spatial_multiplier = af_setting.get("gap_spatial_multiplier", af_gap_spatial_multiplier)
+            # Legacy support: old adaptive_initial_step_um -> sweep_range_um
+            if "adaptive_initial_step_um" in af_setting and "sweep_range_um" not in af_setting:
+                af_sweep_range_um = af_setting["adaptive_initial_step_um"] * 2
+            logger.info(
+                f"Loaded autofocus settings for {current_objective}: "
+                f"n_steps={af_n_steps}, search_range={af_search_range}um, n_tiles={af_n_tiles}, "
+                f"interp_strength={af_interp_strength}, interp_kind={af_interp_kind}, "
+                f"score_metric={af_score_metric_name}, "
+                f"texture_threshold={af_texture_threshold}, tissue_area_threshold={af_tissue_area_threshold}, "
+                f"rgb_brightness_threshold={af_rgb_brightness_threshold}, "
+                f"sweep: range={af_sweep_range_um}um, n_steps={af_sweep_n_steps}, "
+                f"edge_retries={af_edge_retries}, "
+                f"gap_index_mult={af_gap_index_multiplier}, gap_spatial_mult={af_gap_spatial_multiplier}"
+            )
+            af_settings_found = True
+            break
+
+    if not af_settings_found:
+        available_objectives = [s.get("objective", "unknown") for s in af_settings_list]
+        raise RuntimeError(
+            f"No autofocus settings found for objective '{current_objective}' in {autofocus_file}\n"
+            f"Available objectives in config: {available_objectives}\n"
+            f"Cannot proceed with acquisition - please add autofocus settings for '{current_objective}' "
+            f"or verify the objective name matches the configuration."
+        )
+
+    # Check that autofocus settings have been explicitly calibrated.
+    af_calibrated = af_setting.get("calibrated", True) if af_setting else True
+    if af_calibrated is False:
+        raise RuntimeError(
+            f"Autofocus settings for objective '{current_objective}' have not been calibrated!\n"
+            f"The autofocus configuration file was generated with default placeholder values "
+            f"that may not be safe for your hardware.\n"
+            f"\n"
+            f"To fix this:\n"
+            f"  1. Open {autofocus_file}\n"
+            f"  2. Adjust search_range_um and n_steps for your objective\n"
+            f"  3. Set 'calibrated: true' for this objective\n"
+            f"  4. Or run the Autofocus Benchmark utility from the QP Scope menu\n"
+            f"\n"
+            f"CRITICAL: An incorrect search_range_um can crash the objective into the sample!"
+        )
+
+    # -------- Schema v2 strategy resolution --------
+    from microscope_control.autofocus.strategies import (
+        build_strategy,
+        StrategyFailureMode,
+    )
+
+    af_strategy = None
+    af_strategy_name = None
+    af_focus_channel = params.get("focus_channel")
+
+    try:
+        schema_version = (
+            autofocus_config.get("schema_version", 1) if isinstance(autofocus_config, dict) else 1
+        )
+        strategies_library = autofocus_config.get("strategies", {}) if isinstance(autofocus_config, dict) else {}
+        modality_bindings = autofocus_config.get("modalities", {}) if isinstance(autofocus_config, dict) else {}
+
+        if schema_version >= 2 and strategies_library:
+            current_modality = ctx.modality or ""
+            current_modality_lower = current_modality.lower()
+            best_match = None
+            best_len = 0
+            for mod_key in modality_bindings.keys():
+                mod_key_str = str(mod_key).lower()
+                if current_modality_lower.startswith(mod_key_str) and len(mod_key_str) > best_len:
+                    best_match = mod_key
+                    best_len = len(mod_key_str)
+
+            if best_match is not None:
+                binding = modality_bindings[best_match]
+                strategy_name = binding.get("strategy", "dense_texture")
+                library_entry = strategies_library.get(strategy_name, {})
+                resolved_params = dict(library_entry)
+                overrides_block = binding.get("overrides", {}) or {}
+                if "validity_params" in overrides_block and isinstance(
+                    overrides_block["validity_params"], dict
+                ):
+                    merged_vp = dict(library_entry.get("validity_params", {}) or {})
+                    merged_vp.update(overrides_block["validity_params"])
+                    resolved_params = dict(library_entry)
+                    resolved_params["validity_params"] = merged_vp
+                if "on_failure" in overrides_block:
+                    resolved_params["on_failure"] = overrides_block["on_failure"]
+
+                af_strategy_name = strategy_name
+                af_strategy = build_strategy(strategy_name, resolved_params)
+                logger.info(
+                    "Autofocus strategy resolved: modality='%s' -> binding '%s' -> strategy '%s' (on_failure=%s)",
+                    current_modality, best_match, strategy_name, af_strategy.on_failure.value,
+                )
+            else:
+                logger.info(
+                    "No v2 modality binding found for '%s'; using v1 dense_texture compatibility",
+                    current_modality,
+                )
+
+        # Per-acquisition override: --af-strategy CLI flag wins over YAML.
+        cli_strategy_override = params.get("af_strategy")
+        if cli_strategy_override:
+            library_entry = strategies_library.get(cli_strategy_override, {}) if strategies_library else {}
+            af_strategy = build_strategy(cli_strategy_override, library_entry)
+            af_strategy_name = cli_strategy_override
+            logger.info(
+                "Autofocus strategy overridden by --af-strategy CLI flag: '%s' (on_failure=%s)",
+                cli_strategy_override, af_strategy.on_failure.value,
+            )
+
+        # Fallback: build a DenseTextureStrategy from flat v1 fields
+        if af_strategy is None:
+            af_strategy = build_strategy(
+                "dense_texture",
+                {
+                    "validity_params": {
+                        "texture_threshold": af_texture_threshold,
+                        "tissue_area_threshold": af_tissue_area_threshold,
+                        "rgb_brightness_threshold": af_rgb_brightness_threshold,
+                    },
+                },
+            )
+            af_strategy_name = "dense_texture (v1 compat)"
+            logger.info("Autofocus strategy: v1 compatibility dense_texture built from flat fields")
+    except Exception as strat_err:
+        logger.warning(
+            "Autofocus strategy resolution failed (%s); falling back to dense_texture default",
+            strat_err, exc_info=True,
+        )
+        af_strategy = build_strategy("dense_texture", {})
+        af_strategy_name = "dense_texture (fallback)"
+
+    if af_focus_channel:
+        logger.info("Autofocus focus channel: %s", af_focus_channel)
+
+    if af_n_tiles < 1:
+        logger.warning(
+            f"af_n_tiles={af_n_tiles} is below minimum (1), clamping to 1. "
+            f"At least 1 AF position is required for overlapped I/O drain."
+        )
+        af_n_tiles = max(1, af_n_tiles)
+
+    # Map score metric name to function
+    score_metric_map = {
+        "laplacian_variance": AutofocusUtils.autofocus_profile_laplacian_variance,
+        "sobel": AutofocusUtils.autofocus_profile_sobel,
+        "brenner_gradient": AutofocusUtils.autofocus_profile_brenner_gradient,
+        "robust_sharpness": AutofocusUtils.autofocus_profile_robust_sharpness_metric,
+        "hybrid_sharpness": AutofocusUtils.autofocus_profile_hybrid_sharpness_metric,
+    }
+    af_score_metric = score_metric_map.get(
+        af_score_metric_name, AutofocusUtils.autofocus_profile_laplacian_variance
+    )
+
+    timing_window_size = max(10, 3 * af_n_tiles)
+    logger.info(
+        f"Timing window size for progress estimation: {timing_window_size} tiles "
+        f"(3 x {af_n_tiles} AF positions, min 10)"
+    )
+
+    preferred_af_tile = params.get("preferred_af_tile")
+    af_positions, af_min_distance = AutofocusUtils.get_autofocus_positions(
+        fov, ctx.xy_positions, n_tiles=af_n_tiles,
+        preferred_first_af=preferred_af_tile,
+    )
+
+    small_grid_override = (len(ctx.xy_positions) <= 9)
+    if small_grid_override:
+        logger.info(
+            f"Small grid override: {len(ctx.xy_positions)} tiles <= 9, "
+            f"autofocus at ALL positions: {af_positions} (min_distance={af_min_distance})"
+        )
+    else:
+        pref_msg = f" (preferred tile {preferred_af_tile} from WSI)" if preferred_af_tile is not None else ""
+        logger.info(
+            f"Autofocus positions ({len(af_positions)}/{len(ctx.xy_positions)} tiles): "
+            f"{af_positions} (min_distance={af_min_distance:.1f}){pref_msg}"
+        )
+
+    # Write timing metadata
+    timing_metadata_path = ctx.output_path / "acquisition_metadata.txt"
+    with open(timing_metadata_path, "w") as f:
+        f.write(f"timing_window_size={timing_window_size}\n")
+        f.write(f"af_n_tiles={len(af_positions)}\n")
+        f.write(f"total_tiles={ctx.total_images}\n")
+        f.write(f"af_n_steps={af_n_steps}\n")
+        f.write(f"objective={current_objective}\n")
+    logger.debug(
+        f"Wrote timing metadata to {timing_metadata_path}: "
+        f"window={timing_window_size}, af_positions={len(af_positions)}, tiles={ctx.total_images}"
+    )
+
+    # Populate ctx with all autofocus fields
+    ctx.af_n_tiles = af_n_tiles
+    ctx.af_n_steps = af_n_steps
+    ctx.af_search_range = af_search_range
+    ctx.af_interp_strength = af_interp_strength
+    ctx.af_interp_kind = af_interp_kind
+    ctx.af_score_metric = af_score_metric
+    ctx.af_score_metric_name = af_score_metric_name
+    ctx.af_sweep_range_um = af_sweep_range_um
+    ctx.af_sweep_n_steps = af_sweep_n_steps
+    ctx.af_edge_retries = af_edge_retries
+    ctx.af_gap_index_multiplier = af_gap_index_multiplier
+    ctx.af_gap_spatial_multiplier = af_gap_spatial_multiplier
+    ctx.af_strategy = af_strategy
+    ctx.af_strategy_name = af_strategy_name
+    ctx.af_focus_channel = af_focus_channel
+    ctx.af_positions = af_positions
+    ctx.af_min_distance = af_min_distance
+    ctx.dynamic_af_positions = set(af_positions)
+    ctx.deferred_af_positions = set()
+    ctx.first_tissue_autofocus_done = False
+    ctx.completed_af_positions = []
+
+
+def _run_pre_acquisition_autofocus(ctx: AcquisitionContext) -> None:
+    """Run initial autofocus at first tissue position before main loop.
+
+    Mutates ctx: exposure_90, first_tissue_autofocus_done, completed_af_positions,
+    dynamic_af_positions, last_af_pos_idx.
+    """
+    from microscope_control.autofocus.strategies import StrategyFailureMode
+
+    logger = ctx.logger
+    params = ctx.params
+    hardware = ctx.hardware
+
+    if len(ctx.positions) == 0 or len(ctx.af_positions) == 0:
+        return
+
+    # Apply Z-focus hint if provided (predicted from tilt correction model)
+    if ctx.hint_z is not None:
+        current_z = hardware.get_current_position().z
+        logger.info(f"Z-focus hint received: {ctx.hint_z:.2f} um (current Z: {current_z:.2f} um)")
+        logger.info("Moving to predicted Z position before acquisition...")
+        hardware.move_to_position(Position(z=ctx.hint_z))
+        logger.info(f"Moved to predicted Z: {ctx.hint_z:.2f} um")
+
+    first_af_idx = ctx.af_positions[0]
+    first_af_pos, first_af_filename = ctx.positions[first_af_idx]
+    logger.info(f"=== PRE-ACQUISITION AUTOFOCUS at position {first_af_idx} ===")
+    logger.info(f"Using diagonal autofocus position: X={first_af_pos.x}, Y={first_af_pos.y}")
+
+    # For rotation modalities, set rotation to autofocus angle
+    if ctx.mod_config.autofocus_angle is not None and hasattr(hardware, "set_psg_ticks"):
+        af_angle = ctx.mod_config.autofocus_angle
+        hardware.set_psg_ticks(af_angle)
+        logger.info("Set rotation to %.0f deg for initial autofocus", af_angle)
+
+        # Get autofocus-angle exposure
+        if af_angle not in params["angles"]:
+            raise ValueError(
+                f"No {af_angle}-degree angle in WB calibration parameters. "
+                "Cannot determine autofocus exposure. Re-run WB calibration."
+            )
+        angle_idx = params["angles"].index(af_angle)
+        if angle_idx >= len(params["exposures"]):
+            raise ValueError(
+                f"{af_angle}-degree angle found but no corresponding exposure value. "
+                "Cannot determine autofocus exposure. Re-run WB calibration."
+            )
+        ctx.exposure_90 = params["exposures"][angle_idx]
+
+        # Disable per-channel mode before AF, apply analog gains
+        if ctx.is_jai_camera:
+            try:
+                hardware.camera.disable_individual_exposure()
+                hardware.camera.disable_individual_gain()
+                if ctx.jai_calibration is not None:
+                    uncrossed_gains = (
+                        ctx.jai_calibration.get("angles", {})
+                        .get("uncrossed", {})
+                        .get("gains", {})
+                    )
+                    af_unified_gain = uncrossed_gains.get("unified_gain", 1.0)
+                    hardware.camera.set_unified_gain(af_unified_gain)
+                    af_analog_red = uncrossed_gains.get("analog_red", 1.0)
+                    af_analog_blue = uncrossed_gains.get("analog_blue", 1.0)
+                    hardware.camera.set_rb_analog_gains(
+                        analog_red=af_analog_red, analog_blue=af_analog_blue
+                    )
+                    logger.info(
+                        "Applied uncrossed calibration for AF: "
+                        f"gain={af_unified_gain:.2f}x, "
+                        f"R={af_analog_red:.3f}, B={af_analog_blue:.3f}"
+                    )
+            except Exception as e:
+                logger.warning(f"Could not configure camera for AF: {e}")
+
+        hardware.set_exposure(ctx.exposure_90)
+        logger.info(f"Set exposure to {ctx.exposure_90}ms for initial autofocus")
+
+    # Calculate direction toward center for tissue search loop
+    start_pos = np.array([first_af_pos.x, first_af_pos.y])
+    center_pos = np.mean(ctx.xy_positions, axis=0)
+    direction = center_pos - start_pos
+    if np.linalg.norm(direction) > 0:
+        direction = direction / np.linalg.norm(direction)
+
+    # Tissue detection loop: try current position, then move 1 FOV toward center
+    max_tissue_search_attempts = 3
+    tissue_found = False
+    search_pos = Position(first_af_pos.x, first_af_pos.y, hardware.get_current_position().z)
+    fov = hardware.get_fov()
+    fov_diagonal = np.sqrt(fov[0]**2 + fov[1]**2)
+
+    for attempt in range(max_tissue_search_attempts):
+        hardware.move_to_position(search_pos)
+        logger.info(
+            f"Tissue search attempt {attempt + 1}/{max_tissue_search_attempts}: "
+            f"X={search_pos.x:.1f}, Y={search_pos.y:.1f}"
+        )
+
+        test_img, _ = hardware.snap_image()
+
+        # Ensure consistent format for tissue detection
+        if test_img.dtype in [np.float32, np.float64]:
+            if test_img.max() <= 1.0 and test_img.min() >= 0.0:
+                test_img = (test_img * 255).astype(np.uint8)
+            else:
+                test_img = np.clip(test_img, 0, 255).astype(np.uint8)
+
+        # Brightness safety check (strategy-aware)
+        af_brightness_attempts = 0
+        while af_brightness_attempts < 4:
+            bright_ok, bright_stats = ctx.af_strategy.brightness_acceptable(test_img)
+            if bright_ok:
+                break
+            ctx.exposure_90 *= 2.0
+            hardware.set_exposure(ctx.exposure_90)
+            logger.warning(
+                f"AF test image brightness_check failed ({bright_stats}), "
+                f"doubling exposure to {ctx.exposure_90:.2f}ms"
+            )
+            test_img, _ = hardware.snap_image()
+            if test_img.dtype in [np.float32, np.float64]:
+                if test_img.max() <= 1.0 and test_img.min() >= 0.0:
+                    test_img = (test_img * 255).astype(np.uint8)
+                else:
+                    test_img = np.clip(test_img, 0, 255).astype(np.uint8)
+            af_brightness_attempts += 1
+        if af_brightness_attempts > 0:
+            logger.info(
+                f"AF exposure adjusted to {ctx.exposure_90:.2f}ms "
+                f"(strategy={ctx.af_strategy_name})"
+            )
+
+        # Strategy-aware validity check
+        signal_valid, strategy_stats = ctx.af_strategy.is_valid(test_img, logger_=logger)
+
+        if signal_valid:
+            logger.info(f"Signal valid at attempt {attempt + 1} (strategy={ctx.af_strategy_name})")
+            tissue_found = True
+            break
+
+        failure_mode = ctx.af_strategy.on_failure
+        logger.warning(
+            f"Signal check failed at attempt {attempt + 1} "
+            f"(strategy={ctx.af_strategy_name}, on_failure={failure_mode.value}, "
+            f"stats={strategy_stats})"
+        )
+        if failure_mode is StrategyFailureMode.PROCEED:
+            logger.info("Strategy failure_mode=PROCEED: breaking search loop and running AF anyway")
+            tissue_found = True
+            break
+        if failure_mode is StrategyFailureMode.MANUAL:
+            logger.info("Strategy failure_mode=MANUAL: breaking search loop to pop manual dialog")
+            break
+
+        # DEFER: move toward center for next attempt
+        if attempt < max_tissue_search_attempts - 1:
+            new_xy = np.array([search_pos.x, search_pos.y]) + direction * fov_diagonal
+            search_pos = Position(new_xy[0], new_xy[1], search_pos.z)
+            logger.info("Moving 1 FOV diagonal toward center for next attempt")
+
+    # Run autofocus (with manual fallback if no tissue found)
+    try:
+        if tissue_found:
+            logger.info("Tissue found - running autofocus with manual fallback")
+            initial_z = autofocus_with_manual_fallback(
+                hardware=hardware,
+                request_manual_focus=ctx.request_manual_focus,
+                max_retries=3,
+                fallback_z=ctx.hint_z,
+                n_steps=ctx.af_n_steps,
+                search_range=ctx.af_search_range,
+                score_metric=ctx.af_score_metric,
+                diagnostic_output_path=str(ctx.output_path),
+                logger=logger,
+            )
+        else:
+            logger.warning(f"No tissue found after {max_tissue_search_attempts} search attempts")
+            logger.warning("Attempting autofocus anyway - will go to manual dialog if it fails")
+            initial_z = autofocus_with_manual_fallback(
+                hardware=hardware,
+                request_manual_focus=ctx.request_manual_focus,
+                max_retries=0,
+                fallback_z=ctx.hint_z,
+                n_steps=ctx.af_n_steps,
+                search_range=ctx.af_search_range,
+                score_metric=ctx.af_score_metric,
+                diagnostic_output_path=str(ctx.output_path),
+                logger=logger,
+            )
+
+        logger.info(f"Initial autofocus completed: Z={initial_z:.2f} um")
+        ctx.first_tissue_autofocus_done = True
+        ctx.last_af_pos_idx = first_af_idx
+        ctx.completed_af_positions.append((first_af_pos.x, first_af_pos.y, initial_z))
+        ctx.dynamic_af_positions.discard(first_af_idx)
+
+    except RuntimeError as e:
+        logger.error(f"Initial autofocus failed: {e}")
+        if "cancelled" in str(e).lower():
+            raise _AcquisitionCancelled() from e
+
+    logger.info("=== Starting main acquisition loop ===")
+
+
+def _handle_tile_autofocus(
+    ctx: AcquisitionContext, pos_idx: int, pos, filename: str,
+) -> Tuple[bool, str, float, bool, bool]:
+    """Decide if AF is needed, move stage, and run AF.
+
+    Returns (needs_af, af_type, drift, af_failed, xy_move_pending).
+
+    Mutates ctx: last_af_pos_idx, completed_af_positions, dynamic_af_positions,
+    deferred_af_positions, first_tissue_autofocus_done, exposure_90.
+    """
+    from microscope_control.autofocus.strategies import StrategyFailureMode
+
+    logger = ctx.logger
+    hardware = ctx.hardware
+    params = ctx.params
+    af_type_for_this_tile = "none"
+    drift_for_this_tile = 0.0
+    af_failed_for_this_tile = False
+
+    # Determine the best Z for this tile position.
+    needs_af = pos_idx in ctx.dynamic_af_positions
+
+    # Safety net 1: index gap check
+    index_gap_threshold = ctx.af_gap_index_multiplier * ctx.af_n_tiles
+    if not needs_af and ctx.last_af_pos_idx >= 0:
+        gap = pos_idx - ctx.last_af_pos_idx
+        if gap > index_gap_threshold:
+            needs_af = True
+            logger.info(
+                "  Forcing AF: index gap of %d positions since last AF "
+                "(threshold: %d = %dx%d)",
+                gap, index_gap_threshold,
+                ctx.af_gap_index_multiplier, ctx.af_n_tiles,
+            )
+
+    # Safety net 2: spatial gap check
+    spatial_gap_threshold = ctx.af_gap_spatial_multiplier * ctx.af_min_distance
+    if not needs_af and ctx.completed_af_positions:
+        tile_xy = np.array([[pos.x, pos.y]])
+        af_xy = np.array([(ax, ay) for ax, ay, _ in ctx.completed_af_positions])
+        nearest_af_dist = float(np.min(_cdist_scipy(tile_xy, af_xy)))
+        if nearest_af_dist > spatial_gap_threshold:
+            needs_af = True
+            logger.info(
+                "  Forcing AF: spatial distance %.0f um to nearest AF "
+                "exceeds threshold %.0f um (%.1fx af_min_distance)",
+                nearest_af_dist, spatial_gap_threshold,
+                ctx.af_gap_spatial_multiplier,
+            )
+
+    # For non-AF tiles, move Z to the spatially nearest AF's Z
+    if not needs_af and ctx.completed_af_positions:
+        tile_xy = np.array([[pos.x, pos.y]])
+        af_xy = np.array([(ax, ay) for ax, ay, _ in ctx.completed_af_positions])
+        nearest_idx = int(np.argmin(_cdist_scipy(tile_xy, af_xy)[0]))
+        nearest_z = ctx.completed_af_positions[nearest_idx][2]
+        current_z = hardware.get_current_position().z
+        if abs(nearest_z - current_z) > 0.1:
+            hardware.move_to_position(Position(z=nearest_z))
+            logger.debug(
+                "  Nearest-AF Z correction: %.2f -> %.2f um "
+                "(nearest AF at X=%.0f, Y=%.0f, dist=%.0f um)",
+                current_z, nearest_z,
+                ctx.completed_af_positions[nearest_idx][0],
+                ctx.completed_af_positions[nearest_idx][1],
+                float(_cdist_scipy(tile_xy, [af_xy[nearest_idx]])[0][0]),
+            )
+        pos.z = nearest_z
+    else:
+        pos.z = hardware.get_current_position().z
+
+    # Stage move with retry
+    logger.debug(f"Moving to position: X={pos.x}, Y={pos.y}, Z={pos.z}")
+    t0 = time.perf_counter()
+    move_succeeded = False
+    last_move_error = None
+    for move_attempt in range(3):
+        try:
+            if needs_af:
+                hardware.move_to_position(pos)
+            else:
+                hardware.move_xy_no_wait(pos.x, pos.y)
+            move_succeeded = True
+            break
+        except Exception as move_err:
+            last_move_error = move_err
+            if move_attempt < 2:
+                logger.warning(
+                    f"Stage move failed (attempt {move_attempt + 1}/3): {move_err} "
+                    f"-- retrying in 2s"
+                )
+                time.sleep(2.0)
+            else:
+                logger.error(
+                    f"Stage move failed after 3 attempts: {move_err} "
+                    f"-- requesting user intervention"
+                )
+
+    if not move_succeeded:
+        if ctx.request_hardware_error_recovery is not None:
+            error_detail = str(last_move_error) if last_move_error else "Stage move failed after 3 attempts"
+            logger.info("Pausing acquisition for user to resolve stage error")
+            user_choice = ctx.request_hardware_error_recovery(error_detail)
+            if user_choice == "cancel":
+                logger.warning("User cancelled acquisition during stage error recovery")
+                raise _AcquisitionCancelled()
+            elif user_choice == "skip":
+                logger.info(f"User chose to skip position {pos_idx}")
+                # Return with af_type="skipped" so caller knows to skip
+                return needs_af, "skipped", drift_for_this_tile, True, False
+            # "retry" -- try one more time after user intervention
+            try:
+                if needs_af:
+                    hardware.move_to_position(pos)
+                else:
+                    hardware.move_xy_no_wait(pos.x, pos.y)
+            except Exception as final_err:
+                raise RuntimeError(f"Stage move still failing after user intervention: {final_err}")
+        else:
+            raise RuntimeError("Stage move failed after 3 attempts")
+
+    xy_move_pending = not needs_af
+    log_timing(logger, "Stage XY movement command", t0)
+
+    if not needs_af:
+        return needs_af, af_type_for_this_tile, drift_for_this_tile, af_failed_for_this_tile, xy_move_pending
+
+    # Perform autofocus
+    logger.info(f"Checking for autofocus at position {pos_idx}: X={pos.x}, Y={pos.y}, Z={pos.z}")
+
+    # For rotation modalities, always autofocus at the configured angle
+    if ctx.mod_config.autofocus_angle is not None and hasattr(hardware, "set_psg_ticks"):
+        af_angle = ctx.mod_config.autofocus_angle
+        t_rot = time.perf_counter()
+        hardware.set_psg_ticks(af_angle)
+        t_rot = log_timing(logger, "Rotation to %.0fdeg for autofocus" % af_angle, t_rot)
+        logger.info("Set rotation to %.0f deg for autofocus", af_angle)
+        if af_angle in params["angles"]:
+            angle_idx = params["angles"].index(af_angle)
+            if angle_idx < len(params["exposures"]):
+                ctx.exposure_90 = params["exposures"][angle_idx]
+
+        # Disable per-channel mode and apply analog gains
+        if ctx.is_jai_camera:
+            try:
+                hardware.camera.disable_individual_exposure()
+                hardware.camera.disable_individual_gain()
+                if ctx.jai_calibration is not None:
+                    uncrossed_gains = (
+                        ctx.jai_calibration.get("angles", {})
+                        .get("uncrossed", {})
+                        .get("gains", {})
+                    )
+                    af_unified_gain = uncrossed_gains.get("unified_gain", 1.0)
+                    hardware.camera.set_unified_gain(af_unified_gain)
+                    hardware.camera.set_rb_analog_gains(
+                        analog_red=uncrossed_gains.get("analog_red", 1.0),
+                        analog_blue=uncrossed_gains.get("analog_blue", 1.0),
+                    )
+            except Exception as e:
+                logger.warning(f"Could not configure camera for AF: {e}")
+
+        t_exp = time.perf_counter()
+        hardware.set_exposure(ctx.exposure_90)
+        t_exp = log_timing(logger, "Set exposure for tissue detection", t_exp)
+        logger.info(f"Set exposure to {ctx.exposure_90}ms for 90 deg tissue detection")
+
+    # Take a quick image to assess tissue content
+    t_snap = time.perf_counter()
+    test_img, _ = hardware.snap_image()
+    t_snap = log_timing(logger, "Snap test image for tissue detection", t_snap)
+
+    if test_img.dtype in [np.float32, np.float64]:
+        if test_img.max() <= 1.0 and test_img.min() >= 0.0:
+            test_img = (test_img * 255).astype(np.uint8)
+        else:
+            test_img = np.clip(test_img, 0, 255).astype(np.uint8)
+
+    # Brightness safety check (strategy-aware)
+    af_brightness_attempts = 0
+    while af_brightness_attempts < 4:
+        bright_ok, bright_stats = ctx.af_strategy.brightness_acceptable(test_img)
+        if bright_ok:
+            break
+        ctx.exposure_90 *= 2.0
+        hardware.set_exposure(ctx.exposure_90)
+        logger.warning(
+            f"AF drift-check image brightness_check failed ({bright_stats}), "
+            f"doubling exposure to {ctx.exposure_90:.2f}ms"
+        )
+        test_img, _ = hardware.snap_image()
+        if test_img.dtype in [np.float32, np.float64]:
+            if test_img.max() <= 1.0 and test_img.min() >= 0.0:
+                test_img = (test_img * 255).astype(np.uint8)
+            else:
+                test_img = np.clip(test_img, 0, 255).astype(np.uint8)
+        af_brightness_attempts += 1
+    if af_brightness_attempts > 0:
+        logger.info(
+            f"AF drift-check exposure adjusted to {ctx.exposure_90:.2f}ms "
+            f"(strategy={ctx.af_strategy_name})"
+        )
+
+    # Strategy-aware validity check
+    signal_valid, strategy_stats = ctx.af_strategy.is_valid(test_img, logger_=logger)
+
+    failure_mode = ctx.af_strategy.on_failure
+    should_run_af = signal_valid or failure_mode is StrategyFailureMode.PROCEED
+
+    if should_run_af:
+        logger.info(
+            f"Running drift-check AF (strategy={ctx.af_strategy_name}, "
+            f"valid={signal_valid}, stats={strategy_stats})"
+        )
+
+        if not ctx.first_tissue_autofocus_done:
+            logger.info("  First tissue position - using STANDARD autofocus for accuracy")
+            t_af = time.perf_counter()
+            new_z = autofocus_with_manual_fallback(
+                hardware=hardware,
+                logger=logger,
+                request_manual_focus=ctx.request_manual_focus,
+                max_retries=3,
+                fallback_z=ctx.hint_z,
+                move_stage_to_estimate=True,
+                n_steps=ctx.af_n_steps,
+                search_range=ctx.af_search_range,
+                interp_strength=ctx.af_interp_strength,
+                interp_kind=ctx.af_interp_kind,
+                score_metric=ctx.af_score_metric,
+                diagnostic_output_path=ctx.output_path,
+                position_index=pos_idx,
+            )
+            t_af = log_timing(logger, "STANDARD autofocus", t_af)
+            ctx.first_tissue_autofocus_done = True
+            af_type_for_this_tile = "standard"
+            logger.info(f"  Standard autofocus :: New Z {new_z}")
+        else:
+            SMALL_GRID_SKIP_DRIFT_MAX_TILES = 9
+            if len(ctx.positions) <= SMALL_GRID_SKIP_DRIFT_MAX_TILES:
+                z_before_adaptive = hardware.get_current_position().z
+                logger.info(
+                    "  Small grid (%d tiles <= %d) - skipping sweep drift check, "
+                    "reusing Z=%.2f um from initial AF",
+                    len(ctx.positions), SMALL_GRID_SKIP_DRIFT_MAX_TILES, z_before_adaptive,
+                )
+                new_z = z_before_adaptive
+                af_type_for_this_tile = "skip_small_grid"
+                drift_for_this_tile = 0.0
+            else:
+                z_before_adaptive = hardware.get_current_position().z
+                logger.info("  Subsequent tissue position - using SWEEP drift check for speed")
+                t_af = time.perf_counter()
+                new_z = hardware.autofocus_sweep_drift_check(
+                    range_um=ctx.af_sweep_range_um,
+                    n_steps=ctx.af_sweep_n_steps,
+                    score_metric=ctx.af_score_metric_name,
+                    max_retries=ctx.af_edge_retries,
+                )
+                t_af = log_timing(logger, "SWEEP drift check", t_af)
+                drift = new_z - z_before_adaptive
+                af_type_for_this_tile = "sweep"
+                drift_for_this_tile = drift
+                logger.info(f"  Sweep drift check :: New Z {new_z} (drift: {drift:+.2f} um)")
+
+        # Track this position as the last AF position
+        ctx.last_af_pos_idx = pos_idx
+        af_z = hardware.get_current_position().z
+        if af_type_for_this_tile == "sweep" and abs(drift_for_this_tile) < 0.05:
+            logger.info(
+                "  Sweep produced no drift -- not recording "
+                "in AF map (prevents stale Z propagation)"
+            )
+        else:
+            ctx.completed_af_positions.append((pos.x, pos.y, af_z))
+    else:
+        # Strategy rejected this tile
+        af_failed_for_this_tile = True
+        logger.warning(
+            f"Strategy {ctx.af_strategy_name} rejected tile {pos_idx} "
+            f"(on_failure={failure_mode.value}, stats={strategy_stats}) - deferring autofocus"
+        )
+
+        ctx.dynamic_af_positions.discard(pos_idx)
+        ctx.deferred_af_positions.add(pos_idx)
+
+        next_af_pos = AutofocusUtils.defer_autofocus_to_next_tile(
+            current_pos_idx=pos_idx,
+            original_af_positions=ctx.af_positions,
+            total_positions=len(ctx.positions),
+            af_min_distance=ctx.af_min_distance,
+            positions=ctx.xy_positions,
+            logger=logger,
+        )
+        if next_af_pos is not None and next_af_pos < len(ctx.positions):
+            ctx.dynamic_af_positions.add(next_af_pos)
+            logger.info(f"Added position {next_af_pos} to autofocus queue")
+        else:
+            logger.warning("Could not find suitable position to defer autofocus to")
+
+    # Drain pending background TIFF writes
+    if ctx.write_pool is not None and ctx.write_pool.pending_count > 0:
+        t_drain = time.perf_counter()
+        n_drained = ctx.write_pool.pending_count
+        failed = ctx.write_pool.drain()
+        log_timing(logger, f"Drain {n_drained} pending writes ({failed} failed)", t_drain)
+
+    # Restore per-channel exposure/gain mode after autofocus
+    if (ctx.wb_mode == "per_angle"
+            and ctx.jai_calibration is not None
+            and params["angles"]):
+        first_angle = params["angles"][0]
+        logger.debug(f"Restoring per-channel WB mode after autofocus (first angle: {first_angle})")
+        applied, _ = apply_jai_calibration_for_angle(
+            hardware=hardware,
+            jai_calibration=ctx.jai_calibration,
+            angle=first_angle,
+            per_angle=ctx.white_balance_per_angle,
+            logger=logger,
+        )
+        if not applied:
+            logger.warning("Failed to restore per-channel mode after autofocus")
+
+    return needs_af, af_type_for_this_tile, drift_for_this_tile, af_failed_for_this_tile, xy_move_pending
+
+
+def _acquire_tile_angles(ctx: AcquisitionContext, pos_idx: int, pos, filename: str,
+                         current_stage_pos, xy_move_pending: bool) -> Tuple[dict, bool]:
+    """Acquire all angles (and Z-planes) for a single tile position.
+
+    Returns (tile_worst_sat dict, xy_move_pending updated).
+    """
+    logger = ctx.logger
+    hardware = ctx.hardware
+    params = ctx.params
+    tile_worst_sat = {"R": 0.0, "G": 0.0, "B": 0.0}
+
+    center_z = current_stage_pos.z
+    z_stack_images = {}
+    angle_images = {}
+
+    for z_idx, z_offset in enumerate(ctx.z_offsets):
+        if ctx.z_stack_enabled and z_offset != 0.0:
+            target_z = center_z + z_offset
+            hardware.move_to_position(Position(z=target_z))
+            logger.debug(
+                "Z-stack: plane %d/%d, Z=%.2f (offset=%+.1f)",
+                z_idx + 1, len(ctx.z_offsets), target_z, z_offset,
+            )
+
+        for angle_idx, angle in enumerate(params["angles"]):
+            if ctx.is_cancelled():
+                raise _AcquisitionCancelled()
+
+            angle_start = time.perf_counter()
+            t_rot = time.perf_counter()
+            hardware.set_psg_ticks_no_wait(angle)
+            t_exp = time.perf_counter()
+
+            if ctx.wb_mode == "camera_awb":
+                if angle_idx < len(params["exposures"]):
+                    exposure_ms = params["exposures"][angle_idx]
+                    hardware.set_exposure(exposure_ms)
+                angle_name = angle_to_name(angle, modality=ctx.modality)
+                if ctx.camera_awb_gains and angle_name in ctx.camera_awb_gains:
+                    try:
+                        gain_val = ctx.camera_awb_gains[angle_name]
+                        hardware.camera.set_unified_gain(gain_val)
+                        logger.info(f"  Camera AWB: unified gain={gain_val:.2f} for {angle_name}")
+                    except Exception as e:
+                        logger.debug(f"Could not set unified gain: {e}")
+
+            elif ctx.wb_mode == "simple" and ctx.simple_wb_data:
+                angle_name = angle_to_name(angle, modality=ctx.modality)
+                sw_angles = ctx.simple_wb_data.get("angles", {})
+                if angle_name in sw_angles:
+                    angle_sw = sw_angles[angle_name]
+                    try:
+                        exp_r = angle_sw["r"]
+                        exp_g = angle_sw["g"]
+                        exp_b = angle_sw["b"]
+                        is_unified = abs(exp_r - exp_g) < 0.01 and abs(exp_g - exp_b) < 0.01
+                        sw_gain = angle_sw.get("unified_gain", 1.0)
+                        hardware.camera.apply_settings(
+                            exposures=({"all": exp_g} if is_unified
+                                       else {"r": exp_r, "g": exp_g, "b": exp_b}),
+                            unified_gain=sw_gain,
+                            analog_red=ctx.simple_wb_analog_red,
+                            analog_blue=ctx.simple_wb_analog_blue,
+                            individual_exposure=not is_unified,
+                        )
+                        logger.debug(
+                            "  Simple WB: R=%.1fms, G=%.1fms, B=%.1fms "
+                            "(scale=%sx, gain=%.2f, aR=%.3f, aB=%.3f)",
+                            exp_r, exp_g, exp_b,
+                            angle_sw.get("scale", "?"), sw_gain,
+                            ctx.simple_wb_analog_red, ctx.simple_wb_analog_blue,
+                        )
+                    except Exception as e:
+                        logger.warning(f"Simple WB failed for {angle_name}: {e}")
+                        if angle_idx < len(params["exposures"]):
+                            hardware.set_exposure(params["exposures"][angle_idx])
+                else:
+                    logger.info(f"  Simple WB: no data for {angle_name}, using calibration with scale")
+                    if ctx.jai_calibration is not None:
+                        applied, _ = apply_jai_calibration_for_angle(
+                            hardware=hardware,
+                            jai_calibration=ctx.jai_calibration,
+                            angle=angle,
+                            per_angle=False,
+                            logger=logger,
+                        )
+                        if not applied and angle_idx < len(params["exposures"]):
+                            hardware.set_exposure(params["exposures"][angle_idx])
+                    elif angle_idx < len(params["exposures"]):
+                        hardware.set_exposure(params["exposures"][angle_idx])
+
+            elif ctx.wb_mode == "simple" and ctx.jai_calibration is not None:
+                applied, _ = apply_jai_calibration_for_angle(
+                    hardware=hardware,
+                    jai_calibration=ctx.jai_calibration,
+                    angle=angle,
+                    per_angle=False,
+                    logger=logger,
+                )
+                if not applied and angle_idx < len(params["exposures"]):
+                    hardware.set_exposure(params["exposures"][angle_idx])
+
+            elif ctx.jai_calibration is not None:
+                applied, _ = apply_jai_calibration_for_angle(
+                    hardware=hardware,
+                    jai_calibration=ctx.jai_calibration,
+                    angle=angle,
+                    per_angle=ctx.white_balance_per_angle,
+                    logger=logger,
+                )
+                if not applied and angle_idx < len(params["exposures"]):
+                    try:
+                        hardware.camera.disable_individual_exposure()
+                        hardware.camera.disable_individual_gain()
+                        hardware.camera.set_rb_analog_gains(analog_red=1.0, analog_blue=1.0)
+                    except Exception:
+                        pass
+                    exposure_ms = params["exposures"][angle_idx]
+                    hardware.set_exposure(exposure_ms)
+                    logger.info(f"  JAI calibration failed, using single exposure: {exposure_ms}ms")
+            elif angle_idx < len(params["exposures"]):
+                exposure_ms = params["exposures"][angle_idx]
+                hardware.set_exposure(exposure_ms)
+            t_exp = log_timing(logger, f"Set exposure for angle {angle}deg", t_exp)
+
+            hardware.wait_for_rotation()
+            t_rot = log_timing(logger, f"Rotation to {angle}deg", t_rot)
+
+            if xy_move_pending:
+                hardware.wait_for_xy()
+                xy_move_pending = False
+
+            t_snap = time.perf_counter()
+            image, metadata = hardware.snap_image(debayering=False)
+            t_snap = log_timing(logger, f"Snap image at {angle}deg (includes camera+USB+internal processing)", t_snap)
+
+            if image is None:
+                logger.error(f"Failed to acquire image at angle {angle}")
+                continue
+
+            t_stats = time.perf_counter()
+            img_mean = image.mean((0, 1))
+            t_stats = log_timing(logger, f"Calculate image stats at {angle}deg", t_stats)
+            logger.debug(f"  Image shape: {image.shape}, mean: {img_mean}")
+
+            sat_warn_threshold = (
+                101.0 if ctx.sat_monitor.should_suppress_warnings(angle) else 1.0
+            )
+            sat_result = _check_saturation(
+                image, f"tile {filename} at {angle}deg", logger,
+                threshold_pct=sat_warn_threshold,
+            )
+            if sat_result:
+                for ch in ("R", "G", "B"):
+                    if sat_result.get(ch, 0) > tile_worst_sat[ch]:
+                        tile_worst_sat[ch] = sat_result[ch]
+
+            if ctx.sat_monitor.check_tile(
+                sat_result, angle, pos_idx, filename,
+                stage_x=current_stage_pos.x,
+                stage_y=current_stage_pos.y,
+                stage_z=current_stage_pos.z,
+            ):
+                ctx.sat_monitor.log_summary()
+                raise RuntimeError(ctx.sat_monitor.abort_reason)
+
+            # Save raw image
+            if ctx.save_raw_tiles:
+                raw_output_path = ctx.output_path.parent / "Raw" / ctx.output_path.name
+                raw_image_path = raw_output_path / str(angle) / filename
+                t_mkdir = time.perf_counter()
+                if not raw_image_path.parent.exists():
+                    raw_image_path.parent.mkdir(parents=True, exist_ok=True)
+                t_mkdir = log_timing(logger, f"Create directories at {angle}deg", t_mkdir)
+                try:
+                    write_position_metadata(
+                        ctx.metadata_txt_for_positions, raw_image_path, hardware, ctx.modality
+                    )
+                    raw_pixel_size = hardware.get_pixel_size_um()
+                    ctx.write_pool.submit(
+                        ome_tiff_writer,
+                        filename=str(raw_image_path),
+                        pixel_size_um=raw_pixel_size,
+                        data=image,
+                    )
+                    logger.info(f"  Queued raw image write: {raw_image_path}")
+                except Exception as e:
+                    logger.warning(f"  Failed to queue raw image: {e}")
+
+            # Apply background correction
+            if (
+                ctx.background_correction_enabled
+                and angle in ctx.background_images
+                and angle not in ctx.background_disabled_angles
+            ):
+                bg_img = ctx.background_images[angle]
+                logger.debug(f"  Applying background correction for {angle} degrees")
+                logger.debug(f"    Background stats: mean={bg_img.mean():.1f}, std={bg_img.std():.1f}")
+                t_bg = time.perf_counter()
+                image = BackgroundCorrectionUtils.apply_flat_field_correction(
+                    image,
+                    ctx.background_images[angle],
+                    ctx.background_scaling_factors[angle],
+                    method=ctx.background_correction_method,
+                )
+                t_bg = log_timing(logger, f"Background correction at {angle}deg", t_bg)
+                logger.debug(f"    Correction applied with method: {ctx.background_correction_method}")
+                logger.debug(f"    Post-correction RGB means: {image.mean(axis=(0,1))}")
+                if not ctx.sat_monitor._is_uncrossed(angle):
+                    _check_saturation(image, f"post-correction tile {filename} at {angle}deg", logger)
+            elif ctx.background_correction_enabled and angle in ctx.background_disabled_angles:
+                logger.info(
+                    f"  Background correction SKIPPED for {angle} deg "
+                    "(disabled by acquisition parameters - exposure mismatch or missing background)"
+                )
+            elif ctx.background_correction_enabled and angle not in ctx.background_images:
+                logger.info(
+                    f"  Background correction SKIPPED for {angle} deg "
+                    "(no background image available)"
+                )
+
+            # Apply white balance (software-only, skip when hardware WB active)
+            if ctx.white_balance_enabled and ctx.jai_calibration is None and ctx.wb_mode not in ("camera_awb", "simple"):
+                if angle in ctx.angles_wb:
+                    wb_profile = ctx.angles_wb[angle]
+                else:
+                    wb_profile = [1.0, 1.0, 1.0]
+                    logger.warning(f"    No white balance profile for {angle} deg, using neutral")
+                t_wb = time.perf_counter()
+                gain = calculate_luminance_gain(*wb_profile)
+                image = hardware.white_balance(image, white_balance_profile=wb_profile, gain=gain)
+                t_wb = log_timing(logger, f"White balance at {angle}deg", t_wb)
+                logger.info(
+                    f"  Applied software white balance: R={wb_profile[0]:.2f}, G={wb_profile[1]:.2f}, B={wb_profile[2]:.2f}"
+                )
+            elif ctx.white_balance_enabled and (ctx.jai_calibration is not None or ctx.wb_mode in ("camera_awb", "simple")):
+                logger.debug(f"  Software WB skipped (hardware WB active for {angle} deg, mode={ctx.wb_mode})")
+
+            # Save or accumulate image depending on Z-stack mode
+            if not ctx.z_stack_enabled:
+                image_path = ctx.output_path / str(angle) / filename
+                if image_path.parent.exists():
+                    proc_pixel_size = hardware.get_pixel_size_um()
+                    ctx.write_pool.submit(
+                        ome_tiff_writer,
+                        filename=str(image_path),
+                        pixel_size_um=proc_pixel_size,
+                        data=image,
+                    )
+                    angle_images[angle] = image
+                else:
+                    logger.error(f"Failed to save {image_path} - parent directory missing")
+            else:
+                z_stack_images.setdefault(angle, []).append(image)
+                if ctx.save_raw_tiles:
+                    z_plane_path = ctx.output_path / str(angle) / f"z{z_idx:03d}" / filename
+                    z_plane_path.parent.mkdir(parents=True, exist_ok=True)
+                    ctx.write_pool.submit(
+                        ome_tiff_writer,
+                        filename=str(z_plane_path),
+                        pixel_size_um=hardware.get_pixel_size_um(),
+                        data=image,
+                    )
+
+            ctx.image_count += 1
+            ctx.update_progress(ctx.image_count, ctx.total_images)
+
+            angle_elapsed_ms = (time.perf_counter() - angle_start) * 1000
+            logger.debug(f"  [TIMING] Total for angle {angle}deg: {angle_elapsed_ms:.1f}ms")
+
+    # Z-stack projection
+    if ctx.z_stack_enabled and ctx.projection_fn is not None:
+        for angle in params["angles"]:
+            if angle in z_stack_images and len(z_stack_images[angle]) > 0:
+                projected = ctx.projection_fn(z_stack_images[angle])
+                angle_images[angle] = projected
+                image_path = ctx.output_path / str(angle) / filename
+                if image_path.parent.exists():
+                    ctx.write_pool.submit(
+                        ome_tiff_writer,
+                        filename=str(image_path),
+                        pixel_size_um=hardware.get_pixel_size_um(),
+                        data=projected,
+                    )
+        logger.info(
+            "Z-stack projection (%s) computed for %d angles",
+            params.get("z_projection", "max"), len(z_stack_images),
+        )
+        hardware.move_to_position(Position(z=center_z))
+
+    # Create birefringence image
+    positive_angles = [a for a in angle_images.keys() if a > 0 and a != 90]
+    negative_angles = [a for a in angle_images.keys() if a < 0]
+    logger.debug(
+        f"Biref check: angle_images keys={list(angle_images.keys())}, "
+        f"positive={positive_angles}, negative={negative_angles}"
+    )
+
+    if positive_angles and negative_angles:
+        pos_angle = min(positive_angles)
+        neg_angle = max(negative_angles)
+        biref_dir = ctx.output_path / f"{pos_angle}.biref"
+        tile_config_source = ctx.output_path / str(pos_angle) / "TileConfiguration.txt"
+
+        from ppm_library.imaging.writer import TifWriterUtils as PpmWriterUtils
+        biref_pixel_size = hardware.get_pixel_size_um()
+        biref_pos_img = angle_images[pos_angle]
+        biref_neg_img = angle_images[neg_angle]
+        ctx.write_pool.submit(
+            PpmWriterUtils.create_normalized_birefringence_tile,
+            pos_image=biref_pos_img,
+            neg_image=biref_neg_img,
+            output_dir=biref_dir,
+            filename=filename,
+            pixel_size_um=biref_pixel_size,
+            tile_config_source=tile_config_source,
+            logger=logger,
+            min_intensity=params.get("biref_min_intensity", 0),
+        )
+    else:
+        logger.warning(
+            f"Skipping birefringence for tile {filename}: "
+            f"need both positive (>0, !=90) and negative (<0) angles "
+            f"but got angles={list(angle_images.keys())}"
+        )
+
+    return tile_worst_sat, xy_move_pending
+
+
+def _acquire_tile_channels(ctx: AcquisitionContext, pos, filename: str,
+                           current_stage_pos) -> dict:
+    """Acquire all channels for a single tile position (widefield IF).
+
+    Returns tile_worst_sat dict.
+    """
+    logger = ctx.logger
+    hardware = ctx.hardware
+    tile_worst_sat = {}
+
+    CHANNEL_SAT_RUNAWAY_N = 3
+    CHANNEL_SAT_PCT_THRESHOLD = 5.0
+
+    channel_plan = resolve_channel_plan(
+        ctx.ppm_settings,
+        ctx.params.get("scan_type", ""),
+        ctx.params.get("channels", []) or [],
+        ctx.params.get("channel_exposures", []) or [],
+        channel_intensity_overrides=ctx.params.get("channel_intensities") or None,
+    )
+
+    for ch_entry in channel_plan:
+        apply_channel_hardware_state(
+            hardware, ch_entry, logger, preset_cache=ctx.channel_preset_cache
+        )
+        exposure_ms = float(ch_entry.get("exposure_ms") or 0)
+        if exposure_ms > 0:
+            hardware.set_exposure(exposure_ms)
+            logger.debug("Channel %s: set exposure to %.2f ms", ch_entry["id"], exposure_ms)
+
+        image, metadata = hardware.snap_image()
+
+        # Per-channel flat-field correction
+        if ctx.channel_background_images and ch_entry["id"] in ctx.channel_background_images:
+            try:
+                image = BackgroundCorrectionUtils.apply_flat_field_correction(
+                    image,
+                    ctx.channel_background_images[ch_entry["id"]],
+                    scaling_factor=1.0,
+                    method=ctx.background_correction_method or "divide",
+                )
+                logger.debug(
+                    "  Applied %s background for channel %s",
+                    ctx.background_correction_method or "divide",
+                    ch_entry["id"],
+                )
+            except Exception as bg_e:
+                logger.warning("  Channel %s background correction failed: %s", ch_entry["id"], bg_e)
+
+        sat_result = _check_saturation(image, f"tile[{ch_entry['id']}]", logger)
+        if sat_result:
+            for ch_key, pct in sat_result.items():
+                key = f"{ch_entry['id']}/{ch_key}"
+                if pct > tile_worst_sat.get(key, 0):
+                    tile_worst_sat[key] = pct
+            # Per-channel consecutive-saturation runaway detection
+            worst_channel_sat = max(sat_result.values(), default=0.0)
+            ch_id = ch_entry["id"]
+            if worst_channel_sat > CHANNEL_SAT_PCT_THRESHOLD:
+                ctx.channel_consecutive_saturated[ch_id] = (
+                    ctx.channel_consecutive_saturated.get(ch_id, 0) + 1
+                )
+                if ctx.channel_consecutive_saturated[ch_id] == CHANNEL_SAT_RUNAWAY_N:
+                    logger.error(
+                        "CHANNEL SATURATION RUNAWAY: channel %s has "
+                        "exceeded %.1f%% worst-channel saturation on "
+                        "%d consecutive tiles (current: %.1f%%). "
+                        "Consider cancelling and lowering the %s "
+                        "intensity before more imaging time is wasted.",
+                        ch_id, CHANNEL_SAT_PCT_THRESHOLD,
+                        CHANNEL_SAT_RUNAWAY_N, worst_channel_sat, ch_id,
+                    )
+            else:
+                ctx.channel_consecutive_saturated[ch_id] = 0
+
+        image_path = ctx.output_path / str(ch_entry["id"]) / filename
+        if image_path.parent.exists():
+            bf_pixel_size = hardware.get_pixel_size_um()
+            ctx.write_pool.submit(
+                ome_tiff_writer,
+                filename=str(image_path),
+                pixel_size_um=bf_pixel_size,
+                data=image,
+            )
+            ctx.image_count += 1
+            ctx.update_progress(ctx.image_count, ctx.total_images)
+
+        try:
+            write_position_metadata(ctx.metadata_txt_for_positions, image_path, hardware, ctx.modality)
+        except Exception as e:
+            logger.warning(f"  Failed to write position text {ctx.metadata_txt_for_positions}: {e}")
+
+    return tile_worst_sat
+
+
+def _acquire_tile_single(ctx: AcquisitionContext, pos, filename: str,
+                         current_stage_pos) -> dict:
+    """Acquire a single image for a non-rotation tile (BF, fluorescence).
+
+    Returns tile_worst_sat dict.
+    """
+    logger = ctx.logger
+    hardware = ctx.hardware
+    params = ctx.params
+    tile_worst_sat = {"R": 0.0, "G": 0.0, "B": 0.0}
+
+    # Set exposure explicitly from params
+    if params.get("exposures"):
+        exposure_ms = float(params["exposures"][0])
+        hardware.set_exposure(exposure_ms)
+        logger.debug("Single-image path: set exposure to %.2f ms", exposure_ms)
+
+    image, metadata = hardware.snap_image()
+
+    # Background correction
+    if ctx.background_correction_enabled and ctx.background_images:
+        bg_key = 0.0
+        if bg_key in ctx.background_images:
+            try:
+                bg_scale = ctx.background_scaling_factors.get(bg_key, 1.0) \
+                    if ctx.background_scaling_factors else 1.0
+                image = BackgroundCorrectionUtils.apply_flat_field_correction(
+                    image, ctx.background_images[bg_key],
+                    scaling_factor=bg_scale,
+                    method=ctx.background_correction_method)
+                logger.info(
+                    "  Applied %s background correction (median=%.0f)",
+                    ctx.background_correction_method, float(np.median(image)),
+                )
+            except Exception as e:
+                logger.warning("  Background correction failed: %s", e)
+
+    # Saturation check
+    sat_result = _check_saturation(image, "tile", logger)
+    if sat_result:
+        for ch_key, pct in sat_result.items():
+            if pct > tile_worst_sat.get(ch_key, 0):
+                tile_worst_sat[ch_key] = pct
+
+    image_path = ctx.output_path / filename
+    if image_path.parent.exists():
+        bf_pixel_size = hardware.get_pixel_size_um()
+        ctx.write_pool.submit(
+            ome_tiff_writer,
+            filename=str(image_path),
+            pixel_size_um=bf_pixel_size,
+            data=image,
+        )
+        ctx.image_count += 1
+        ctx.update_progress(ctx.image_count, ctx.total_images)
+
+    try:
+        write_position_metadata(ctx.metadata_txt_for_positions, image_path, hardware, ctx.modality)
+    except Exception as e:
+        logger.warning(f"  Failed to write position text {ctx.metadata_txt_for_positions}: {e}")
+
+    return tile_worst_sat
+
+
+def _record_tile_measurement(
+    ctx: AcquisitionContext, pos_idx: int, filename: str, tile_start: float,
+    needs_af: bool, af_type: str, drift: float, af_failed: bool,
+    tile_worst_sat: dict, current_stage_pos,
+) -> None:
+    """Record per-tile measurement data and stream to NDJSON."""
+    logger = ctx.logger
+    tile_elapsed_ms = (time.perf_counter() - tile_start) * 1000
+    logger.info(
+        "Tile %d/%d: %.1fs (%s)",
+        pos_idx + 1, len(ctx.positions), tile_elapsed_ms / 1000,
+        "AF" if needs_af else "no-AF",
+    )
+
+    # Sparse-sample-aware progress sanity check
+    if len(ctx.tile_measurements) >= 3 and not ctx.progress_warning_fired:
+        completed_tile_times_ms = [m["tile_time_ms"] for m in ctx.tile_measurements[-10:]]
+        avg_recent_ms = sum(completed_tile_times_ms) / len(completed_tile_times_ms)
+        baseline_ms = ctx.tile_measurements[0]["tile_time_ms"]
+        if baseline_ms > 0 and avg_recent_ms > 3.0 * baseline_ms:
+            logger.error(
+                "PROGRESS SANITY CHECK: average tile time over last %d tiles is "
+                "%.1fs, which is %.1fx the first tile's %.1fs. This usually means "
+                "the autofocus strategy is a poor match for the sample (e.g. "
+                "dense_texture applied to sparse IF). Current strategy: %s. "
+                "Consider cancelling and picking a different strategy from the "
+                "Advanced panel dropdown.",
+                len(completed_tile_times_ms),
+                avg_recent_ms / 1000.0,
+                avg_recent_ms / baseline_ms,
+                baseline_ms / 1000.0,
+                ctx.af_strategy_name,
+            )
+            ctx.progress_warning_fired = True
+
+    # Periodic progress summary
+    if (pos_idx + 1) % 100 == 0 and pos_idx > 0:
+        completed = pos_idx + 1
+        elapsed_total_s = sum(
+            m["tile_time_ms"] for m in ctx.tile_measurements
+        ) / 1000 + tile_elapsed_ms / 1000
+        avg_s = elapsed_total_s / completed
+        remaining = len(ctx.positions) - completed
+        eta_s = remaining * avg_s
+        eta_h = eta_s / 3600
+        throughput = completed / (elapsed_total_s / 3600) if elapsed_total_s > 0 else 0
+        logger.info(
+            "[PROGRESS] %d/%d (%.1f%%) | avg %.1fs/tile | ETA %.1fh | %.0f tiles/hr",
+            completed, len(ctx.positions),
+            100 * completed / len(ctx.positions),
+            avg_s, eta_h, throughput,
+        )
+
+    tile_measurement_entry = {
+        "position_index": pos_idx,
+        "filename": filename,
+        "z_um": round(current_stage_pos.z, 2),
+        "af_performed": needs_af,
+        "af_type": af_type,
+        "af_strategy": ctx.af_strategy_name,
+        "af_drift_um": round(drift, 2),
+        "af_failed": af_failed,
+        "tile_time_ms": round(tile_elapsed_ms, 0),
+        "saturation_R_pct": round(tile_worst_sat.get("R", tile_worst_sat.get("Gray", 0)), 1),
+        "saturation_G_pct": round(tile_worst_sat.get("G", tile_worst_sat.get("Gray", 0)), 1),
+        "saturation_B_pct": round(tile_worst_sat.get("B", tile_worst_sat.get("Gray", 0)), 1),
+        "saturation_worst_pct": round(max(tile_worst_sat.values()) if tile_worst_sat else 0, 1),
+    }
+    ctx.tile_measurements.append(tile_measurement_entry)
+
+    if ctx.tile_measurements_stream is not None:
+        try:
+            ctx.tile_measurements_stream.write(json.dumps(tile_measurement_entry) + "\n")
+            ctx.tile_measurements_stream.flush()
+        except Exception as e:
+            logger.debug("Failed to stream NDJSON entry for tile %d: %s", pos_idx, e)
 
 
 def write_position_metadata(metadata_txt_for_positions, raw_image_path, hardware, modality):
