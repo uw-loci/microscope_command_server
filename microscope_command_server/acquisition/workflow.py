@@ -3364,19 +3364,56 @@ def _run_pre_acquisition_autofocus(ctx: AcquisitionContext) -> None:
         hardware.set_psg_ticks(af_angle)
         logger.info("Set rotation to %.0f deg for initial autofocus", af_angle)
 
-        # Get autofocus-angle exposure
-        if af_angle not in params["angles"]:
-            raise ValueError(
-                f"No {af_angle}-degree angle in WB calibration parameters. "
-                "Cannot determine autofocus exposure. Re-run WB calibration."
+        # Get autofocus-angle exposure. The user is NOT required to include the
+        # AF angle (e.g. 90 deg uncrossed for PPM) in their acquisition angles,
+        # so fall back to the calibrated uncrossed exposure when the acquisition
+        # does not cover the AF angle. AF brightness check will adapt further.
+        af_exposure: Optional[float] = None
+        if af_angle in params["angles"]:
+            angle_idx = params["angles"].index(af_angle)
+            if angle_idx < len(params["exposures"]):
+                af_exposure = params["exposures"][angle_idx]
+                logger.info(
+                    f"AF exposure {af_exposure}ms from acquisition params "
+                    f"(angle {af_angle} deg)"
+                )
+
+        if af_exposure is None and ctx.jai_calibration is not None:
+            uncrossed_exp = (
+                ctx.jai_calibration.get("angles", {})
+                .get("uncrossed", {})
+                .get("exposures_ms", {})
             )
-        angle_idx = params["angles"].index(af_angle)
-        if angle_idx >= len(params["exposures"]):
-            raise ValueError(
-                f"{af_angle}-degree angle found but no corresponding exposure value. "
-                "Cannot determine autofocus exposure. Re-run WB calibration."
-            )
-        ctx.exposure_90 = params["exposures"][angle_idx]
+            r = uncrossed_exp.get("r")
+            g = uncrossed_exp.get("g")
+            b = uncrossed_exp.get("b")
+            if r is not None and g is not None and b is not None:
+                af_exposure = (float(r) + float(g) + float(b)) / 3.0
+                logger.info(
+                    f"AF angle {af_angle} deg not in acquisition angles; "
+                    f"using calibrated uncrossed exposure (R={r:.2f}, G={g:.2f}, "
+                    f"B={b:.2f} -> mean={af_exposure:.2f}ms)"
+                )
+
+        if af_exposure is None:
+            if params.get("exposures"):
+                # Uncrossed is brighter than birefringence/crossed angles, so
+                # halve the first acquisition exposure as a conservative start.
+                # AF brightness check will double if too dim.
+                af_exposure = params["exposures"][0] / 2.0
+                logger.warning(
+                    f"AF angle {af_angle} deg not in acquisition angles and no "
+                    f"uncrossed calibration exposure available; falling back to "
+                    f"half the first acquisition exposure ({af_exposure:.2f}ms). "
+                    f"Run WB calibration for reliable AF exposure."
+                )
+            else:
+                raise ValueError(
+                    f"Cannot determine AF exposure for angle {af_angle} deg: "
+                    f"no acquisition exposures and no uncrossed calibration data."
+                )
+
+        ctx.exposure_90 = af_exposure
 
         # Disable per-channel mode before AF, apply analog gains
         if ctx.is_jai_camera:
