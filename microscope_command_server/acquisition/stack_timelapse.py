@@ -111,6 +111,10 @@ def acquire_z_stack(
             logger.warning(f"Could not load WB calibration: {e}")
 
     saved_files = []
+    # Buffer frames per angle so we can emit a single multi-plane OME-TIFF per
+    # angle once the Z loop completes. Keyed by angle -> list of (z_index,
+    # actual_z, image) in acquisition order.
+    angle_frames: Dict[float, list] = {angle: [] for angle in angles}
     start_time = time.time()
 
     for plane_idx, z_pos in enumerate(z_positions):
@@ -139,51 +143,98 @@ def acquire_z_stack(
                 logger.error(f"Failed to snap at Z={z_pos}, angle={angle}")
                 continue
 
-            # Save with descriptive filename
-            angle_suffix = f"_angle{angle:.0f}" if len(angles) > 1 else ""
-            filename = f"z{plane_idx:04d}_Z{z_pos:.1f}{angle_suffix}.tif"
-            filepath = output_path / filename
+            angle_frames[angle].append((plane_idx, actual_z, image))
 
-            _save_image(image, filepath, {
-                "z_position_um": actual_z,
-                "z_index": plane_idx,
-                "angle": angle,
-                "modality": modality,
-            })
-            saved_files.append(str(filepath))
+    # Emit one OME-TIFF per angle using StackWriter. Non-PPM runs with a
+    # single angle=0 and produces one zstack.ome.tiff with a real OME Z
+    # dimension. PPM angles are written as independent sibling files
+    # (zstack_angleNN.ome.tiff), per project decision that PPM angles stay
+    # as separate files rather than combined channels.
+    from microscope_imageprocessing.io.ome_writer import StackWriter
 
-    # Apply projection if requested -- combine individual Z planes into a single file
+    pixel_size_um = _resolve_pixel_size_um(config_manager, modality, objective, detector)
+
+    for angle, frames in angle_frames.items():
+        if not frames:
+            logger.warning(f"No frames captured for angle {angle}; skipping file write")
+            continue
+        # All frames share shape + dtype (same camera, same acquisition)
+        first_img = frames[0][2]
+        size_y, size_x = first_img.shape[:2]
+        size_c = 3 if (first_img.ndim == 3 and first_img.shape[2] == 3) else 1
+        is_rgb = size_c == 3
+
+        angle_suffix = f"_angle{angle:.0f}" if len(angles) > 1 else ""
+        out_file = output_path / f"zstack{angle_suffix}.ome.tiff"
+
+        channel_names = ["RGB"] if is_rgb else [f"{modality}{angle_suffix}"]
+
+        with StackWriter(
+            output_path=out_file,
+            size_t=1,
+            size_z=len(frames),
+            size_c=1,
+            size_y=size_y,
+            size_x=size_x,
+            dtype=first_img.dtype,
+            pixel_size_um=pixel_size_um,
+            z_step_um=z_step,
+            channel_names=channel_names,
+            granularity="single",
+            photometric="rgb" if is_rgb else "minisblack",
+        ) as writer:
+            for plane_idx, actual_z, image in frames:
+                writer.write_frame(
+                    image,
+                    t=0,
+                    z=plane_idx,
+                    c=0,
+                    plane_metadata={
+                        "PositionZ": float(actual_z),
+                        "angle": float(angle),
+                    },
+                )
+        saved_files.append(str(out_file))
+        logger.info(f"Wrote Z-stack OME-TIFF: {out_file} (SizeZ={len(frames)})")
+
+    # Apply projection if requested -- one extra 2D file per angle alongside
+    # the full Z-stack OME-TIFF.
     projected_file = None
     projection_name = projection
     if projection_name and projection_name != "none" and n_planes > 1:
         try:
             from microscope_command_server.acquisition.projections import get_projection
             projection_fn = get_projection(projection_name)
-            # Collect all non-angle images (or just all images for brightfield)
-            plane_images = []
-            for plane_idx, z_pos in enumerate(z_positions):
-                # Read back the saved file
-                import tifffile
-                angle_suffix = ""
-                filename = f"z{plane_idx:04d}_Z{z_pos:.1f}{angle_suffix}.tif"
-                filepath = output_path / filename
-                if filepath.exists():
-                    plane_images.append(tifffile.imread(str(filepath)))
 
-            if plane_images:
+            for angle, frames in angle_frames.items():
+                if not frames:
+                    continue
+                plane_images = [f[2] for f in frames]
                 projected = projection_fn(plane_images)
-                proj_filename = f"zstack_{projection_name}.tif"
-                proj_filepath = output_path / proj_filename
-                _save_image(projected, proj_filepath, {
-                    "projection": projection_name,
-                    "n_planes": n_planes,
-                    "z_start": z_start,
-                    "z_end": z_end,
-                    "z_step": z_step,
-                    "modality": modality,
-                })
-                projected_file = str(proj_filepath)
-                logger.info(f"Z-stack projection ({projection_name}): {proj_filepath}")
+                first_img = plane_images[0]
+                size_y, size_x = first_img.shape[:2]
+                is_rgb = first_img.ndim == 3 and first_img.shape[2] == 3
+
+                angle_suffix = f"_angle{angle:.0f}" if len(angles) > 1 else ""
+                proj_file = output_path / f"zstack_{projection_name}{angle_suffix}.ome.tiff"
+
+                with StackWriter(
+                    output_path=proj_file,
+                    size_t=1,
+                    size_z=1,
+                    size_c=1,
+                    size_y=size_y,
+                    size_x=size_x,
+                    dtype=projected.dtype,
+                    pixel_size_um=pixel_size_um,
+                    channel_names=["RGB" if is_rgb else f"{projection_name}{angle_suffix}"],
+                    granularity="single",
+                    photometric="rgb" if is_rgb else "minisblack",
+                ) as writer:
+                    writer.write_frame(projected, t=0, z=0, c=0)
+
+                projected_file = str(proj_file)
+                logger.info(f"Z-stack projection ({projection_name}): {proj_file}")
         except Exception as e:
             logger.warning(f"Z-stack projection failed: {e}")
 
@@ -352,6 +403,45 @@ def acquire_time_lapse(
 # ------------------------------------------------------------------
 # Helpers
 # ------------------------------------------------------------------
+
+def _resolve_pixel_size_um(config_manager, modality: str, objective, detector) -> float:
+    """Best-effort pixel size lookup for OME-TIFF metadata.
+
+    Tries the config manager's pixel-size resolver when available. Falls back
+    to 1.0 um with a warning so the writer always has a numeric value (the
+    OME-XML requires one). Downstream tools read PhysicalSizeX/Y from the
+    emitted file and can correct scale if the true value is known elsewhere.
+    """
+    if config_manager is None:
+        logger.warning("No config_manager available; using placeholder pixel_size_um=1.0")
+        return 1.0
+
+    for attr in ("get_pixel_size_um", "get_pixel_size", "pixel_size_um"):
+        candidate = getattr(config_manager, attr, None)
+        if candidate is None:
+            continue
+        try:
+            value = candidate(modality, objective, detector) if callable(candidate) else candidate
+            if value is not None:
+                return float(value)
+        except TypeError:
+            try:
+                value = candidate()
+                if value is not None:
+                    return float(value)
+            except Exception:
+                pass
+        except Exception as e:
+            logger.debug(f"pixel size resolver {attr} failed: {e}")
+
+    logger.warning(
+        "Could not resolve pixel_size_um from config_manager; "
+        "using placeholder 1.0. Set modalities.%s.pixel_size_um in config or "
+        "extend ConfigManager with get_pixel_size_um().",
+        modality,
+    )
+    return 1.0
+
 
 def _apply_wb_for_snap(hardware, jai_calibration, angle, modality, logger):
     """Apply white balance settings for a given angle before snapping."""
