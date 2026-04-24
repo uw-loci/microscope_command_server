@@ -1342,9 +1342,14 @@ def autofocus_with_manual_fallback(
                     logger.info("User chose to skip autofocus")
                     return skip_z
                 elif user_choice == "cancel":
-                    # User chose to cancel acquisition
+                    # User chose to cancel acquisition. Raise the sentinel the
+                    # outer acquisition loop already catches so state transitions
+                    # to CANCELLED (not FAILED). A plain RuntimeError would be
+                    # caught by the generic `except Exception` and mapped to
+                    # FAILED, which is semantically wrong and doesn't close the
+                    # QuPath progress dialog the same way.
                     logger.warning("User cancelled acquisition during manual focus")
-                    raise RuntimeError("Acquisition cancelled by user during manual focus")
+                    raise _AcquisitionCancelled("User cancelled acquisition during manual focus")
                 elif user_choice == "retry":
                     if retries_remaining > 0:
                         # IMPORTANT: Run autofocus at CURRENT position (where user found tissue)

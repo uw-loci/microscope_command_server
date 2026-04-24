@@ -374,9 +374,22 @@ def acquisitionWorkflow(message, client_addr):
         manual_focus_request_events[client_addr].set()
         # Clear previous choice
         manual_focus_user_choice[client_addr] = None
-        # Wait for user to acknowledge (blocks acquisition thread)
+        # Wait for user to acknowledge (blocks acquisition thread). Poll both
+        # the manual-focus-complete event AND the acquisition-cancel event so
+        # clients that cancel via CANC while the focus dialog is open don't
+        # hang forever -- the cancel path now short-circuits to user_choice
+        # ="cancel" even if SKPAF/ACKMF never arrives.
         logger.info("Waiting for manual focus acknowledgment from user...")
-        manual_focus_complete_events[client_addr].wait()
+        complete_event = manual_focus_complete_events[client_addr]
+        cancel_event = acquisition_cancel_events[client_addr]
+        while not complete_event.wait(timeout=0.2):
+            if cancel_event.is_set():
+                logger.info(
+                    "Acquisition cancelled while waiting for manual focus; "
+                    "treating as user_choice='cancel'"
+                )
+                manual_focus_user_choice[client_addr] = "cancel"
+                break
         # Get user's choice
         user_choice = manual_focus_user_choice[client_addr] or "cancel"
         # Clear events for next potential use
