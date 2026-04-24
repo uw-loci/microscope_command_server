@@ -2610,6 +2610,9 @@ def _prepare_acquisition(
     z_stack_enabled = params.get("z_stack", False)
     z_offsets = [0.0]
     projection_fn = None
+    logger.info("Z-stack check: z_stack=%s, z_start=%s, z_end=%s, z_step=%s, z_projection=%s",
+                z_stack_enabled, params.get("z_start"), params.get("z_end"),
+                params.get("z_step"), params.get("z_projection"))
     if z_stack_enabled:
         z_start_abs = params.get("z_start")
         z_end_abs = params.get("z_end")
