@@ -25,6 +25,7 @@ from microscope_command_server.acquisition.tiles import TileConfigUtils
 from microscope_command_server.modality import get_config as get_modality_config
 from microscope_imageprocessing.io.writer import ome_tiff_writer
 from microscope_imageprocessing.correction.background import BackgroundCorrectionUtils
+from microscope_command_server.acquisition.timepoint_scheduler import TimepointScheduler
 import shlex
 import skimage.filters
 from concurrent.futures import ThreadPoolExecutor, Future
@@ -1850,6 +1851,19 @@ def parse_acquisition_message(message: str) -> dict:
             elif parts[i] == "--biref-min-intensity" and i + 1 < len(parts):
                 params["biref_min_intensity"] = int(parts[i + 1])
                 i += 2
+            # Time-lapse + output-format flags (Z-stack + time-lapse refactor).
+            # Defaults (timepoints=1, interval=0.0, output_format='ome-per-t')
+            # preserve pre-refactor single-pass behavior when the Java side
+            # omits these flags.
+            elif parts[i] == "--timepoints" and i + 1 < len(parts):
+                params["n_timepoints"] = int(parts[i + 1])
+                i += 2
+            elif parts[i] == "--interval" and i + 1 < len(parts):
+                params["interval_seconds"] = float(parts[i + 1])
+                i += 2
+            elif parts[i] == "--output-format" and i + 1 < len(parts):
+                params["output_format"] = parts[i + 1]
+                i += 2
             else:
                 i += 1
 
@@ -1935,6 +1949,13 @@ def parse_acquisition_message(message: str) -> dict:
             elif disabled_angles_str:
                 disabled_angles = [float(x) for x in disabled_angles_str.split()]
         params["background_disabled_angles"] = disabled_angles
+
+        # Time-lapse + output-format defaults. Keeping these outside the
+        # flag loop so callers that omit --timepoints / --interval / --output-format
+        # still get concrete values downstream (single pass, 'ome-per-t').
+        params.setdefault("n_timepoints", 1)
+        params.setdefault("interval_seconds", 0.0)
+        params.setdefault("output_format", "ome-per-t")
 
         # Validate required parameters
         required = [
@@ -2063,6 +2084,15 @@ class AcquisitionContext:
     projection_fn: Optional[Callable] = None
     save_raw_tiles: bool = False
 
+    # -- Time-lapse + output format --
+    # Defaults preserve the pre-refactor single-pass behavior: n_timepoints=1
+    # collapses the T-outer loop in _acquisition_workflow to one pass and
+    # makes the position loop behave identically to before the refactor.
+    n_timepoints: int = 1
+    interval_seconds: float = 0.0
+    output_format: str = "ome-per-t"
+    t0: float = 0.0  # set at loop start (time.monotonic()); 0.0 means "not yet started"
+
     # -- Autofocus (populated by _configure_autofocus) --
     af_n_tiles: int = 5
     af_n_steps: int = 11
@@ -2172,64 +2202,93 @@ def _acquisition_workflow(
         # Phase 9: Create saturation monitor, write pool, NDJSON stream
         _initialize_loop_infrastructure(ctx)
 
-        # Phase 10: Main acquisition loop
-        for pos_idx, (pos, filename) in enumerate(ctx.positions):
-            if ctx.is_cancelled():
-                logger.warning(f"Acquisition cancelled by client {client_addr}")
-                ctx.set_state("CANCELLED")
-                return
-
-            logger.info(f"Position {pos_idx + 1}/{len(ctx.positions)}: {filename}")
-            tile_start = time.perf_counter()
-
-            # AF decision + stage move + autofocus execution
-            needs_af, af_type, drift, af_failed, xy_move_pending = (
-                _handle_tile_autofocus(ctx, pos_idx, pos, filename)
-            )
-
-            # User chose to skip this tile during hardware error recovery
-            if af_type == "skipped":
-                continue
-
-            # Collect stage position for this tile
-            current_stage_pos = hardware.get_current_position()
-            ctx.stage_positions_collected.append((
-                filename,
-                current_stage_pos.x,
-                current_stage_pos.y,
-                current_stage_pos.z,
-            ))
-
-            # Dispatch by modality
-            tile_worst_sat = {"R": 0.0, "G": 0.0, "B": 0.0}
-            if ctx.params["angles"]:
-                tile_worst_sat, xy_move_pending = _acquire_tile_angles(
-                    ctx, pos_idx, pos, filename, current_stage_pos, xy_move_pending
+        # Phase 10: Main acquisition loop (T-outer / position-middle).
+        # When n_timepoints == 1 (default) the scheduler is a no-op and
+        # the loop collapses to the pre-refactor single-pass behavior.
+        ctx.t0 = time.monotonic()
+        scheduler = TimepointScheduler(
+            t0_monotonic=ctx.t0,
+            interval_seconds=ctx.interval_seconds,
+            logger=logger,
+        )
+        for t_idx in range(ctx.n_timepoints):
+            if t_idx > 0:
+                # Time-lapse pacing. wait_until() returns 0 if overdue
+                # (acq_time > interval) with a warning, or after the
+                # cancel poll fires.
+                if ctx.is_cancelled():
+                    logger.warning(f"Acquisition cancelled by client {client_addr}")
+                    ctx.set_state("CANCELLED")
+                    return
+                scheduler.wait_until(t_idx, cancel_event=ctx.is_cancelled)
+                if ctx.is_cancelled():
+                    logger.warning(f"Acquisition cancelled by client {client_addr}")
+                    ctx.set_state("CANCELLED")
+                    return
+                logger.info(
+                    "=== TIMEPOINT %d/%d starting at t0+%.1fs ===",
+                    t_idx + 1,
+                    ctx.n_timepoints,
+                    time.monotonic() - ctx.t0,
                 )
-            else:
-                # Wait for non-blocking XY move before single-image/channel snap
-                if xy_move_pending:
-                    ctx.hardware.wait_for_xy()
 
-                # Try channel-based acquisition first
-                channel_plan = resolve_channel_plan(
-                    ctx.ppm_settings,
-                    ctx.params.get("scan_type", ""),
-                    ctx.params.get("channels", []) or [],
-                    ctx.params.get("channel_exposures", []) or [],
-                    channel_intensity_overrides=ctx.params.get("channel_intensities") or None,
+            for pos_idx, (pos, filename) in enumerate(ctx.positions):
+                if ctx.is_cancelled():
+                    logger.warning(f"Acquisition cancelled by client {client_addr}")
+                    ctx.set_state("CANCELLED")
+                    return
+
+                logger.info(f"Position {pos_idx + 1}/{len(ctx.positions)}: {filename}")
+                tile_start = time.perf_counter()
+
+                # AF decision + stage move + autofocus execution
+                needs_af, af_type, drift, af_failed, xy_move_pending = (
+                    _handle_tile_autofocus(ctx, pos_idx, pos, filename)
                 )
-                if channel_plan:
-                    tile_worst_sat = _acquire_tile_channels(ctx, pos, filename, current_stage_pos)
+
+                # User chose to skip this tile during hardware error recovery
+                if af_type == "skipped":
+                    continue
+
+                # Collect stage position for this tile
+                current_stage_pos = hardware.get_current_position()
+                ctx.stage_positions_collected.append((
+                    filename,
+                    current_stage_pos.x,
+                    current_stage_pos.y,
+                    current_stage_pos.z,
+                ))
+
+                # Dispatch by modality
+                tile_worst_sat = {"R": 0.0, "G": 0.0, "B": 0.0}
+                if ctx.params["angles"]:
+                    tile_worst_sat, xy_move_pending = _acquire_tile_angles(
+                        ctx, pos_idx, pos, filename, current_stage_pos, xy_move_pending
+                    )
                 else:
-                    tile_worst_sat = _acquire_tile_single(ctx, pos, filename, current_stage_pos)
+                    # Wait for non-blocking XY move before single-image/channel snap
+                    if xy_move_pending:
+                        ctx.hardware.wait_for_xy()
 
-            # Record per-tile measurements
-            _record_tile_measurement(
-                ctx, pos_idx, filename, tile_start,
-                needs_af, af_type, drift, af_failed,
-                tile_worst_sat, current_stage_pos,
-            )
+                    # Try channel-based acquisition first
+                    channel_plan = resolve_channel_plan(
+                        ctx.ppm_settings,
+                        ctx.params.get("scan_type", ""),
+                        ctx.params.get("channels", []) or [],
+                        ctx.params.get("channel_exposures", []) or [],
+                        channel_intensity_overrides=ctx.params.get("channel_intensities") or None,
+                    )
+                    if channel_plan:
+                        tile_worst_sat = _acquire_tile_channels(ctx, pos, filename, current_stage_pos)
+                    else:
+                        tile_worst_sat = _acquire_tile_single(ctx, pos, filename, current_stage_pos)
+
+                # Record per-tile measurements
+                _record_tile_measurement(
+                    ctx, pos_idx, filename, tile_start,
+                    needs_af, af_type, drift, af_failed,
+                    tile_worst_sat, current_stage_pos,
+                )
 
         # Phase 11: Post-acquisition finalization
         _finalize_acquisition(ctx)
@@ -2915,13 +2974,30 @@ def _prepare_acquisition(
     else:
         n_steps_per_tile = 1
     n_angles = len(params["angles"]) if params["angles"] else 1
-    total_images = len(positions) * n_z_planes * n_steps_per_tile
+    # Time-lapse multiplier. For single-pass acquisitions (the default),
+    # n_timepoints=1 and total_images / log line are unchanged.
+    n_timepoints = int(params.get("n_timepoints", 1))
+    if n_timepoints < 1:
+        logger.warning(
+            "n_timepoints=%d is invalid; clamping to 1", n_timepoints
+        )
+        n_timepoints = 1
+    total_images = len(positions) * n_z_planes * n_steps_per_tile * n_timepoints
 
     update_progress(0, total_images)
-    logger.info(
-        f"Starting acquisition of {total_images} total images "
-        f"({len(positions)} positions x {n_z_planes} Z-planes x {n_angles} angles)"
-    )
+    if n_timepoints > 1:
+        interval_seconds = float(params.get("interval_seconds", 0.0))
+        logger.info(
+            f"Starting time-lapse acquisition of {total_images} total images "
+            f"({n_timepoints} timepoints x {len(positions)} positions x "
+            f"{n_z_planes} Z-planes x {n_angles} angles, "
+            f"interval={interval_seconds:.1f}s)"
+        )
+    else:
+        logger.info(
+            f"Starting acquisition of {total_images} total images "
+            f"({len(positions)} positions x {n_z_planes} Z-planes x {n_angles} angles)"
+        )
 
     metadata_txt_for_positions = output_path / "image_positions_metadata.txt"
 
@@ -2959,6 +3035,9 @@ def _prepare_acquisition(
         z_offsets=z_offsets,
         projection_fn=projection_fn,
         save_raw_tiles=save_raw_tiles,
+        n_timepoints=n_timepoints,
+        interval_seconds=float(params.get("interval_seconds", 0.0)),
+        output_format=str(params.get("output_format", "ome-per-t")),
         hint_z=params.get("hint_z"),
         metadata_txt_for_positions=metadata_txt_for_positions,
         update_progress=update_progress,
