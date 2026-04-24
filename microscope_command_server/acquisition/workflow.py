@@ -3762,21 +3762,12 @@ def _handle_tile_autofocus(
         failed = ctx.write_pool.drain()
         log_timing(logger, f"Drain {n_drained} pending writes ({failed} failed)", t_drain)
 
-    # Restore per-channel exposure/gain mode after autofocus
-    if (ctx.wb_mode == "per_angle"
-            and ctx.jai_calibration is not None
-            and params["angles"]):
-        first_angle = params["angles"][0]
-        logger.debug(f"Restoring per-channel WB mode after autofocus (first angle: {first_angle})")
-        applied, _ = apply_jai_calibration_for_angle(
-            hardware=hardware,
-            jai_calibration=ctx.jai_calibration,
-            angle=first_angle,
-            per_angle=ctx.white_balance_per_angle,
-            logger=logger,
-        )
-        if not applied:
-            logger.warning("Failed to restore per-channel mode after autofocus")
+    # NOTE: No WB restore needed here. The angle loop's first iteration
+    # calls apply_jai_calibration_for_angle (per_angle mode) or
+    # camera.apply_settings (simple mode), which re-enables per-channel
+    # mode as part of its operation. The previous explicit restore was
+    # redundant and cost ~1.3s per AF tile (614 duplicate calls = 13 min
+    # wasted in a 2,399-tile acquisition, April 2026 log analysis).
 
     return needs_af, af_type_for_this_tile, drift_for_this_tile, af_failed_for_this_tile, xy_move_pending
 
