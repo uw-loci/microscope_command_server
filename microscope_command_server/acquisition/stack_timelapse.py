@@ -38,6 +38,7 @@ def acquire_z_stack(
     detector: str = None,
     yaml_file_path: str = None,
     progress_callback: Optional[Callable[[int, int, str], None]] = None,
+    projection: str = "none",
 ) -> Dict:
     """
     Acquire a Z-stack at the current XY position.
@@ -151,6 +152,41 @@ def acquire_z_stack(
             })
             saved_files.append(str(filepath))
 
+    # Apply projection if requested -- combine individual Z planes into a single file
+    projected_file = None
+    projection_name = projection
+    if projection_name and projection_name != "none" and n_planes > 1:
+        try:
+            from microscope_command_server.acquisition.projections import get_projection
+            projection_fn = get_projection(projection_name)
+            # Collect all non-angle images (or just all images for brightfield)
+            plane_images = []
+            for plane_idx, z_pos in enumerate(z_positions):
+                # Read back the saved file
+                import tifffile
+                angle_suffix = ""
+                filename = f"z{plane_idx:04d}_Z{z_pos:.1f}{angle_suffix}.tif"
+                filepath = output_path / filename
+                if filepath.exists():
+                    plane_images.append(tifffile.imread(str(filepath)))
+
+            if plane_images:
+                projected = projection_fn(plane_images)
+                proj_filename = f"zstack_{projection_name}.tif"
+                proj_filepath = output_path / proj_filename
+                _save_image(projected, proj_filepath, {
+                    "projection": projection_name,
+                    "n_planes": n_planes,
+                    "z_start": z_start,
+                    "z_end": z_end,
+                    "z_step": z_step,
+                    "modality": modality,
+                })
+                projected_file = str(proj_filepath)
+                logger.info(f"Z-stack projection ({projection_name}): {proj_filepath}")
+        except Exception as e:
+            logger.warning(f"Z-stack projection failed: {e}")
+
     elapsed = time.time() - start_time
     logger.info(f"=== Z-STACK COMPLETE: {n_planes} planes, {len(saved_files)} images, "
                 f"{elapsed:.1f}s ===")
@@ -163,6 +199,7 @@ def acquire_z_stack(
         "z_positions": z_positions,
         "output_folder": str(output_path),
         "files": saved_files,
+        "projected_file": projected_file,
         "elapsed_seconds": elapsed,
     }
 

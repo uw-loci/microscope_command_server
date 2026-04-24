@@ -426,6 +426,8 @@ def handle_zstack(conn, client, hardware, settings, **kwargs):
             params["objective"] = parts[i + 1]; i += 2
         elif parts[i] == "--detector" and i + 1 < len(parts):
             params["detector"] = parts[i + 1]; i += 2
+        elif parts[i] == "--projection" and i + 1 < len(parts):
+            params["projection"] = parts[i + 1]; i += 2
         else:
             i += 1
 
@@ -451,6 +453,7 @@ def handle_zstack(conn, client, hardware, settings, **kwargs):
             objective=params.get("objective"),
             detector=params.get("detector"),
             yaml_file_path=params.get("yaml"),
+            projection=params.get("projection", "none"),
         )
         response = (f"SUCCESS:{params['output']}|"
                     f"planes:{result['n_planes']}|"
