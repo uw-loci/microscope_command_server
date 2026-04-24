@@ -4317,7 +4317,10 @@ def _acquire_tile_channels(ctx: AcquisitionContext, pos, filename: str,
 
 def _acquire_tile_single(ctx: AcquisitionContext, pos, filename: str,
                          current_stage_pos) -> dict:
-    """Acquire a single image for a non-rotation tile (BF, fluorescence).
+    """Acquire image(s) for a non-rotation tile (BF, fluorescence).
+
+    Supports Z-stack: when z_stack_enabled, iterates Z-offsets around
+    center_z, accumulates planes, and saves a projected 2D image.
 
     Returns tile_worst_sat dict.
     """
@@ -4332,46 +4335,89 @@ def _acquire_tile_single(ctx: AcquisitionContext, pos, filename: str,
         hardware.set_exposure(exposure_ms)
         logger.debug("Single-image path: set exposure to %.2f ms", exposure_ms)
 
-    image, metadata = hardware.snap_image()
+    center_z = current_stage_pos.z
+    z_stack_planes = []  # accumulate Z planes when z_stack_enabled
 
-    # Background correction
-    if ctx.background_correction_enabled and ctx.background_images:
-        bg_key = 0.0
-        if bg_key in ctx.background_images:
-            try:
-                bg_scale = ctx.background_scaling_factors.get(bg_key, 1.0) \
-                    if ctx.background_scaling_factors else 1.0
-                image = BackgroundCorrectionUtils.apply_flat_field_correction(
-                    image, ctx.background_images[bg_key],
-                    scaling_factor=bg_scale,
-                    method=ctx.background_correction_method)
-                logger.info(
-                    "  Applied %s background correction (median=%.0f)",
-                    ctx.background_correction_method, float(np.median(image)),
+    for z_idx, z_offset in enumerate(ctx.z_offsets):
+        # Move Z if doing Z-stack (skip for single-plane 2D)
+        if ctx.z_stack_enabled and z_offset != 0.0:
+            target_z = center_z + z_offset
+            hardware.move_to_position(Position(z=target_z))
+            logger.debug(
+                "Z-stack: plane %d/%d, Z=%.2f (offset=%+.1f)",
+                z_idx + 1, len(ctx.z_offsets), target_z, z_offset,
+            )
+
+        image, metadata = hardware.snap_image()
+
+        # Background correction
+        if ctx.background_correction_enabled and ctx.background_images:
+            bg_key = 0.0
+            if bg_key in ctx.background_images:
+                try:
+                    bg_scale = ctx.background_scaling_factors.get(bg_key, 1.0) \
+                        if ctx.background_scaling_factors else 1.0
+                    image = BackgroundCorrectionUtils.apply_flat_field_correction(
+                        image, ctx.background_images[bg_key],
+                        scaling_factor=bg_scale,
+                        method=ctx.background_correction_method)
+                except Exception as e:
+                    logger.warning("  Background correction failed: %s", e)
+
+        # Saturation check
+        sat_result = _check_saturation(image, "tile", logger)
+        if sat_result:
+            for ch_key, pct in sat_result.items():
+                if pct > tile_worst_sat.get(ch_key, 0):
+                    tile_worst_sat[ch_key] = pct
+
+        if not ctx.z_stack_enabled:
+            # 2D mode: save directly
+            image_path = ctx.output_path / filename
+            if image_path.parent.exists():
+                bf_pixel_size = hardware.get_pixel_size_um()
+                ctx.write_pool.submit(
+                    ome_tiff_writer,
+                    filename=str(image_path),
+                    pixel_size_um=bf_pixel_size,
+                    data=image,
                 )
-            except Exception as e:
-                logger.warning("  Background correction failed: %s", e)
+        else:
+            # Z-stack mode: accumulate for projection
+            z_stack_planes.append(image)
+            if ctx.save_raw_tiles:
+                z_plane_path = ctx.output_path / f"z{z_idx:03d}" / filename
+                z_plane_path.parent.mkdir(parents=True, exist_ok=True)
+                ctx.write_pool.submit(
+                    ome_tiff_writer,
+                    filename=str(z_plane_path),
+                    pixel_size_um=hardware.get_pixel_size_um(),
+                    data=image,
+                )
 
-    # Saturation check
-    sat_result = _check_saturation(image, "tile", logger)
-    if sat_result:
-        for ch_key, pct in sat_result.items():
-            if pct > tile_worst_sat.get(ch_key, 0):
-                tile_worst_sat[ch_key] = pct
-
-    image_path = ctx.output_path / filename
-    if image_path.parent.exists():
-        bf_pixel_size = hardware.get_pixel_size_um()
-        ctx.write_pool.submit(
-            ome_tiff_writer,
-            filename=str(image_path),
-            pixel_size_um=bf_pixel_size,
-            data=image,
-        )
         ctx.image_count += 1
         ctx.update_progress(ctx.image_count, ctx.total_images)
 
+    # Z-stack projection: reduce planes to single 2D image
+    if ctx.z_stack_enabled and ctx.projection_fn is not None and z_stack_planes:
+        projected = ctx.projection_fn(z_stack_planes)
+        image_path = ctx.output_path / filename
+        if image_path.parent.exists():
+            ctx.write_pool.submit(
+                ome_tiff_writer,
+                filename=str(image_path),
+                pixel_size_um=hardware.get_pixel_size_um(),
+                data=projected,
+            )
+        logger.info(
+            "Z-stack projection (%s) computed for %d planes",
+            ctx.params.get("z_projection", "max"), len(z_stack_planes),
+        )
+        # Return Z to center position for next tile
+        hardware.move_to_position(Position(z=center_z))
+
     try:
+        image_path = ctx.output_path / filename
         write_position_metadata(ctx.metadata_txt_for_positions, image_path, hardware, ctx.modality)
     except Exception as e:
         logger.warning(f"  Failed to write position text {ctx.metadata_txt_for_positions}: {e}")
