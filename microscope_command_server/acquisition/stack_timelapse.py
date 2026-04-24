@@ -117,33 +117,59 @@ def acquire_z_stack(
     angle_frames: Dict[float, list] = {angle: [] for angle in angles}
     start_time = time.time()
 
-    for plane_idx, z_pos in enumerate(z_positions):
-        if progress_callback:
-            progress_callback(plane_idx, n_planes, f"Z={z_pos:.1f} um")
+    # Capture starting XYZ so we can restore the stage after the acquisition.
+    # Users expect the stage to return to the original position (not sit at
+    # the last Z plane of the stack).
+    from microscope_control.hardware import Position
+    try:
+        start_position = hardware.get_current_position()
+        logger.info(
+            f"Z-stack start position: X={start_position.x:.2f}, "
+            f"Y={start_position.y:.2f}, Z={start_position.z:.2f} um"
+        )
+    except Exception as e:
+        logger.warning(f"Could not capture start position for restore: {e}")
+        start_position = None
 
-        # Move Z
-        from microscope_control.hardware import Position
-        hardware.move_to_position(Position(z=z_pos))
-        actual_z = hardware.get_z_position()
-        logger.info(f"Plane {plane_idx + 1}/{n_planes}: Z={actual_z:.2f} um (target={z_pos:.2f})")
+    try:
+        for plane_idx, z_pos in enumerate(z_positions):
+            if progress_callback:
+                progress_callback(plane_idx, n_planes, f"Z={z_pos:.1f} um")
 
-        # Acquire at each angle
-        for angle in angles:
-            # Rotate if PPM
-            if len(angles) > 1 and hasattr(hardware, "set_psg_ticks"):
-                hardware.set_psg_ticks(angle)
+            # Move Z
+            hardware.move_to_position(Position(z=z_pos))
+            actual_z = hardware.get_z_position()
+            logger.info(f"Plane {plane_idx + 1}/{n_planes}: Z={actual_z:.2f} um (target={z_pos:.2f})")
 
-            # Apply WB if calibration available
-            if jai_calibration:
-                _apply_wb_for_snap(hardware, jai_calibration, angle, modality, logger)
+            # Acquire at each angle
+            for angle in angles:
+                # Rotate if PPM
+                if len(angles) > 1 and hasattr(hardware, "set_psg_ticks"):
+                    hardware.set_psg_ticks(angle)
 
-            # Snap
-            image, metadata = hardware.snap_image()
-            if image is None:
-                logger.error(f"Failed to snap at Z={z_pos}, angle={angle}")
-                continue
+                # Apply WB if calibration available
+                if jai_calibration:
+                    _apply_wb_for_snap(hardware, jai_calibration, angle, modality, logger)
 
-            angle_frames[angle].append((plane_idx, actual_z, image))
+                # Snap
+                image, metadata = hardware.snap_image()
+                if image is None:
+                    logger.error(f"Failed to snap at Z={z_pos}, angle={angle}")
+                    continue
+
+                angle_frames[angle].append((plane_idx, actual_z, image))
+    finally:
+        # Always restore the stage to the starting position, even if the
+        # acquisition raised. Users expect XYZ to return where it started.
+        if start_position is not None:
+            try:
+                hardware.move_to_position(start_position)
+                logger.info(
+                    f"Restored stage to start: X={start_position.x:.2f}, "
+                    f"Y={start_position.y:.2f}, Z={start_position.z:.2f} um"
+                )
+            except Exception as e:
+                logger.error(f"Failed to restore stage position: {e}")
 
     # Emit one OME-TIFF per angle using StackWriter. Non-PPM runs with a
     # single angle=0 and produces one zstack.ome.tiff with a real OME Z
