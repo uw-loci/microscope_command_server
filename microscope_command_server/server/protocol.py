@@ -144,6 +144,14 @@ class ExtendedCommand:
     # Illumination & Profile Commands
     GETILLM = b"getillm_"  # Get illumination state (power, range, on/off)
     SETILLM = b"setillm_"  # Set illumination power (4-byte float)
+    # Per-device illumination set: drives a NAMED source (not whichever one
+    # the active profile selected). Lets the Live Viewer / Camera Control
+    # tune any declared source -- DiaLamp, Lumencor, Pockels cell, etc. --
+    # without having to APPLYPR to that source's profile first. Vendor-
+    # agnostic: server walks every modality, builds the Illumination via
+    # _build_illumination_from_config, finds the device-name match.
+    # Payload: 32-byte device name (null-padded UTF-8) + 4-byte big-endian float.
+    SETILLMD = b"setilmd_"
     APPLYPR = b"applypr_"  # Apply acquisition profile (calls apply_mode_setup)
     # Apply a single channel from a profile's channel library: cube + light
     # source switch + per-channel intensity property write + exposure. Used

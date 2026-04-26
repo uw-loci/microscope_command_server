@@ -96,6 +96,88 @@ def handle_setillm(conn, client, hardware, settings, **kwargs):
         conn.sendall(b"ERR_ILLM")
 
 
+def handle_setilmd(conn, client, hardware, settings, **kwargs):
+    """Set illumination power on a NAMED device.
+
+    Independent of which source the active profile selected. Walks every
+    modality declared in the config, builds each illumination object via
+    the same _build_illumination_from_config helper apply_mode_setup uses,
+    finds the one whose MM device name matches the requested name, and
+    calls set_power on it. Vendor-agnostic: works for any Illumination
+    subclass (LED, DevicePropertyIllumination, PockelsCell, ...) without
+    per-device code paths.
+
+    Caveat by design: if the requested source's optical path is not
+    currently selected (e.g. asking the Epi LED to power up while the
+    Light Path preset still routes to BF Camera), the value is staged --
+    the device write goes through but no light reaches the sample until
+    the user APPLYPRs the matching profile. This is intentional: live
+    feedback during multi-source tuning would require interleaving path
+    switches with snaps, which is out of scope here.
+
+    Protocol: 36-byte payload = 32-byte device name (null-padded UTF-8) +
+    4-byte big-endian float (power).
+
+    Response: 'ACK_____' on success, 'ERR_DEVN' if the device name has
+    no match, 'ERR_ILLM' on any other failure.
+    """
+    logger.debug("Client %s requesting per-device illumination set", client.addr)
+    device_name = "?"
+    power = 0.0
+    try:
+        data = conn.recv(36)
+        if len(data) < 36:
+            logger.error("SETILLMD: short payload (%d bytes, want 36)", len(data))
+            conn.sendall(b"ERR_ILLM")
+            return
+
+        device_name = data[:32].rstrip(b"\x00").decode("utf-8", errors="replace").strip()
+        power = struct.unpack(">f", data[32:36])[0]
+        if not device_name:
+            logger.error("SETILLMD: empty device name")
+            conn.sendall(b"ERR_DEVN")
+            return
+
+        modalities = (settings or {}).get("modalities", {}) or {}
+        target = None
+        for mod_cfg in modalities.values():
+            if not isinstance(mod_cfg, dict):
+                continue
+            try:
+                candidate = hardware._build_illumination_from_config(mod_cfg)
+            except Exception:
+                continue
+            if candidate is None:
+                continue
+            if getattr(candidate, "_device", None) == device_name:
+                target = candidate
+                break
+
+        # Also accept the active illumination if it matches by device --
+        # covers programmatic overrides that may not round-trip through
+        # the modalities iteration above.
+        if target is None and hardware._illumination is not None:
+            if getattr(hardware._illumination, "_device", None) == device_name:
+                target = hardware._illumination
+
+        if target is None:
+            logger.error("SETILLMD: no illumination source found for device '%s'", device_name)
+            conn.sendall(b"ERR_DEVN")
+            return
+
+        if power <= 0:
+            target.off()
+            logger.info("SETILLMD: turned off device '%s'", device_name)
+        else:
+            target.set_power(power)
+            logger.info("SETILLMD: set device '%s' power to %.2f", device_name, power)
+
+        conn.sendall(b"ACK_____")
+    except Exception as e:
+        logger.error("SETILLMD failed for device='%s' power=%.2f: %s", device_name, power, e)
+        conn.sendall(b"ERR_ILLM")
+
+
 def handle_applypr(conn, client, hardware, settings, **kwargs):
     """Apply an acquisition profile (calls apply_mode_setup).
 
