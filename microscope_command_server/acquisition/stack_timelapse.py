@@ -356,8 +356,13 @@ def acquire_time_lapse(
             logger.warning(f"Could not load WB calibration: {e}")
 
     saved_files = []
+    # Buffer per-angle frames so we can emit a single multi-page OME-TIFF
+    # per angle once the timepoint loop completes. Keyed by angle -> list of
+    # (tp_idx, elapsed_since_start, image) in acquisition order.
+    angle_frames: Dict[float, list] = {angle: [] for angle in angles}
     start_time = time.time()
     t0 = time.time()
+    actual_tp = 0  # Number of timepoints actually acquired (for cancel case)
 
     for tp_idx in range(n_timepoints):
         # Check for cancellation
@@ -386,17 +391,9 @@ def acquire_time_lapse(
                 logger.error(f"Failed to snap at T={tp_idx}, angle={angle}")
                 continue
 
-            angle_suffix = f"_angle{angle:.0f}" if len(angles) > 1 else ""
-            filename = f"t{tp_idx:05d}_T{elapsed_since_start:.1f}s{angle_suffix}.tif"
-            filepath = output_path / filename
+            angle_frames[angle].append((tp_idx, elapsed_since_start, image))
 
-            _save_image(image, filepath, {
-                "timepoint": tp_idx,
-                "elapsed_seconds": elapsed_since_start,
-                "angle": angle,
-                "modality": modality,
-            })
-            saved_files.append(str(filepath))
+        actual_tp = tp_idx + 1
 
         # Wait for next timepoint (accounting for acquisition time)
         if tp_idx < n_timepoints - 1 and interval_seconds > 0:
@@ -410,10 +407,60 @@ def acquire_time_lapse(
                         break
                     time.sleep(min(0.5, sleep_end - time.time()))
 
+    # Emit one multi-page OME-TIFF per angle using StackWriter. Non-PPM runs
+    # with a single angle=0 and produces one timelapse.ome.tiff with a real
+    # OME T dimension, TimeIncrement metadata, per-frame DeltaT. PPM angles
+    # are written as independent sibling files (timelapse_angleNN.ome.tiff)
+    # to mirror the Z-stack project decision (PPM angles stay separate
+    # rather than combining into OME channels).
+    from microscope_imageprocessing.io.ome_writer import StackWriter
+
+    pixel_size_um = _resolve_pixel_size_um(config_manager, modality, objective, detector)
+
+    for angle, frames in angle_frames.items():
+        if not frames:
+            logger.warning(f"No frames captured for angle {angle}; skipping file write")
+            continue
+        first_img = frames[0][2]
+        size_y, size_x = first_img.shape[:2]
+        is_rgb = first_img.ndim == 3 and first_img.shape[2] == 3
+
+        angle_suffix = f"_angle{angle:.0f}" if len(angles) > 1 else ""
+        out_file = output_path / f"timelapse{angle_suffix}.ome.tiff"
+
+        channel_names = ["RGB"] if is_rgb else [f"{modality}{angle_suffix}"]
+
+        with StackWriter(
+            output_path=out_file,
+            size_t=len(frames),
+            size_z=1,
+            size_c=1,
+            size_y=size_y,
+            size_x=size_x,
+            dtype=first_img.dtype,
+            pixel_size_um=pixel_size_um,
+            time_increment_s=interval_seconds if interval_seconds > 0 else None,
+            channel_names=channel_names,
+            granularity="single",
+            photometric="rgb" if is_rgb else "minisblack",
+        ) as writer:
+            for t_local, (tp_idx, elapsed_s, image) in enumerate(frames):
+                writer.write_frame(
+                    image,
+                    t=t_local,
+                    z=0,
+                    c=0,
+                    plane_metadata={
+                        "delta_t_s": float(elapsed_s),
+                        "angle": float(angle),
+                    },
+                )
+        saved_files.append(str(out_file))
+        logger.info(f"Wrote time-lapse OME-TIFF: {out_file} (SizeT={len(frames)})")
+
     elapsed = time.time() - start_time
-    actual_tp = len(set(f.split("_T")[0] for f in [Path(f).stem for f in saved_files]))
     logger.info(f"=== TIME-LAPSE COMPLETE: {actual_tp} timepoints, "
-                f"{len(saved_files)} images, {elapsed:.1f}s ===")
+                f"{len(saved_files)} files, {elapsed:.1f}s ===")
 
     if progress_callback:
         progress_callback(n_timepoints, n_timepoints, "Complete")
