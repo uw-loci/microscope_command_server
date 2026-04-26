@@ -1982,67 +1982,6 @@ def parse_acquisition_message(message: str) -> dict:
     raise ValueError("Invalid acquisition message format - must use flag-based format with '--' parameters")
 
 
-def get_angles_wb_from_settings(
-    settings: Dict[str, Any],
-    modality: Optional[str] = None,
-) -> Dict[float, List[float]]:
-    """Extract white balance values for different angles from settings.
-
-    Uses modality config to determine the WB settings key and angle mapping.
-    Falls back to neutral [1,1,1] if no WB settings are found.
-    """
-    mod_config = get_modality_config(modality)
-    angles_wb = {}
-
-    # Determine WB key from modality config or derive from modality name
-    wb_settings = settings.get("white_balance", {})
-    wb_key = mod_config.wb_settings_key
-    if not wb_key and modality:
-        wb_key = modality.split("_")[0].lower()
-    modality_wb = wb_settings.get(wb_key, {}) if wb_key else {}
-
-    # Use modality config angle names, or fall back to the modality_wb keys
-    angle_mapping = mod_config.name_to_angle if mod_config.name_to_angle else {}
-
-    for angle_name, angle_value in angle_mapping.items():
-        if angle_name in modality_wb:
-            wb_values = modality_wb[angle_name]
-            # Handle different formats
-            if isinstance(wb_values, list):
-                if len(wb_values) > 0 and isinstance(wb_values[0], str):
-                    # Format: ["1.0 1.0 1.0"]
-                    angles_wb[angle_value] = [float(x) for x in wb_values[0].split()]
-                else:
-                    # Format: [1.0, 1.0, 1.0]
-                    angles_wb[angle_value] = wb_values
-            elif isinstance(wb_values, str):
-                # Format: "1.0 1.0 1.0"
-                angles_wb[angle_value] = [float(x) for x in wb_values.split()]
-
-    # Neutral fallback if no software WB settings found in config.
-    # All [1.0, 1.0, 1.0] = no software color correction applied.
-    # Per-angle [R,G,B] software WB coefficients were never reintroduced
-    # after the imageprocessing-yml split (config now stores hardware-side
-    # WB via JAI analog gains/exposures and derives software WB from
-    # background images). The caller substitutes background-derived
-    # coefficients when this returns all-neutral, so this is the normal
-    # path on PPM and does not indicate a configuration problem.
-    if not angles_wb:
-        logger.info(
-            "No explicit software WB in config (settings['white_balance']['%s']); "
-            "caller will derive coefficients from background images",
-            wb_key or "unknown",
-        )
-        # Build neutral entries for all configured angles
-        if angle_mapping:
-            angles_wb = {v: [1.0, 1.0, 1.0] for v in angle_mapping.values()}
-        else:
-            # Non-rotation modality: single neutral entry
-            angles_wb = {0.0: [1.0, 1.0, 1.0]}
-
-    return angles_wb
-
-
 class _AcquisitionCancelled(Exception):
     """Raised inside extracted functions when is_cancelled() returns True."""
 
@@ -2931,14 +2870,23 @@ def _prepare_acquisition(
         logger.info("White balance disabled (wb_mode=%s)", wb_mode)
 
     if white_balance_enabled:
-        angles_wb = get_angles_wb_from_settings(ppm_settings, modality=modality)
-        all_neutral = all(v == [1.0, 1.0, 1.0] for v in angles_wb.values())
-        if all_neutral and background_wb_coeffs:
-            logger.info(
-                "No WB settings in config - using background-derived "
-                "coefficients for %d angles", len(background_wb_coeffs)
-            )
+        if background_wb_coeffs:
             angles_wb = {angle: list(coeffs) for angle, coeffs in background_wb_coeffs.items()}
+            logger.info(
+                "Software WB: using background-derived coefficients for %d angles",
+                len(angles_wb),
+            )
+        else:
+            mod_config = get_modality_config(modality)
+            angle_mapping = mod_config.name_to_angle if mod_config.name_to_angle else {}
+            if angle_mapping:
+                angles_wb = {v: [1.0, 1.0, 1.0] for v in angle_mapping.values()}
+            else:
+                angles_wb = {0.0: [1.0, 1.0, 1.0]}
+            logger.info(
+                "Software WB: no background-derived coefficients; using neutral [1,1,1] for %d angles",
+                len(angles_wb),
+            )
 
         if white_balance_per_angle:
             logger.info(f"Using per-angle white balance for {len(angles_wb)} angles")
