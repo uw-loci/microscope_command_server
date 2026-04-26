@@ -145,3 +145,9 @@ class ExtendedCommand:
     GETILLM = b"getillm_"  # Get illumination state (power, range, on/off)
     SETILLM = b"setillm_"  # Set illumination power (4-byte float)
     APPLYPR = b"applypr_"  # Apply acquisition profile (calls apply_mode_setup)
+    # Apply a single channel from a profile's channel library: cube + light
+    # source switch + per-channel intensity property write + exposure. Used
+    # by Live Viewer's per-channel preview radios. Empty channel id deactivates
+    # all illumination for the profile's modality.
+    # Payload: 32-byte profile name + 32-byte channel id (null-padded UTF-8).
+    APPLYCH = b"applych_"

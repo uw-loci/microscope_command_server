@@ -44,7 +44,7 @@ from microscope_command_server.server.handlers.acquisition import (
     handle_acquire, handle_bgacquire, handle_zstack, handle_tlapse,
 )
 from microscope_command_server.server.handlers.illumination import (
-    handle_getillm, handle_setillm, handle_applypr,
+    handle_getillm, handle_setillm, handle_applypr, handle_applych,
 )
 from microscope_command_server.server.handlers.system import (
     handle_config, handle_reconfig, handle_disconnect, handle_shutdown, handle_siftal,
@@ -128,6 +128,7 @@ COMMAND_HANDLERS = {
     ExtendedCommand.GETILLM: handle_getillm,
     ExtendedCommand.SETILLM: handle_setillm,
     ExtendedCommand.APPLYPR: handle_applypr,
+    ExtendedCommand.APPLYCH: handle_applych,
 
     # System & alignment
     ExtendedCommand.CONFIG: handle_config,
