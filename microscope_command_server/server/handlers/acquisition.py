@@ -428,6 +428,12 @@ def handle_zstack(conn, client, hardware, settings, **kwargs):
             params["detector"] = parts[i + 1]; i += 2
         elif parts[i] == "--projection" and i + 1 < len(parts):
             params["projection"] = parts[i + 1]; i += 2
+        elif parts[i] == "--bg-correction" and i + 1 < len(parts):
+            params["bg_correction"] = parts[i + 1].lower() == "true"; i += 2
+        elif parts[i] == "--bg-folder" and i + 1 < len(parts):
+            params["bg_folder"] = parts[i + 1]; i += 2
+        elif parts[i] == "--bg-method" and i + 1 < len(parts):
+            params["bg_method"] = parts[i + 1]; i += 2
         else:
             i += 1
 
@@ -454,6 +460,9 @@ def handle_zstack(conn, client, hardware, settings, **kwargs):
             detector=params.get("detector"),
             yaml_file_path=params.get("yaml"),
             projection=params.get("projection", "none"),
+            background_correction_enabled=params.get("bg_correction", False),
+            background_folder=params.get("bg_folder"),
+            background_correction_method=params.get("bg_method", "divide"),
         )
         response = (f"SUCCESS:{params['output']}|"
                     f"planes:{result['n_planes']}|"
@@ -512,6 +521,12 @@ def handle_tlapse(conn, client, hardware, settings, **kwargs):
             params["objective"] = parts[i + 1]; i += 2
         elif parts[i] == "--detector" and i + 1 < len(parts):
             params["detector"] = parts[i + 1]; i += 2
+        elif parts[i] == "--bg-correction" and i + 1 < len(parts):
+            params["bg_correction"] = parts[i + 1].lower() == "true"; i += 2
+        elif parts[i] == "--bg-folder" and i + 1 < len(parts):
+            params["bg_folder"] = parts[i + 1]; i += 2
+        elif parts[i] == "--bg-method" and i + 1 < len(parts):
+            params["bg_method"] = parts[i + 1]; i += 2
         else:
             i += 1
 
@@ -535,6 +550,9 @@ def handle_tlapse(conn, client, hardware, settings, **kwargs):
             objective=params.get("objective"),
             detector=params.get("detector"),
             yaml_file_path=params.get("yaml"),
+            background_correction_enabled=params.get("bg_correction", False),
+            background_folder=params.get("bg_folder"),
+            background_correction_method=params.get("bg_method", "divide"),
         )
         response = (f"SUCCESS:{params['output']}|"
                     f"timepoints:{result['n_timepoints']}|"

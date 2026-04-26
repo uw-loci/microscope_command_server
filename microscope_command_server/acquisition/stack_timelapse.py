@@ -39,6 +39,9 @@ def acquire_z_stack(
     yaml_file_path: str = None,
     progress_callback: Optional[Callable[[int, int, str], None]] = None,
     projection: str = "none",
+    background_correction_enabled: bool = False,
+    background_folder: Optional[str] = None,
+    background_correction_method: str = "divide",
 ) -> Dict:
     """
     Acquire a Z-stack at the current XY position.
@@ -60,6 +63,14 @@ def acquire_z_stack(
         detector: Detector ID for calibration
         yaml_file_path: Path to config YAML
         progress_callback: Called with (current_plane, total_planes, message)
+        projection: Z-projection operator ("none","max","min","sum","mean","std")
+        background_correction_enabled: When true, apply per-angle flat-field
+            correction to every snap using images from background_folder.
+        background_folder: Path to a directory containing per-angle background
+            images. Layout matches the bounded-acquisition workflow's loader
+            (BackgroundCorrectionUtils.load_background_images) -- typically
+            {folder}/{angle}.tif or {folder}/{angle}/background.tif.
+        background_correction_method: "divide" (flat-field) or "subtract".
 
     Returns:
         Dict with results: n_planes, z_positions, output_folder, files
@@ -110,6 +121,14 @@ def acquire_z_stack(
         except Exception as e:
             logger.warning(f"Could not load WB calibration: {e}")
 
+    # Load per-angle background images (parity with main workflow).
+    background_images, background_scaling_factors = _load_background_images_for_angles(
+        enabled=background_correction_enabled,
+        background_folder=background_folder,
+        angles=angles,
+    )
+    bg_active = bool(background_images)
+
     saved_files = []
     # Buffer frames per angle so we can emit a single multi-plane OME-TIFF per
     # angle once the Z loop completes. Keyed by angle -> list of (z_index,
@@ -156,6 +175,19 @@ def acquire_z_stack(
                 if image is None:
                     logger.error(f"Failed to snap at Z={z_pos}, angle={angle}")
                     continue
+
+                # Apply per-angle flat-field correction when enabled. Mirrors
+                # the main workflow's _acquire_tile_angles BG path so PPM
+                # output from the single-point dialog matches what BoundedAcq
+                # would have produced for the same modality/folder.
+                if bg_active and angle in background_images:
+                    image = _apply_bg_correction(
+                        image=image,
+                        bg_image=background_images[angle],
+                        scaling=background_scaling_factors.get(angle),
+                        method=background_correction_method,
+                        angle=angle,
+                    )
 
                 angle_frames[angle].append((plane_idx, actual_z, image))
     finally:
@@ -295,6 +327,9 @@ def acquire_time_lapse(
     yaml_file_path: str = None,
     progress_callback: Optional[Callable[[int, int, str], None]] = None,
     cancel_check: Optional[Callable[[], bool]] = None,
+    background_correction_enabled: bool = False,
+    background_folder: Optional[str] = None,
+    background_correction_method: str = "divide",
 ) -> Dict:
     """
     Acquire a time-lapse at the current position.
@@ -355,6 +390,14 @@ def acquire_time_lapse(
         except Exception as e:
             logger.warning(f"Could not load WB calibration: {e}")
 
+    # Load per-angle background images (parity with main workflow).
+    background_images, background_scaling_factors = _load_background_images_for_angles(
+        enabled=background_correction_enabled,
+        background_folder=background_folder,
+        angles=angles,
+    )
+    bg_active = bool(background_images)
+
     saved_files = []
     # Buffer per-angle frames so we can emit a single multi-page OME-TIFF
     # per angle once the timepoint loop completes. Keyed by angle -> list of
@@ -390,6 +433,16 @@ def acquire_time_lapse(
             if image is None:
                 logger.error(f"Failed to snap at T={tp_idx}, angle={angle}")
                 continue
+
+            # Per-angle flat-field correction (parity with main workflow).
+            if bg_active and angle in background_images:
+                image = _apply_bg_correction(
+                    image=image,
+                    bg_image=background_images[angle],
+                    scaling=background_scaling_factors.get(angle),
+                    method=background_correction_method,
+                    angle=angle,
+                )
 
             angle_frames[angle].append((tp_idx, elapsed_since_start, image))
 
@@ -476,6 +529,79 @@ def acquire_time_lapse(
 # ------------------------------------------------------------------
 # Helpers
 # ------------------------------------------------------------------
+
+def _load_background_images_for_angles(
+    enabled: bool,
+    background_folder: Optional[str],
+    angles: List[float],
+):
+    """Load per-angle background images for flat-field correction.
+
+    Mirrors the main workflow's loader path (BackgroundCorrectionUtils.
+    load_background_images) so the single-point dialog produces output
+    consistent with BoundedAcq for the same modality + folder.
+
+    Returns a (background_images, background_scaling_factors) tuple. Both
+    are dicts keyed by angle (float). Returns ({}, {}) when correction is
+    disabled, the folder is missing, or no images load successfully.
+    """
+    if not enabled or not background_folder:
+        return {}, {}
+    bg_dir = Path(background_folder)
+    if not bg_dir.exists():
+        logger.warning(
+            "Background correction enabled but folder does not exist: %s",
+            bg_dir,
+        )
+        return {}, {}
+    try:
+        from microscope_imageprocessing.correction.background import (
+            BackgroundCorrectionUtils,
+        )
+        bg_images, scaling, _wb = BackgroundCorrectionUtils.load_background_images(
+            bg_dir, angles, logger
+        )
+        if bg_images:
+            logger.info(
+                "Loaded %d background image(s) from %s for angles %s",
+                len(bg_images),
+                bg_dir,
+                list(bg_images.keys()),
+            )
+        else:
+            logger.warning(
+                "No background images found in %s for angles %s -- "
+                "correction will be skipped",
+                bg_dir,
+                angles,
+            )
+        return bg_images or {}, scaling or {}
+    except Exception as e:
+        logger.warning("Failed to load background images from %s: %s", bg_dir, e)
+        return {}, {}
+
+
+def _apply_bg_correction(image, bg_image, scaling, method: str, angle: float):
+    """Apply flat-field (or subtractive) correction for a single snap.
+
+    Returns the corrected image. Falls back to the original image on any
+    exception so a per-angle failure doesn't lose the rest of the
+    acquisition.
+    """
+    try:
+        from microscope_imageprocessing.correction.background import (
+            BackgroundCorrectionUtils,
+        )
+        return BackgroundCorrectionUtils.apply_flat_field_correction(
+            image, bg_image, scaling, method=method,
+        )
+    except Exception as e:
+        logger.warning(
+            "Background correction failed at angle %s: %s -- using raw image",
+            angle, e,
+        )
+        return image
+
 
 def _resolve_pixel_size_um(config_manager, modality: str, objective, detector) -> float:
     """Best-effort pixel size lookup for OME-TIFF metadata.
