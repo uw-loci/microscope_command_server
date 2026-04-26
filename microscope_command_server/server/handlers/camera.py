@@ -1,13 +1,16 @@
 """Camera control command handlers.
 
 Handles camera property queries and settings:
-GETCAM, GETMODE, SETMODE, GETEXP, SETEXP, GETGAIN, SETGAIN, SETCAM
+GETCAM, GETMODE, SETMODE, GETEXP, SETEXP, GETGAIN, SETGAIN, SETCAM,
+GETBIN, SETBIN, GETCAP
 
 These commands use the Camera ABC's per-channel capability methods.
 Cameras that support per-channel control (e.g. JAI 3-CCD) return True
 from supports_per_channel_exposure(); all others use unified defaults.
 """
 
+import json
+import re
 import struct
 import time
 import logging
@@ -513,3 +516,260 @@ def handle_setbin(conn, client, hardware, settings, **kwargs):
     except Exception as e:
         logger.error("SETBIN failed: %s", e)
         conn.sendall(b"ERR_SETB")
+
+
+# --- Camera Control v2 phase 2: capability query ---
+
+
+def _resolve_profile(profile_name, profiles):
+    """Resolve a profile name to its config dict.
+
+    Accepts trailing "_<counter>" suffixes (e.g. Brightfield_10x_3) the
+    same way apply_mode_setup does, so the Java client can pass exactly
+    what it would pass to APPLYPR.
+    """
+    if not profile_name:
+        return None
+    if profile_name in profiles:
+        return profiles[profile_name]
+    stripped = re.sub(r"_(\d+)$", "", profile_name)
+    return profiles.get(stripped)
+
+
+def _modality_section_for_profile(profile_cfg, modalities):
+    """Find the modality section a profile points at."""
+    if not isinstance(profile_cfg, dict):
+        return None, None
+    mod_name = profile_cfg.get("modality")
+    if not mod_name:
+        return None, None
+    return mod_name, modalities.get(mod_name)
+
+
+def _build_illumination_descriptors(hardware, modalities):
+    """Walk every modality and yield {label, device, power_range, current_power, is_on}.
+
+    Dedups by device name. Each illumination object is built via the same
+    _build_illumination_from_config helper apply_mode_setup uses, so the
+    Java side sees exactly what the workflow would activate.
+    """
+    descriptors = []
+    seen = set()
+
+    def _emit(source):
+        if source is None:
+            return
+        device = getattr(source, "_device", None) or getattr(source, "_label", None) or "<unknown>"
+        if device in seen:
+            return
+        seen.add(device)
+        try:
+            power_range = list(source.get_power_range())
+        except Exception:
+            power_range = [0.0, 0.0]
+        try:
+            current_power = float(source.get_power())
+        except Exception:
+            current_power = 0.0
+        try:
+            is_on = bool(source.is_on())
+        except Exception:
+            is_on = False
+        descriptors.append({
+            "label": getattr(source, "_label", device),
+            "device": device,
+            "power_range": power_range,
+            "current_power": current_power,
+            "is_on": is_on,
+        })
+
+    if hardware._illumination is not None:
+        _emit(hardware._illumination)
+
+    for mod_name, mod_config in (modalities or {}).items():
+        if not isinstance(mod_config, dict):
+            continue
+        try:
+            source = hardware._build_illumination_from_config(mod_config)
+        except Exception as e:
+            logger.debug("GETCAP: skipping illumination for modality '%s': %s", mod_name, e)
+            continue
+        _emit(source)
+
+    return descriptors
+
+
+def _detect_camera_type(hardware):
+    """Coarse classification used by Camera Control v2 to pick UI branches."""
+    cam = hardware.camera
+    cls_name = type(cam).__name__.lower()
+    if "jai" in cls_name:
+        return "jai"
+    if "laserscanning" in cls_name or "lsm" in cls_name:
+        return "laser_scanning"
+    name = getattr(cam, "_name", "") or ""
+    if "hamamatsu" in name.lower():
+        return "hamamatsu"
+    return "generic"
+
+
+def _modality_channels(mod_config, modality_name):
+    """Return a list of channel descriptors, or None for non-channel modalities.
+
+    A channel descriptor is the dict the modality config already stores
+    (channel id, exposure_ms, intensity device-property hints) plus an
+    "id" field copied from the channel key when missing. Different
+    configs structure channels two ways:
+
+    1. mod_config['channels'] is a dict keyed by channel id (BF+IF,
+       Fluorescence with full library)
+    2. mod_config['channels'] is a list of strings (channel ids only,
+       library lives elsewhere -- e.g. profile-keyed)
+
+    For (2) the client can fall back to the modality library lookup it
+    already does today; this function just returns the IDs.
+    """
+    raw = mod_config.get("channels") if isinstance(mod_config, dict) else None
+    if raw is None:
+        return None
+    if isinstance(raw, dict):
+        out = []
+        for cid, cfg in raw.items():
+            entry = {"id": cid}
+            if isinstance(cfg, dict):
+                if "exposure_ms" in cfg:
+                    entry["exposure_ms"] = cfg["exposure_ms"]
+                if "intensity_property" in cfg:
+                    entry["intensity_property"] = cfg["intensity_property"]
+                if "default_intensity" in cfg:
+                    entry["default_intensity"] = cfg["default_intensity"]
+            out.append(entry)
+        return out
+    if isinstance(raw, list):
+        return [{"id": str(cid)} for cid in raw]
+    return None
+
+
+def _modality_rotation_angles(mod_config):
+    """Return a list of angle ticks, or None when modality is single-angle."""
+    raw = mod_config.get("rotation_angles") if isinstance(mod_config, dict) else None
+    if not isinstance(raw, list) or not raw:
+        return None
+    angles = []
+    for entry in raw:
+        if isinstance(entry, dict) and "tick" in entry:
+            try:
+                angles.append(float(entry["tick"]))
+            except (TypeError, ValueError):
+                continue
+        else:
+            try:
+                angles.append(float(entry))
+            except (TypeError, ValueError):
+                continue
+    return angles or None
+
+
+def handle_getcap(conn, client, hardware, settings, **kwargs):
+    """Return a JSON capability descriptor for Camera Control v2.
+
+    Payload: 32-byte null-padded UTF-8 profile name (or empty).
+        - empty / blank   -> describe current state, using
+                             hardware._active_profile if known
+        - non-empty       -> describe the profile (without applying it),
+                             so the dialog can render the controls that
+                             would be relevant after Apply.
+
+    Response: 4-byte big-endian length + UTF-8 JSON. On error returns
+    a 4-byte 0 length so the Java reader doesn't hang.
+    """
+    logger.debug("Client %s requested GETCAP", client.addr)
+    try:
+        data = conn.recv(32)
+        requested = data.rstrip(b"\x00").decode("utf-8", errors="replace").strip() if data else ""
+
+        profiles = settings.get("acquisition_profiles", {}) or {}
+        modalities = settings.get("modalities", {}) or {}
+
+        if requested:
+            profile_name = requested
+        else:
+            profile_name = hardware._active_profile or ""
+
+        profile_cfg = _resolve_profile(profile_name, profiles)
+        modality_name, mod_config = _modality_section_for_profile(profile_cfg, modalities)
+
+        cam = hardware.camera
+        try:
+            available_binnings = list(cam.get_available_binnings())
+        except Exception:
+            available_binnings = [1]
+        try:
+            current_binning = int(cam.get_binning())
+        except Exception:
+            current_binning = 1
+        try:
+            exp_min = float(cam.get_min_exposure_ms())
+            exp_max = float(cam.get_max_exposure_ms())
+        except Exception:
+            exp_min, exp_max = 0.01, 10000.0
+        try:
+            gain_range = cam.get_gain_range()
+            gain_range = list(gain_range) if gain_range is not None else None
+        except Exception:
+            gain_range = None
+
+        camera_block = {
+            "name": cam.get_name() if hasattr(cam, "get_name") else getattr(cam, "_name", "<unknown>"),
+            "type": _detect_camera_type(hardware),
+            "supports_per_channel_exposure": bool(cam.supports_per_channel_exposure()),
+            "supports_hardware_white_balance": bool(cam.supports_hardware_white_balance()),
+            "available_binnings": available_binnings,
+            "current_binning": current_binning,
+            "exposure_range_ms": [exp_min, exp_max],
+            "gain_range": gain_range,
+        }
+
+        if mod_config is not None:
+            channels = _modality_channels(mod_config, modality_name)
+            angles = _modality_rotation_angles(mod_config)
+            modality_block = {
+                "name": modality_name,
+                "default_wb_mode": mod_config.get("default_wb_mode", "off"),
+                "is_multi_angle": angles is not None and len(angles) > 1,
+                "channels": channels,
+                "rotation_angles": angles,
+            }
+        else:
+            modality_block = {
+                "name": modality_name,
+                "default_wb_mode": "off",
+                "is_multi_angle": False,
+                "channels": None,
+                "rotation_angles": None,
+            }
+
+        capabilities = {
+            "camera": camera_block,
+            "illumination": _build_illumination_descriptors(hardware, modalities),
+            "modality": modality_block,
+            "active_profile": hardware._active_profile,
+        }
+
+        payload = json.dumps(capabilities).encode("utf-8")
+        conn.sendall(struct.pack(">I", len(payload)))
+        conn.sendall(payload)
+        logger.info(
+            "GETCAP: profile='%s' (active='%s') -> %d-byte JSON, %d illumination(s), modality=%s",
+            requested or "(current)",
+            hardware._active_profile,
+            len(payload),
+            len(capabilities["illumination"]),
+            modality_name,
+        )
+    except Exception as e:
+        logger.error("GETCAP failed: %s", e, exc_info=True)
+        try:
+            conn.sendall(struct.pack(">I", 0))
+        except Exception:
+            pass

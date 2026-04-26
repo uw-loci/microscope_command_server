@@ -96,6 +96,14 @@ class ExtendedCommand:
     GETBIN = b"getbin__"  # Get current + available binning factors (response: count + ints + current)
     SETBIN = b"setbin__"  # Set binning factor (1-byte unsigned payload)
 
+    # Capabilities (Camera Control v2 phase 2)
+    # Single round-trip query that returns everything Camera Control v2
+    # needs to render. Optional 32-byte payload: profile name to scope the
+    # answer (e.g. "if I were to apply Brightfield_10x, what controls?");
+    # empty payload returns the current state.
+    # Response: 4-byte big-endian length + UTF-8 JSON blob.
+    GETCAP = b"getcap__"
+
     # NOTE: SETWBMD (camera WB mode control) was removed -- JAI hardware AWB
     # cannot be reliably controlled through Pycromanager. Set AWB manually in
     # MicroManager's Device Property Browser.
