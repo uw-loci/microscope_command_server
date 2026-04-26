@@ -115,7 +115,54 @@ def handle_config(conn, client, hardware, settings, **kwargs):
                 new_ip = addr[0]
 
                 if active_ip == new_ip:
-                    # Same IP reconnecting - allow takeover (previous connection likely crashed)
+                    # Same IP reconnecting - usually the previous connection
+                    # crashed and we should let the new one take over.
+                    # CRITICAL EXCEPTION: if the previous addr is currently
+                    # running an acquisition workflow, taking over kills it
+                    # mid-flight. This was observed 2026-04-25 on PPM:
+                    # during a multi-annotation existing-image workflow, a
+                    # transient status-query timeout on the Java side caused
+                    # MicroscopeSocketClient to auto-reconnect. The reconnect
+                    # opened a new socket and re-sent CONFIG. Without this
+                    # guard the takeover closed the still-acquiring primary
+                    # socket, aborted the workflow with WinError 10053, and
+                    # drained 5 pending writes. The Java side then surfaced
+                    # this as "Read timed out" -> "Acquisition failed".
+                    #
+                    # Reject the new CONFIG (CFG_BLCK) when an acquisition
+                    # is active for the existing addr -- the original
+                    # connection keeps running, the spurious reconnect dies
+                    # cleanly. The Java client will see a CFG_BLCK response
+                    # rather than a hijacked socket; future change should
+                    # have it not auto-reconnect during acquisitions, but
+                    # this server-side guard is the load-bearing fix.
+                    acquisition_states = kwargs.get("acquisition_states", {})
+                    AcquisitionState = kwargs.get("AcquisitionState")
+                    active_state = acquisition_states.get(current_active_addr)
+                    is_actively_acquiring = (
+                        active_state is not None
+                        and AcquisitionState is not None
+                        and active_state in (
+                            AcquisitionState.RUNNING,
+                            AcquisitionState.CANCELLING,
+                        )
+                    )
+                    if is_actively_acquiring:
+                        logger.warning(
+                            "CONFIG: Refusing same-IP takeover from %s -- previous "
+                            "connection is actively running acquisition (state=%s). "
+                            "New connection %s will be rejected to protect the "
+                            "in-flight workflow.",
+                            current_active_addr, active_state, addr,
+                        )
+                        error_msg = (
+                            f"BLOCKED: Active acquisition on {current_active_addr}; "
+                            f"refusing to take over."
+                        ).encode("utf-8")
+                        error_length = struct.pack("!I", len(error_msg))
+                        conn.sendall(b"CFG_BLCK" + error_length + error_msg)
+                        return None
+
                     logger.warning("CONFIG: Same IP reconnecting - taking over from %s", current_active_addr)
                     logger.warning("CONFIG: Previous connection may have been improperly closed")
                     # Stop any orphaned sequence acquisition left running by
