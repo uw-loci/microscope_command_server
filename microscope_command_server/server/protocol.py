@@ -92,6 +92,10 @@ class ExtendedCommand:
     SETGAIN = b"setgain_"  # Set gain (count=1: JAI unified, count>=3: JAI per-channel)
     SETCAM = b"setcam__"   # Compound: set mode + exposures + gains atomically (1 round-trip)
 
+    # Binning (Camera Control v2 phase 1)
+    GETBIN = b"getbin__"  # Get current + available binning factors (response: count + ints + current)
+    SETBIN = b"setbin__"  # Set binning factor (1-byte unsigned payload)
+
     # NOTE: SETWBMD (camera WB mode control) was removed -- JAI hardware AWB
     # cannot be reliably controlled through Pycromanager. Set AWB manually in
     # MicroManager's Device Property Browser.

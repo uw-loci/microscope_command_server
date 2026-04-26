@@ -437,3 +437,79 @@ def handle_setcam(conn, client, hardware, settings, **kwargs):
     except Exception as e:
         logger.error("SETCAM failed: %s", e)
         conn.sendall(b"ERR_SETC")
+
+
+# --- Binning (Camera Control v2 phase 1) -------------------------------
+
+def handle_getbin(conn, client, hardware, settings, **kwargs):
+    """Return available binning factors and the current factor.
+
+    Response shape (variable length):
+        1 byte  : count N of available factors
+        N bytes : each factor as an unsigned byte (1, 2, 4, 8, ...)
+        1 byte  : current binning factor
+
+    Cameras with no binning support report N=1, factors=[1], current=1.
+
+    Errors return a single 'ERROR:<msg>' length-padded to 16 bytes so the
+    Java client can distinguish from the success path by reading the
+    leading byte (which would be a valid count for binning, but cameras
+    with N>16 are extremely rare; the Java client checks for the ASCII
+    prefix 'E' too).
+    """
+    logger.debug("Client %s requested binning", client.addr)
+    try:
+        cam = hardware.camera
+        available = cam.get_available_binnings() or [1]
+        # Clamp to byte range -- nobody bins by more than 255 in practice.
+        available = [int(v) & 0xFF for v in available if 1 <= int(v) <= 255]
+        if not available:
+            available = [1]
+        current = int(cam.get_binning()) & 0xFF
+        if current < 1:
+            current = 1
+        payload = bytes([len(available)]) + bytes(available) + bytes([current])
+        conn.sendall(payload)
+        logger.info("GETBIN: available=%s current=%d", available, current)
+    except Exception as e:
+        logger.error("GETBIN failed: %s", e)
+        msg = f"ERROR:{str(e)[:9]}".encode("utf-8").ljust(16, b"\x00")
+        conn.sendall(msg)
+
+
+def handle_setbin(conn, client, hardware, settings, **kwargs):
+    """Set the camera binning factor.
+
+    Payload: 1 byte (unsigned) -- the binning factor to apply.
+    Response: 'ACK_____' (8 bytes) on success, 'ERR_SETB' on failure.
+
+    Wrapped here in a stop-if-streaming pattern matching SETCAM, since
+    binning changes are typically rejected by drivers while a sequence
+    acquisition is running.
+    """
+    logger.debug("Client %s requested set-binning", client.addr)
+    try:
+        data = conn.recv(1)
+        if len(data) != 1:
+            raise ValueError(f"Expected 1-byte payload, got {len(data)}")
+        value = int.from_bytes(data, "big")
+        if value < 1:
+            raise ValueError(f"Binning value must be >= 1, got {value}")
+
+        core = hardware.core
+        stopped = False
+        try:
+            if core.is_sequence_running():
+                core.stop_sequence_acquisition()
+                stopped = True
+        except Exception as e:
+            logger.debug("SETBIN stop-streaming probe failed: %s", e)
+
+        hardware.camera.set_binning(value)
+
+        conn.sendall(b"ACK_____")
+        logger.info("SETBIN: applied binning=%d (streaming was %s)",
+                    value, "stopped" if stopped else "not running")
+    except Exception as e:
+        logger.error("SETBIN failed: %s", e)
+        conn.sendall(b"ERR_SETB")

@@ -134,13 +134,17 @@ def acquire_rapid_scan(
     # Set camera binning for faster ZMQ transfer.
     # Binning=2 -> 2x2 -> 4x fewer pixels -> ~4x faster frame transfer.
     # FOV stays the same, pixel size doubles.
+    # Routes through the Camera abstraction so the same set/restore path
+    # works for any camera type and the new GETBIN/SETBIN socket commands
+    # see consistent state.
     core = hardware.core
     camera_device = core.get_camera_device()
+    camera = hardware.camera
     original_binning = None
     if binning > 1:
         try:
-            original_binning = core.get_property(camera_device, "Binning")
-            core.set_property(camera_device, "Binning", str(binning))
+            original_binning = camera.get_binning()
+            camera.set_binning(binning)
             logger.info("Set camera binning=%d (was %s)", binning, original_binning)
         except Exception as e:
             logger.warning("Could not set binning=%d: %s", binning, e)
@@ -422,7 +426,7 @@ def acquire_rapid_scan(
         # Restore camera binning
         if original_binning is not None:
             try:
-                core.set_property(camera_device, "Binning", original_binning)
+                camera.set_binning(int(original_binning))
                 logger.info("Restored camera binning=%s", original_binning)
             except Exception as e:
                 logger.warning("Could not restore binning: %s", e)
