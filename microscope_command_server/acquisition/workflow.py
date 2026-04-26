@@ -3601,6 +3601,16 @@ def _handle_tile_autofocus(
     # Determine the best Z for this tile position.
     needs_af = pos_idx in ctx.dynamic_af_positions
 
+    # Skip AF on the last tile -- the corrected Z has no downstream
+    # snap to benefit from it, and even a successful drift update
+    # would never be applied. Saves ~3-5s per acquisition for free.
+    if needs_af and pos_idx == len(ctx.positions) - 1:
+        logger.info(
+            "  Skipping AF at final position %d/%d (no downstream tiles to use the result)",
+            pos_idx, len(ctx.positions) - 1,
+        )
+        needs_af = False
+
     # Safety net 1: index gap check
     index_gap_threshold = ctx.af_gap_index_multiplier * ctx.af_n_tiles
     if not needs_af and ctx.last_af_pos_idx >= 0:
