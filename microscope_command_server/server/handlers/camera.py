@@ -575,12 +575,27 @@ def _build_illumination_descriptors(hardware, modalities):
             is_on = bool(source.is_on())
         except Exception:
             is_on = False
+
+        # value_type tells the UI which widget to render. "binary" means
+        # the source has only the State property (state_prop == intensity_prop)
+        # and the only valid powers are 0 and max_intensity -- a checkbox /
+        # toggle is appropriate, NOT a free-form spinner. "continuous" means
+        # any value in power_range is valid (a spinner is right). "discrete"
+        # is reserved for future use when an MM device exposes a small
+        # enumerated intensity property (radio button list).
+        try:
+            is_binary = bool(getattr(source, "_is_binary", lambda: False)())
+        except Exception:
+            is_binary = False
+        value_type = "binary" if is_binary else "continuous"
+
         descriptors.append({
             "label": getattr(source, "_label", device),
             "device": device,
             "power_range": power_range,
             "current_power": current_power,
             "is_on": is_on,
+            "value_type": value_type,
         })
 
     if hardware._illumination is not None:
