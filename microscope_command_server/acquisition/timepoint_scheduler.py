@@ -1,8 +1,8 @@
 """Timepoint scheduler for time-lapse acquisitions.
 
-Pulled out as its own module (separate from single_point.py) so that the
-T-outer loop in workflow.py can import it without touching the
-contract-skeleton module that downstream teams are building against.
+Imported by workflow.py's T-outer loop and by acquire_time_lapse in
+stack_timelapse.py to give both paths the same drift-bounded timepoint
+pacing semantics.
 
 The scheduler anchors all timepoint start times to a fixed t0 captured at
 the start of the acquisition so slow iterations do NOT accumulate drift:
