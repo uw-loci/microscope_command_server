@@ -2021,10 +2021,16 @@ def get_angles_wb_from_settings(
 
     # Neutral fallback if no software WB settings found in config.
     # All [1.0, 1.0, 1.0] = no software color correction applied.
+    # Per-angle [R,G,B] software WB coefficients were never reintroduced
+    # after the imageprocessing-yml split (config now stores hardware-side
+    # WB via JAI analog gains/exposures and derives software WB from
+    # background images). The caller substitutes background-derived
+    # coefficients when this returns all-neutral, so this is the normal
+    # path on PPM and does not indicate a configuration problem.
     if not angles_wb:
-        logger.warning(
-            "No software white balance settings found in config "
-            "(settings['white_balance']['%s']), using neutral [1,1,1] for all angles",
+        logger.info(
+            "No explicit software WB in config (settings['white_balance']['%s']); "
+            "caller will derive coefficients from background images",
             wb_key or "unknown",
         )
         # Build neutral entries for all configured angles

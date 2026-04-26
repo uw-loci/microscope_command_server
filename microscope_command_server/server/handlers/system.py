@@ -136,27 +136,43 @@ def handle_config(conn, client, hardware, settings, **kwargs):
                     # rather than a hijacked socket; future change should
                     # have it not auto-reconnect during acquisitions, but
                     # this server-side guard is the load-bearing fix.
+                    # Check ALL connections from the same IP for an active
+                    # acquisition, not just `current_active_addr`. The Java
+                    # client uses two sockets (primary + auxiliary). Whichever
+                    # sent CONFIG most recently becomes `current_active_addr`,
+                    # but the acquisition may be running on the OTHER socket.
+                    # Observed on PPM 2026-04-26: aux socket sent CONFIG after
+                    # primary started ACQUIRE; a later primary reconnect
+                    # checked aux's state (IDLE), missed the live acquisition
+                    # on the primary, and the takeover killed it mid-tile.
                     acquisition_states = kwargs.get("acquisition_states", {})
                     AcquisitionState = kwargs.get("AcquisitionState")
-                    active_state = acquisition_states.get(current_active_addr)
-                    is_actively_acquiring = (
-                        active_state is not None
-                        and AcquisitionState is not None
-                        and active_state in (
+                    acquiring_addr = None
+                    active_state = None
+                    if AcquisitionState is not None:
+                        running_states = (
                             AcquisitionState.RUNNING,
                             AcquisitionState.CANCELLING,
                         )
-                    )
-                    if is_actively_acquiring:
+                        for other_addr, other_state in list(acquisition_states.items()):
+                            if other_addr[0] != new_ip:
+                                continue
+                            if other_addr == addr:
+                                continue
+                            if other_state in running_states:
+                                acquiring_addr = other_addr
+                                active_state = other_state
+                                break
+                    if acquiring_addr is not None:
                         logger.warning(
-                            "CONFIG: Refusing same-IP takeover from %s -- previous "
-                            "connection is actively running acquisition (state=%s). "
-                            "New connection %s will be rejected to protect the "
-                            "in-flight workflow.",
-                            current_active_addr, active_state, addr,
+                            "CONFIG: Refusing same-IP takeover from %s -- "
+                            "connection %s is actively running acquisition "
+                            "(state=%s). New connection %s will be rejected "
+                            "to protect the in-flight workflow.",
+                            current_active_addr, acquiring_addr, active_state, addr,
                         )
                         error_msg = (
-                            f"BLOCKED: Active acquisition on {current_active_addr}; "
+                            f"BLOCKED: Active acquisition on {acquiring_addr}; "
                             f"refusing to take over."
                         ).encode("utf-8")
                         error_length = struct.pack("!I", len(error_msg))
