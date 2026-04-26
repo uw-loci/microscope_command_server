@@ -1810,6 +1810,9 @@ def parse_acquisition_message(message: str) -> dict:
             elif parts[i] == "--af-range" and i + 1 < len(parts):
                 params["autofocus_range"] = float(parts[i + 1])
                 i += 2
+            elif parts[i] == "--af-disabled":
+                params["af_disabled"] = True
+                i += 1
             elif parts[i] == "--save-raw" and i + 1 < len(parts):
                 params["save_raw"] = parts[i + 1].lower() == "true"
                 i += 2
@@ -3061,9 +3064,27 @@ def _configure_autofocus(ctx: AcquisitionContext) -> None:
     """Load AF settings from YAML, resolve strategy, compute AF positions.
 
     Mutates ctx autofocus fields in-place.
+
+    When --af-disabled was sent on the wire, this is a no-op: the YAML
+    is not loaded, no AF positions are scheduled, and the per-tile
+    dispatcher's `pos_idx in ctx.dynamic_af_positions` test will be
+    False for every tile, killing pre-acquisition AF, drift checks, and
+    the manual-focus fallback.
     """
     logger = ctx.logger
     params = ctx.params
+
+    if params.get("af_disabled"):
+        logger.warning(
+            "Autofocus DISABLED for this acquisition (--af-disabled). "
+            "No pre-acquisition AF, no per-tile drift checks, no manual-focus prompts. "
+            "Z drift will not be corrected."
+        )
+        ctx.af_positions = []
+        ctx.dynamic_af_positions = set()
+        ctx.deferred_af_positions = set()
+        ctx.completed_af_positions = []
+        return
 
     fov = ctx.hardware.get_fov()
 
