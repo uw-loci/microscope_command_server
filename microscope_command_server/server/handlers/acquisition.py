@@ -434,6 +434,10 @@ def handle_zstack(conn, client, hardware, settings, **kwargs):
             params["bg_folder"] = parts[i + 1]; i += 2
         elif parts[i] == "--bg-method" and i + 1 < len(parts):
             params["bg_method"] = parts[i + 1]; i += 2
+        elif parts[i] == "--timepoints" and i + 1 < len(parts):
+            params["timepoints"] = int(parts[i + 1]); i += 2
+        elif parts[i] == "--interval" and i + 1 < len(parts):
+            params["interval"] = float(parts[i + 1]); i += 2
         else:
             i += 1
 
@@ -463,13 +467,20 @@ def handle_zstack(conn, client, hardware, settings, **kwargs):
             background_correction_enabled=params.get("bg_correction", False),
             background_folder=params.get("bg_folder"),
             background_correction_method=params.get("bg_method", "divide"),
+            n_timepoints=params.get("timepoints", 1),
+            interval_seconds=params.get("interval", 0.0),
         )
         response = (f"SUCCESS:{params['output']}|"
                     f"planes:{result['n_planes']}|"
+                    f"timepoints:{result.get('n_timepoints', 1)}|"
                     f"files:{len(result['files'])}|"
                     f"elapsed:{result['elapsed_seconds']:.1f}s")
         conn.sendall(response.encode())
-        logger.info("ZSTACK complete: %d planes", result['n_planes'])
+        logger.info(
+            "ZSTACK complete: T=%d, Z=%d",
+            result.get('n_timepoints', 1),
+            result['n_planes'],
+        )
     except Exception as e:
         logger.error("ZSTACK failed: %s", e, exc_info=True)
         conn.sendall(f"FAILED:{str(e)}".encode())

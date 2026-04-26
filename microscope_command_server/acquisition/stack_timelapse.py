@@ -42,12 +42,21 @@ def acquire_z_stack(
     background_correction_enabled: bool = False,
     background_folder: Optional[str] = None,
     background_correction_method: str = "divide",
+    n_timepoints: int = 1,
+    interval_seconds: float = 0.0,
+    cancel_check: Optional[Callable[[], bool]] = None,
 ) -> Dict:
     """
-    Acquire a Z-stack at the current XY position.
+    Acquire a Z-stack (optionally combined with time-lapse) at the current XY.
 
-    Moves Z through the specified range, snapping an image at each plane.
-    If PPM modality, acquires all angles at each Z position.
+    Default behaviour (n_timepoints=1) is a single Z-stack: move through the
+    Z range, snap at each plane, restore stage. With n_timepoints>1, the
+    whole Z stack repeats at every timepoint with TimepointScheduler-driven
+    pacing -- each timepoint starts at t0 + N*interval_seconds, drift bounded
+    to a single interval. PPM angles iterate inside each (T, Z) point; output
+    files keep the per-angle layout (timelapse acquisition naming conventions
+    are reused so combined Z+T produces SizeT > 1 AND SizeZ > 1 in one
+    OME-TIFF per angle).
 
     Args:
         hardware: PycromanagerHardware instance
@@ -62,8 +71,10 @@ def acquire_z_stack(
         objective: Objective ID for calibration
         detector: Detector ID for calibration
         yaml_file_path: Path to config YAML
-        progress_callback: Called with (current_plane, total_planes, message)
-        projection: Z-projection operator ("none","max","min","sum","mean","std")
+        progress_callback: Called with (current_step, total_steps, message)
+            where total_steps = n_timepoints * n_planes.
+        projection: Z-projection operator ("none","max","min","sum","mean","std").
+            Computed per timepoint when n_timepoints > 1.
         background_correction_enabled: When true, apply per-angle flat-field
             correction to every snap using images from background_folder.
         background_folder: Path to a directory containing per-angle background
@@ -71,9 +82,18 @@ def acquire_z_stack(
             (BackgroundCorrectionUtils.load_background_images) -- typically
             {folder}/{angle}.tif or {folder}/{angle}/background.tif.
         background_correction_method: "divide" (flat-field) or "subtract".
+        n_timepoints: Number of timepoints (default 1 = pure Z-stack).
+            Combined with z_step, supports Z+T output (SizeT, SizeZ both > 1).
+        interval_seconds: Seconds between timepoint START times when
+            n_timepoints > 1. 0 means "as fast as possible". Pacing is
+            anchored to t0 (NOT to the previous tp's completion) so slow
+            iterations don't accumulate drift.
+        cancel_check: Optional callable returning True to abort. Polled
+            between timepoints during the interval wait.
 
     Returns:
-        Dict with results: n_planes, z_positions, output_folder, files
+        Dict with results: n_planes, n_timepoints, z_positions,
+        output_folder, files, projected_file, elapsed_seconds.
     """
     output_path = Path(output_folder)
     output_path.mkdir(parents=True, exist_ok=True)
@@ -130,11 +150,22 @@ def acquire_z_stack(
     bg_active = bool(background_images)
 
     saved_files = []
-    # Buffer frames per angle so we can emit a single multi-plane OME-TIFF per
-    # angle once the Z loop completes. Keyed by angle -> list of (z_index,
-    # actual_z, image) in acquisition order.
-    angle_frames: Dict[float, list] = {angle: [] for angle in angles}
+    # Validate T params
+    if n_timepoints < 1:
+        raise ValueError(f"n_timepoints must be >= 1, got {n_timepoints}")
+    if interval_seconds < 0:
+        raise ValueError(f"interval_seconds must be >= 0, got {interval_seconds}")
+    has_t = n_timepoints > 1
+
+    # Buffer frames per angle. For combined Z+T, the buffer holds one entry
+    # per (t_idx, z_idx) within each angle so the writer can emit a single
+    # OME-TIFF per angle with both SizeT and SizeZ. Keyed by
+    # angle -> dict[(t_idx, z_idx)] = (actual_z, image, delta_t_s).
+    angle_frames: Dict[float, Dict[Tuple[int, int], Tuple[float, Any, float]]] = {
+        angle: {} for angle in angles
+    }
     start_time = time.time()
+    actual_n_timepoints = 0
 
     # Capture starting XYZ so we can restore the stage after the acquisition.
     # Users expect the stage to return to the original position (not sit at
@@ -143,53 +174,102 @@ def acquire_z_stack(
     try:
         start_position = hardware.get_current_position()
         logger.info(
-            f"Z-stack start position: X={start_position.x:.2f}, "
+            f"Acquisition start position: X={start_position.x:.2f}, "
             f"Y={start_position.y:.2f}, Z={start_position.z:.2f} um"
         )
     except Exception as e:
         logger.warning(f"Could not capture start position for restore: {e}")
         start_position = None
 
+    # Optional T-outer scheduler. Only instantiated when n_timepoints > 1
+    # so pure Z-stack callers don't pull in the scheduler module.
+    scheduler = None
+    if has_t:
+        from microscope_command_server.acquisition.timepoint_scheduler import (
+            TimepointScheduler,
+        )
+        t0 = time.monotonic()
+        scheduler = TimepointScheduler(
+            t0_monotonic=t0,
+            interval_seconds=interval_seconds,
+            logger=logger,
+        )
+        logger.info(
+            f"=== Z+T ACQUISITION: {n_timepoints} timepoints x {n_planes} Z planes "
+            f"x {len(angles)} angle(s), interval={interval_seconds}s ==="
+        )
+
+    total_steps = n_timepoints * n_planes
     try:
-        for plane_idx, z_pos in enumerate(z_positions):
-            if progress_callback:
-                progress_callback(plane_idx, n_planes, f"Z={z_pos:.1f} um")
-
-            # Move Z
-            hardware.move_to_position(Position(z=z_pos))
-            actual_z = hardware.get_z_position()
-            logger.info(f"Plane {plane_idx + 1}/{n_planes}: Z={actual_z:.2f} um (target={z_pos:.2f})")
-
-            # Acquire at each angle
-            for angle in angles:
-                # Rotate if PPM
-                if len(angles) > 1 and hasattr(hardware, "set_psg_ticks"):
-                    hardware.set_psg_ticks(angle)
-
-                # Apply WB if calibration available
-                if jai_calibration:
-                    _apply_wb_for_snap(hardware, jai_calibration, angle, modality, logger)
-
-                # Snap
-                image, metadata = hardware.snap_image()
-                if image is None:
-                    logger.error(f"Failed to snap at Z={z_pos}, angle={angle}")
-                    continue
-
-                # Apply per-angle flat-field correction when enabled. Mirrors
-                # the main workflow's _acquire_tile_angles BG path so PPM
-                # output from the single-point dialog matches what BoundedAcq
-                # would have produced for the same modality/folder.
-                if bg_active and angle in background_images:
-                    image = _apply_bg_correction(
-                        image=image,
-                        bg_image=background_images[angle],
-                        scaling=background_scaling_factors.get(angle),
-                        method=background_correction_method,
-                        angle=angle,
+        for t_idx in range(n_timepoints):
+            # Cancellation + scheduled wait before timepoints after the first.
+            if cancel_check and cancel_check():
+                logger.info(f"Acquisition cancelled at timepoint {t_idx + 1}/{n_timepoints}")
+                break
+            if has_t and t_idx > 0:
+                scheduler.wait_until(t_idx, cancel_event=cancel_check)
+                if cancel_check and cancel_check():
+                    logger.info(
+                        f"Acquisition cancelled during wait before timepoint "
+                        f"{t_idx + 1}/{n_timepoints}"
                     )
+                    break
+            tp_start_wall = time.time()
+            tp_elapsed = tp_start_wall - start_time
+            if has_t:
+                logger.info(
+                    f"=== Timepoint {t_idx + 1}/{n_timepoints} at T={tp_elapsed:.1f}s ==="
+                )
 
-                angle_frames[angle].append((plane_idx, actual_z, image))
+            for plane_idx, z_pos in enumerate(z_positions):
+                step_idx = t_idx * n_planes + plane_idx
+                if progress_callback:
+                    msg = f"Z={z_pos:.1f} um"
+                    if has_t:
+                        msg = f"T{t_idx + 1}/{n_timepoints}, " + msg
+                    progress_callback(step_idx, total_steps, msg)
+
+                # Move Z
+                hardware.move_to_position(Position(z=z_pos))
+                actual_z = hardware.get_z_position()
+                logger.info(
+                    f"Plane {plane_idx + 1}/{n_planes}: Z={actual_z:.2f} um "
+                    f"(target={z_pos:.2f})"
+                )
+
+                # Acquire at each angle
+                for angle in angles:
+                    # Rotate if PPM
+                    if len(angles) > 1 and hasattr(hardware, "set_psg_ticks"):
+                        hardware.set_psg_ticks(angle)
+
+                    # Apply WB if calibration available
+                    if jai_calibration:
+                        _apply_wb_for_snap(hardware, jai_calibration, angle, modality, logger)
+
+                    # Snap
+                    image, metadata = hardware.snap_image()
+                    if image is None:
+                        logger.error(f"Failed to snap at T={t_idx} Z={z_pos}, angle={angle}")
+                        continue
+
+                    # Apply per-angle flat-field correction when enabled. Mirrors
+                    # the main workflow's _acquire_tile_angles BG path so PPM
+                    # output from the single-point dialog matches what BoundedAcq
+                    # would have produced for the same modality/folder.
+                    if bg_active and angle in background_images:
+                        image = _apply_bg_correction(
+                            image=image,
+                            bg_image=background_images[angle],
+                            scaling=background_scaling_factors.get(angle),
+                            method=background_correction_method,
+                            angle=angle,
+                        )
+
+                    angle_frames[angle][(t_idx, plane_idx)] = (
+                        actual_z, image, tp_elapsed,
+                    )
+            actual_n_timepoints = t_idx + 1
     finally:
         # Always restore the stage to the starting position, even if the
         # acquisition raised. Users expect XYZ to return where it started.
@@ -202,6 +282,8 @@ def acquire_z_stack(
                 )
             except Exception as e:
                 logger.error(f"Failed to restore stage position: {e}")
+    if not has_t:
+        actual_n_timepoints = 1
 
     # Emit one OME-TIFF per angle using StackWriter. Non-PPM runs with a
     # single angle=0 and produces one zstack.ome.tiff with a real OME Z
@@ -217,43 +299,54 @@ def acquire_z_stack(
             logger.warning(f"No frames captured for angle {angle}; skipping file write")
             continue
         # All frames share shape + dtype (same camera, same acquisition)
-        first_img = frames[0][2]
+        first_key = next(iter(frames))
+        first_img = frames[first_key][1]
         size_y, size_x = first_img.shape[:2]
-        size_c = 3 if (first_img.ndim == 3 and first_img.shape[2] == 3) else 1
-        is_rgb = size_c == 3
+        is_rgb = first_img.ndim == 3 and first_img.shape[2] == 3
 
         angle_suffix = f"_angle{angle:.0f}" if len(angles) > 1 else ""
-        out_file = output_path / f"zstack{angle_suffix}.ome.tiff"
+        # File stem: keep "zstack" for pure Z, "zstack_t" prefix when both
+        # T and Z are >1 so downstream tools can tell from the filename
+        # without having to read OME-XML.
+        if has_t:
+            out_file = output_path / f"zstack_t{angle_suffix}.ome.tiff"
+        else:
+            out_file = output_path / f"zstack{angle_suffix}.ome.tiff"
 
         channel_names = ["RGB"] if is_rgb else [f"{modality}{angle_suffix}"]
 
         with StackWriter(
             output_path=out_file,
-            size_t=1,
-            size_z=len(frames),
+            size_t=actual_n_timepoints,
+            size_z=n_planes,
             size_c=1,
             size_y=size_y,
             size_x=size_x,
             dtype=first_img.dtype,
             pixel_size_um=pixel_size_um,
             z_step_um=z_step,
+            time_increment_s=interval_seconds if has_t and interval_seconds > 0 else None,
             channel_names=channel_names,
             granularity="single",
             photometric="rgb" if is_rgb else "minisblack",
         ) as writer:
-            for plane_idx, actual_z, image in frames:
+            for (t_idx, z_idx), (actual_z, image, delta_t_s) in frames.items():
                 writer.write_frame(
                     image,
-                    t=0,
-                    z=plane_idx,
+                    t=t_idx,
+                    z=z_idx,
                     c=0,
                     plane_metadata={
-                        "PositionZ": float(actual_z),
+                        "position_z_um": float(actual_z),
+                        "delta_t_s": float(delta_t_s),
                         "angle": float(angle),
                     },
                 )
         saved_files.append(str(out_file))
-        logger.info(f"Wrote Z-stack OME-TIFF: {out_file} (SizeZ={len(frames)})")
+        logger.info(
+            f"Wrote OME-TIFF: {out_file} "
+            f"(SizeT={actual_n_timepoints}, SizeZ={n_planes})"
+        )
 
     # Apply projection if requested -- one extra 2D file per angle alongside
     # the full Z-stack OME-TIFF.
@@ -267,44 +360,73 @@ def acquire_z_stack(
             for angle, frames in angle_frames.items():
                 if not frames:
                     continue
-                plane_images = [f[2] for f in frames]
-                projected = projection_fn(plane_images)
-                first_img = plane_images[0]
-                size_y, size_x = first_img.shape[:2]
-                is_rgb = first_img.ndim == 3 and first_img.shape[2] == 3
+                # Project per timepoint (so combined Z+T produces a SizeT
+                # projection file alongside the full Z+T cube). For pure
+                # Z-stack, this collapses to a single 2D plane as before.
+                # Group buffer entries by t_idx -> list of (z_idx, image)
+                # then run the projection function on the ordered images.
+                from collections import defaultdict
+                by_t: Dict[int, list] = defaultdict(list)
+                for (t_idx, z_idx), (_actual_z, image, _delta_t) in frames.items():
+                    by_t[t_idx].append((z_idx, image))
+                if not by_t:
+                    continue
+
+                # Reference frame for shape / dtype.
+                ref_t = next(iter(by_t))
+                ref_z, ref_img = sorted(by_t[ref_t])[0]
+                size_y, size_x = ref_img.shape[:2]
+                is_rgb = ref_img.ndim == 3 and ref_img.shape[2] == 3
 
                 angle_suffix = f"_angle{angle:.0f}" if len(angles) > 1 else ""
-                proj_file = output_path / f"zstack_{projection_name}{angle_suffix}.ome.tiff"
+                proj_file = output_path / (
+                    f"zstack_{projection_name}{angle_suffix}.ome.tiff"
+                )
 
                 with StackWriter(
                     output_path=proj_file,
-                    size_t=1,
+                    size_t=actual_n_timepoints,
                     size_z=1,
                     size_c=1,
                     size_y=size_y,
                     size_x=size_x,
-                    dtype=projected.dtype,
+                    dtype=ref_img.dtype,
                     pixel_size_um=pixel_size_um,
+                    time_increment_s=(
+                        interval_seconds if has_t and interval_seconds > 0 else None
+                    ),
                     channel_names=["RGB" if is_rgb else f"{projection_name}{angle_suffix}"],
                     granularity="single",
                     photometric="rgb" if is_rgb else "minisblack",
                 ) as writer:
-                    writer.write_frame(projected, t=0, z=0, c=0)
+                    for t_idx in range(actual_n_timepoints):
+                        if t_idx not in by_t:
+                            continue
+                        ordered = [img for _z, img in sorted(by_t[t_idx])]
+                        projected = projection_fn(ordered)
+                        writer.write_frame(projected, t=t_idx, z=0, c=0)
 
                 projected_file = str(proj_file)
-                logger.info(f"Z-stack projection ({projection_name}): {proj_file}")
+                logger.info(
+                    f"Projection ({projection_name}): {proj_file} "
+                    f"(SizeT={actual_n_timepoints})"
+                )
         except Exception as e:
-            logger.warning(f"Z-stack projection failed: {e}")
+            logger.warning(f"Projection failed: {e}")
 
     elapsed = time.time() - start_time
-    logger.info(f"=== Z-STACK COMPLETE: {n_planes} planes, {len(saved_files)} images, "
-                f"{elapsed:.1f}s ===")
+    label = "Z+T" if has_t else "Z-STACK"
+    logger.info(
+        f"=== {label} COMPLETE: T={actual_n_timepoints}, Z={n_planes}, "
+        f"{len(saved_files)} files, {elapsed:.1f}s ==="
+    )
 
     if progress_callback:
-        progress_callback(n_planes, n_planes, "Complete")
+        progress_callback(total_steps, total_steps, "Complete")
 
     return {
         "n_planes": n_planes,
+        "n_timepoints": actual_n_timepoints,
         "z_positions": z_positions,
         "output_folder": str(output_path),
         "files": saved_files,
