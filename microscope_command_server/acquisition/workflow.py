@@ -1264,8 +1264,6 @@ def autofocus_with_manual_fallback(
     request_manual_focus: Optional[Callable[[int], str]] = None,
     max_retries: int = 3,
     fallback_z: Optional[float] = None,
-    edge_retries: int = 0,
-    edge_widen_factor: float = 2.0,
     **autofocus_kwargs
 ):
     """
@@ -1287,13 +1285,10 @@ def autofocus_with_manual_fallback(
         max_retries: Maximum number of retry attempts after manual focus
         fallback_z: Z position to use when user skips (e.g., the Z-hint from
                     the tilt model). If None, uses the failed AF's attempted_z.
-        edge_retries: When > 0, transparently retry pre-manual-prompt with a
-                      widened (and direction-shifted) sweep range when the
-                      failure mode is "peak at edge" (best Z lies outside the
-                      current sweep). Sweep is clamped to the configured stage
-                      Z limits. Same semantics as sweep-drift's edge_retries.
-        edge_widen_factor: Multiplier applied to search_range on each edge retry.
-        **autofocus_kwargs: Arguments to pass to hardware.autofocus()
+        **autofocus_kwargs: Arguments to pass to hardware.autofocus(). Pass
+                            ``edge_retries=N`` to enable transparent
+                            peak-at-edge widen-and-shift retries inside the
+                            hardware layer before this wrapper sees a failure.
 
     Returns:
         float: Best focus Z position on success
@@ -1306,13 +1301,7 @@ def autofocus_with_manual_fallback(
     original_pos = hardware.get_current_position()
     original_x, original_y = original_pos.x, original_pos.y
 
-    edge_retries_used = 0
-    attempt = -1
-
-    while True:
-        attempt += 1
-        if attempt >= max_retries:
-            break
+    for attempt in range(max_retries):
         result = hardware.autofocus(**autofocus_kwargs)
 
         # Check if autofocus succeeded (returns float) or failed (returns dict)
@@ -1325,101 +1314,8 @@ def autofocus_with_manual_fallback(
             logger.warning(f"  Quality score: {result['quality_score']:.2f}, "
                           f"Prominence: {result['peak_prominence']:.2f}")
 
-            # Note: p98_p2 fallback is now handled inside hardware.autofocus() itself
-            # (scores both metrics in a single sweep, no re-acquisition needed)
-
-            # Edge-retry: when the failure mode is "peak at edge" (best Z lies
-            # outside the current sweep), retry with a widened range shifted in
-            # the inferred direction BEFORE prompting for manual focus. This is
-            # the same idea as the sweep-drift path's edge retry, applied here.
-            if edge_retries_used < edge_retries:
-                validation = result.get('validation', {}) or {}
-                has_asc = bool(validation.get('has_ascending', False))
-                has_desc = bool(validation.get('has_descending', False))
-                # has_asc != has_desc means a clear directional edge:
-                #   asc=True, desc=False -> peak at END (best Z above sweep)
-                #   asc=False, desc=True -> peak at START (best Z below sweep)
-                directional_edge = has_asc != has_desc
-                if directional_edge:
-                    edge_retries_used += 1
-                    old_range = float(autofocus_kwargs.get("search_range", 50.0))
-                    new_range = old_range * float(edge_widen_factor)
-
-                    # Determine direction-shift center: move the new sweep so
-                    # the previously-peaked edge is roughly centered.
-                    shift_sign = 1 if (has_asc and not has_desc) else -1
-                    cur_z = hardware.get_current_position().z
-                    target_center = cur_z + shift_sign * (old_range / 2.0)
-
-                    # Clamp the new sweep so [center - new_range/2, center + new_range/2]
-                    # fits within [z_min + margin, z_max - margin]. If the
-                    # available band is narrower than new_range, shrink new_range
-                    # to fit. Margin matches sweep_focus (5 um).
-                    z_limits = (
-                        hardware.settings.get("stage", {})
-                        .get("limits", {})
-                        .get("z_um", {})
-                    )
-                    z_min = z_limits.get("low")
-                    z_max = z_limits.get("high")
-                    margin = 5.0
-                    if z_min is None or z_max is None:
-                        logger.warning(
-                            "  Edge retry: stage Z limits not configured; "
-                            "skipping edge retry and falling through to "
-                            "manual focus prompt"
-                        )
-                    else:
-                        available = (z_max - margin) - (z_min + margin)
-                        if available <= 0:
-                            logger.warning(
-                                "  Edge retry: stage Z limits leave no usable "
-                                "sweep band (z_min=%.1f, z_max=%.1f, margin=%.1f); "
-                                "skipping edge retry",
-                                z_min, z_max, margin,
-                            )
-                        else:
-                            if available < new_range:
-                                new_range = available
-                            half = new_range / 2.0
-                            clamped_center = max(
-                                z_min + margin + half,
-                                min(z_max - margin - half, target_center),
-                            )
-                            # Sanity: if clamping pinned us to the same band the
-                            # original sweep already covered (i.e. we've already
-                            # explored everything the stage allows), skip the
-                            # retry and let manual focus take over -- there's
-                            # nowhere new to search.
-                            new_low = clamped_center - half
-                            new_high = clamped_center + half
-                            old_low = cur_z - old_range / 2.0
-                            old_high = cur_z + old_range / 2.0
-                            if new_low >= old_low - 1e-3 and new_high <= old_high + 1e-3:
-                                logger.warning(
-                                    "  Edge retry: stage Z limits prevent expansion "
-                                    "beyond the already-swept band [%.2f, %.2f] um; "
-                                    "skipping edge retry",
-                                    old_low, old_high,
-                                )
-                            else:
-                                logger.warning(
-                                    "  Pre-AF peak-at-edge (asc=%s, desc=%s); "
-                                    "edge retry %d/%d: center %.2f -> %.2f um, "
-                                    "range %.1f -> %.1f um (clamped to stage Z "
-                                    "limits [%.1f, %.1f])",
-                                    has_asc, has_desc,
-                                    edge_retries_used, edge_retries,
-                                    cur_z, clamped_center,
-                                    old_range, new_range,
-                                    z_min, z_max,
-                                )
-                                hardware.move_to_position(Position(z=clamped_center))
-                                autofocus_kwargs["search_range"] = new_range
-                                # Re-run autofocus with the widened sweep
-                                # without consuming a manual-retry slot.
-                                attempt -= 1
-                                continue
+            # Note: p98_p2 fallback and (optionally) peak-at-edge widen-shift
+            # retries are handled inside hardware.autofocus() itself.
 
             if request_manual_focus is not None:
                 # Always show dialog, even on last attempt
@@ -3626,8 +3522,8 @@ def _run_pre_acquisition_autofocus(ctx: AcquisitionContext) -> None:
                 request_manual_focus=ctx.request_manual_focus,
                 max_retries=3,
                 fallback_z=ctx.hint_z,
-                edge_retries=ctx.af_edge_retries,
                 n_steps=ctx.af_n_steps,
+                edge_retries=ctx.af_edge_retries,
                 search_range=ctx.af_search_range,
                 score_metric=ctx.af_score_metric,
                 diagnostic_output_path=str(ctx.output_path),
@@ -3641,8 +3537,8 @@ def _run_pre_acquisition_autofocus(ctx: AcquisitionContext) -> None:
                 request_manual_focus=ctx.request_manual_focus,
                 max_retries=0,
                 fallback_z=ctx.hint_z,
-                edge_retries=ctx.af_edge_retries,
                 n_steps=ctx.af_n_steps,
+                edge_retries=ctx.af_edge_retries,
                 search_range=ctx.af_search_range,
                 score_metric=ctx.af_score_metric,
                 diagnostic_output_path=str(ctx.output_path),
