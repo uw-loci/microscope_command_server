@@ -33,6 +33,28 @@ from concurrent.futures import ThreadPoolExecutor, Future
 logger = logging.getLogger(__name__)
 
 
+# Modalities where every tile is expected to fill the detector's dynamic range.
+# Under-exposure on these is a calibration symptom (stale WB, wrong detector
+# profile, lamp moved); on other modalities (fluorescence, laser scanning)
+# dim tiles are normal/desired and warning would be noise. Mirrors the Java
+# ModalityHandler.expectsUniformBrightness() default-false contract.
+_UNIFORM_BRIGHT_MODALITY_PREFIXES = ("ppm", "brightfield", "bf")
+
+
+def _modality_expects_uniform_brightness(modality: str) -> bool:
+    """Return True iff the modality expects every tile to fill the dynamic range.
+
+    The match is prefix-based (case-insensitive) so config-side variants like
+    ``ppm_10x``, ``ppm_20x``, ``Brightfield_20x``, ``bf_40x`` all resolve.
+    Fluorescence, multiphoton, SHG, and laser-scanning modalities return
+    False -- a dim tile on those is normal (rare cell types, sparse signal).
+    """
+    if not modality:
+        return False
+    lowered = modality.strip().lower()
+    return any(lowered.startswith(prefix) for prefix in _UNIFORM_BRIGHT_MODALITY_PREFIXES)
+
+
 def _saturation_threshold(image) -> int:
     """Derive near-saturation threshold from image dtype.
 
@@ -473,6 +495,60 @@ def load_jai_calibration_from_imageprocessing(
             if logger:
                 logger.info(f"No profile found for {modality}/{objective}/{detector}")
             return None
+
+        # Freshness check: if wb_last_modified is more than 14 days old, warn.
+        # The 2026-04-27 silent-first-detector incident left a 12-day-stale JAI
+        # 10x calibration in place while a fresh WB run wrote to the wrong
+        # detector profile -- without this warning, the only signal was very
+        # dim acquired tiles. Warn loudly so the user can recalibrate (or
+        # confirm the slot is intentionally frozen).
+        wb_last_modified = detector_profile.get("wb_last_modified")
+        simple_wb_section = detector_profile.get("simple_wb", {}) or {}
+        simple_last = simple_wb_section.get("last_calibrated") if isinstance(simple_wb_section, dict) else None
+        if logger:
+            try:
+                from datetime import datetime, timedelta
+                now = datetime.now()
+                if isinstance(wb_last_modified, str) and wb_last_modified:
+                    try:
+                        ts = datetime.fromisoformat(wb_last_modified)
+                        age = now - ts
+                        if age > timedelta(days=14):
+                            logger.warning(
+                                "WB calibration for %s/%s/%s is %d days old "
+                                "(wb_last_modified=%s). Acquired images may not match "
+                                "calibration targets; consider recalibrating.",
+                                modality, objective, detector, age.days, wb_last_modified,
+                            )
+                    except ValueError:
+                        logger.debug("Could not parse wb_last_modified=%r", wb_last_modified)
+                # Drift check between the per-angle wb_last_modified and the
+                # simple_wb.last_calibrated. If they disagree by more than 7
+                # days, the user has likely run one calibration mode but not
+                # the other -- BG correction with the older mode will silently
+                # use stale data.
+                if (
+                    isinstance(wb_last_modified, str)
+                    and isinstance(simple_last, str)
+                    and wb_last_modified and simple_last
+                ):
+                    try:
+                        ts_pa = datetime.fromisoformat(wb_last_modified)
+                        ts_simple = datetime.fromisoformat(simple_last)
+                        drift = abs(ts_pa - ts_simple)
+                        if drift > timedelta(days=7):
+                            logger.warning(
+                                "WB mode drift on %s/%s/%s: per-angle wb_last_modified=%s "
+                                "vs simple_wb.last_calibrated=%s (%d-day drift). "
+                                "BG correction with the older mode may use stale exposures.",
+                                modality, objective, detector,
+                                wb_last_modified, simple_last, drift.days,
+                            )
+                    except ValueError:
+                        pass
+            except Exception:
+                # Freshness logging is best-effort -- never block the load
+                pass
 
         exposures_ms = detector_profile.get("exposures_ms", {})
         gains = detector_profile.get("gains", {})
@@ -6180,6 +6256,27 @@ def simple_background_collection(
                                 logger.warning(
                                     "SATURATION WARNING: per-angle WB angle=%s has %.1f%% clipped pixels",
                                     angle, sat_frac * 100)
+
+                            # Under-exposure guard. Only enabled for modalities
+                            # where every tile is expected to fill the dynamic
+                            # range (PPM, Brightfield) -- on fluorescence /
+                            # laser-scanning channels a dim tile is normal
+                            # (rare cell types, sparse signals) and warning
+                            # would be noise. The 2026-04-27 silent-first-
+                            # detector incident produced exactly this dim
+                            # pattern and would have been caught here.
+                            if _modality_expects_uniform_brightness(modality):
+                                if image.dtype == np.uint8:
+                                    median = float(np.median(image))
+                                    # 20/255 ~= 8% of full scale; well below any
+                                    # reasonable calibration target (125-245).
+                                    if median < 20.0:
+                                        logger.warning(
+                                            "UNDER-EXPOSURE WARNING: per-angle WB angle=%s has "
+                                            "median=%.1f (uniform-bright modality '%s' expects ~target). "
+                                            "Likely stale calibration or wrong detector profile.",
+                                            angle, median, modality,
+                                        )
 
                             # Store reference for biref pair matching
                             if angle > 0 and angle != 90:
