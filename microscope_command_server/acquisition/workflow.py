@@ -87,6 +87,93 @@ def _saturation_role_for(modality: str, angle_deg: float) -> str:
     return SATURATION_ROLE_NORMAL
 
 
+# Underexposure thresholds (p99 below these flags the tile as underexposed).
+# uint8 / 255 ratio, applied to whichever dtype max is in use. Uniform-bright
+# modalities (PPM, brightfield) use a stricter threshold because every tile
+# is supposed to fill the dynamic range; sparse modalities (fluorescence,
+# laser scanning) tolerate dim tiles.
+_UNDEREXPOSED_P99_RATIO_UNIFORM = 60.0 / 255.0   # PPM, brightfield: <p99=60/255
+_UNDEREXPOSED_P99_RATIO_SPARSE = 30.0 / 255.0    # fluorescence, LSM: <p99=30/255
+
+
+def _compute_tile_stats(image) -> dict:
+    """Per-channel percentile + mean + std stats for a tile image.
+
+    Returns a flat dict with keys like ``p1_R``, ``p99_R``, ``mean_R``,
+    ``std_R``, ``dynamic_range_R`` (and similarly for G/B; or ``_gray`` for
+    monochrome). Empty dict on None or unexpected shape. Computed once per
+    snapped image and accumulated across angles by the caller.
+    """
+    if image is None:
+        return {}
+    out = {}
+    try:
+        if image.ndim == 2:
+            ch_keys = [("gray", image)]
+        elif image.ndim == 3 and image.shape[2] >= 3:
+            ch_keys = [("R", image[:, :, 0]), ("G", image[:, :, 1]), ("B", image[:, :, 2])]
+        else:
+            return {}
+        for label, ch in ch_keys:
+            p1 = float(np.percentile(ch, 1))
+            p99 = float(np.percentile(ch, 99))
+            out[f"p1_{label}"] = round(p1, 1)
+            out[f"p99_{label}"] = round(p99, 1)
+            out[f"mean_{label}"] = round(float(ch.mean()), 1)
+            out[f"std_{label}"] = round(float(ch.std()), 1)
+            out[f"dynamic_range_{label}"] = round(p99 - p1, 1)
+    except Exception:
+        return {}
+    return out
+
+
+def _accumulate_tile_stats(accum: dict, sample: dict) -> None:
+    """Aggregate per-image stats into a per-tile worst/best/mean accumulator.
+
+    For p1 keep the smallest seen, for p99 keep the largest, for mean and
+    std keep a running average across angles. Accumulator dict is mutated
+    in place.
+    """
+    if not sample:
+        return
+    counts = accum.setdefault("__counts__", {})
+    for key, val in sample.items():
+        if key.startswith("p1_"):
+            accum[key] = min(accum.get(key, val), val) if key in accum else val
+        elif key.startswith("p99_") or key.startswith("dynamic_range_"):
+            accum[key] = max(accum.get(key, val), val) if key in accum else val
+        elif key.startswith("mean_") or key.startswith("std_"):
+            n = counts.get(key, 0)
+            prev = accum.get(key, 0.0)
+            accum[key] = round((prev * n + val) / (n + 1), 1)
+            counts[key] = n + 1
+
+
+def _stats_underexposed(stats: dict, modality: str) -> bool:
+    """Return True when the tile's p99 sits below the modality's underexposure threshold.
+
+    Uses the strict 60/255 threshold for modalities that expect every tile
+    to fill the dynamic range (PPM, brightfield) and the relaxed 30/255
+    threshold otherwise. Detects the data range from p99 magnitude (>4096
+    = uint16, scaled to 16-bit max).
+    """
+    if not stats:
+        return False
+    # Pick the worst (lowest) p99 across channels as the canonical brightness signal.
+    p99_keys = [k for k in stats.keys() if k.startswith("p99_")]
+    if not p99_keys:
+        return False
+    p99_min = min(stats[k] for k in p99_keys)
+    # Scale threshold to data range
+    is_uint16 = p99_min > 4096 or any(stats[k] > 4096 for k in p99_keys)
+    if _modality_expects_uniform_brightness(modality):
+        ratio = _UNDEREXPOSED_P99_RATIO_UNIFORM
+    else:
+        ratio = _UNDEREXPOSED_P99_RATIO_SPARSE
+    threshold = ratio * (65535 if is_uint16 else 255)
+    return p99_min < threshold
+
+
 def _saturation_threshold(image) -> int:
     """Derive near-saturation threshold from image dtype.
 
@@ -2326,8 +2413,9 @@ def _acquisition_workflow(
                 # Dispatch by modality
                 tile_worst_sat = {"R": 0.0, "G": 0.0, "B": 0.0}
                 tile_role_sat = {SATURATION_ROLE_LOW: 0.0, SATURATION_ROLE_HIGH: 0.0, SATURATION_ROLE_NORMAL: 0.0}
+                tile_stats: dict = {}
                 if ctx.params["angles"]:
-                    tile_worst_sat, tile_role_sat, xy_move_pending = _acquire_tile_angles(
+                    tile_worst_sat, tile_role_sat, tile_stats, xy_move_pending = _acquire_tile_angles(
                         ctx, pos_idx, pos, filename, current_stage_pos, xy_move_pending
                     )
                 else:
@@ -2344,9 +2432,9 @@ def _acquisition_workflow(
                         channel_intensity_overrides=ctx.params.get("channel_intensities") or None,
                     )
                     if channel_plan:
-                        tile_worst_sat, tile_role_sat = _acquire_tile_channels(ctx, pos, filename, current_stage_pos)
+                        tile_worst_sat, tile_role_sat, tile_stats = _acquire_tile_channels(ctx, pos, filename, current_stage_pos)
                     else:
-                        tile_worst_sat, tile_role_sat = _acquire_tile_single(ctx, pos, filename, current_stage_pos)
+                        tile_worst_sat, tile_role_sat, tile_stats = _acquire_tile_single(ctx, pos, filename, current_stage_pos)
 
                 # Record per-tile measurements
                 _record_tile_measurement(
@@ -2354,6 +2442,7 @@ def _acquisition_workflow(
                     needs_af, af_type, drift, af_failed,
                     tile_worst_sat, current_stage_pos,
                     tile_role_sat=tile_role_sat,
+                    tile_stats=tile_stats,
                 )
 
         # Phase 11: Post-acquisition finalization
@@ -3997,20 +4086,23 @@ def _handle_tile_autofocus(
 
 
 def _acquire_tile_angles(ctx: AcquisitionContext, pos_idx: int, pos, filename: str,
-                         current_stage_pos, xy_move_pending: bool) -> Tuple[dict, dict, bool]:
+                         current_stage_pos, xy_move_pending: bool) -> Tuple[dict, dict, dict, bool]:
     """Acquire all angles (and Z-planes) for a single tile position.
 
-    Returns (tile_worst_sat, tile_role_sat, xy_move_pending updated).
+    Returns (tile_worst_sat, tile_role_sat, tile_stats, xy_move_pending updated).
     tile_role_sat collects worst-pct broken down by SaturationRole so the
     QuPath measurement table can filter PPM tiles where small-angle (low
     signal) channels saturated, ignoring uncrossed (90 deg) which is
-    intentionally bright.
+    intentionally bright. tile_stats collects p1/p99/mean/std/dynamic_range
+    per channel, aggregated across angles -- p1 is min seen, p99 + dynamic
+    range are max seen, mean and std are angle-averaged.
     """
     logger = ctx.logger
     hardware = ctx.hardware
     params = ctx.params
     tile_worst_sat = {"R": 0.0, "G": 0.0, "B": 0.0}
     tile_role_sat = {SATURATION_ROLE_LOW: 0.0, SATURATION_ROLE_HIGH: 0.0, SATURATION_ROLE_NORMAL: 0.0}
+    tile_stats: dict = {}
 
     center_z = current_stage_pos.z
     z_stack_images = {}
@@ -4165,6 +4257,14 @@ def _acquire_tile_angles(ctx: AcquisitionContext, pos_idx: int, pos, filename: s
                 worst_this_angle = max(sat_result.values()) if sat_result else 0.0
                 if worst_this_angle > tile_role_sat.get(role, 0.0):
                     tile_role_sat[role] = worst_this_angle
+
+            # Per-tile percentile / mean / std stats, aggregated across angles.
+            # P1 catches under-exposure (low p99) -- the same QuPath measurement
+            # table now surfaces both saturation and dim-tile failure modes.
+            try:
+                _accumulate_tile_stats(tile_stats, _compute_tile_stats(image))
+            except Exception as stats_err:
+                logger.debug(f"  Stats compute failed at {angle}deg: {stats_err}")
 
             if ctx.sat_monitor.check_tile(
                 sat_result, angle, pos_idx, filename,
@@ -4335,14 +4435,15 @@ def _acquire_tile_angles(ctx: AcquisitionContext, pos_idx: int, pos, filename: s
             f"but got angles={list(angle_images.keys())}"
         )
 
-    return tile_worst_sat, tile_role_sat, xy_move_pending
+    tile_stats.pop("__counts__", None)
+    return tile_worst_sat, tile_role_sat, tile_stats, xy_move_pending
 
 
 def _acquire_tile_channels(ctx: AcquisitionContext, pos, filename: str,
-                           current_stage_pos) -> Tuple[dict, dict]:
+                           current_stage_pos) -> Tuple[dict, dict, dict]:
     """Acquire all channels for a single tile position (widefield IF).
 
-    Returns (tile_worst_sat, tile_role_sat).
+    Returns (tile_worst_sat, tile_role_sat, tile_stats).
     Channel-based modalities have no angle concept, so all saturation is
     reported under SaturationRole.SIGNAL_NORMAL.
     """
@@ -4350,6 +4451,7 @@ def _acquire_tile_channels(ctx: AcquisitionContext, pos, filename: str,
     hardware = ctx.hardware
     tile_worst_sat = {}
     tile_role_sat = {SATURATION_ROLE_LOW: 0.0, SATURATION_ROLE_HIGH: 0.0, SATURATION_ROLE_NORMAL: 0.0}
+    tile_stats: dict = {}
 
     CHANNEL_SAT_RUNAWAY_N = 3
     CHANNEL_SAT_PCT_THRESHOLD = 5.0
@@ -4415,6 +4517,11 @@ def _acquire_tile_channels(ctx: AcquisitionContext, pos, filename: str,
                 worst_this_channel = max(sat_result.values()) if sat_result else 0.0
                 if worst_this_channel > tile_role_sat[SATURATION_ROLE_NORMAL]:
                     tile_role_sat[SATURATION_ROLE_NORMAL] = worst_this_channel
+
+            try:
+                _accumulate_tile_stats(tile_stats, _compute_tile_stats(image))
+            except Exception as stats_err:
+                logger.debug(f"  Stats compute failed for {ch_id}: {stats_err}")
 
             if not ctx.z_stack_enabled:
                 # 2D mode: save directly
@@ -4498,24 +4605,27 @@ def _acquire_tile_channels(ctx: AcquisitionContext, pos, filename: str,
         else:
             ctx.channel_consecutive_saturated[ch_id] = 0
 
-    return tile_worst_sat, tile_role_sat
+    tile_stats.pop("__counts__", None)
+    return tile_worst_sat, tile_role_sat, tile_stats
 
 
 def _acquire_tile_single(ctx: AcquisitionContext, pos, filename: str,
-                         current_stage_pos) -> Tuple[dict, dict]:
+                         current_stage_pos) -> Tuple[dict, dict, dict]:
     """Acquire image(s) for a non-rotation tile (BF, fluorescence).
 
     Supports Z-stack: when z_stack_enabled, iterates Z-offsets around
     center_z, accumulates planes, and saves a projected 2D image.
 
-    Returns (tile_worst_sat, tile_role_sat). Single-acquisition modalities
-    have no angle concept, so all saturation lands in SaturationRole.SIGNAL_NORMAL.
+    Returns (tile_worst_sat, tile_role_sat, tile_stats). Single-acquisition
+    modalities have no angle concept, so all saturation lands in
+    SaturationRole.SIGNAL_NORMAL.
     """
     logger = ctx.logger
     hardware = ctx.hardware
     params = ctx.params
     tile_worst_sat = {"R": 0.0, "G": 0.0, "B": 0.0}
     tile_role_sat = {SATURATION_ROLE_LOW: 0.0, SATURATION_ROLE_HIGH: 0.0, SATURATION_ROLE_NORMAL: 0.0}
+    tile_stats: dict = {}
 
     # Set exposure explicitly from params
     if params.get("exposures"):
@@ -4562,6 +4672,11 @@ def _acquire_tile_single(ctx: AcquisitionContext, pos, filename: str,
             worst_this_image = max(sat_result.values()) if sat_result else 0.0
             if worst_this_image > tile_role_sat[SATURATION_ROLE_NORMAL]:
                 tile_role_sat[SATURATION_ROLE_NORMAL] = worst_this_image
+
+        try:
+            _accumulate_tile_stats(tile_stats, _compute_tile_stats(image))
+        except Exception as stats_err:
+            logger.debug(f"  Stats compute failed: {stats_err}")
 
         if not ctx.z_stack_enabled:
             # 2D mode: save directly
@@ -4614,7 +4729,8 @@ def _acquire_tile_single(ctx: AcquisitionContext, pos, filename: str,
     except Exception as e:
         logger.warning(f"  Failed to write position text {ctx.metadata_txt_for_positions}: {e}")
 
-    return tile_worst_sat, tile_role_sat
+    tile_stats.pop("__counts__", None)
+    return tile_worst_sat, tile_role_sat, tile_stats
 
 
 def _record_tile_measurement(
@@ -4622,6 +4738,7 @@ def _record_tile_measurement(
     needs_af: bool, af_type: str, drift: float, af_failed: bool,
     tile_worst_sat: dict, current_stage_pos,
     tile_role_sat: Optional[dict] = None,
+    tile_stats: Optional[dict] = None,
 ) -> None:
     """Record per-tile measurement data and stream to NDJSON."""
     logger = ctx.logger
@@ -4718,6 +4835,12 @@ def _record_tile_measurement(
         "acq_order_index": pos_idx,
         "acq_timestamp_iso": time.strftime("%Y-%m-%dT%H:%M:%S", time.localtime(tile_start)),
     }
+    # Per-channel percentile / mean / std stats (P1 metrics). Surfaces dim-tile
+    # under-exposure in the same QuPath measurement table as saturation.
+    if tile_stats:
+        for k, v in tile_stats.items():
+            tile_measurement_entry[k] = v
+        tile_measurement_entry["underexposed"] = bool(_stats_underexposed(tile_stats, ctx.modality))
     ctx.tile_measurements.append(tile_measurement_entry)
 
     if ctx.tile_measurements_stream is not None:
