@@ -162,15 +162,52 @@ def handle_move(conn, client, hardware, settings, **kwargs):
 
 
 def handle_movez(conn, client, hardware, settings, **kwargs):
-    """Move Z stage to position (read 4 bytes: one float)."""
+    """Move Z stage to position (read 4 bytes: one float).
+
+    If a Live Viewer continuous sequence acquisition is running, pause
+    it for the duration of the move and resume after. Without the pause,
+    MMCore device-property contention stretches long-distance Z moves
+    (>~100 um on the PI Z stage) out to ~30 s -- 10 s wait_z busy-poll
+    plus a 20 s wait_for_device fallback that ultimately times out --
+    and drops the client socket.
+    """
     z = conn.recv(4)
     z_position = struct.unpack("!f", z)[0]
     logger.info("Client %s requested move to Z=%.2f", client.addr, z_position)
+
+    sequence_was_running = False
+    try:
+        sequence_was_running = bool(hardware.core.is_sequence_running())
+    except Exception as check_err:
+        logger.warning("MOVEZ: could not query sequence state: %s", check_err)
+
+    if sequence_was_running:
+        try:
+            hardware.core.stop_sequence_acquisition()
+            logger.info("MOVEZ: paused sequence acquisition for Z move")
+        except Exception as stop_err:
+            logger.warning(
+                "MOVEZ: failed to stop sequence (proceeding with contention risk): %s",
+                stop_err,
+            )
+            sequence_was_running = False
+
     try:
         hardware.move_to_position(Position(z=z_position))
         logger.info("Move completed to Z=%.2f", z_position)
     except Exception as e:
         logger.error("Failed to move to Z position: %s", e, exc_info=True)
+    finally:
+        if sequence_was_running:
+            try:
+                hardware.core.start_continuous_sequence_acquisition(0)
+                logger.info("MOVEZ: resumed sequence acquisition after Z move")
+            except Exception as resume_err:
+                logger.error(
+                    "MOVEZ: failed to resume sequence acquisition: %s",
+                    resume_err,
+                    exc_info=True,
+                )
 
 
 def handle_movznw(conn, client, hardware, settings, **kwargs):
