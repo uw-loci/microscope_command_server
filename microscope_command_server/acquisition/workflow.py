@@ -55,6 +55,38 @@ def _modality_expects_uniform_brightness(modality: str) -> bool:
     return any(lowered.startswith(prefix) for prefix in _UNIFORM_BRIGHT_MODALITY_PREFIXES)
 
 
+# Saturation role classification: which angles in a multi-angle modality are
+# expected to be bright (saturation OK) vs faint (saturation is a real defect).
+# Mirrors qupath.ext.qpsc.modality.ModalityHandler.classifyAngleSaturation()
+# on the Java side -- both must use the same |angle-90|<2 tolerance for PPM
+# uncrossed detection so the role labels agree.
+SATURATION_ROLE_LOW = "signal_low"        # faint signal expected; saturation is bad
+SATURATION_ROLE_HIGH = "signal_high"      # bright by design (PPM uncrossed); saturation OK
+SATURATION_ROLE_NORMAL = "signal_normal"  # ordinary tile; saturation is bad
+
+_PPM_UNCROSSED_TOLERANCE_DEG = 2.0
+
+
+def _saturation_role_for(modality: str, angle_deg: float) -> str:
+    """Classify how to interpret saturation on a tile captured at this angle.
+
+    For PPM (and prefix variants), the uncrossed angle (~90 deg) is intentionally
+    bright and saturation there is normal/expected; the crossed (0) and small
+    polarisation angles (+/-7) are low-signal and saturation there is a real
+    calibration defect. Other modalities return SATURATION_ROLE_NORMAL.
+
+    Stays in lock-step with Java PPMModalityHandler.classifyAngleSaturation().
+    """
+    if not modality:
+        return SATURATION_ROLE_NORMAL
+    lowered = modality.strip().lower()
+    if lowered.startswith("ppm"):
+        if abs(abs(angle_deg) - 90.0) < _PPM_UNCROSSED_TOLERANCE_DEG:
+            return SATURATION_ROLE_HIGH
+        return SATURATION_ROLE_LOW
+    return SATURATION_ROLE_NORMAL
+
+
 def _saturation_threshold(image) -> int:
     """Derive near-saturation threshold from image dtype.
 
@@ -2293,8 +2325,9 @@ def _acquisition_workflow(
 
                 # Dispatch by modality
                 tile_worst_sat = {"R": 0.0, "G": 0.0, "B": 0.0}
+                tile_role_sat = {SATURATION_ROLE_LOW: 0.0, SATURATION_ROLE_HIGH: 0.0, SATURATION_ROLE_NORMAL: 0.0}
                 if ctx.params["angles"]:
-                    tile_worst_sat, xy_move_pending = _acquire_tile_angles(
+                    tile_worst_sat, tile_role_sat, xy_move_pending = _acquire_tile_angles(
                         ctx, pos_idx, pos, filename, current_stage_pos, xy_move_pending
                     )
                 else:
@@ -2311,15 +2344,16 @@ def _acquisition_workflow(
                         channel_intensity_overrides=ctx.params.get("channel_intensities") or None,
                     )
                     if channel_plan:
-                        tile_worst_sat = _acquire_tile_channels(ctx, pos, filename, current_stage_pos)
+                        tile_worst_sat, tile_role_sat = _acquire_tile_channels(ctx, pos, filename, current_stage_pos)
                     else:
-                        tile_worst_sat = _acquire_tile_single(ctx, pos, filename, current_stage_pos)
+                        tile_worst_sat, tile_role_sat = _acquire_tile_single(ctx, pos, filename, current_stage_pos)
 
                 # Record per-tile measurements
                 _record_tile_measurement(
                     ctx, pos_idx, filename, tile_start,
                     needs_af, af_type, drift, af_failed,
                     tile_worst_sat, current_stage_pos,
+                    tile_role_sat=tile_role_sat,
                 )
 
         # Phase 11: Post-acquisition finalization
@@ -3963,15 +3997,20 @@ def _handle_tile_autofocus(
 
 
 def _acquire_tile_angles(ctx: AcquisitionContext, pos_idx: int, pos, filename: str,
-                         current_stage_pos, xy_move_pending: bool) -> Tuple[dict, bool]:
+                         current_stage_pos, xy_move_pending: bool) -> Tuple[dict, dict, bool]:
     """Acquire all angles (and Z-planes) for a single tile position.
 
-    Returns (tile_worst_sat dict, xy_move_pending updated).
+    Returns (tile_worst_sat, tile_role_sat, xy_move_pending updated).
+    tile_role_sat collects worst-pct broken down by SaturationRole so the
+    QuPath measurement table can filter PPM tiles where small-angle (low
+    signal) channels saturated, ignoring uncrossed (90 deg) which is
+    intentionally bright.
     """
     logger = ctx.logger
     hardware = ctx.hardware
     params = ctx.params
     tile_worst_sat = {"R": 0.0, "G": 0.0, "B": 0.0}
+    tile_role_sat = {SATURATION_ROLE_LOW: 0.0, SATURATION_ROLE_HIGH: 0.0, SATURATION_ROLE_NORMAL: 0.0}
 
     center_z = current_stage_pos.z
     z_stack_images = {}
@@ -4118,6 +4157,14 @@ def _acquire_tile_angles(ctx: AcquisitionContext, pos_idx: int, pos, filename: s
                 for ch in ("R", "G", "B"):
                     if sat_result.get(ch, 0) > tile_worst_sat[ch]:
                         tile_worst_sat[ch] = sat_result[ch]
+                # Per-role saturation aggregation: track the worst per-channel
+                # pct seen at any angle that classifies into each role. PPM
+                # uncrossed (~90 deg) hits role_high; crossed/positive/negative
+                # hit role_low. Non-PPM modalities collapse all into role_normal.
+                role = _saturation_role_for(ctx.modality, angle)
+                worst_this_angle = max(sat_result.values()) if sat_result else 0.0
+                if worst_this_angle > tile_role_sat.get(role, 0.0):
+                    tile_role_sat[role] = worst_this_angle
 
             if ctx.sat_monitor.check_tile(
                 sat_result, angle, pos_idx, filename,
@@ -4288,18 +4335,21 @@ def _acquire_tile_angles(ctx: AcquisitionContext, pos_idx: int, pos, filename: s
             f"but got angles={list(angle_images.keys())}"
         )
 
-    return tile_worst_sat, xy_move_pending
+    return tile_worst_sat, tile_role_sat, xy_move_pending
 
 
 def _acquire_tile_channels(ctx: AcquisitionContext, pos, filename: str,
-                           current_stage_pos) -> dict:
+                           current_stage_pos) -> Tuple[dict, dict]:
     """Acquire all channels for a single tile position (widefield IF).
 
-    Returns tile_worst_sat dict.
+    Returns (tile_worst_sat, tile_role_sat).
+    Channel-based modalities have no angle concept, so all saturation is
+    reported under SaturationRole.SIGNAL_NORMAL.
     """
     logger = ctx.logger
     hardware = ctx.hardware
     tile_worst_sat = {}
+    tile_role_sat = {SATURATION_ROLE_LOW: 0.0, SATURATION_ROLE_HIGH: 0.0, SATURATION_ROLE_NORMAL: 0.0}
 
     CHANNEL_SAT_RUNAWAY_N = 3
     CHANNEL_SAT_PCT_THRESHOLD = 5.0
@@ -4361,6 +4411,10 @@ def _acquire_tile_channels(ctx: AcquisitionContext, pos, filename: str,
                 for ch_key, pct in sat_result.items():
                     if pct > worst_sat_for_channel.get(ch_key, 0):
                         worst_sat_for_channel[ch_key] = pct
+                # Channel-based: no per-angle distinction, accumulate into normal role
+                worst_this_channel = max(sat_result.values()) if sat_result else 0.0
+                if worst_this_channel > tile_role_sat[SATURATION_ROLE_NORMAL]:
+                    tile_role_sat[SATURATION_ROLE_NORMAL] = worst_this_channel
 
             if not ctx.z_stack_enabled:
                 # 2D mode: save directly
@@ -4444,22 +4498,24 @@ def _acquire_tile_channels(ctx: AcquisitionContext, pos, filename: str,
         else:
             ctx.channel_consecutive_saturated[ch_id] = 0
 
-    return tile_worst_sat
+    return tile_worst_sat, tile_role_sat
 
 
 def _acquire_tile_single(ctx: AcquisitionContext, pos, filename: str,
-                         current_stage_pos) -> dict:
+                         current_stage_pos) -> Tuple[dict, dict]:
     """Acquire image(s) for a non-rotation tile (BF, fluorescence).
 
     Supports Z-stack: when z_stack_enabled, iterates Z-offsets around
     center_z, accumulates planes, and saves a projected 2D image.
 
-    Returns tile_worst_sat dict.
+    Returns (tile_worst_sat, tile_role_sat). Single-acquisition modalities
+    have no angle concept, so all saturation lands in SaturationRole.SIGNAL_NORMAL.
     """
     logger = ctx.logger
     hardware = ctx.hardware
     params = ctx.params
     tile_worst_sat = {"R": 0.0, "G": 0.0, "B": 0.0}
+    tile_role_sat = {SATURATION_ROLE_LOW: 0.0, SATURATION_ROLE_HIGH: 0.0, SATURATION_ROLE_NORMAL: 0.0}
 
     # Set exposure explicitly from params
     if params.get("exposures"):
@@ -4502,6 +4558,10 @@ def _acquire_tile_single(ctx: AcquisitionContext, pos, filename: str,
             for ch_key, pct in sat_result.items():
                 if pct > tile_worst_sat.get(ch_key, 0):
                     tile_worst_sat[ch_key] = pct
+            # Single-image modalities: no angle context, treat as normal
+            worst_this_image = max(sat_result.values()) if sat_result else 0.0
+            if worst_this_image > tile_role_sat[SATURATION_ROLE_NORMAL]:
+                tile_role_sat[SATURATION_ROLE_NORMAL] = worst_this_image
 
         if not ctx.z_stack_enabled:
             # 2D mode: save directly
@@ -4554,13 +4614,14 @@ def _acquire_tile_single(ctx: AcquisitionContext, pos, filename: str,
     except Exception as e:
         logger.warning(f"  Failed to write position text {ctx.metadata_txt_for_positions}: {e}")
 
-    return tile_worst_sat
+    return tile_worst_sat, tile_role_sat
 
 
 def _record_tile_measurement(
     ctx: AcquisitionContext, pos_idx: int, filename: str, tile_start: float,
     needs_af: bool, af_type: str, drift: float, af_failed: bool,
     tile_worst_sat: dict, current_stage_pos,
+    tile_role_sat: Optional[dict] = None,
 ) -> None:
     """Record per-tile measurement data and stream to NDJSON."""
     logger = ctx.logger
@@ -4610,6 +4671,28 @@ def _record_tile_measurement(
             avg_s, eta_h, throughput,
         )
 
+    tile_role_sat = tile_role_sat or {}
+    role_low_pct = round(tile_role_sat.get(SATURATION_ROLE_LOW, 0.0), 1)
+    role_high_pct = round(tile_role_sat.get(SATURATION_ROLE_HIGH, 0.0), 1)
+    role_normal_pct = round(tile_role_sat.get(SATURATION_ROLE_NORMAL, 0.0), 1)
+
+    # The "primary" role for this tile is whichever non-zero role has the
+    # worst saturation, biased toward the role that actually matters for
+    # filtering (LOW > NORMAL > HIGH). PPM tiles always carry both LOW (small
+    # angles) and HIGH (uncrossed) roles; we expose both as separate fields
+    # below and tag the dominant concerning role here. role_label is the
+    # filtering-friendly tag QuPath measurements / dialogs use.
+    if role_low_pct > 0:
+        role_label = SATURATION_ROLE_LOW
+    elif role_normal_pct > 0:
+        role_label = SATURATION_ROLE_NORMAL
+    elif role_high_pct > 0:
+        role_label = SATURATION_ROLE_HIGH
+    else:
+        # No saturation at all; tag with what role the modality would assign
+        # to a default (0 deg) tile so downstream filters still see a label.
+        role_label = _saturation_role_for(ctx.modality, 0.0)
+
     tile_measurement_entry = {
         "position_index": pos_idx,
         "filename": filename,
@@ -4624,6 +4707,16 @@ def _record_tile_measurement(
         "saturation_G_pct": round(tile_worst_sat.get("G", tile_worst_sat.get("Gray", 0)), 1),
         "saturation_B_pct": round(tile_worst_sat.get("B", tile_worst_sat.get("Gray", 0)), 1),
         "saturation_worst_pct": round(max(tile_worst_sat.values()) if tile_worst_sat else 0, 1),
+        # Role-aggregate saturation: LOW = small-angle PPM (saturation is bad);
+        # HIGH = uncrossed (~90 deg, intentionally bright, saturation OK);
+        # NORMAL = single-image/channel modalities. role_label is the filter
+        # tag for the QuPath measurement table.
+        "saturation_role": role_label,
+        "saturation_role_low_pct": role_low_pct,
+        "saturation_role_high_pct": role_high_pct,
+        "saturation_role_normal_pct": role_normal_pct,
+        "acq_order_index": pos_idx,
+        "acq_timestamp_iso": time.strftime("%Y-%m-%dT%H:%M:%S", time.localtime(tile_start)),
     }
     ctx.tile_measurements.append(tile_measurement_entry)
 
