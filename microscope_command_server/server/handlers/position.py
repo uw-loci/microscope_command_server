@@ -88,9 +88,20 @@ def _pause_sequence_for_move(hardware, tag):
             )
             sequence_was_running = False
 
-    # 2) Focus speed recovery
+    # 2) Focus speed recovery -- one-way. If MaxSpeed is below normal, bump
+    # to 100 and leave it there. Do NOT save and restore the caller's value:
+    # the leaked-low value is a bug we want to fix permanently for this
+    # session. Streaming AF and probez will set MaxSpeed=1 again the next
+    # time they intentionally run (and restore in their own finally blocks).
+    #
+    # Restoring would also reintroduce a race between concurrent move
+    # handlers: MOVE (aux) and MOVEZ (primary) can arrive simultaneously,
+    # both detect MaxSpeed=1, both bump to 100, the faster one finishes and
+    # "restores" to 1 while the slower one is mid-move -- and the slower
+    # move then runs at the leaked-slow speed. Observed 2026-04-27 23:27:01
+    # on PPM: parallel MOVE+MOVEZ, MOVE restored MaxSpeed=1 at 23:27:03.394
+    # while MOVEZ was still executing, Z move stalled the full 30 s.
     focus_dev, speed_prop, original_speed = _get_focus_speed_property(core)
-    speed_was_recovered = False
     if focus_dev and speed_prop and original_speed is not None:
         try:
             current = float(original_speed)
@@ -99,13 +110,14 @@ def _pause_sequence_for_move(hardware, tag):
         if current is not None and current < _FOCUS_SPEED_RECOVER_THRESHOLD:
             logger.warning(
                 "%s: focus stage '%s' %s=%s is below normal range -- "
-                "auto-recovering to %s for this move (likely leaked from "
-                "an interrupted streaming AF or probez run)",
+                "recovering to %s and LEAVING IT THERE (likely leaked from "
+                "an interrupted streaming AF or probez run; we will not "
+                "restore the leaked value because that loses the fix and "
+                "races with concurrent move handlers)",
                 tag, focus_dev, speed_prop, original_speed, _FOCUS_NORMAL_MAX_SPEED,
             )
             try:
                 core.set_property(focus_dev, speed_prop, _FOCUS_NORMAL_MAX_SPEED)
-                speed_was_recovered = True
             except Exception as set_err:
                 logger.warning(
                     "%s: failed to recover focus stage speed: %s", tag, set_err,
@@ -114,18 +126,6 @@ def _pause_sequence_for_move(hardware, tag):
     try:
         yield
     finally:
-        if speed_was_recovered:
-            try:
-                core.set_property(focus_dev, speed_prop, str(original_speed))
-                logger.info(
-                    "%s: restored focus stage '%s' %s to caller's value %s",
-                    tag, focus_dev, speed_prop, original_speed,
-                )
-            except Exception as restore_err:
-                logger.error(
-                    "%s: failed to restore focus stage speed to %s: %s",
-                    tag, original_speed, restore_err, exc_info=True,
-                )
         if sequence_was_running:
             try:
                 core.start_continuous_sequence_acquisition(0)
