@@ -8,10 +8,56 @@ MOVE, MOVEZ, MOVZNW, MOVEXYZ, MOVER
 import struct
 import time
 import logging
+from contextlib import contextmanager
 
 from microscope_control.hardware import Position
 
 logger = logging.getLogger(__name__)
+
+
+@contextmanager
+def _pause_sequence_for_move(hardware, tag):
+    """Pause continuous sequence acquisition for the duration of a hardware-blocking move.
+
+    If a Live Viewer sequence acquisition is running, MMCore device-property
+    contention can stretch long-distance stage moves (especially Z on the PI
+    stage) out to ~30 s -- 10 s wait_z busy-poll plus a 20 s wait_for_device
+    fallback that ultimately times out and drops the client socket. Stopping
+    the sequence frees MMCore so the move completes promptly; the sequence is
+    restarted in a finally block.
+
+    Used by all blocking translational stage moves (MOVE, MOVEZ, MOVEXYZ).
+    Non-blocking moves (MOVZNW) and rotation (MOVER, separate hardware bus)
+    do not need this and skip it.
+    """
+    sequence_was_running = False
+    try:
+        sequence_was_running = bool(hardware.core.is_sequence_running())
+    except Exception as check_err:
+        logger.warning("%s: could not query sequence state: %s", tag, check_err)
+
+    if sequence_was_running:
+        try:
+            hardware.core.stop_sequence_acquisition()
+            logger.info("%s: paused sequence acquisition for stage move", tag)
+        except Exception as stop_err:
+            logger.warning(
+                "%s: failed to stop sequence (proceeding with contention risk): %s",
+                tag, stop_err,
+            )
+            sequence_was_running = False
+    try:
+        yield
+    finally:
+        if sequence_was_running:
+            try:
+                hardware.core.start_continuous_sequence_acquisition(0)
+                logger.info("%s: resumed sequence acquisition after stage move", tag)
+            except Exception as resume_err:
+                logger.error(
+                    "%s: failed to resume sequence acquisition: %s",
+                    tag, resume_err, exc_info=True,
+                )
 
 # GETXY / GETZ / GETXYZ handlers serve the live position display in
 # QuPath's StageControlPanel and the live-viewer overlay. Both poll
@@ -145,14 +191,19 @@ def handle_getzf(conn, client, hardware, settings, **kwargs):
 
 
 def handle_move(conn, client, hardware, settings, **kwargs):
-    """Move XY stage to position (read 8 bytes: two floats)."""
+    """Move XY stage to position (read 8 bytes: two floats).
+
+    Pauses any running Live Viewer sequence acquisition for the duration
+    of the move (see _pause_sequence_for_move).
+    """
     coords = conn.recv(8)
     if len(coords) == 8:
         x, y = struct.unpack("!ff", coords)
         logger.info("Client %s requested move to: X=%.1f, Y=%.1f", client.addr, x, y)
         try:
             t0 = time.perf_counter()
-            hardware.move_to_position(Position(x, y))
+            with _pause_sequence_for_move(hardware, "MOVE"):
+                hardware.move_to_position(Position(x, y))
             t_ms = (time.perf_counter() - t0) * 1000
             logger.info("MOVE completed to X=%.1f, Y=%.1f in %.0fms", x, y, t_ms)
         except Exception as e:
@@ -164,54 +215,26 @@ def handle_move(conn, client, hardware, settings, **kwargs):
 def handle_movez(conn, client, hardware, settings, **kwargs):
     """Move Z stage to position (read 4 bytes: one float).
 
-    If a Live Viewer continuous sequence acquisition is running, pause
-    it for the duration of the move and resume after. Without the pause,
-    MMCore device-property contention stretches long-distance Z moves
-    (>~100 um on the PI Z stage) out to ~30 s -- 10 s wait_z busy-poll
-    plus a 20 s wait_for_device fallback that ultimately times out --
-    and drops the client socket.
+    Pauses any running Live Viewer sequence acquisition for the duration
+    of the move (see _pause_sequence_for_move).
     """
     z = conn.recv(4)
     z_position = struct.unpack("!f", z)[0]
     logger.info("Client %s requested move to Z=%.2f", client.addr, z_position)
-
-    sequence_was_running = False
     try:
-        sequence_was_running = bool(hardware.core.is_sequence_running())
-    except Exception as check_err:
-        logger.warning("MOVEZ: could not query sequence state: %s", check_err)
-
-    if sequence_was_running:
-        try:
-            hardware.core.stop_sequence_acquisition()
-            logger.info("MOVEZ: paused sequence acquisition for Z move")
-        except Exception as stop_err:
-            logger.warning(
-                "MOVEZ: failed to stop sequence (proceeding with contention risk): %s",
-                stop_err,
-            )
-            sequence_was_running = False
-
-    try:
-        hardware.move_to_position(Position(z=z_position))
+        with _pause_sequence_for_move(hardware, "MOVEZ"):
+            hardware.move_to_position(Position(z=z_position))
         logger.info("Move completed to Z=%.2f", z_position)
     except Exception as e:
         logger.error("Failed to move to Z position: %s", e, exc_info=True)
-    finally:
-        if sequence_was_running:
-            try:
-                hardware.core.start_continuous_sequence_acquisition(0)
-                logger.info("MOVEZ: resumed sequence acquisition after Z move")
-            except Exception as resume_err:
-                logger.error(
-                    "MOVEZ: failed to resume sequence acquisition: %s",
-                    resume_err,
-                    exc_info=True,
-                )
 
 
 def handle_movznw(conn, client, hardware, settings, **kwargs):
-    """Non-blocking Z move (for sweep focus). Read 4 bytes: one float."""
+    """Non-blocking Z move (for sweep focus). Read 4 bytes: one float.
+
+    Returns immediately without waiting for the stage to arrive, so it
+    cannot stall on MMCore contention and does not need the pause helper.
+    """
     z = conn.recv(4)
     z_position = struct.unpack("!f", z)[0]
     logger.debug("Client %s non-blocking Z move to %.2f", client.addr, z_position)
@@ -222,12 +245,17 @@ def handle_movznw(conn, client, hardware, settings, **kwargs):
 
 
 def handle_movexyz(conn, client, hardware, settings, **kwargs):
-    """Move to XYZ position (read 12 bytes: three floats)."""
+    """Move to XYZ position (read 12 bytes: three floats).
+
+    Pauses any running Live Viewer sequence acquisition for the duration
+    of the move (see _pause_sequence_for_move).
+    """
     xyz_data = conn.recv(12)
     x, y, z = struct.unpack("!fff", xyz_data)
     logger.info("Client %s requested move to XYZ=(%.1f, %.1f, %.2f)", client.addr, x, y, z)
     try:
-        hardware.move_to_position(Position(x, y, z))
+        with _pause_sequence_for_move(hardware, "MOVEXYZ"):
+            hardware.move_to_position(Position(x, y, z))
         logger.info("Successfully moved to XYZ: (%.1f, %.1f, %.2f)", x, y, z)
     except Exception as e:
         logger.error("Failed to move to XYZ (%.1f, %.1f, %.2f): %s", x, y, z, e, exc_info=True)
