@@ -15,30 +15,71 @@ from microscope_control.hardware import Position
 logger = logging.getLogger(__name__)
 
 
+# Stuck-slow-Z recovery: streaming AF and probez deliberately set the focus
+# stage's MaxSpeed (Prior ProScan: 1-100 percent scale) to "1" for slow
+# scanning and restore it in their finally blocks. If one of those paths
+# crashes or its socket drops before the finally runs, MaxSpeed stays at
+# 1 (~11.5 um/s). Every subsequent ordinary stage move then hits the 30 s
+# wait_z + wait_for_device timeout chain because a 500 um move now takes
+# ~43 s. Detect on the way in, restore, log, and put the caller's value
+# back when the move completes.
+_FOCUS_NORMAL_MAX_SPEED = "100"
+_FOCUS_SPEED_RECOVER_THRESHOLD = 50.0
+_FOCUS_SPEED_PROPS = ("MaxSpeed", "Velocity", "Speed", "MaxVelocity")
+
+
+def _get_focus_speed_property(core):
+    """Return (focus_device, prop_name, current_value_str) or (None, None, None) if unavailable."""
+    try:
+        focus_dev = core.get_focus_device()
+    except Exception as e:
+        logger.debug("could not get focus device: %s", e)
+        return None, None, None
+    if not focus_dev:
+        return None, None, None
+    for prop in _FOCUS_SPEED_PROPS:
+        try:
+            if core.has_property(focus_dev, prop):
+                value = core.get_property(focus_dev, prop)
+                return focus_dev, prop, value
+        except Exception:
+            continue
+    return focus_dev, None, None
+
+
 @contextmanager
 def _pause_sequence_for_move(hardware, tag):
-    """Pause continuous sequence acquisition for the duration of a hardware-blocking move.
+    """Pause continuous sequence acquisition and recover slow focus speed for a blocking move.
 
-    If a Live Viewer sequence acquisition is running, MMCore device-property
-    contention can stretch long-distance stage moves (especially Z on the PI
-    stage) out to ~30 s -- 10 s wait_z busy-poll plus a 20 s wait_for_device
-    fallback that ultimately times out and drops the client socket. Stopping
-    the sequence frees MMCore so the move completes promptly; the sequence is
-    restarted in a finally block.
+    Two defenses, both restored in a finally block:
+
+    1) If a Live Viewer sequence acquisition is running, stop it. MMCore
+       device-property contention with sequence acquisition can stretch
+       long stage moves to the 30 s wait_z + wait_for_device timeout.
+
+    2) If the focus stage's MaxSpeed is below the normal range, bump it to
+       100 for the move. Streaming AF and probez set MaxSpeed=1 for slow
+       scanning and restore in their own finally blocks; if either path
+       was interrupted, the stage stays at 1 (~11.5 um/s) and ordinary
+       moves stall. Recovering here makes the next blocking move fast and
+       surfaces the leak in the log.
 
     Used by all blocking translational stage moves (MOVE, MOVEZ, MOVEXYZ).
     Non-blocking moves (MOVZNW) and rotation (MOVER, separate hardware bus)
-    do not need this and skip it.
+    skip this.
     """
+    core = hardware.core
+
+    # 1) Sequence acquisition pause
     sequence_was_running = False
     try:
-        sequence_was_running = bool(hardware.core.is_sequence_running())
+        sequence_was_running = bool(core.is_sequence_running())
     except Exception as check_err:
         logger.warning("%s: could not query sequence state: %s", tag, check_err)
 
     if sequence_was_running:
         try:
-            hardware.core.stop_sequence_acquisition()
+            core.stop_sequence_acquisition()
             logger.info("%s: paused sequence acquisition for stage move", tag)
         except Exception as stop_err:
             logger.warning(
@@ -46,12 +87,48 @@ def _pause_sequence_for_move(hardware, tag):
                 tag, stop_err,
             )
             sequence_was_running = False
+
+    # 2) Focus speed recovery
+    focus_dev, speed_prop, original_speed = _get_focus_speed_property(core)
+    speed_was_recovered = False
+    if focus_dev and speed_prop and original_speed is not None:
+        try:
+            current = float(original_speed)
+        except (TypeError, ValueError):
+            current = None
+        if current is not None and current < _FOCUS_SPEED_RECOVER_THRESHOLD:
+            logger.warning(
+                "%s: focus stage '%s' %s=%s is below normal range -- "
+                "auto-recovering to %s for this move (likely leaked from "
+                "an interrupted streaming AF or probez run)",
+                tag, focus_dev, speed_prop, original_speed, _FOCUS_NORMAL_MAX_SPEED,
+            )
+            try:
+                core.set_property(focus_dev, speed_prop, _FOCUS_NORMAL_MAX_SPEED)
+                speed_was_recovered = True
+            except Exception as set_err:
+                logger.warning(
+                    "%s: failed to recover focus stage speed: %s", tag, set_err,
+                )
+
     try:
         yield
     finally:
+        if speed_was_recovered:
+            try:
+                core.set_property(focus_dev, speed_prop, str(original_speed))
+                logger.info(
+                    "%s: restored focus stage '%s' %s to caller's value %s",
+                    tag, focus_dev, speed_prop, original_speed,
+                )
+            except Exception as restore_err:
+                logger.error(
+                    "%s: failed to restore focus stage speed to %s: %s",
+                    tag, original_speed, restore_err, exc_info=True,
+                )
         if sequence_was_running:
             try:
-                hardware.core.start_continuous_sequence_acquisition(0)
+                core.start_continuous_sequence_acquisition(0)
                 logger.info("%s: resumed sequence acquisition after stage move", tag)
             except Exception as resume_err:
                 logger.error(
