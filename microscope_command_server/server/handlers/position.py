@@ -15,72 +15,6 @@ from microscope_control.hardware import Position
 logger = logging.getLogger(__name__)
 
 
-# Streaming AF and probez deliberately set the focus stage's MaxSpeed
-# (Prior ProScan: 1-100 percent scale) to "1" for slow scanning and
-# restore it in their finally blocks. If one of those paths crashes or
-# its socket drops before the finally runs, MaxSpeed stays at 1
-# (~11.5 um/s) and every subsequent ordinary stage move stalls -- a
-# 500 um move at that speed takes ~43 s, which hits the 30 s
-# wait_z + wait_for_device timeout chain.
-_FOCUS_NORMAL_MAX_SPEED = "100"
-_FOCUS_SPEED_RECOVER_THRESHOLD = 50.0
-_FOCUS_SPEED_PROPS = ("MaxSpeed", "Velocity", "Speed", "MaxVelocity")
-
-
-def _get_focus_speed_property(core):
-    """Return (focus_device, prop_name, current_value_str) or (None, None, None) if unavailable."""
-    try:
-        focus_dev = core.get_focus_device()
-    except Exception as e:
-        logger.debug("could not get focus device: %s", e)
-        return None, None, None
-    if not focus_dev:
-        return None, None, None
-    for prop in _FOCUS_SPEED_PROPS:
-        try:
-            if core.has_property(focus_dev, prop):
-                value = core.get_property(focus_dev, prop)
-                return focus_dev, prop, value
-        except Exception:
-            continue
-    return focus_dev, None, None
-
-
-def _recover_focus_speed_if_leaked(core, tag):
-    """One-way bump leaked-low focus stage MaxSpeed back to 100.
-
-    Detect on entry and bump to 100 if below the recovery threshold;
-    do NOT save and restore. The leaked-low value is a bug to fix
-    permanently for this session. Streaming AF and probez will set
-    MaxSpeed=1 again the next time they intentionally run (and restore
-    in their own finally blocks).
-
-    Called by all blocking translational moves (MOVE, MOVEZ, MOVEXYZ)
-    so the recovery fires on the very next move regardless of axis.
-    """
-    focus_dev, speed_prop, original_speed = _get_focus_speed_property(core)
-    if not (focus_dev and speed_prop and original_speed is not None):
-        return
-    try:
-        current = float(original_speed)
-    except (TypeError, ValueError):
-        return
-    if current >= _FOCUS_SPEED_RECOVER_THRESHOLD:
-        return
-    logger.warning(
-        "%s: focus stage '%s' %s=%s is below normal range -- "
-        "recovering to %s and LEAVING IT THERE (likely leaked from "
-        "an interrupted streaming AF or probez run)",
-        tag, focus_dev, speed_prop, original_speed, _FOCUS_NORMAL_MAX_SPEED,
-    )
-    try:
-        core.set_property(focus_dev, speed_prop, _FOCUS_NORMAL_MAX_SPEED)
-    except Exception as set_err:
-        logger.warning(
-            "%s: failed to recover focus stage speed: %s", tag, set_err,
-        )
-
-
 @contextmanager
 def _pause_sequence_for_move(hardware, tag):
     """Pause continuous sequence acquisition for the duration of a hardware-blocking move.
@@ -266,17 +200,15 @@ def handle_getzf(conn, client, hardware, settings, **kwargs):
 def handle_move(conn, client, hardware, settings, **kwargs):
     """Move XY stage to position (read 8 bytes: two floats).
 
-    Recovers leaked-low focus stage MaxSpeed if needed. Does NOT pause
-    Live Viewer sequence acquisition -- XY contention is not an issue
-    on motorised stages and continuous joystick motion would otherwise
-    starve the live frame stream.
+    Does NOT pause Live Viewer sequence acquisition -- XY contention
+    is not an issue on motorised stages and continuous joystick motion
+    would otherwise starve the live frame stream.
     """
     coords = conn.recv(8)
     if len(coords) == 8:
         x, y = struct.unpack("!ff", coords)
         logger.info("Client %s requested move to: X=%.1f, Y=%.1f", client.addr, x, y)
         try:
-            _recover_focus_speed_if_leaked(hardware.core, "MOVE")
             t0 = time.perf_counter()
             hardware.move_to_position(Position(x, y))
             t_ms = (time.perf_counter() - t0) * 1000
@@ -290,16 +222,14 @@ def handle_move(conn, client, hardware, settings, **kwargs):
 def handle_movez(conn, client, hardware, settings, **kwargs):
     """Move Z stage to position (read 4 bytes: one float).
 
-    Recovers leaked-low focus stage MaxSpeed if needed and pauses any
-    running Live Viewer sequence acquisition for the duration of the
-    move (long Z moves on the PI stage hit MMCore contention with
-    sequence acquisition; see _pause_sequence_for_move).
+    Pauses any running Live Viewer sequence acquisition for the
+    duration of the move (long Z moves on the PI stage hit MMCore
+    contention with sequence acquisition; see _pause_sequence_for_move).
     """
     z = conn.recv(4)
     z_position = struct.unpack("!f", z)[0]
     logger.info("Client %s requested move to Z=%.2f", client.addr, z_position)
     try:
-        _recover_focus_speed_if_leaked(hardware.core, "MOVEZ")
         with _pause_sequence_for_move(hardware, "MOVEZ"):
             hardware.move_to_position(Position(z=z_position))
         logger.info("Move completed to Z=%.2f", z_position)
@@ -325,16 +255,14 @@ def handle_movznw(conn, client, hardware, settings, **kwargs):
 def handle_movexyz(conn, client, hardware, settings, **kwargs):
     """Move to XYZ position (read 12 bytes: three floats).
 
-    Recovers leaked-low focus stage MaxSpeed if needed. Does NOT pause
-    Live Viewer sequence acquisition (same rationale as handle_move:
-    blocking the live stream during ordinary stage motion is worse than
-    the contention risk).
+    Does NOT pause Live Viewer sequence acquisition (same rationale as
+    handle_move: blocking the live stream during ordinary stage motion
+    is worse than the contention risk).
     """
     xyz_data = conn.recv(12)
     x, y, z = struct.unpack("!fff", xyz_data)
     logger.info("Client %s requested move to XYZ=(%.1f, %.1f, %.2f)", client.addr, x, y, z)
     try:
-        _recover_focus_speed_if_leaked(hardware.core, "MOVEXYZ")
         hardware.move_to_position(Position(x, y, z))
         logger.info("Successfully moved to XYZ: (%.1f, %.1f, %.2f)", x, y, z)
     except Exception as e:
