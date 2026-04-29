@@ -15,14 +15,13 @@ from microscope_control.hardware import Position
 logger = logging.getLogger(__name__)
 
 
-# Stuck-slow-Z recovery: streaming AF and probez deliberately set the focus
-# stage's MaxSpeed (Prior ProScan: 1-100 percent scale) to "1" for slow
-# scanning and restore it in their finally blocks. If one of those paths
-# crashes or its socket drops before the finally runs, MaxSpeed stays at
-# 1 (~11.5 um/s). Every subsequent ordinary stage move then hits the 30 s
-# wait_z + wait_for_device timeout chain because a 500 um move now takes
-# ~43 s. Detect on the way in, restore, log, and put the caller's value
-# back when the move completes.
+# Streaming AF and probez deliberately set the focus stage's MaxSpeed
+# (Prior ProScan: 1-100 percent scale) to "1" for slow scanning and
+# restore it in their finally blocks. If one of those paths crashes or
+# its socket drops before the finally runs, MaxSpeed stays at 1
+# (~11.5 um/s) and every subsequent ordinary stage move stalls -- a
+# 500 um move at that speed takes ~43 s, which hits the 30 s
+# wait_z + wait_for_device timeout chain.
 _FOCUS_NORMAL_MAX_SPEED = "100"
 _FOCUS_SPEED_RECOVER_THRESHOLD = 50.0
 _FOCUS_SPEED_PROPS = ("MaxSpeed", "Velocity", "Speed", "MaxVelocity")
@@ -47,30 +46,62 @@ def _get_focus_speed_property(core):
     return focus_dev, None, None
 
 
+def _recover_focus_speed_if_leaked(core, tag):
+    """One-way bump leaked-low focus stage MaxSpeed back to 100.
+
+    Detect on entry and bump to 100 if below the recovery threshold;
+    do NOT save and restore. The leaked-low value is a bug to fix
+    permanently for this session. Streaming AF and probez will set
+    MaxSpeed=1 again the next time they intentionally run (and restore
+    in their own finally blocks).
+
+    Called by all blocking translational moves (MOVE, MOVEZ, MOVEXYZ)
+    so the recovery fires on the very next move regardless of axis.
+    """
+    focus_dev, speed_prop, original_speed = _get_focus_speed_property(core)
+    if not (focus_dev and speed_prop and original_speed is not None):
+        return
+    try:
+        current = float(original_speed)
+    except (TypeError, ValueError):
+        return
+    if current >= _FOCUS_SPEED_RECOVER_THRESHOLD:
+        return
+    logger.warning(
+        "%s: focus stage '%s' %s=%s is below normal range -- "
+        "recovering to %s and LEAVING IT THERE (likely leaked from "
+        "an interrupted streaming AF or probez run)",
+        tag, focus_dev, speed_prop, original_speed, _FOCUS_NORMAL_MAX_SPEED,
+    )
+    try:
+        core.set_property(focus_dev, speed_prop, _FOCUS_NORMAL_MAX_SPEED)
+    except Exception as set_err:
+        logger.warning(
+            "%s: failed to recover focus stage speed: %s", tag, set_err,
+        )
+
+
 @contextmanager
 def _pause_sequence_for_move(hardware, tag):
-    """Pause continuous sequence acquisition and recover slow focus speed for a blocking move.
+    """Pause continuous sequence acquisition for the duration of a hardware-blocking move.
 
-    Two defenses, both restored in a finally block:
+    If a Live Viewer sequence acquisition is running, MMCore device-property
+    contention can stretch long Z moves on the PI Z stage out to ~30 s --
+    10 s wait_z busy-poll plus a 20 s wait_for_device fallback that
+    ultimately times out and drops the client socket. Stopping the sequence
+    frees MMCore so the move completes promptly; the sequence is restarted
+    in a finally block.
 
-    1) If a Live Viewer sequence acquisition is running, stop it. MMCore
-       device-property contention with sequence acquisition can stretch
-       long stage moves to the 30 s wait_z + wait_for_device timeout.
-
-    2) If the focus stage's MaxSpeed is below the normal range, bump it to
-       100 for the move. Streaming AF and probez set MaxSpeed=1 for slow
-       scanning and restore in their own finally blocks; if either path
-       was interrupted, the stage stays at 1 (~11.5 um/s) and ordinary
-       moves stall. Recovering here makes the next blocking move fast and
-       surfaces the leak in the log.
-
-    Used by all blocking translational stage moves (MOVE, MOVEZ, MOVEXYZ).
-    Non-blocking moves (MOVZNW) and rotation (MOVER, separate hardware bus)
-    skip this.
+    Used only by MOVEZ. XY translation (MOVE, MOVEXYZ) intentionally does
+    NOT use this -- XY moves on motorised stages don't have the same
+    contention pattern, and wrapping every joystick tick in a stop/start
+    cycle starved the Live Viewer of frames during continuous motion
+    (regression introduced 2026-04-27, fixed 2026-04-28). Non-blocking
+    moves (MOVZNW) and rotation (MOVER, separate hardware bus) also skip
+    this.
     """
     core = hardware.core
 
-    # 1) Sequence acquisition pause
     sequence_was_running = False
     try:
         sequence_was_running = bool(core.is_sequence_running())
@@ -87,41 +118,6 @@ def _pause_sequence_for_move(hardware, tag):
                 tag, stop_err,
             )
             sequence_was_running = False
-
-    # 2) Focus speed recovery -- one-way. If MaxSpeed is below normal, bump
-    # to 100 and leave it there. Do NOT save and restore the caller's value:
-    # the leaked-low value is a bug we want to fix permanently for this
-    # session. Streaming AF and probez will set MaxSpeed=1 again the next
-    # time they intentionally run (and restore in their own finally blocks).
-    #
-    # Restoring would also reintroduce a race between concurrent move
-    # handlers: MOVE (aux) and MOVEZ (primary) can arrive simultaneously,
-    # both detect MaxSpeed=1, both bump to 100, the faster one finishes and
-    # "restores" to 1 while the slower one is mid-move -- and the slower
-    # move then runs at the leaked-slow speed. Observed 2026-04-27 23:27:01
-    # on PPM: parallel MOVE+MOVEZ, MOVE restored MaxSpeed=1 at 23:27:03.394
-    # while MOVEZ was still executing, Z move stalled the full 30 s.
-    focus_dev, speed_prop, original_speed = _get_focus_speed_property(core)
-    if focus_dev and speed_prop and original_speed is not None:
-        try:
-            current = float(original_speed)
-        except (TypeError, ValueError):
-            current = None
-        if current is not None and current < _FOCUS_SPEED_RECOVER_THRESHOLD:
-            logger.warning(
-                "%s: focus stage '%s' %s=%s is below normal range -- "
-                "recovering to %s and LEAVING IT THERE (likely leaked from "
-                "an interrupted streaming AF or probez run; we will not "
-                "restore the leaked value because that loses the fix and "
-                "races with concurrent move handlers)",
-                tag, focus_dev, speed_prop, original_speed, _FOCUS_NORMAL_MAX_SPEED,
-            )
-            try:
-                core.set_property(focus_dev, speed_prop, _FOCUS_NORMAL_MAX_SPEED)
-            except Exception as set_err:
-                logger.warning(
-                    "%s: failed to recover focus stage speed: %s", tag, set_err,
-                )
 
     try:
         yield
@@ -270,17 +266,19 @@ def handle_getzf(conn, client, hardware, settings, **kwargs):
 def handle_move(conn, client, hardware, settings, **kwargs):
     """Move XY stage to position (read 8 bytes: two floats).
 
-    Pauses any running Live Viewer sequence acquisition for the duration
-    of the move (see _pause_sequence_for_move).
+    Recovers leaked-low focus stage MaxSpeed if needed. Does NOT pause
+    Live Viewer sequence acquisition -- XY contention is not an issue
+    on motorised stages and continuous joystick motion would otherwise
+    starve the live frame stream.
     """
     coords = conn.recv(8)
     if len(coords) == 8:
         x, y = struct.unpack("!ff", coords)
         logger.info("Client %s requested move to: X=%.1f, Y=%.1f", client.addr, x, y)
         try:
+            _recover_focus_speed_if_leaked(hardware.core, "MOVE")
             t0 = time.perf_counter()
-            with _pause_sequence_for_move(hardware, "MOVE"):
-                hardware.move_to_position(Position(x, y))
+            hardware.move_to_position(Position(x, y))
             t_ms = (time.perf_counter() - t0) * 1000
             logger.info("MOVE completed to X=%.1f, Y=%.1f in %.0fms", x, y, t_ms)
         except Exception as e:
@@ -292,13 +290,16 @@ def handle_move(conn, client, hardware, settings, **kwargs):
 def handle_movez(conn, client, hardware, settings, **kwargs):
     """Move Z stage to position (read 4 bytes: one float).
 
-    Pauses any running Live Viewer sequence acquisition for the duration
-    of the move (see _pause_sequence_for_move).
+    Recovers leaked-low focus stage MaxSpeed if needed and pauses any
+    running Live Viewer sequence acquisition for the duration of the
+    move (long Z moves on the PI stage hit MMCore contention with
+    sequence acquisition; see _pause_sequence_for_move).
     """
     z = conn.recv(4)
     z_position = struct.unpack("!f", z)[0]
     logger.info("Client %s requested move to Z=%.2f", client.addr, z_position)
     try:
+        _recover_focus_speed_if_leaked(hardware.core, "MOVEZ")
         with _pause_sequence_for_move(hardware, "MOVEZ"):
             hardware.move_to_position(Position(z=z_position))
         logger.info("Move completed to Z=%.2f", z_position)
@@ -324,15 +325,17 @@ def handle_movznw(conn, client, hardware, settings, **kwargs):
 def handle_movexyz(conn, client, hardware, settings, **kwargs):
     """Move to XYZ position (read 12 bytes: three floats).
 
-    Pauses any running Live Viewer sequence acquisition for the duration
-    of the move (see _pause_sequence_for_move).
+    Recovers leaked-low focus stage MaxSpeed if needed. Does NOT pause
+    Live Viewer sequence acquisition (same rationale as handle_move:
+    blocking the live stream during ordinary stage motion is worse than
+    the contention risk).
     """
     xyz_data = conn.recv(12)
     x, y, z = struct.unpack("!fff", xyz_data)
     logger.info("Client %s requested move to XYZ=(%.1f, %.1f, %.2f)", client.addr, x, y, z)
     try:
-        with _pause_sequence_for_move(hardware, "MOVEXYZ"):
-            hardware.move_to_position(Position(x, y, z))
+        _recover_focus_speed_if_leaked(hardware.core, "MOVEXYZ")
+        hardware.move_to_position(Position(x, y, z))
         logger.info("Successfully moved to XYZ: (%.1f, %.1f, %.2f)", x, y, z)
     except Exception as e:
         logger.error("Failed to move to XYZ (%.1f, %.1f, %.2f): %s", x, y, z, e, exc_info=True)
