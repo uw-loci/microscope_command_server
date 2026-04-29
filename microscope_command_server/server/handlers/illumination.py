@@ -337,3 +337,59 @@ def handle_applych(conn, client, hardware, settings, **kwargs):
             profile_name, channel_id, e,
         )
         conn.sendall(b"ERR_CHAN")
+
+
+def handle_setprop(conn, client, hardware, settings, **kwargs):
+    """Generic Micro-Manager set_property write.
+
+    Forwards (device, property, value) directly to core.set_property.
+    Used by the Live Viewer per-channel intensity spinner so a channel's
+    intensity_property (e.g. DLED.Intensity-385nm on a multi-wavelength
+    LED controller) can be tuned in real time without re-applying the
+    whole channel via APPLYCH.
+
+    Vendor-agnostic: any device that exposes the named property as a
+    Micro-Manager property is supported. The value is sent as a string
+    (Micro-Manager normalizes numerics internally).
+
+    Protocol: 128-byte payload =
+        32 bytes device name + 32 bytes property name + 64 bytes value
+    All UTF-8, null-padded.
+
+    Response: 'ACK_____' on success, 'ERR_PROP' on any failure
+    (unknown device/property, write rejected, etc.).
+    """
+    logger.debug("Client %s requesting generic set_property", client.addr)
+    device = "?"
+    prop = "?"
+    value = "?"
+    try:
+        data = conn.recv(128)
+        if len(data) < 128:
+            logger.error("SETPROP: short payload (%d bytes, want 128)", len(data))
+            conn.sendall(b"ERR_PROP")
+            return
+
+        device = data[0:32].rstrip(b"\x00").decode("utf-8", errors="replace").strip()
+        prop = data[32:64].rstrip(b"\x00").decode("utf-8", errors="replace").strip()
+        value = data[64:128].rstrip(b"\x00").decode("utf-8", errors="replace").strip()
+        if not device or not prop:
+            logger.error("SETPROP: empty device or property (device='%s', prop='%s')", device, prop)
+            conn.sendall(b"ERR_PROP")
+            return
+
+        core = getattr(hardware, "core", None)
+        if core is None:
+            logger.error("SETPROP: hardware has no core attribute")
+            conn.sendall(b"ERR_PROP")
+            return
+
+        core.set_property(str(device), str(prop), str(value))
+        logger.info("SETPROP: %s.%s <- %s", device, prop, value)
+        conn.sendall(b"ACK_____")
+    except Exception as e:
+        logger.error(
+            "SETPROP failed for %s.%s <- %s: %s",
+            device, prop, value, e,
+        )
+        conn.sendall(b"ERR_PROP")

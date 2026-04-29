@@ -152,6 +152,14 @@ class ExtendedCommand:
     # _build_illumination_from_config, finds the device-name match.
     # Payload: 32-byte device name (null-padded UTF-8) + 4-byte big-endian float.
     SETILLMD = b"setilmd_"
+    # Generic Micro-Manager set_property: write any (device, property, value)
+    # without going through an Illumination object or a profile. Used by the
+    # Live Viewer's per-channel intensity spinner so a fluorescence channel's
+    # intensity_property (e.g. DLED.Intensity-385nm) can be tuned in real time
+    # without a full APPLYCH round-trip. Vendor-agnostic.
+    # Payload: 32-byte device + 32-byte property + 64-byte value (all
+    # null-padded UTF-8). Total 128 bytes.
+    SETPROP = b"setprop_"
     APPLYPR = b"applypr_"  # Apply acquisition profile (calls apply_mode_setup)
     # Apply a single channel from a profile's channel library: cube + light
     # source switch + per-channel intensity property write + exposure. Used
