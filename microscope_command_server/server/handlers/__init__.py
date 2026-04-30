@@ -51,6 +51,7 @@ from microscope_command_server.server.handlers.system import (
     handle_config, handle_reconfig, handle_disconnect, handle_shutdown, handle_siftal,
 )
 from microscope_command_server.server.handlers.probez import handle_probez
+from microscope_command_server.server.handlers.probe_stage_af import handle_probe_stage_af
 from microscope_command_server.server.handlers.streaming_focus import handle_streaming_focus
 from microscope_command_server.server.handlers.rapid_scan import handle_rapid_scan
 
@@ -142,6 +143,9 @@ COMMAND_HANDLERS = {
 
     # Z-stage diagnostic probe
     ExtendedCommand.PROBEZ: handle_probez,
+
+    # Setup-wizard stage probe (recommends streaming_af YAML values)
+    ExtendedCommand.PRBSAFZ: handle_probe_stage_af,
 
     # Streaming autofocus
     ExtendedCommand.STRMAFZ: handle_streaming_focus,

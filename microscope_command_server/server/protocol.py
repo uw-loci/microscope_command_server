@@ -135,6 +135,12 @@ class ExtendedCommand:
     # Z-stage diagnostic probe (one-shot characterization run)
     PROBEZ = b"probez__"  # Run Z-stage timing/streaming probe, log results
 
+    # Setup-wizard probe: discover the focus stage's speed property,
+    # parse its allowed values, time-verify with a 1-um round-trip,
+    # and recommend slow_speed_value / slow_speed_um_per_s /
+    # normal_speed_value to write into config_<scope>.yml.
+    PRBSAFZ = b"prbsafz_"  # Probe Stage Autofocus -- wizard time
+
     # Streaming autofocus -- continuous-Z autofocus via streamed frames
     # during non-blocking stage motion. Replaces the stepped sweep
     # drift check on calibrated hardware.

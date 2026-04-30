@@ -117,6 +117,13 @@ SLOW_SPEED_VALUE = "1"
 # Normal value to restore after the scan.
 NORMAL_SPEED_VALUE = "100"
 
+# Default expected slow-speed Z velocity (um/s). Used for sample-time
+# Z interpolation in _run_streaming_scan and as the blur-budget gate in
+# the saturation pre-flight. Empirically measured on Prior MaxSpeed=1.
+# Overridden per-rig by stage.streaming_af.slow_speed_um_per_s in the
+# main config YAML.
+MIN_VELOCITY_UM_S = 11.5
+
 # Motion blur budget (um). If expected blur per frame exceeds this,
 # Streaming autofocus is not feasible. Derived from 25% of a representative 20X
 # DOF (~2 um).
@@ -555,6 +562,41 @@ def _load_autofocus_yaml_for_objective(yaml_path: str, objective: Optional[str])
     if entries and isinstance(entries[0], dict):
         return entries[0]
     return {}
+
+
+def _load_streaming_af_config(yaml_path: str) -> Dict[str, Any]:
+    """Load `stage.streaming_af.*` from the main config_<scope>.yml.
+
+    Returns a dict with whatever keys are present, or an empty dict if
+    the file is missing / unreadable / lacks the block. Callers treat
+    each missing key as "use the legacy hardcoded default" so a
+    pre-migration config still works.
+
+    Expected keys (all optional from this loader's perspective; the
+    Java schema may require some of them at v3):
+        enabled            -- bool
+        speed_property     -- str or None
+        slow_speed_value   -- str (raw stage value, e.g. '1' or '0.50mm/sec')
+        slow_speed_um_per_s -- float (actual velocity, for blur calc)
+        normal_speed_value -- str (raw stage value to restore)
+    """
+    if not yaml_path:
+        return {}
+    try:
+        import yaml
+    except Exception as e:
+        logger.warning("PyYAML not available: %s", e)
+        return {}
+    try:
+        with open(yaml_path, "r") as f:
+            doc = yaml.safe_load(f) or {}
+    except Exception as e:
+        logger.warning("Failed to parse %s: %s", yaml_path, e)
+        return {}
+    block = (((doc.get("stage") or {}).get("streaming_af")) or {})
+    if not isinstance(block, dict):
+        return {}
+    return block
 
 
 def _resolve_objective(core, settings, client_objective: Optional[str], pixel_tol: float = 0.01) -> Tuple[Optional[str], str]:
@@ -1305,6 +1347,10 @@ class _ScanAttemptResult:
                                  within noise (scan window inside one
                                  depth-of-field); retrying with the
                                  same range will not help
+        'no_slow_speed'       -- the stage will not accept a slow speed
+                                 for streaming (property absent or value
+                                 rejected); caller should route this
+                                 acquisition to the Brent fallback
         'error'               -- hardware or protocol error mid-scan
     """
     def __init__(self, status: str, best_z: Optional[float],
@@ -1321,13 +1367,15 @@ class _ScanAttemptResult:
 def _attempt_one_scan(
     core,
     focus_device: str,
-    speed_prop: str,
+    speed_prop: Optional[str],
     z_center: float,
     range_um: float,
     sequence_was_running_on_entry: bool,
     attempt_label: str = "",
-    velocity_um_s: float = 11.5,
+    velocity_um_s: float = MIN_VELOCITY_UM_S,
     metric_name: str = "normalized_variance",
+    slow_value: str = SLOW_SPEED_VALUE,
+    normal_value: str = NORMAL_SPEED_VALUE,
 ) -> _ScanAttemptResult:
     """Run one streaming AF scan centered on z_center with the given range.
 
@@ -1338,10 +1386,21 @@ def _attempt_one_scan(
     The `attempt_label` is prepended to log lines so multi-attempt
     runs are easy to follow (e.g. 'attempt 2/3: ').
 
+    `speed_prop` may be None when the focus device has no writable
+    speed-like property -- in that case streaming is not feasible and
+    this returns 'no_slow_speed' immediately so the caller can route
+    to Brent's snap-and-stop fallback.
+
     Args:
         velocity_um_s: expected slow-speed stage velocity; used by
             _run_streaming_scan to interpolate Z at frame capture time.
         metric_name: which focus metric to compute per frame.
+        slow_value: value to set on speed_prop during the slow scan.
+            Defaults to SLOW_SPEED_VALUE; per-rig override comes
+            from stage.streaming_af.slow_speed_value YAML.
+        normal_value: value to restore for positioning moves and
+            after the scan. Defaults to NORMAL_SPEED_VALUE; per-rig
+            override comes from stage.streaming_af.normal_speed_value.
     """
     tag_prefix = f"{attempt_label}: " if attempt_label else ""
     z_start = z_center - range_um / 2.0
@@ -1349,17 +1408,37 @@ def _attempt_one_scan(
     logger.info("STREAM_AF:%sscan window [%.3f -> %.3f] (center %.3f, range %.2f)",
                 tag_prefix, z_start, z_end, z_center, range_um)
 
+    if speed_prop is None:
+        return _ScanAttemptResult(
+            "no_slow_speed", None, 0, 0.0,
+            f"focus device '{focus_device}' has no writable speed property",
+        )
+
     try:
         # Positioning seed at full speed.
-        _try_set(core, focus_device, speed_prop, NORMAL_SPEED_VALUE)
+        _try_set(core, focus_device, speed_prop, normal_value)
         core.set_position(focus_device, z_start)
         _wait_via_busy(core, focus_device)
 
         # Drop to slow speed for the scan motion only.
-        if not _try_set(core, focus_device, speed_prop, SLOW_SPEED_VALUE):
+        if not _try_set(core, focus_device, speed_prop, slow_value):
+            # Diagnostic: log the property's allowed values so we can
+            # tell from a log alone what slow value this stage would
+            # accept. Different vendors use different units / scales
+            # (Prior: 1-100 percent; ASI: um/s; some adapters: enum).
+            try:
+                allowed = _str_vector_to_list(
+                    core.get_allowed_property_values(focus_device, speed_prop)
+                )
+                logger.debug(
+                    "STREAM_AF:%sslow-speed set rejected; %s.%s allowed values = %s",
+                    tag_prefix, focus_device, speed_prop, allowed or "(none reported)",
+                )
+            except Exception:
+                pass
             return _ScanAttemptResult(
-                "error", None, 0, 0.0,
-                f"could not set {speed_prop}={SLOW_SPEED_VALUE}",
+                "no_slow_speed", None, 0, 0.0,
+                f"stage rejected {speed_prop}={slow_value}",
             )
 
         sequence_started_here = False
@@ -1389,7 +1468,7 @@ def _attempt_one_scan(
                 except Exception:
                     pass
 
-        _try_set(core, focus_device, speed_prop, NORMAL_SPEED_VALUE)
+        _try_set(core, focus_device, speed_prop, normal_value)
 
         # --- Sample filtering and fit ---
         clean = [(t, z, m) for (t, z, m) in samples
@@ -1528,12 +1607,13 @@ def _attempt_one_scan(
 def _brent_fallback_scan(
     core,
     focus_device: str,
-    speed_prop: str,
+    speed_prop: Optional[str],
     z_lo: float,
     z_hi: float,
     metric_name: str,
     max_evals: int = 8,
     abs_tolerance_um: float = 0.5,
+    normal_value: str = NORMAL_SPEED_VALUE,
 ) -> _ScanAttemptResult:
     """Stop-and-snap Brent's method search over [z_lo, z_hi].
 
@@ -1588,8 +1668,10 @@ def _brent_fallback_scan(
     z_mid = (z_lo + z_hi) / 2.0
 
     # Use full stage speed for Brent evaluations -- each one is a
-    # stationary snap, no benefit to running slowly.
-    _try_set(core, focus_device, speed_prop, NORMAL_SPEED_VALUE)
+    # stationary snap, no benefit to running slowly. Skip when the
+    # stage has no writable speed property; Brent doesn't need one.
+    if speed_prop is not None:
+        _try_set(core, focus_device, speed_prop, normal_value)
 
     # Track every evaluation for the eventual result.
     evals: List[Tuple[float, float]] = []  # (z, metric)
@@ -1755,17 +1837,77 @@ def handle_streaming_focus(conn, client, hardware, settings, **kwargs):
         range_um = float(af_entry.get("sweep_range_um", FALLBACK_RANGE_UM))
         logger.info("STREAM_AF:using sweep_range_um from yaml = %.2f um", range_um)
 
-    # --- Speed property discovery ---
-    speed_prop = _find_speed_property(core, focus_device)
-    if speed_prop is None:
-        reason = (f"focus device '{focus_device}' has no speed property "
-                  f"(MaxSpeed/Velocity/Speed/MaxVelocity)")
-        logger.warning("STREAM_AF:UNAVAILABLE -- %s", reason)
-        conn.sendall(f"UNAVAILABLE:{reason}".encode())
-        return
-    logger.info("STREAM_AF:stage speed property = '%s'", speed_prop)
+    # --- streaming_af YAML config (populated by setup-wizard probe) ---
+    # The block at stage.streaming_af in config_<scope>.yml drives the
+    # speed values used during the sweep. Each key falls back to the
+    # legacy hardcoded constant when absent so pre-migration configs
+    # keep working until they're re-probed.
+    sa_cfg = _load_streaming_af_config(yaml_path)
+    yaml_enabled = sa_cfg.get("enabled")
+    yaml_speed_prop = sa_cfg.get("speed_property")
+    yaml_slow_value = sa_cfg.get("slow_speed_value")
+    yaml_slow_um_s = sa_cfg.get("slow_speed_um_per_s")
+    yaml_normal_value = sa_cfg.get("normal_speed_value")
 
-    original_speed = _try_get(core, focus_device, speed_prop)
+    # The handler's per-call effective values. Start from legacy
+    # constants; YAML overrides any populated key.
+    eff_slow_value = (str(yaml_slow_value) if yaml_slow_value is not None
+                      else SLOW_SPEED_VALUE)
+    eff_normal_value = (str(yaml_normal_value) if yaml_normal_value is not None
+                        else NORMAL_SPEED_VALUE)
+    eff_slow_um_s = (float(yaml_slow_um_s) if yaml_slow_um_s is not None
+                     else MIN_VELOCITY_UM_S)
+    if sa_cfg:
+        logger.info(
+            "STREAM_AF:streaming_af config: enabled=%s slow=%r normal=%r um/s=%.2f",
+            yaml_enabled, eff_slow_value, eff_normal_value, eff_slow_um_s,
+        )
+    else:
+        logger.info(
+            "STREAM_AF:no stage.streaming_af YAML block; using legacy "
+            "constants (slow=%r normal=%r). Run 'Re-probe Stage AF' to "
+            "calibrate for this hardware.",
+            eff_slow_value, eff_normal_value,
+        )
+
+    # --- Speed property discovery ---
+    # speed_prop is None when:
+    #   (a) the stage exposes no writable speed-like property, OR
+    #   (b) the YAML explicitly disables streaming for this rig.
+    # In both cases the per-attempt _try_set short-circuits with
+    # 'no_slow_speed' and the existing Brent escalation handles the
+    # acquisition. No additional branches.
+    if yaml_enabled is False:
+        speed_prop = None
+        original_speed = None
+        logger.info(
+            "STREAM_AF:streaming disabled in YAML (stage.streaming_af.enabled=false); "
+            "routing this acquisition to Brent snap-and-stop fallback",
+        )
+    else:
+        # If the wizard recorded a specific property name, prefer it
+        # so we don't re-scan candidates every call. Validate it's
+        # writable; fall back to auto-detect on miss.
+        speed_prop = None
+        if yaml_speed_prop:
+            try:
+                if not core.is_property_read_only(focus_device, yaml_speed_prop):
+                    speed_prop = yaml_speed_prop
+            except Exception:
+                pass
+        if speed_prop is None:
+            speed_prop = _find_speed_property(core, focus_device)
+        if speed_prop is None:
+            logger.info(
+                "STREAM_AF:focus device '%s' has no writable speed property "
+                "(searched %s); streaming disabled, using Brent snap-and-stop "
+                "fallback for this acquisition",
+                focus_device, list(SPEED_PROPERTY_CANDIDATES),
+            )
+            original_speed = None
+        else:
+            logger.info("STREAM_AF:stage speed property = '%s'", speed_prop)
+            original_speed = _try_get(core, focus_device, speed_prop)
     try:
         initial_z = float(core.get_position(focus_device))
     except Exception as e:
@@ -1849,11 +1991,11 @@ def handle_streaming_focus(conn, client, hardware, settings, **kwargs):
         logger.warning("STREAM_AF:get_exposure failed: %s", e)
         exposure_ms = 0.0
 
-    # Use a conservative min velocity estimate of 11.5 um/s (Prior
-    # MaxSpeed=1 forward) unless we have a better source. Eventually
-    # this comes from per-rig calibration; for v1 the fallback
-    # matches the only rig we've measured.
-    min_velocity_um_s = 11.5
+    # Per-rig slow velocity estimate. Sourced from
+    # stage.streaming_af.slow_speed_um_per_s in the YAML when the
+    # wizard has probed this rig; otherwise falls back to
+    # MIN_VELOCITY_UM_S (Prior MaxSpeed=1 measurement).
+    min_velocity_um_s = eff_slow_um_s
     expected_blur_um = min_velocity_um_s * (exposure_ms / 1000.0) if exposure_ms else 0.0
     logger.info("STREAM_AF:exposure=%.2fms  est min velocity=%.2f um/s  "
                 "expected blur=%.3f um  budget=%.3f um",
@@ -1978,6 +2120,8 @@ def handle_streaming_focus(conn, client, hardware, settings, **kwargs):
                 attempt_label=label,
                 velocity_um_s=min_velocity_um_s,
                 metric_name=metric_name,
+                slow_value=eff_slow_value,
+                normal_value=eff_normal_value,
             )
             attempts_log.append(
                 f"{label}: center={current_center:.3f} "
@@ -2075,18 +2219,27 @@ def handle_streaming_focus(conn, client, hardware, settings, **kwargs):
                 )
 
         # --- Brent fallback ---
-        # If the union fit also failed (no interior peak in the
-        # combined data), fall back to a Brent search. Brent uses
-        # smart point placement and typically converges in 6-8
-        # evaluations even when the peak location is unknown, so it
-        # rescues cases where the streaming+shift approach misses
-        # the peak due to sample density, metric noise, or awkward
-        # initial offset. We seed the bracket from the metric peak
-        # of all collected samples (when available) instead of the
-        # full coverage span -- a tight bracket converges faster
-        # and avoids Brent landing on irrelevant Z far from any
-        # actual sample.
-        if final_result.status in ("edge_low", "edge_high"):
+        # Three escalation paths land here:
+        #   - edge_low / edge_high: streaming saw a slope but the
+        #     peak is outside the window. The union fit also failed
+        #     to find an interior peak in the combined data.
+        #   - no_slow_speed: the stage refused the slow-speed value
+        #     for streaming OR has no writable speed property at all
+        #     (OWS3 'Speed' value rejected, or hardware that doesn't
+        #     expose any of the candidate properties). Streaming is
+        #     impossible but Brent's snap-and-stop search needs no
+        #     speed manipulation, so we degrade to it directly.
+        # Brent uses smart point placement and typically converges
+        # in 6-8 evaluations even when the peak location is unknown,
+        # so it rescues cases where the streaming+shift approach
+        # misses the peak due to sample density, metric noise, or
+        # awkward initial offset. We seed the bracket from the
+        # metric peak of all collected samples (when available)
+        # instead of the full coverage span -- a tight bracket
+        # converges faster and avoids Brent landing on irrelevant Z
+        # far from any actual sample. With no samples (no_slow_speed
+        # on first attempt) we search a wider window.
+        if final_result.status in ("edge_low", "edge_high", "no_slow_speed"):
             if all_attempt_samples_zm:
                 # Anchor on the best sample we've already got, then
                 # widen to one full range either side.
@@ -2119,6 +2272,7 @@ def handle_streaming_focus(conn, client, hardware, settings, **kwargs):
                     brent_result = _brent_fallback_scan(
                         core, focus_device, speed_prop,
                         brent_lo, brent_hi, metric_name,
+                        normal_value=eff_normal_value,
                     )
                     # Restart the sequence if the Live Viewer was
                     # depending on it when we arrived.
@@ -2289,10 +2443,14 @@ def handle_streaming_focus(conn, client, hardware, settings, **kwargs):
                     core.stop_sequence_acquisition()
             except Exception:
                 pass
-        if original_speed is not None:
-            _try_set(core, focus_device, speed_prop, str(original_speed))
-        else:
-            _try_set(core, focus_device, speed_prop, NORMAL_SPEED_VALUE)
+        # Skip the restore entirely when the stage has no writable
+        # speed property (speed_prop is None) -- there's nothing to
+        # restore and _try_set with prop=None would fail noisily.
+        if speed_prop is not None:
+            if original_speed is not None:
+                _try_set(core, focus_device, speed_prop, str(original_speed))
+            else:
+                _try_set(core, focus_device, speed_prop, eff_normal_value)
         # Always restore the camera ROI -- a no-op if crop wasn't
         # applied. Leaving a cropped ROI would affect every
         # subsequent live-viewer frame and every acquisition snap
