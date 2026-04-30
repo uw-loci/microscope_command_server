@@ -311,6 +311,63 @@ def handle_applych(conn, client, hardware, settings, **kwargs):
                 else:
                     ch_entry[k] = v
 
+        # Cross-channel cleanup: zero every other channel's intensity
+        # property so the previously-active wavelength does not stay lit
+        # when switching channels. The channel library entries declare
+        # intensity_property as a {device, property} mapping (or None for
+        # channels driven only by state_property like brightfield's
+        # DiaLamp). Channels without an intensity_property mapping are
+        # skipped silently.
+        core = getattr(hardware, "core", None)
+        if core is not None:
+            for entry in library:
+                if not isinstance(entry, dict):
+                    continue
+                if entry.get("id") == channel_id:
+                    continue
+                ip = entry.get("intensity_property")
+                if not isinstance(ip, dict):
+                    continue
+                dev = ip.get("device")
+                prop = ip.get("property")
+                if not (dev and prop):
+                    continue
+                try:
+                    core.set_property(str(dev), str(prop), "0")
+                    logger.debug(
+                        "APPLYCH: zeroed %s.%s for inactive channel '%s'",
+                        dev, prop, entry.get("id"),
+                    )
+                except Exception as e:
+                    logger.warning(
+                        "APPLYCH: failed to zero %s.%s: %s", dev, prop, e
+                    )
+
+        # Re-enable the modality's state property. Modality teardown via
+        # _disable_all_modality_illuminations writes state=0; APPLYCH on a
+        # named channel must restore state=1 before the per-channel
+        # presets/properties run, otherwise the LED stays dark even though
+        # the channel's intensity property is at the configured value.
+        # PPM modalities have no state_property declared at the modality
+        # level; skip silently if either field is missing.
+        if core is not None:
+            illum_cfg = modality_cfg.get("illumination")
+            if isinstance(illum_cfg, dict):
+                state_dev = illum_cfg.get("device")
+                state_prop = illum_cfg.get("state_property")
+                if state_dev and state_prop:
+                    try:
+                        core.set_property(str(state_dev), str(state_prop), "1")
+                        logger.debug(
+                            "APPLYCH: enabled modality state %s.%s=1",
+                            state_dev, state_prop,
+                        )
+                    except Exception as e:
+                        logger.warning(
+                            "APPLYCH: failed to enable modality state %s.%s: %s",
+                            state_dev, state_prop, e,
+                        )
+
         # Lazy import to avoid a server -> control circular import when
         # this module is loaded at startup.
         from microscope_command_server.acquisition.workflow import (
