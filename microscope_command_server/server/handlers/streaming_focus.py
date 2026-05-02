@@ -1427,22 +1427,59 @@ def _attempt_one_scan(
         _try_set(core, focus_device, speed_prop, normal_value)
 
         # --- Sample filtering and fit ---
+        # Primary truncation: time-based. wall_ms is authoritative
+        # (interpolated Z = wall_ms * velocity_um_s) and motion ends
+        # at exactly motion_end_ms. Anything past that is post-motion
+        # tail at z_end -- discard. A small grace window
+        # (POST_MOTION_GRACE_MS) keeps samples whose timestamps land
+        # just after motion_end due to poll jitter; without it a
+        # single late-arriving sample would round-trip into the tail
+        # bucket and lose the last bit of the curve.
+        #
+        # Secondary safety net: Z-stagnation. If the stage stalled
+        # mid-scan (rare; would be a hardware fault), motion_end_ms
+        # would still elapse but the last samples would all carry
+        # the same interpolated Z up to the stall point. The
+        # stagnation check catches that. The threshold (0.5 um) is
+        # set above the per-frame Z step at typical scan velocities
+        # (e.g., 6 um/s * 50 ms = 0.3 um per frame) so it cannot
+        # false-trip during normal motion -- the previous 0.05 um
+        # threshold did false-trip whenever frame cadence was slow
+        # enough that the camera missed a frame, which on OWS3
+        # truncated a 20 um scan to 10.7 um and produced
+        # 'metric range within noise' warnings.
+        POST_MOTION_GRACE_MS = 100.0
+        Z_STAGNATION_UM = 0.5
+        Z_STAGNATION_RUN = 5
+        motion_end_ms = (
+            abs(z_end - z_start) / max(velocity_um_s, 0.01) * 1000.0
+        )
+        time_cutoff_ms = motion_end_ms + POST_MOTION_GRACE_MS
+
         clean = [(t, z, m) for (t, z, m) in samples
                  if z == z and m == m and math.isfinite(z) and math.isfinite(m)]
         in_motion = []
         stable_run = 0
         last_z = None
         for (t, z, m) in clean:
-            if last_z is not None and abs(z - last_z) < 0.05:
+            if t > time_cutoff_ms:
+                break  # post-motion tail
+            if last_z is not None and abs(z - last_z) < Z_STAGNATION_UM:
                 stable_run += 1
-                if stable_run >= 3:
-                    break
+                if stable_run >= Z_STAGNATION_RUN:
+                    break  # stage stalled mid-scan
             else:
                 stable_run = 0
                 in_motion.append((t, z, m))
                 last_z = z
         if len(in_motion) < MIN_FRAMES_FOR_FIT and len(clean) >= MIN_FRAMES_FOR_FIT:
             in_motion = clean[:max(MIN_FRAMES_FOR_FIT, len(in_motion))]
+        logger.info(
+            "STREAM_AF:%sin_motion filter kept %d/%d samples "
+            "(time_cutoff=%.0fms motion_end=%.0fms)",
+            tag_prefix, len(in_motion), len(clean),
+            time_cutoff_ms, motion_end_ms,
+        )
 
         n_motion_samples = len(in_motion)
         if n_motion_samples >= 2:
