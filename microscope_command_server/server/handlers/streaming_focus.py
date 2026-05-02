@@ -365,152 +365,22 @@ def _snap_image_as_numpy(core) -> Optional[np.ndarray]:
         return arr
 
 
-def _focus_metric_normalized_variance(gray: np.ndarray) -> float:
-    """Variance / mean. Robust, cheap, works well for texture-rich
-    scenes (brightfield, PPM). Can be misleading for sparse-signal
-    fluorescence where a few bright pixels dominate the variance
-    regardless of focus."""
-    mean = gray.mean()
-    if mean <= 1e-9:
-        return 0.0
-    return float(gray.var() / mean)
+# Focus-metric implementations and the per-modality default lookup
+# moved to microscope_imageprocessing.focus on 2026-05-01. The streaming
+# AF code path is one of several call sites; consolidating means
+# autofocus_<scope>.yml's score_metric field uses the same vocabulary
+# everywhere and a typo can't drift between code paths.
+#
+# The dispatcher (resolve_metric) raises on unknown names. The streaming
+# AF wrapper below catches that and falls back to the modality default
+# with a logged warning so a stale YAML cannot crash an acquisition --
+# the user gets a clear "renamed to X" message in the log instead.
+from microscope_imageprocessing.focus import (
+    UnknownMetricError,
+    modality_default_metric,
+    resolve_metric,
+)
 
-
-def _focus_metric_volath5(gray: np.ndarray) -> float:
-    """Volath's F5 metric (autocorrelation at lag 1 minus N*mean^2).
-
-    The MM source comments describe this as 'smooths out
-    high-frequency (suppresses noise)' -- the key win for noisy
-    sparse-signal modalities (widefield fluorescence, laser-scanning
-    microscopy), which have mostly-dark backgrounds with signal
-    confined to a small fraction of pixels. Normalized variance in
-    that regime is dominated by shot noise in the background rather
-    than the focus of the signal pixels; Volath5's autocorrelation
-    form effectively ignores uncorrelated noise.
-
-    Math: F5 = sum_{x, y} I(x, y) * I(x+1, y) - M * N * mean(I)^2
-
-    Equivalent numpy:  (I[:, :-1] * I[:, 1:]).sum() - N * mean(I)^2
-
-    Adapted from: Micro-Manager's ImgSharpnessAnalysis.java (also
-    exposed via OughtaFocus). See the "Attribution / Prior art"
-    section in the module docstring for the full citation.
-    """
-    if gray.ndim != 2 or gray.shape[1] < 2:
-        return 0.0
-    shifted_product = float((gray[:, :-1] * gray[:, 1:]).sum())
-    n = float(gray.size)
-    mean = float(gray.mean())
-    return shifted_product - n * mean * mean
-
-
-def _focus_metric_tenengrad(gray: np.ndarray) -> float:
-    """Sum of squared Sobel gradient magnitudes. Robust sharpness
-    metric; the 2016 light-sheet paper cited in MM's
-    ImgSharpnessAnalysis calls it 'best non-spectral metric' for
-    their application. Alternative to normalized_variance for
-    texture-rich tissue imaging.
-
-    Implemented with plain numpy (no scipy dep) via first
-    differences in X and Y, squared and summed. This is the
-    discrete Sobel without the 2x center weighting; close enough
-    for focus ranking purposes.
-
-    Adapted from: Micro-Manager's ImgSharpnessAnalysis.java. See
-    the "Attribution / Prior art" section in the module docstring
-    for the full citation.
-    """
-    if gray.ndim != 2 or gray.shape[0] < 2 or gray.shape[1] < 2:
-        return 0.0
-    gx = np.diff(gray, axis=1)
-    gy = np.diff(gray, axis=0)
-    return float((gx * gx).sum() + (gy * gy).sum())
-
-
-def _focus_metric_laplacian_variance(gray: np.ndarray) -> float:
-    """Variance of a 3x3 Laplacian-filtered image. The Laplacian
-    is a high-pass operator: low-spatial-frequency illumination
-    (lamp vignette, BG profile) is killed before variance is
-    measured, so the metric responds primarily to fine detail
-    that changes with focus. This is the metric to use when
-    normalized_variance is being dominated by a static lamp
-    profile -- typical at low-mag (10x) brightfield with a wide
-    depth of field, where the focus contribution to raw variance
-    is small relative to the illumination gradient.
-
-    Computed without scipy via the 4-neighbour stencil
-    [[0,1,0],[1,-4,1],[0,1,0]]. Matches the autofocus YAML
-    'laplacian_variance' name so per-objective YAML overrides
-    work.
-    """
-    if gray.ndim != 2 or gray.shape[0] < 3 or gray.shape[1] < 3:
-        return 0.0
-    lap = (
-        -4.0 * gray[1:-1, 1:-1]
-        + gray[:-2, 1:-1]
-        + gray[2:, 1:-1]
-        + gray[1:-1, :-2]
-        + gray[1:-1, 2:]
-    )
-    return float(lap.var())
-
-
-def _focus_metric_brenner_gradient(gray: np.ndarray) -> float:
-    """Brenner's metric: sum of squared horizontal differences at
-    lag 2. High-pass like Laplacian/Tenengrad and immune to slow
-    illumination gradients. Cheap (one pair of slices, no
-    multi-axis ops). Matches the autofocus YAML 'brenner_gradient'
-    name so per-objective YAML overrides work.
-    """
-    if gray.ndim != 2 or gray.shape[1] < 3:
-        return 0.0
-    d = gray[:, 2:] - gray[:, :-2]
-    return float((d * d).sum())
-
-
-# Registry of available focus metrics. New implementations drop in
-# here and are automatically available to the modality dispatcher.
-# Names match the vocabulary used in autofocus_<scope>.yml so the
-# per-objective `score_metric` field can override the modality
-# default.
-_FOCUS_METRICS = {
-    "normalized_variance": _focus_metric_normalized_variance,
-    "volath5": _focus_metric_volath5,
-    "tenengrad": _focus_metric_tenengrad,
-    "laplacian_variance": _focus_metric_laplacian_variance,
-    "brenner_gradient": _focus_metric_brenner_gradient,
-}
-
-
-# Per-modality default metric. The mapping is defensible rather
-# than rig-calibrated: normalized_variance for texture-rich
-# modalities, volath5 for sparse-signal modalities where noise
-# suppression matters more than dynamic range.
-METRIC_BY_MODALITY = {
-    # Brightfield / PPM at low mag tend to have a wide DOF and a
-    # dominant lamp vignette in the raw frames, so var/mean is
-    # dominated by the static illumination gradient and changes
-    # <1% across the focus sweep. Tenengrad is a gradient sum --
-    # inherently high-pass, immune to the vignette, and swings
-    # dramatically with focus on tissue. Confirmed at OWS3 BF 10x
-    # where normalized_variance reported 0.19% peak-relative range
-    # (well below the 5% flat-metric refusal threshold) even when
-    # the live view showed clear focus sweep.
-    "brightfield": "tenengrad",
-    "bf": "tenengrad",
-    "ppm": "tenengrad",
-    "polarized": "tenengrad",
-    "fluorescence": "volath5",
-    "fluorescent": "volath5",
-    "widefield": "volath5",
-    "wf": "volath5",
-    "laser_scanning": "volath5",
-    "lsm": "volath5",
-    "shg": "volath5",
-    "multiphoton": "volath5",
-    "1p": "volath5",
-    "2p": "volath5",
-}
 DEFAULT_METRIC_NAME = "tenengrad"
 
 
@@ -521,17 +391,19 @@ def _resolve_metric_name(
     """Pick a focus metric for the streaming AF run.
 
     Resolution order:
-      1. Per-objective `score_metric` from autofocus_<scope>.yml
+      1. Per-objective ``score_metric`` from autofocus_<scope>.yml
          (passed in via af_entry). Lets a user override the metric
          per objective without code changes.
-      2. Modality default from METRIC_BY_MODALITY.
-      3. DEFAULT_METRIC_NAME.
+      2. Modality default (from focus_metrics_manifest.yml's
+         modality_defaults).
+      3. ``DEFAULT_METRIC_NAME`` (tenengrad).
 
-    A YAML-named metric that is not in `_FOCUS_METRICS` (e.g.
-    "sobel", "p98_p2", or any name from a future schema) is
-    rejected with a warning and resolution falls through to the
-    modality default. The sentinel "none" is treated as "skip
-    YAML override" (used by the manual_only strategy).
+    A YAML-named metric not known to the manifest (typo, removed
+    alias, or a metric that does not support the streaming path) is
+    logged with a clear migration hint and resolution falls through
+    to the modality default. The sentinel ``"none"`` is treated as
+    "skip YAML override" -- used by the manual_only strategy where
+    streaming AF is itself bypassed.
     """
     yaml_metric: Optional[str] = None
     if af_entry:
@@ -540,43 +412,39 @@ def _resolve_metric_name(
             yaml_metric = raw.strip().lower()
 
     if yaml_metric and yaml_metric != "none":
-        if yaml_metric in _FOCUS_METRICS:
+        try:
+            resolve_metric(yaml_metric)
             return yaml_metric
-        logger.warning(
-            "STREAM_AF:autofocus yaml score_metric=%r is not in the "
-            "streaming-AF metric registry %s; falling back to "
-            "modality default. Update the yaml or add the metric "
-            "to _FOCUS_METRICS.",
-            raw, sorted(_FOCUS_METRICS),
-        )
+        except UnknownMetricError as e:
+            logger.warning(
+                "STREAM_AF: autofocus yaml score_metric=%r is invalid "
+                "(%s); falling back to modality default.",
+                yaml_metric, e,
+            )
 
-    if not modality:
-        return DEFAULT_METRIC_NAME
-    return METRIC_BY_MODALITY.get(modality.strip().lower(), DEFAULT_METRIC_NAME)
+    return modality_default_metric(modality, fallback=DEFAULT_METRIC_NAME)
 
 
 def _focus_metric(img, metric_name: str = DEFAULT_METRIC_NAME) -> float:
     """Compute a focus metric on the given image.
 
-    Dispatches on metric_name. Always extracts the green/first
-    channel for multi-component images, then delegates to the
-    chosen metric implementation. Returns 0.0 on empty/bad input
-    so callers can sort/argmax without special-casing None.
+    Dispatches via ``resolve_metric``. The dispatcher accepts 2D and
+    3D input directly (multi-channel reduces to the green/index-1
+    channel) and returns 0.0 on empty/bad input. If ``metric_name``
+    is unknown the call is logged once and falls back to the default.
     """
     if img is None:
         return 0.0
-    a = np.asarray(img)
-    if a.size == 0:
-        return 0.0
-    if a.ndim == 3:
-        ch = 1 if a.shape[2] >= 2 else 0
-        gray = a[:, :, ch]
-    else:
-        gray = a
-    g = gray.astype(np.float64, copy=False)
-    fn = _FOCUS_METRICS.get(metric_name, _FOCUS_METRICS[DEFAULT_METRIC_NAME])
     try:
-        return fn(g)
+        fn = resolve_metric(metric_name)
+    except UnknownMetricError as e:
+        logger.debug(
+            "focus metric '%s' not in manifest (%s); using %s",
+            metric_name, e, DEFAULT_METRIC_NAME,
+        )
+        fn = resolve_metric(DEFAULT_METRIC_NAME)
+    try:
+        return float(fn(img))
     except Exception as e:
         logger.debug("focus metric '%s' raised: %s", metric_name, e)
         return 0.0
