@@ -427,12 +427,58 @@ def _focus_metric_tenengrad(gray: np.ndarray) -> float:
     return float((gx * gx).sum() + (gy * gy).sum())
 
 
+def _focus_metric_laplacian_variance(gray: np.ndarray) -> float:
+    """Variance of a 3x3 Laplacian-filtered image. The Laplacian
+    is a high-pass operator: low-spatial-frequency illumination
+    (lamp vignette, BG profile) is killed before variance is
+    measured, so the metric responds primarily to fine detail
+    that changes with focus. This is the metric to use when
+    normalized_variance is being dominated by a static lamp
+    profile -- typical at low-mag (10x) brightfield with a wide
+    depth of field, where the focus contribution to raw variance
+    is small relative to the illumination gradient.
+
+    Computed without scipy via the 4-neighbour stencil
+    [[0,1,0],[1,-4,1],[0,1,0]]. Matches the autofocus YAML
+    'laplacian_variance' name so per-objective YAML overrides
+    work.
+    """
+    if gray.ndim != 2 or gray.shape[0] < 3 or gray.shape[1] < 3:
+        return 0.0
+    lap = (
+        -4.0 * gray[1:-1, 1:-1]
+        + gray[:-2, 1:-1]
+        + gray[2:, 1:-1]
+        + gray[1:-1, :-2]
+        + gray[1:-1, 2:]
+    )
+    return float(lap.var())
+
+
+def _focus_metric_brenner_gradient(gray: np.ndarray) -> float:
+    """Brenner's metric: sum of squared horizontal differences at
+    lag 2. High-pass like Laplacian/Tenengrad and immune to slow
+    illumination gradients. Cheap (one pair of slices, no
+    multi-axis ops). Matches the autofocus YAML 'brenner_gradient'
+    name so per-objective YAML overrides work.
+    """
+    if gray.ndim != 2 or gray.shape[1] < 3:
+        return 0.0
+    d = gray[:, 2:] - gray[:, :-2]
+    return float((d * d).sum())
+
+
 # Registry of available focus metrics. New implementations drop in
 # here and are automatically available to the modality dispatcher.
+# Names match the vocabulary used in autofocus_<scope>.yml so the
+# per-objective `score_metric` field can override the modality
+# default.
 _FOCUS_METRICS = {
     "normalized_variance": _focus_metric_normalized_variance,
     "volath5": _focus_metric_volath5,
     "tenengrad": _focus_metric_tenengrad,
+    "laplacian_variance": _focus_metric_laplacian_variance,
+    "brenner_gradient": _focus_metric_brenner_gradient,
 }
 
 
@@ -441,10 +487,19 @@ _FOCUS_METRICS = {
 # modalities, volath5 for sparse-signal modalities where noise
 # suppression matters more than dynamic range.
 METRIC_BY_MODALITY = {
-    "brightfield": "normalized_variance",
-    "bf": "normalized_variance",
-    "ppm": "normalized_variance",
-    "polarized": "normalized_variance",
+    # Brightfield / PPM at low mag tend to have a wide DOF and a
+    # dominant lamp vignette in the raw frames, so var/mean is
+    # dominated by the static illumination gradient and changes
+    # <1% across the focus sweep. Tenengrad is a gradient sum --
+    # inherently high-pass, immune to the vignette, and swings
+    # dramatically with focus on tissue. Confirmed at OWS3 BF 10x
+    # where normalized_variance reported 0.19% peak-relative range
+    # (well below the 5% flat-metric refusal threshold) even when
+    # the live view showed clear focus sweep.
+    "brightfield": "tenengrad",
+    "bf": "tenengrad",
+    "ppm": "tenengrad",
+    "polarized": "tenengrad",
     "fluorescence": "volath5",
     "fluorescent": "volath5",
     "widefield": "volath5",
@@ -456,12 +511,45 @@ METRIC_BY_MODALITY = {
     "1p": "volath5",
     "2p": "volath5",
 }
-DEFAULT_METRIC_NAME = "normalized_variance"
+DEFAULT_METRIC_NAME = "tenengrad"
 
 
-def _resolve_metric_name(modality: Optional[str]) -> str:
-    """Pick a focus metric for the given modality, falling back to
-    the default when modality is None or unknown."""
+def _resolve_metric_name(
+    modality: Optional[str],
+    af_entry: Optional[Dict[str, Any]] = None,
+) -> str:
+    """Pick a focus metric for the streaming AF run.
+
+    Resolution order:
+      1. Per-objective `score_metric` from autofocus_<scope>.yml
+         (passed in via af_entry). Lets a user override the metric
+         per objective without code changes.
+      2. Modality default from METRIC_BY_MODALITY.
+      3. DEFAULT_METRIC_NAME.
+
+    A YAML-named metric that is not in `_FOCUS_METRICS` (e.g.
+    "sobel", "p98_p2", or any name from a future schema) is
+    rejected with a warning and resolution falls through to the
+    modality default. The sentinel "none" is treated as "skip
+    YAML override" (used by the manual_only strategy).
+    """
+    yaml_metric: Optional[str] = None
+    if af_entry:
+        raw = af_entry.get("score_metric")
+        if isinstance(raw, str):
+            yaml_metric = raw.strip().lower()
+
+    if yaml_metric and yaml_metric != "none":
+        if yaml_metric in _FOCUS_METRICS:
+            return yaml_metric
+        logger.warning(
+            "STREAM_AF:autofocus yaml score_metric=%r is not in the "
+            "streaming-AF metric registry %s; falling back to "
+            "modality default. Update the yaml or add the metric "
+            "to _FOCUS_METRICS.",
+            raw, sorted(_FOCUS_METRICS),
+        )
+
     if not modality:
         return DEFAULT_METRIC_NAME
     return METRIC_BY_MODALITY.get(modality.strip().lower(), DEFAULT_METRIC_NAME)
@@ -1786,13 +1874,10 @@ def handle_streaming_focus(conn, client, hardware, settings, **kwargs):
                 addr, yaml_path, client_objective, client_modality,
                 range_override_um, crop_factor)
 
-    # Resolve focus metric from modality. Pattern matches the
-    # saturation threshold dispatch just below -- brightfield/PPM
-    # use normalized_variance, fluorescence and laser-scanning use
-    # Volath5 for noise robustness.
-    metric_name = _resolve_metric_name(client_modality)
-    logger.info("STREAM_AF:focus metric for modality '%s' = '%s'",
-                client_modality or "unknown", metric_name)
+    # Note: focus-metric resolution is deferred until after the
+    # autofocus yaml entry is loaded, so the per-objective
+    # `score_metric` field (if any) can override the modality
+    # default. See _resolve_metric_name() and the call site below.
 
     # Resolve the saturation threshold from the client-provided
     # modality. Normalize to lower case for dict lookup; unknown or
@@ -1829,6 +1914,23 @@ def handle_streaming_focus(conn, client, hardware, settings, **kwargs):
     if not af_entry:
         logger.warning("STREAM_AF:no autofocus yaml entry -- using fallback range %s um",
                        FALLBACK_RANGE_UM)
+
+    # Now that af_entry is known, resolve the focus metric. The
+    # yaml's per-objective `score_metric` wins over the modality
+    # default; unknown names fall through with a warning.
+    metric_name = _resolve_metric_name(client_modality, af_entry)
+    yaml_score_metric = af_entry.get("score_metric") if af_entry else None
+    if yaml_score_metric:
+        logger.info(
+            "STREAM_AF:focus metric for modality '%s' = '%s' "
+            "(yaml score_metric=%r)",
+            client_modality or "unknown", metric_name, yaml_score_metric,
+        )
+    else:
+        logger.info(
+            "STREAM_AF:focus metric for modality '%s' = '%s' (modality default)",
+            client_modality or "unknown", metric_name,
+        )
 
     if range_override_um is not None:
         range_um = max(1.0, float(range_override_um))
