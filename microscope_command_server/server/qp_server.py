@@ -226,6 +226,16 @@ server_configured = False  # True only after CONFIG command received with valid 
 active_connection_addr = None  # Track single active client connection (blocks other connections)
 active_connection_config_path = None  # Path to config file provided by active connection
 connection_state_lock = Lock()  # Protect connection state from race conditions
+# Serializes calls into MM core's sequence-acquisition state machine
+# (start_sequence_acquisition / stop_sequence_acquisition / is_sequence_running).
+# MM core itself is not safe for concurrent calls into these methods, and a
+# concurrent re-entry deadlocks the server. Held by handle_stopseq for the
+# duration of the stop call, and try-acquired (with a short timeout) by the
+# CONFIG-takeover orphaned-stop path so a pending Java-initiated stop doesn't
+# get clobbered by a same-IP reconnect's takeover (witnessed 2026-05-02 OWS3:
+# stopseq from old client + takeover orphan-stop from new client deadlocked
+# the dispatch thread, hanging every subsequent CONFIG handler).
+sequence_op_lock = Lock()
 # Track all connected clients from the configured IP so we only unconfigure
 # when ALL connections from that IP disconnect (Java uses main + aux sockets).
 active_ip_connections = set()  # Set of (ip, port) tuples from the active IP
@@ -486,6 +496,7 @@ def handle_client(conn, addr):
         "server_configured": server_configured,
         "shutdown_event": shutdown_event,
         "connection_state_lock": connection_state_lock,
+        "sequence_op_lock": sequence_op_lock,
         "active_connection_addr": active_connection_addr,
         "active_connection_config_path": active_connection_config_path,
         # Config manager (for CONFIG handler to reload settings)

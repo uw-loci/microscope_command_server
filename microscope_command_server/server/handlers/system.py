@@ -186,17 +186,44 @@ def handle_config(conn, client, hardware, settings, **kwargs):
                     # streaming into MM's circular buffer and eventually
                     # hard-lock the Hamamatsu sCMOS driver + MicroManager
                     # itself (observed on OWS3 2026-04-09).
-                    try:
-                        if hardware.core.is_sequence_running():
+                    #
+                    # MM core is not safe for concurrent sequence-state
+                    # mutations. If the dying client's STOPSEQ handler is
+                    # mid-call when we get here, calling stop_sequence_acquisition
+                    # again deadlocks the dispatch thread (witnessed
+                    # 2026-05-02 OWS3 -- after the deadlock the server
+                    # accepted new connections but never read CONFIG bytes
+                    # off them, hanging every subsequent client). Try to
+                    # acquire ``sequence_op_lock`` non-blockingly with a
+                    # short timeout; if we can't, the in-flight STOPSEQ
+                    # will finish on its own and there's nothing to clean
+                    # up here.
+                    sequence_op_lock = kwargs.get("sequence_op_lock")
+                    acquired = False
+                    if sequence_op_lock is not None:
+                        acquired = sequence_op_lock.acquire(timeout=2.0)
+                        if not acquired:
                             logger.warning(
-                                "CONFIG: Stopping orphaned sequence acquisition from dead client"
+                                "CONFIG: Skipping orphaned-stop -- another sequence op is in "
+                                "progress (likely the dying client's STOPSEQ); it will complete "
+                                "on its own."
                             )
-                            hardware.core.stop_sequence_acquisition()
-                    except Exception as stop_err:
-                        logger.error(
-                            "CONFIG: Failed to stop orphaned sequence acquisition: %s",
-                            stop_err,
-                        )
+                    try:
+                        if sequence_op_lock is None or acquired:
+                            try:
+                                if hardware.core.is_sequence_running():
+                                    logger.warning(
+                                        "CONFIG: Stopping orphaned sequence acquisition from dead client"
+                                    )
+                                    hardware.core.stop_sequence_acquisition()
+                            except Exception as stop_err:
+                                logger.error(
+                                    "CONFIG: Failed to stop orphaned sequence acquisition: %s",
+                                    stop_err,
+                                )
+                    finally:
+                        if acquired:
+                            sequence_op_lock.release()
                     # Clear the old addr (will be set to new addr below).
                     # KEEP current_active_config_path so the downstream
                     # path_changed check can skip rebuilding hardware when

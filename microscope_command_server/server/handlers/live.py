@@ -148,15 +148,29 @@ def handle_stopseq(conn, client, hardware, settings, **kwargs):
     """Stop continuous sequence acquisition (core-level).
 
     Response: 'ACK_____' on success, 'ERR_SEQ_' on failure.
+
+    Holds ``sequence_op_lock`` for the duration of the MM-core stop call so
+    a concurrent CONFIG-takeover orphan-stop from a same-IP reconnect does
+    not re-enter the core simultaneously (deadlock observed 2026-05-02
+    OWS3). Entry / mid / exit are all logged so a hang inside the core call
+    is visible from the server log instead of looking like a silent failure.
     """
     logger.info("Client %s requested stop continuous acquisition", client.addr)
+    sequence_op_lock = kwargs.get("sequence_op_lock")
+    if sequence_op_lock is not None:
+        sequence_op_lock.acquire()
     try:
+        logger.info("STOPSEQ: calling hardware.stop_continuous_acquisition() for %s", client.addr)
         hardware.stop_continuous_acquisition()
+        logger.info("STOPSEQ: hardware.stop_continuous_acquisition() returned for %s", client.addr)
         conn.sendall(b"ACK_____")
         logger.info("Continuous sequence acquisition stopped")
     except Exception as e:
         logger.error("Failed to stop continuous acquisition: %s", e)
         conn.sendall(b"ERR_SEQ_")
+    finally:
+        if sequence_op_lock is not None:
+            sequence_op_lock.release()
 
 
 def handle_snap(conn, client, hardware, settings, **kwargs):
