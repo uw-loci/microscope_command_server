@@ -5328,6 +5328,17 @@ def acquire_background_with_target_intensity(
     channel_sat_limit = None
     overall_sat_limit = None
 
+    # Track recent exposures so we can detect plateau-convergence (the
+    # exposure has stabilised at the camera's quantization limit and no
+    # further proportional adjustment will move it). Without this, a
+    # 16-bit camera holding median=51200 +/-20 with tolerance=2.5 counts
+    # spins all 10 iterations and silently drops to the "last image"
+    # fallback even though the result is correct -- the convergence
+    # check is just tighter than the camera can physically resolve.
+    PLATEAU_WINDOW = 3
+    PLATEAU_FRACTION = 0.005  # 0.5% relative change considered "no movement"
+    recent_exposures: list = []
+
     for iteration in range(max_iterations):
         # Snap image (debayering auto-detected based on camera type)
         image, metadata = hardware.snap_image()
@@ -5417,16 +5428,48 @@ def acquire_background_with_target_intensity(
             hardware.set_exposure(current_exposure)
             continue
 
-        # Check convergence (only when no channel is saturated)
+        # Check convergence (only when no channel is saturated).
+        # Effective tolerance is floored at 0.5% of target so a client
+        # passing a strict absolute tolerance (e.g. 2.5 counts) on a
+        # 16-bit target (e.g. 51200) doesn't ask for tighter precision
+        # than the camera's exposure quantization can deliver. Without
+        # the floor, the loop spins forever near target despite already
+        # being well within shot noise.
+        effective_tolerance = max(tolerance, 0.005 * target_intensity)
         intensity_error = abs(mean_intensity - target_intensity)
-        if intensity_error <= tolerance:
+        if intensity_error <= effective_tolerance:
             if logger:
                 logger.info(
                     f"Converged! Final: median={mean_intensity:.1f}, "
-                    f"exposure={current_exposure:.1f}ms, iterations={iteration + 1}"
+                    f"exposure={current_exposure:.1f}ms, iterations={iteration + 1} "
+                    f"(error={intensity_error:.1f} <= tol={effective_tolerance:.1f})"
                 )
             _check_saturation(image, "background", logger or logging.getLogger(__name__))
             return image, current_exposure
+
+        # Plateau detection: if the exposure hasn't moved meaningfully
+        # for PLATEAU_WINDOW iterations, the proportional controller has
+        # bottomed out at the camera's resolution. Accept the current
+        # image as long as we're within ~3x of the effective tolerance
+        # (i.e. genuinely close to target, not just stuck at a wrong
+        # exposure). This is the typical successful-but-noisy case.
+        recent_exposures.append(current_exposure)
+        if len(recent_exposures) > PLATEAU_WINDOW:
+            recent_exposures.pop(0)
+        if len(recent_exposures) == PLATEAU_WINDOW:
+            lo = min(recent_exposures)
+            hi = max(recent_exposures)
+            plateau = (hi - lo) <= PLATEAU_FRACTION * max(lo, MIN_EXPOSURE_MS)
+            if plateau and intensity_error <= 3.0 * effective_tolerance:
+                if logger:
+                    logger.info(
+                        f"Exposure plateaued at {current_exposure:.2f}ms over "
+                        f"{PLATEAU_WINDOW} iterations (median={mean_intensity:.1f}, "
+                        f"error={intensity_error:.1f} <= 3x tol={3.0 * effective_tolerance:.1f}). "
+                        f"Camera quantization reached -- accepting as converged."
+                    )
+                _check_saturation(image, "background", logger or logging.getLogger(__name__))
+                return image, current_exposure
 
         # Calculate proportional adjustment
         # If image is too dark, increase exposure; if too bright, decrease
@@ -5477,15 +5520,34 @@ def acquire_background_with_target_intensity(
             current_exposure = new_exposure
             hardware.set_exposure(current_exposure)
 
-    # Max iterations reached without convergence
-    if logger:
-        logger.warning(
-            f"Did not converge after {max_iterations} iterations. "
-            f"Using last image: median={float(np.median(last_image)):.1f}, exposure={last_exposure:.1f}ms"
-        )
-    _check_saturation(last_image, "background", logger or logging.getLogger(__name__))
+    # Max iterations reached. Decide between "close enough" (accept the
+    # last image, plateau-style) and "genuinely failed" (raise so the
+    # caller can surface this as a failed background collection rather
+    # than silently saving a wrong-exposure image).
+    final_median = float(np.median(last_image)) if last_image is not None else 0.0
+    final_error = abs(final_median - target_intensity)
+    relaxed_tolerance = max(tolerance, 0.005 * target_intensity) * 3.0
+    if final_error <= relaxed_tolerance:
+        if logger:
+            logger.warning(
+                f"Did not strictly converge after {max_iterations} iterations, "
+                f"but final median={final_median:.1f} is within 3x tolerance "
+                f"({final_error:.1f} <= {relaxed_tolerance:.1f}); accepting result."
+            )
+        _check_saturation(last_image, "background", logger or logging.getLogger(__name__))
+        return last_image, last_exposure
 
-    return last_image, last_exposure
+    # Genuinely off-target -- caller must NOT pretend this succeeded.
+    msg = (
+        f"Adaptive exposure failed to converge after {max_iterations} iterations: "
+        f"median={final_median:.1f} target={target_intensity:.1f} "
+        f"error={final_error:.1f} > acceptable={relaxed_tolerance:.1f} "
+        f"(final exposure={last_exposure:.2f}ms). "
+        f"Reposition to a uniform background and retry, or widen the target tolerance."
+    )
+    if logger:
+        logger.error(msg)
+    raise RuntimeError(msg)
 
 
 def acquire_background_with_biref_matching(
@@ -5985,13 +6047,17 @@ def simple_background_collection(
         # placeholder, not a real polarization angle, and saving it as a
         # numeric filename is confusing for monochrome / brightfield users.
         is_non_rotation_background = not angles
-        if not angles:
+        if is_non_rotation_background:
+            # Sentinel angle 0.0 keeps the per-iteration loop simple, but
+            # we never use the value or write it into the log -- this is
+            # a single-image collection on a non-rotation modality.
             angles = [0.0]
             exposures = [exposures[0] if exposures else 50.0]
-            logger.info("No angles specified -- collecting single brightfield background (angle=0)")
-
-        logger.info(f"Collecting backgrounds for angles: {angles} using adaptive exposure")
-        logger.info(f"Initial exposures from client: {exposures}")
+            logger.info("Collecting single background image using adaptive exposure")
+            logger.info(f"Initial exposure from client: {exposures[0]:.2f}ms")
+        else:
+            logger.info(f"Collecting backgrounds for angles: {angles} using adaptive exposure")
+            logger.info(f"Initial exposures from client: {exposures}")
 
         # Load microscope configuration
         if not Path(yaml_file_path).exists():
@@ -6201,7 +6267,14 @@ def simple_background_collection(
                         if "angle_degrees" in adata and "exposure_ms" in adata:
                             saved_exposures[adata["angle_degrees"]] = adata["exposure_ms"]
                     if saved_exposures:
-                        logger.info(f"Loaded prior exposures: {saved_exposures}")
+                        if is_non_rotation_background:
+                            # Drop the angle-keyed dict shape from the user-facing
+                            # log on non-rotation modalities -- there's only one
+                            # value and the 0.0 key is a sentinel.
+                            prior_ms = next(iter(saved_exposures.values()))
+                            logger.info(f"Loaded prior exposure: {prior_ms:.2f}ms")
+                        else:
+                            logger.info(f"Loaded prior exposures: {saved_exposures}")
         except Exception:
             pass  # No saved data, will use client defaults
 
@@ -6212,9 +6285,12 @@ def simple_background_collection(
         # sum(|R_pos - R_neg| + |G_pos - G_neg| + |B_pos - B_neg|)
         biref_pair_references = {}  # Maps positive angle -> reference image
 
-        # Acquire background for each angle
+        # Acquire background for each angle (single iteration on non-rotation modalities).
         for angle_idx, angle in enumerate(angles):
-            logger.info(f"Acquiring background {angle_idx + 1}/{total_images} for angle {angle}")
+            if is_non_rotation_background:
+                logger.info(f"Acquiring background image ({angle_idx + 1}/{total_images})")
+            else:
+                logger.info(f"Acquiring background {angle_idx + 1}/{total_images} for angle {angle}")
 
             # Set rotation angle if rotation stage is present
             if hardware.rotation_stage is not None:
@@ -6632,7 +6708,10 @@ def simple_background_collection(
                 data=image,
             )
 
-            logger.info(f"Saved background for {angle} deg to {background_path}")
+            if is_non_rotation_background:
+                logger.info(f"Saved background to {background_path}")
+            else:
+                logger.info(f"Saved background for {angle} deg to {background_path}")
 
             # Update progress
             update_progress(angle_idx + 1, total_images)

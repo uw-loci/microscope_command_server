@@ -329,8 +329,10 @@ def handle_bgacquire(conn, client, hardware, settings, **kwargs):
                         target_intensity_override=params.get("target_intensity"),
                     )
 
-                    # Format exposures as angle:exposure pairs
-                    # e.g., "90:137.1,7:245.8,-7:155.2"
+                    # Format exposures as angle:exposure pairs over the wire
+                    # (e.g. "90:137.1,7:245.8,-7:155.2"). Wire format is fixed
+                    # because the Java client parses it; only the diagnostic
+                    # log line varies between rotation and non-rotation.
                     exposures_formatted = ",".join(
                         f"{angle}:{exposure:.2f}"
                         for angle, exposure in sorted(final_exposures.items())
@@ -339,10 +341,22 @@ def handle_bgacquire(conn, client, hardware, settings, **kwargs):
                     # Send success response with output path and final exposures
                     response = f"SUCCESS:{params['output_folder_path']}|{exposures_formatted}".encode()
                     conn.sendall(response)
-                    logger.info(
-                        "Background acquisition completed successfully with exposures: %s",
-                        exposures_formatted,
+                    requested_angles = params.get("angles_str", "").strip()
+                    is_non_rotation = (
+                        not requested_angles
+                        or requested_angles in ("()", "(0)", "(0.0)")
                     )
+                    if is_non_rotation and len(final_exposures) == 1:
+                        only_exposure = next(iter(final_exposures.values()))
+                        logger.info(
+                            "Background acquisition completed successfully (exposure=%.2fms)",
+                            only_exposure,
+                        )
+                    else:
+                        logger.info(
+                            "Background acquisition completed successfully with exposures: %s",
+                            exposures_formatted,
+                        )
 
                 except Exception as e:
                     logger.error(
