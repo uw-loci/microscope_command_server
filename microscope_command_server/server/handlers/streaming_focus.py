@@ -1459,16 +1459,37 @@ def _attempt_one_scan(
                  if z == z and m == m and math.isfinite(z) and math.isfinite(m)]
         in_motion = []
         stalled = False
+        # Track whether we've seen real motion yet. The stall check is
+        # gated on this so the stage's acceleration ramp -- where Z
+        # changes by less than STALL_Z_UM across STALL_WINDOW samples
+        # because the motor hasn't reached configured velocity -- does
+        # NOT register as a stall. Without this gate, the very first 5
+        # samples of every PPM scan look identical to a stall and the
+        # filter discards every sample (PPM regression 2026-05-04:
+        # 0/31 samples kept on a 6 um scan that completed normally).
+        ever_moved = False
+        z_first = None
+        z_max_seen = -float("inf")
+        z_min_seen = float("inf")
         for (t, z, m) in clean:
             if t > time_cutoff_ms:
                 break  # post-motion tail
             in_motion.append((t, z, m))
-            if len(in_motion) >= STALL_WINDOW:
+            if z_first is None:
+                z_first = z
+            z_max_seen = max(z_max_seen, z)
+            z_min_seen = min(z_min_seen, z)
+            if not ever_moved and (z_max_seen - z_min_seen) >= STALL_Z_UM:
+                ever_moved = True
+            if ever_moved and len(in_motion) >= STALL_WINDOW:
                 window = in_motion[-STALL_WINDOW:]
                 z_span_w = max(p[1] for p in window) - min(p[1] for p in window)
                 t_span_w = window[-1][0] - window[0][0]
                 if t_span_w > STALL_MIN_DT_MS and z_span_w < STALL_Z_UM:
-                    # Real stall: drop the stalled window and stop.
+                    # Real stall: stage moved earlier in the scan but
+                    # has stopped moving now. Drop the stalled window
+                    # (those samples carry stale Z) and stop reading
+                    # further frames.
                     in_motion = in_motion[:-STALL_WINDOW]
                     stalled = True
                     break
