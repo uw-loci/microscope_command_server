@@ -1469,14 +1469,37 @@ def _attempt_one_scan(
         )
         time_cutoff_ms = motion_end_ms + POST_MOTION_GRACE_MS
 
+        # PRE-MOTION HEAD DISCARD
+        # Stage acceleration ramp + stale-buffer frames captured before
+        # constant-velocity motion is reached produce samples whose
+        # interpolated Z (z_start + wall_ms * velocity_um_s) does NOT
+        # match the actual stage position. On PPM 40x 2026-05-04 the
+        # first ~290ms of every scan showed a metric "peak" 50%+ above
+        # the rest of the scan baseline, the gaussian fit latched onto
+        # it, and the AF moved the stage 2-3 um AWAY from focus. The
+        # baseline 30 samples that followed were tightly grouped (<1%
+        # variation) -- correctly representing flat metric across the
+        # scan window -- but the fit weighted the head outliers far
+        # more heavily than the post-stable samples.
+        #
+        # Drop a fixed head window. 300ms covers Prior stage
+        # acceleration (~150-250ms observed) plus a margin for stale
+        # frames the camera buffer hadn't yet flushed when the move
+        # was issued. Velocity-aware: the alternative head = "first
+        # 5% of motion_end_ms" would shrink to ~50ms on a 2um/1s
+        # scan and still admit accel artifacts; a fixed floor is
+        # safer.
+        HEAD_DISCARD_MS = 300.0
+
         clean = [(t, z, m) for (t, z, m) in samples
                  if z == z and m == m and math.isfinite(z) and math.isfinite(m)]
-        in_motion = [(t, z, m) for (t, z, m) in clean if t <= time_cutoff_ms]
+        in_motion = [(t, z, m) for (t, z, m) in clean
+                     if HEAD_DISCARD_MS <= t <= time_cutoff_ms]
         logger.info(
             "STREAM_AF:%sin_motion filter kept %d/%d samples "
-            "(time_cutoff=%.0fms motion_end=%.0fms)",
+            "(head_discard=%.0fms time_cutoff=%.0fms motion_end=%.0fms)",
             tag_prefix, len(in_motion), len(clean),
-            time_cutoff_ms, motion_end_ms,
+            HEAD_DISCARD_MS, time_cutoff_ms, motion_end_ms,
         )
 
         n_motion_samples = len(in_motion)
