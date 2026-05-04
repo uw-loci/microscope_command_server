@@ -1432,25 +1432,24 @@ def _attempt_one_scan(
         # at exactly motion_end_ms. Anything past that is post-motion
         # tail at z_end -- discard. A small grace window
         # (POST_MOTION_GRACE_MS) keeps samples whose timestamps land
-        # just after motion_end due to poll jitter; without it a
-        # single late-arriving sample would round-trip into the tail
-        # bucket and lose the last bit of the curve.
+        # just after motion_end due to poll jitter.
         #
-        # Secondary safety net: Z-stagnation. If the stage stalled
-        # mid-scan (rare; would be a hardware fault), motion_end_ms
-        # would still elapse but the last samples would all carry
-        # the same interpolated Z up to the stall point. The
-        # stagnation check catches that. The threshold (0.5 um) is
-        # set above the per-frame Z step at typical scan velocities
-        # (e.g., 6 um/s * 50 ms = 0.3 um per frame) so it cannot
-        # false-trip during normal motion -- the previous 0.05 um
-        # threshold did false-trip whenever frame cadence was slow
-        # enough that the camera missed a frame, which on OWS3
-        # truncated a 20 um scan to 10.7 um and produced
-        # 'metric range within noise' warnings.
+        # Secondary safety net: motor-stall detection over a rolling
+        # window of STALL_WINDOW samples. The stage has stalled if the
+        # window covers >STALL_MIN_DT_MS of wall time but <STALL_Z_UM
+        # of Z motion. The PREVIOUS implementation compared each
+        # sample's Z against the LAST APPENDED sample's Z and broke
+        # after STALL_RUN matches under threshold -- this functioned
+        # as a Z-downsampler at fast scans (e.g. OWS3 6 um/s) but
+        # silently false-tripped at slow PPM scans (1.42 um/s, frame
+        # spacing only ~0.04 um), keeping just the first ~5 frames
+        # near z_start every time and producing union-fit artefacts
+        # mid-window. The window-span check is velocity-agnostic
+        # because it requires real wall-time to elapse.
         POST_MOTION_GRACE_MS = 100.0
-        Z_STAGNATION_UM = 0.5
-        Z_STAGNATION_RUN = 5
+        STALL_Z_UM = 0.5
+        STALL_WINDOW = 5
+        STALL_MIN_DT_MS = 50.0
         motion_end_ms = (
             abs(z_end - z_start) / max(velocity_um_s, 0.01) * 1000.0
         )
@@ -1459,21 +1458,27 @@ def _attempt_one_scan(
         clean = [(t, z, m) for (t, z, m) in samples
                  if z == z and m == m and math.isfinite(z) and math.isfinite(m)]
         in_motion = []
-        stable_run = 0
-        last_z = None
+        stalled = False
         for (t, z, m) in clean:
             if t > time_cutoff_ms:
                 break  # post-motion tail
-            if last_z is not None and abs(z - last_z) < Z_STAGNATION_UM:
-                stable_run += 1
-                if stable_run >= Z_STAGNATION_RUN:
-                    break  # stage stalled mid-scan
-            else:
-                stable_run = 0
-                in_motion.append((t, z, m))
-                last_z = z
-        if len(in_motion) < MIN_FRAMES_FOR_FIT and len(clean) >= MIN_FRAMES_FOR_FIT:
-            in_motion = clean[:max(MIN_FRAMES_FOR_FIT, len(in_motion))]
+            in_motion.append((t, z, m))
+            if len(in_motion) >= STALL_WINDOW:
+                window = in_motion[-STALL_WINDOW:]
+                z_span_w = max(p[1] for p in window) - min(p[1] for p in window)
+                t_span_w = window[-1][0] - window[0][0]
+                if t_span_w > STALL_MIN_DT_MS and z_span_w < STALL_Z_UM:
+                    # Real stall: drop the stalled window and stop.
+                    in_motion = in_motion[:-STALL_WINDOW]
+                    stalled = True
+                    break
+        if stalled:
+            logger.warning(
+                "STREAM_AF:%sstall detected (window of %d samples spanned "
+                "%.1fms but only %.3f um of Z motion, threshold %.3f um); "
+                "discarding stalled window",
+                tag_prefix, STALL_WINDOW, t_span_w, z_span_w, STALL_Z_UM,
+            )
         logger.info(
             "STREAM_AF:%sin_motion filter kept %d/%d samples "
             "(time_cutoff=%.0fms motion_end=%.0fms)",
