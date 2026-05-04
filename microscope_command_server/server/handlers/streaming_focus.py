@@ -189,8 +189,14 @@ MIN_FRAMES_FOR_FIT = 6
 # 10 um or less: the whole scan stays inside the ~10 um DOF, the
 # metric varies by <1%, and any committed shift is coin-flip
 # random. Empirically seen as 0.6-0.7% at PPM 10x; a real peak
-# at 20x gives ~80%+. 5% is a comfortable threshold for both.
-FLAT_METRIC_FRACTION = 0.05
+# at 20x gives ~80%+.
+#
+# 2026-05-04: bumped 5% -> 8% after a PPM 40x scan with 4% range
+# committed Z=89.3 when truth was 90 (0.7 um = ~1.2 DOFs off). At
+# 4-5% range the gaussian fit minimum-quality is below useful;
+# refusing the commit and asking the user to widen the scan or
+# focus manually is more honest than landing 1+ DOFs off.
+FLAT_METRIC_FRACTION = 0.08
 
 # Maximum number of edge-retry attempts beyond the first scan. Each
 # retry shifts the scan window one full range in the direction of
@@ -1504,20 +1510,21 @@ def _attempt_one_scan(
         # match the actual stage position. On PPM 40x 2026-05-04 the
         # first ~290ms of every scan showed a metric "peak" 50%+ above
         # the rest of the scan baseline, the gaussian fit latched onto
-        # it, and the AF moved the stage 2-3 um AWAY from focus. The
-        # baseline 30 samples that followed were tightly grouped (<1%
-        # variation) -- correctly representing flat metric across the
-        # scan window -- but the fit weighted the head outliers far
-        # more heavily than the post-stable samples.
+        # it, and the AF moved the stage 2-3 um AWAY from focus.
         #
-        # Drop a fixed head window. 300ms covers Prior stage
-        # acceleration (~150-250ms observed) plus a margin for stale
-        # frames the camera buffer hadn't yet flushed when the move
-        # was issued. Velocity-aware: the alternative head = "first
-        # 5% of motion_end_ms" would shrink to ~50ms on a 2um/1s
-        # scan and still admit accel artifacts; a fixed floor is
-        # safer.
-        HEAD_DISCARD_MS = 300.0
+        # 2026-05-04 follow-up: 300ms wasn't enough. After the buffer-
+        # saturation fix admitted the full 4 s scan, we still saw 3-5%
+        # elevated metric at samples just past the 300ms cutoff
+        # (t=484-565 ms). With the rest of the scan flat at <1%, those
+        # 2-3 head samples biased the gaussian fit toward the LOW-Z
+        # edge of the scan window: Z_truth=90, fit committed Z=89.3.
+        # 600ms cleanly clears the contamination zone while still
+        # leaving 3.6 s of the 4.2 s motion_duration on PPM 40x.
+        #
+        # Velocity-aware: the alternative head = "first 5% of
+        # motion_end_ms" would shrink to ~100ms on a 2um/1s scan and
+        # still admit accel artifacts; a fixed floor is safer.
+        HEAD_DISCARD_MS = 600.0
 
         clean = [(t, z, m) for (t, z, m) in samples
                  if z == z and m == m and math.isfinite(z) and math.isfinite(m)]
