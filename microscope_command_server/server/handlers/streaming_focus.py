@@ -1211,7 +1211,35 @@ def _run_streaming_scan(
     # work (normalized_variance on a 1024x772x3 image is ~5-15ms,
     # enough to skew a 20-50ms poll cadence if done inline).
     raw_captures: List[Tuple[float, np.ndarray]] = []
-    last_remaining = -1
+    # Content fingerprint of the last captured frame. We compare
+    # the first N bytes of get_last_image() to detect new frames
+    # instead of using core.get_remaining_image_count().
+    #
+    # PRIOR DESIGN (failed PPM 40x 2026-05-04): the loop used
+    # `remaining > last_remaining` to detect new frames. That
+    # works while the MM circular buffer is filling monotonically,
+    # but Micro-Manager's default behaviour when the buffer
+    # saturates is to OVERWRITE the oldest frame in place --
+    # `remaining` plateaus at the buffer capacity instead of
+    # continuing to grow. Once that happens, the new-frame check
+    # never fires again and the loop captures zero frames for the
+    # rest of the scan.
+    #
+    # Observed: a 4.2 s PPM scan at 38 fps captured the first 39
+    # frames over t=0-2070ms (filling the buffer), then ZERO
+    # frames for the remaining 2.3 s (t=2070-4319ms). The stage
+    # was visibly passing through true focus (Z~90) during that
+    # silent window. Gaussian fit on the first-half-only data
+    # picked Z=86.4 and committed a -1.0 um shift AWAY from
+    # focus.
+    #
+    # Fingerprint approach: peek at get_last_image() every poll;
+    # keep the frame only when its leading bytes differ from the
+    # last one we kept. Pollrate (2 ms) is much faster than frame
+    # period (~26 ms at 38 fps), so dedupe is reliable. CPU cost
+    # of slicing & comparing 32 bytes is negligible.
+    last_fingerprint: Optional[bytes] = None
+    FINGERPRINT_BYTES = 32
 
     t0 = time.perf_counter()
     try:
@@ -1227,25 +1255,25 @@ def _run_streaming_scan(
         if t_now_ms > scan_exit_at_ms:
             break
 
-        # Detect new frame via the remaining-image-count delta.
-        # Cheaper than a full pixel fingerprint; reliable while
-        # the buffer is filling monotonically (which it is for
-        # the duration of a single scan, since nothing is
-        # popping).
         try:
-            remaining = core.get_remaining_image_count()
+            pixels = core.get_last_image()
         except Exception:
-            remaining = last_remaining
+            pixels = None
 
-        if remaining > last_remaining:
+        if pixels is not None:
             try:
-                pixels = core.get_last_image()
-            except Exception:
-                pixels = None
-            if pixels is not None:
+                # Cheap fingerprint: leading bytes of the raw
+                # pixel buffer. For a 1024x772x3 frame this is
+                # 32 bytes out of ~2.4 MB, sufficient to
+                # distinguish frames given camera read noise.
                 arr = np.asarray(pixels)
+                fp = bytes(arr.reshape(-1).view(np.uint8)[:FINGERPRINT_BYTES])
+            except Exception:
+                fp = None
+                arr = None
+            if fp is not None and fp != last_fingerprint:
                 raw_captures.append((t_now_ms, arr))
-            last_remaining = remaining
+                last_fingerprint = fp
 
         time.sleep(SCAN_POLL_SLEEP_S)
 
