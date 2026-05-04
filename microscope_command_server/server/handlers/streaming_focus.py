@@ -1409,7 +1409,20 @@ def _attempt_one_scan(
             time.sleep(0.15)
 
         try:
-            hard_deadline_s = max(1.0, range_um * HARD_DEADLINE_SEC_PER_UM + 2.0)
+            # Hard deadline must comfortably exceed motion_duration_ms or
+            # the loop exits before the stage reaches z_end. The original
+            # formula (range_um * 0.15 + 2.0s) was tuned for a fast
+            # stage (~11.5 um/s SLOW_SPEED) and trips early at PPM speeds
+            # (1.42 um/s, motion_duration ~4.2s for a 6 um scan, deadline
+            # 2.9s -> scan truncated to ~70% of the planned range).
+            # Floor the deadline at motion_duration_ms + 2s plus the old
+            # multiplier as a fallback.
+            motion_duration_s = abs(z_end - z_start) / max(velocity_um_s, 0.01)
+            hard_deadline_s = max(
+                1.0,
+                range_um * HARD_DEADLINE_SEC_PER_UM + 2.0,
+                motion_duration_s + 2.0,
+            )
             samples = _run_streaming_scan(core, focus_device, speed_prop,
                                         z_start, z_end, hard_deadline_s,
                                         velocity_um_s=velocity_um_s)
@@ -1427,29 +1440,30 @@ def _attempt_one_scan(
         _try_set(core, focus_device, speed_prop, normal_value)
 
         # --- Sample filtering and fit ---
-        # Primary truncation: time-based. wall_ms is authoritative
-        # (interpolated Z = wall_ms * velocity_um_s) and motion ends
-        # at exactly motion_end_ms. Anything past that is post-motion
-        # tail at z_end -- discard. A small grace window
+        # Truncation: time-based ONLY. wall_ms is authoritative;
+        # interpolated Z = z_start + wall_ms * velocity_um_s is a
+        # linear function of wall_ms by construction. Anything past
+        # motion_end_ms is post-motion tail (stage at z_end with
+        # static frames) -- discard. A small grace window
         # (POST_MOTION_GRACE_MS) keeps samples whose timestamps land
         # just after motion_end due to poll jitter.
         #
-        # Secondary safety net: motor-stall detection over a rolling
-        # window of STALL_WINDOW samples. The stage has stalled if the
-        # window covers >STALL_MIN_DT_MS of wall time but <STALL_Z_UM
-        # of Z motion. The PREVIOUS implementation compared each
-        # sample's Z against the LAST APPENDED sample's Z and broke
-        # after STALL_RUN matches under threshold -- this functioned
-        # as a Z-downsampler at fast scans (e.g. OWS3 6 um/s) but
-        # silently false-tripped at slow PPM scans (1.42 um/s, frame
-        # spacing only ~0.04 um), keeping just the first ~5 frames
-        # near z_start every time and producing union-fit artefacts
-        # mid-window. The window-span check is velocity-agnostic
-        # because it requires real wall-time to elapse.
+        # PRIOR HISTORY: a "Z-stagnation safety net" lived here to
+        # detect motor stalls. It was deleted on 2026-05-04 after a
+        # PPM session showed it false-tripping on every scan: because
+        # z_interp is derived from wall_ms via a constant velocity,
+        # the ratio z_span_w / t_span_w is identically velocity_um_s
+        # for any window. The check (z_span < STALL_Z_UM AND t_span >
+        # STALL_MIN_DT_MS) reduced to "5 samples span 50..352 ms" --
+        # which fires on normal frame timing, not on stalls. Real
+        # stall detection would require querying actual stage Z
+        # during the scan, not interpolating from time. With the
+        # interpolated-Z model, time-based cutoff already handles the
+        # only failure mode worth catching: stage finishes early and
+        # subsequent frames are at z_end. The post-motion grace
+        # window does the right thing in that case (samples after
+        # motion_end_ms get dropped, leaving the in-motion samples).
         POST_MOTION_GRACE_MS = 100.0
-        STALL_Z_UM = 0.5
-        STALL_WINDOW = 5
-        STALL_MIN_DT_MS = 50.0
         motion_end_ms = (
             abs(z_end - z_start) / max(velocity_um_s, 0.01) * 1000.0
         )
@@ -1457,49 +1471,7 @@ def _attempt_one_scan(
 
         clean = [(t, z, m) for (t, z, m) in samples
                  if z == z and m == m and math.isfinite(z) and math.isfinite(m)]
-        in_motion = []
-        stalled = False
-        # Track whether we've seen real motion yet. The stall check is
-        # gated on this so the stage's acceleration ramp -- where Z
-        # changes by less than STALL_Z_UM across STALL_WINDOW samples
-        # because the motor hasn't reached configured velocity -- does
-        # NOT register as a stall. Without this gate, the very first 5
-        # samples of every PPM scan look identical to a stall and the
-        # filter discards every sample (PPM regression 2026-05-04:
-        # 0/31 samples kept on a 6 um scan that completed normally).
-        ever_moved = False
-        z_first = None
-        z_max_seen = -float("inf")
-        z_min_seen = float("inf")
-        for (t, z, m) in clean:
-            if t > time_cutoff_ms:
-                break  # post-motion tail
-            in_motion.append((t, z, m))
-            if z_first is None:
-                z_first = z
-            z_max_seen = max(z_max_seen, z)
-            z_min_seen = min(z_min_seen, z)
-            if not ever_moved and (z_max_seen - z_min_seen) >= STALL_Z_UM:
-                ever_moved = True
-            if ever_moved and len(in_motion) >= STALL_WINDOW:
-                window = in_motion[-STALL_WINDOW:]
-                z_span_w = max(p[1] for p in window) - min(p[1] for p in window)
-                t_span_w = window[-1][0] - window[0][0]
-                if t_span_w > STALL_MIN_DT_MS and z_span_w < STALL_Z_UM:
-                    # Real stall: stage moved earlier in the scan but
-                    # has stopped moving now. Drop the stalled window
-                    # (those samples carry stale Z) and stop reading
-                    # further frames.
-                    in_motion = in_motion[:-STALL_WINDOW]
-                    stalled = True
-                    break
-        if stalled:
-            logger.warning(
-                "STREAM_AF:%sstall detected (window of %d samples spanned "
-                "%.1fms but only %.3f um of Z motion, threshold %.3f um); "
-                "discarding stalled window",
-                tag_prefix, STALL_WINDOW, t_span_w, z_span_w, STALL_Z_UM,
-            )
+        in_motion = [(t, z, m) for (t, z, m) in clean if t <= time_cutoff_ms]
         logger.info(
             "STREAM_AF:%sin_motion filter kept %d/%d samples "
             "(time_cutoff=%.0fms motion_end=%.0fms)",
