@@ -95,8 +95,22 @@ def acquire_z_stack(
         Dict with results: n_planes, n_timepoints, z_positions,
         output_folder, files, projected_file, elapsed_seconds.
     """
-    output_path = Path(output_folder)
-    output_path.mkdir(parents=True, exist_ok=True)
+    output_path = Path(output_folder).resolve()
+    try:
+        output_path.mkdir(parents=True, exist_ok=True)
+    except OSError as e:
+        # Hard-fail on a bad output path BEFORE acquiring 30+ images we
+        # would then have nowhere to write. The handler-level try/except
+        # surfaces this as FAILED:<reason> back to the client.
+        raise OSError(
+            f"Cannot create output folder {output_path!s}: {e}. Check that "
+            f"the parent path exists and the drive is mounted."
+        ) from e
+    if not output_path.is_dir():
+        raise OSError(
+            f"Output folder did not materialize after mkdir: {output_path!s}"
+        )
+    logger.info(f"Output folder ready: {output_path}")
 
     # Calculate Z positions
     if z_step <= 0:
@@ -342,10 +356,26 @@ def acquire_z_stack(
                         "angle": float(angle),
                     },
                 )
+        # Defensive check: the writer's `with` block exited cleanly above,
+        # but verify the file actually landed on disk. A silent
+        # not-on-disk would previously be reported as success in the log
+        # while the user found nothing in the output folder.
+        if not out_file.is_file():
+            raise IOError(
+                f"OME-TIFF writer reported success but file not on disk: "
+                f"{out_file!s}. Check filesystem permissions, antivirus "
+                f"quarantine, or remote-mount sync."
+            )
+        file_bytes = out_file.stat().st_size
+        if file_bytes <= 0:
+            raise IOError(
+                f"OME-TIFF written but zero-bytes: {out_file!s}"
+            )
         saved_files.append(str(out_file))
         logger.info(
             f"Wrote OME-TIFF: {out_file} "
-            f"(SizeT={actual_n_timepoints}, SizeZ={n_planes})"
+            f"(SizeT={actual_n_timepoints}, SizeZ={n_planes}, "
+            f"{file_bytes / 1024 / 1024:.1f} MB)"
         )
 
     # Apply projection if requested -- one extra 2D file per angle alongside
@@ -477,8 +507,18 @@ def acquire_time_lapse(
     Returns:
         Dict with results: n_timepoints, output_folder, files, elapsed
     """
-    output_path = Path(output_folder)
-    output_path.mkdir(parents=True, exist_ok=True)
+    output_path = Path(output_folder).resolve()
+    try:
+        output_path.mkdir(parents=True, exist_ok=True)
+    except OSError as e:
+        raise OSError(
+            f"Cannot create output folder {output_path!s}: {e}. Check that "
+            f"the parent path exists and the drive is mounted."
+        ) from e
+    if not output_path.is_dir():
+        raise OSError(
+            f"Output folder did not materialize after mkdir: {output_path!s}"
+        )
 
     if n_timepoints <= 0:
         raise ValueError(f"n_timepoints must be positive, got {n_timepoints}")
@@ -630,8 +670,20 @@ def acquire_time_lapse(
                         "angle": float(angle),
                     },
                 )
+        if not out_file.is_file():
+            raise IOError(
+                f"OME-TIFF writer reported success but file not on disk: "
+                f"{out_file!s}. Check filesystem permissions, antivirus "
+                f"quarantine, or remote-mount sync."
+            )
+        file_bytes = out_file.stat().st_size
+        if file_bytes <= 0:
+            raise IOError(f"OME-TIFF written but zero-bytes: {out_file!s}")
         saved_files.append(str(out_file))
-        logger.info(f"Wrote time-lapse OME-TIFF: {out_file} (SizeT={len(frames)})")
+        logger.info(
+            f"Wrote time-lapse OME-TIFF: {out_file} (SizeT={len(frames)}, "
+            f"{file_bytes / 1024 / 1024:.1f} MB)"
+        )
 
     elapsed = time.time() - start_time
     logger.info(f"=== TIME-LAPSE COMPLETE: {actual_tp} timepoints, "
@@ -726,40 +778,37 @@ def _apply_bg_correction(image, bg_image, scaling, method: str, angle: float):
 
 
 def _resolve_pixel_size_um(config_manager, modality: str, objective, detector) -> float:
-    """Best-effort pixel size lookup for OME-TIFF metadata.
+    """Resolve pixel size for OME-TIFF metadata via ConfigManager.get_pixel_size.
 
-    Tries the config manager's pixel-size resolver when available. Falls back
-    to 1.0 um with a warning so the writer always has a numeric value (the
-    OME-XML requires one). Downstream tools read PhysicalSizeX/Y from the
-    emitted file and can correct scale if the true value is known elsewhere.
+    Reads from `acq_profiles.defaults[*].settings.pixel_size_xy_um[detector]`.
+    Falls back to 1.0 um with a warning so the writer always has a numeric
+    value (OME-XML requires one).
     """
     if config_manager is None:
         logger.warning("No config_manager available; using placeholder pixel_size_um=1.0")
         return 1.0
 
-    for attr in ("get_pixel_size_um", "get_pixel_size", "pixel_size_um"):
-        candidate = getattr(config_manager, attr, None)
-        if candidate is None:
-            continue
+    if not objective or not detector:
+        logger.warning(
+            "Missing objective (%r) or detector (%r); using placeholder pixel_size_um=1.0",
+            objective, detector,
+        )
+        return 1.0
+
+    fn = getattr(config_manager, "get_pixel_size", None)
+    if callable(fn):
         try:
-            value = candidate(modality, objective, detector) if callable(candidate) else candidate
+            value = fn(objective, detector)
             if value is not None:
                 return float(value)
-        except TypeError:
-            try:
-                value = candidate()
-                if value is not None:
-                    return float(value)
-            except Exception:
-                pass
         except Exception as e:
-            logger.debug(f"pixel size resolver {attr} failed: {e}")
+            logger.debug(f"get_pixel_size({objective!r}, {detector!r}) failed: {e}")
 
     logger.warning(
-        "Could not resolve pixel_size_um from config_manager; "
-        "using placeholder 1.0. Set modalities.%s.pixel_size_um in config or "
-        "extend ConfigManager with get_pixel_size_um().",
-        modality,
+        "Could not resolve pixel_size_um for objective=%s detector=%s; "
+        "using placeholder 1.0. Add the pair to "
+        "acq_profiles.defaults[*].settings.pixel_size_xy_um in the active config.",
+        objective, detector,
     )
     return 1.0
 
