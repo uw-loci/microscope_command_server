@@ -871,32 +871,78 @@ def _try_get(core, device: str, prop: str) -> Optional[str]:
         return None
 
 
-def _wait_via_busy(core, device: str, timeout_s: float = 10.0) -> None:
-    """Tight busy-poll wait for the focus device. Same correctness
-    safeguards as microscope_control.hardware.stage._wait_z_via_busy:
-    requires 2 consecutive not-busy reads before returning; falls
-    back to core.wait_for_device on exception or timeout.
+def _wait_via_busy(core, device: str, timeout_s: float = 10.0,
+                   target_z: float | None = None,
+                   tolerance_um: float = 0.5) -> None:
+    """Tight busy-poll wait for the focus device. Mirrors
+    microscope_control.hardware.stage._wait_z_via_busy:
+      - 5 consecutive not-busy reads required (was 2; bumped 2026-05-05
+        to be more resistant to firmware reporting transient idle states
+        before the trajectory has settled).
+      - Optional ``target_z`` arrival verification with WARNING log when
+        the stage reports not-busy but is far from the commanded Z.
+        Catches the "stage control silently broken" failure mode the
+        user flagged on 2026-05-05 with sweep + streaming AF.
+      - Falls back to core.wait_for_device on exception, timeout, or
+        arrival-check failure.
     """
     try:
         deadline = time.perf_counter() + timeout_s
         clear = 0
+        clear_required = 5
         while time.perf_counter() < deadline:
             try:
                 if not core.device_busy(device):
                     clear += 1
-                    if clear >= 2:
-                        return
+                    if clear >= clear_required:
+                        break
                 else:
                     clear = 0
             except Exception:
                 break
             time.sleep(0.003)
+        else:
+            try:
+                core.wait_for_device(device)
+            except Exception:
+                pass
     except Exception:
-        pass
-    try:
-        core.wait_for_device(device)
-    except Exception:
-        pass
+        try:
+            core.wait_for_device(device)
+        except Exception:
+            pass
+
+    # Arrival verification when target_z is known.
+    if target_z is not None:
+        try:
+            actual_z = core.get_position()
+            err = abs(actual_z - target_z)
+            if err > tolerance_um:
+                logger.warning(
+                    "streaming wait_via_busy arrival FAILED: target=%.3f um, "
+                    "actual=%.3f um, err=%.3f um (tol=%.3f um) on '%s'. "
+                    "Stage reported not-busy but did not arrive. Falling "
+                    "back to wait_for_device.",
+                    target_z, actual_z, err, tolerance_um, device,
+                )
+                try:
+                    core.wait_for_device(device)
+                except Exception as e:
+                    logger.warning("wait_for_device fallback failed: %s", e)
+                try:
+                    actual_z2 = core.get_position()
+                    err2 = abs(actual_z2 - target_z)
+                    if err2 > tolerance_um:
+                        logger.error(
+                            "streaming wait_via_busy STILL off-target: "
+                            "target=%.3f, actual=%.3f, err=%.3f um. "
+                            "Stage controller may be in a bad state.",
+                            target_z, actual_z2, err2,
+                        )
+                except Exception:
+                    pass
+        except Exception:
+            pass
 
 
 # ----- Parabolic peak fit -----
@@ -1433,7 +1479,7 @@ def _attempt_one_scan(
         # Positioning seed at full speed.
         _try_set(core, focus_device, speed_prop, normal_value)
         core.set_position(focus_device, z_start)
-        _wait_via_busy(core, focus_device)
+        _wait_via_busy(core, focus_device, target_z=z_start)
 
         # Drop to slow speed for the scan motion only.
         if not _try_set(core, focus_device, speed_prop, slow_value):
@@ -1800,7 +1846,7 @@ def _brent_fallback_scan(
     def neg_metric(z: float) -> float:
         try:
             core.set_position(focus_device, float(z))
-            _wait_via_busy(core, focus_device)
+            _wait_via_busy(core, focus_device, target_z=float(z))
             core.snap_image()
             img = _snap_image_as_numpy(core)
             z_actual = float(core.get_position(focus_device))
@@ -2477,7 +2523,7 @@ def handle_streaming_focus(conn, client, hardware, settings, **kwargs):
             # Commit the peak Z.
             best_z = final_result.best_z
             core.set_position(focus_device, best_z)
-            _wait_via_busy(core, focus_device)
+            _wait_via_busy(core, focus_device, target_z=best_z)
             try:
                 final_z = float(core.get_position(focus_device))
             except Exception:
@@ -2512,7 +2558,7 @@ def handle_streaming_focus(conn, client, hardware, settings, **kwargs):
                     best_slope_z = global_best[0]
                     try:
                         core.set_position(focus_device, best_slope_z)
-                        _wait_via_busy(core, focus_device)
+                        _wait_via_busy(core, focus_device, target_z=best_slope_z)
                         logger.info(
                             "STREAM_AF:no peak found but moving to best Z=%.3f "
                             "(slope argmax across %d samples, shift %+.3f)",
@@ -2524,7 +2570,7 @@ def handle_streaming_focus(conn, client, hardware, settings, **kwargs):
             if best_slope_z is None:
                 try:
                     core.set_position(focus_device, initial_z)
-                    _wait_via_busy(core, focus_device)
+                    _wait_via_busy(core, focus_device, target_z=initial_z)
                 except Exception:
                     pass
 

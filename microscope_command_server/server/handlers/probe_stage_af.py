@@ -129,18 +129,18 @@ def _measure_velocity_um_s(
         # Move +1 um, time it.
         t0 = time.monotonic()
         core.set_position(focus_device, z0 + VERIFY_MOVE_UM)
-        _wait_via_busy(core, focus_device)
+        _wait_via_busy(core, focus_device, target_z=z0 + VERIFY_MOVE_UM)
         forward_s = time.monotonic() - t0
         # Move back -1 um, time it.
         t1 = time.monotonic()
         core.set_position(focus_device, z0)
-        _wait_via_busy(core, focus_device)
+        _wait_via_busy(core, focus_device, target_z=z0)
         back_s = time.monotonic() - t1
     except Exception as e:
         # Best effort to put it back.
         try:
             core.set_position(focus_device, z0)
-            _wait_via_busy(core, focus_device)
+            _wait_via_busy(core, focus_device, target_z=z0)
         except Exception:
             pass
         return None, f"round-trip move failed: {e}"
