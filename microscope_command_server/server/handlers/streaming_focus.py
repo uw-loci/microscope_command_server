@@ -1496,6 +1496,42 @@ def _attempt_one_scan(
                 except Exception:
                     pass
 
+        # Diagnostic: read actual stage position immediately after the
+        # scan loop returns. Compare to expected z_end. If the actual Z
+        # is far from z_end, the stage either never accepted the slow
+        # speed (so it ran much faster, finished early, and the "scan"
+        # was static frames at z_end) OR the slow speed value is mis-
+        # calibrated (so the scan didn't traverse the planned range).
+        # Either case explains a flat-metric refusal even when the scan
+        # window is well within DOF.
+        try:
+            actual_z_after_scan = float(core.get_position(focus_device))
+            expected_motion_um = abs(z_end - z_start)
+            actual_motion_um = abs(actual_z_after_scan - z_start)
+            motion_ratio = actual_motion_um / max(expected_motion_um, 1e-3)
+            logger.info(
+                "STREAM_AF:%spost-scan stage Z=%.3f (expected z_end=%.3f); "
+                "achieved %.2f um of planned %.2f um = %.0f%% (motion_duration_s=%.2f, "
+                "velocity_um_s=%.2f, hard_deadline_s=%.2f)",
+                tag_prefix, actual_z_after_scan, z_end,
+                actual_motion_um, expected_motion_um, motion_ratio * 100.0,
+                motion_duration_s, velocity_um_s, hard_deadline_s,
+            )
+            if motion_ratio < 0.5 or motion_ratio > 1.5:
+                logger.warning(
+                    "STREAM_AF:%sstage motion mismatch: achieved %.0f%% of planned "
+                    "range. Slow-speed value '%s' on %s.%s may be misconfigured "
+                    "for this rig. Verify stage.streaming_af.slow_speed_value and "
+                    "stage.streaming_af.slow_speed_um_per_s in YAML.",
+                    tag_prefix, motion_ratio * 100.0,
+                    slow_value, focus_device, speed_prop,
+                )
+        except Exception as e:
+            logger.debug(
+                "STREAM_AF:%scould not read post-scan stage Z: %s",
+                tag_prefix, e,
+            )
+
         _try_set(core, focus_device, speed_prop, normal_value)
 
         # --- Sample filtering and fit ---
@@ -1597,6 +1633,17 @@ def _attempt_one_scan(
                     tag_prefix, metric_range,
                     metric_range_frac * 100.0, metric_peak,
                 )
+                # Dump per-sample trace on the refusal path so the
+                # operator can see whether the metric is genuinely flat
+                # across the swept Z range, or whether all samples
+                # collapsed to the same Z (stage not actually moving).
+                # Without this, metric_flat looks identical from the log
+                # whether the stage is stuck or the sample is featureless.
+                for i, (t, z, m) in enumerate(in_motion):
+                    logger.info(
+                        "STREAM_AF:%sFLAT sample %3d  t=%7.1f ms  z=%.3f  metric=%.4f",
+                        tag_prefix, i, t, z, m,
+                    )
                 return _ScanAttemptResult(
                     "metric_flat", None, n_motion_samples, z_span,
                     f"metric range {metric_range_frac:.2%} of peak is "
