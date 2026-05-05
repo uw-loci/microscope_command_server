@@ -26,6 +26,11 @@ def match_sift(
     min_pixel_size_um: float = 1.0,
     contrast_threshold: float = 0.04,
     nfeatures: int = 0,
+    mono_normalization: str = "PERCENTILE",
+    percentile_low: float = 2.0,
+    percentile_high: float = 98.0,
+    clahe_enabled: bool = True,
+    clahe_clip_limit: float = 2.0,
 ) -> Optional[Tuple[float, float, int, float]]:
     """
     Match a microscope snapshot to a WSI region using SIFT features.
@@ -46,15 +51,52 @@ def match_sift(
             sensor noise, and other high-frequency artifacts that create
             spurious keypoints. Default 1.0 um/px is sufficient for
             tissue-level structural features.
+        mono_normalization: How to convert >8-bit grayscale input to 8-bit.
+            "PERCENTILE" (default) stretches [percentile_low, percentile_high]
+            to [0, 255] -- best when the camera doesn't use the full bit range
+            (typical 12-14 bit cameras). "MIN_MAX" stretches the full data
+            range. "BIT_SHIFT" preserves the legacy /256 behaviour for
+            cameras that already produce data spanning the full 16-bit range.
+        percentile_low / percentile_high: Percentile clip points used when
+            mono_normalization == "PERCENTILE". Defaults 2/98 are robust
+            against a few saturated pixels.
+        clahe_enabled: Apply Contrast-Limited Adaptive Histogram
+            Equalisation to both grayscale images before SIFT. This is
+            the standard cross-modality robustness trick (e.g. matching
+            8-bit H&E vs. monochrome brightfield) and dramatically
+            improves keypoint compatibility. Default on.
+        clahe_clip_limit: CLAHE clipLimit. Higher = more aggressive
+            equalisation. 2.0 is a safe default; raise to 4.0 if matches
+            are still scarce.
 
     Returns:
         Tuple of (offset_x_um, offset_y_um, n_inliers, confidence) or None if matching failed.
         Offset is the correction to apply to the stage position:
         stage should move by (offset_x, offset_y) to center on the matching region.
     """
-    # Convert to grayscale
-    gray_micro = _to_gray(microscope_image)
-    gray_wsi = _to_gray(wsi_region)
+    # Convert to 8-bit grayscale, normalising as configured.
+    gray_micro = _to_gray(
+        microscope_image,
+        mono_normalization=mono_normalization,
+        percentile_low=percentile_low,
+        percentile_high=percentile_high,
+    )
+    gray_wsi = _to_gray(
+        wsi_region,
+        mono_normalization=mono_normalization,
+        percentile_low=percentile_low,
+        percentile_high=percentile_high,
+    )
+
+    # Cross-modality contrast normalisation. Applied AFTER the per-image
+    # to-8-bit conversion so we equalise on the same scale for both.
+    if clahe_enabled:
+        clahe = cv2.createCLAHE(clipLimit=float(clahe_clip_limit), tileGridSize=(8, 8))
+        gray_micro = clahe.apply(gray_micro)
+        gray_wsi = clahe.apply(gray_wsi)
+        logger.info(
+            f"Applied CLAHE (clipLimit={clahe_clip_limit}) to both images"
+        )
 
     # Apply flips to WSI region to match microscope orientation
     if flip_x and flip_y:
@@ -188,8 +230,27 @@ def match_sift(
     return (offset_um_x, offset_um_y, n_inliers, confidence)
 
 
-def _to_gray(image: np.ndarray) -> np.ndarray:
-    """Convert image to 8-bit grayscale."""
+def _to_gray(
+    image: np.ndarray,
+    mono_normalization: str = "PERCENTILE",
+    percentile_low: float = 2.0,
+    percentile_high: float = 98.0,
+) -> np.ndarray:
+    """Convert image to 8-bit grayscale with configurable normalization.
+
+    For multi-channel input (typical 8-bit RGB H&E), this collapses to
+    luminance via OpenCV. For single-channel input above 8-bit (typical
+    12-14 bit camera packed in 16-bit container), this rescales to 8-bit
+    using the requested mode:
+
+    - PERCENTILE (default): clip to [percentile_low, percentile_high] of
+      the actual data, then linearly stretch to [0, 255]. Robust to a
+      few saturated pixels and to cameras that don't use the full bit
+      range (the common case). This is the right default for SIFT.
+    - MIN_MAX: linear stretch from min to max of the image.
+    - BIT_SHIFT: legacy /256 behaviour. Use only when the camera is
+      known to span the full 16-bit range.
+    """
     if image.ndim == 3:
         if image.shape[2] == 4:
             gray = cv2.cvtColor(image, cv2.COLOR_BGRA2GRAY)
@@ -200,10 +261,44 @@ def _to_gray(image: np.ndarray) -> np.ndarray:
     else:
         gray = image
 
-    # Convert to 8-bit if needed
-    if gray.dtype == np.uint16:
-        gray = (gray / 256).astype(np.uint8)
-    elif gray.dtype != np.uint8:
-        gray = gray.astype(np.uint8)
+    if gray.dtype == np.uint8:
+        return gray
 
-    return gray
+    # Need to compress to 8-bit. The naive /256 collapses dynamic range
+    # whenever the source doesn't use the full 16-bit range (very common
+    # on cameras that output 12 or 14 effective bits packed into uint16).
+    mode = (mono_normalization or "PERCENTILE").upper()
+
+    if mode == "BIT_SHIFT":
+        if gray.dtype == np.uint16:
+            out = (gray / 256).astype(np.uint8)
+        else:
+            out = gray.astype(np.uint8)
+        logger.info(
+            f"_to_gray: BIT_SHIFT applied (input dtype={gray.dtype}, "
+            f"min={int(gray.min())}, max={int(gray.max())})"
+        )
+        return out
+
+    if mode == "MIN_MAX":
+        lo = float(gray.min())
+        hi = float(gray.max())
+    else:  # PERCENTILE (default)
+        lo = float(np.percentile(gray, max(0.0, min(percentile_low, 100.0))))
+        hi = float(np.percentile(gray, max(0.0, min(percentile_high, 100.0))))
+
+    if hi <= lo:
+        # Degenerate (flat) image -- avoid divide-by-zero, return zeros.
+        logger.warning(
+            f"_to_gray: degenerate range lo={lo}, hi={hi} (input dtype={gray.dtype}); "
+            f"returning zero image"
+        )
+        return np.zeros(gray.shape, dtype=np.uint8)
+
+    scaled = (gray.astype(np.float32) - lo) * (255.0 / (hi - lo))
+    out = np.clip(scaled, 0, 255).astype(np.uint8)
+    logger.info(
+        f"_to_gray: mode={mode}, input dtype={gray.dtype} range=[{int(gray.min())},{int(gray.max())}], "
+        f"clip=[{lo:.0f},{hi:.0f}], output 8-bit range=[{int(out.min())},{int(out.max())}]"
+    )
+    return out

@@ -443,6 +443,16 @@ def handle_siftal(conn, client, hardware, settings, **kwargs):
             params["contrast_threshold"] = float(parts[i + 1]); i += 2
         elif parts[i] == "--nfeatures" and i + 1 < len(parts):
             params["nfeatures"] = int(parts[i + 1]); i += 2
+        elif parts[i] == "--mono-norm" and i + 1 < len(parts):
+            params["mono_normalization"] = parts[i + 1]; i += 2
+        elif parts[i] == "--pct-low" and i + 1 < len(parts):
+            params["percentile_low"] = float(parts[i + 1]); i += 2
+        elif parts[i] == "--pct-high" and i + 1 < len(parts):
+            params["percentile_high"] = float(parts[i + 1]); i += 2
+        elif parts[i] == "--clahe" and i + 1 < len(parts):
+            params["clahe_enabled"] = parts[i + 1].lower() in ("1", "true", "yes"); i += 2
+        elif parts[i] == "--clahe-clip" and i + 1 < len(parts):
+            params["clahe_clip_limit"] = float(parts[i + 1]); i += 2
         elif parts[i] == "--flip-x":
             params["flip_x"] = True; i += 1
         elif parts[i] == "--flip-y":
@@ -486,12 +496,20 @@ def handle_siftal(conn, client, hardware, settings, **kwargs):
         min_match_count = params.get("min_match_count", 10)
         contrast_threshold = params.get("contrast_threshold", 0.04)
         nfeatures = params.get("nfeatures", 0)
+        mono_normalization = params.get("mono_normalization", "PERCENTILE")
+        percentile_low = params.get("percentile_low", 2.0)
+        percentile_high = params.get("percentile_high", 98.0)
+        clahe_enabled = params.get("clahe_enabled", True)
+        clahe_clip_limit = params.get("clahe_clip_limit", 2.0)
 
         logger.info(
             "SIFT: micro_px=%s, wsi_px=%s, min_px=%s, flip=(%s,%s), "
-            "ratio=%s, min_matches=%s, contrast=%s, nfeatures=%s",
+            "ratio=%s, min_matches=%s, contrast=%s, nfeatures=%s, "
+            "mono_norm=%s, pct=(%s,%s), clahe=%s clip=%s",
             micro_px, wsi_px, min_px, flip_x, flip_y,
             ratio_threshold, min_match_count, contrast_threshold, nfeatures,
+            mono_normalization, percentile_low, percentile_high,
+            clahe_enabled, clahe_clip_limit,
         )
 
         result = match_sift(
@@ -506,6 +524,11 @@ def handle_siftal(conn, client, hardware, settings, **kwargs):
             min_pixel_size_um=min_px,
             contrast_threshold=contrast_threshold,
             nfeatures=nfeatures,
+            mono_normalization=mono_normalization,
+            percentile_low=percentile_low,
+            percentile_high=percentile_high,
+            clahe_enabled=clahe_enabled,
+            clahe_clip_limit=clahe_clip_limit,
         )
 
         if result is None:
