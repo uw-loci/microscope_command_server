@@ -1218,10 +1218,10 @@ def _run_streaming_scan(
     # enough to skew a 20-50ms poll cadence if done inline).
     raw_captures: List[Tuple[float, np.ndarray]] = []
     # Content fingerprint of the last captured frame. We compare
-    # the first N bytes of get_last_image() to detect new frames
-    # instead of using core.get_remaining_image_count().
+    # bytes from a CENTRAL slice of get_last_image() to detect new
+    # frames instead of using core.get_remaining_image_count().
     #
-    # PRIOR DESIGN (failed PPM 40x 2026-05-04): the loop used
+    # PRIOR DESIGN #1 (failed PPM 40x 2026-05-04): the loop used
     # `remaining > last_remaining` to detect new frames. That
     # works while the MM circular buffer is filling monotonically,
     # but Micro-Manager's default behaviour when the buffer
@@ -1231,21 +1231,28 @@ def _run_streaming_scan(
     # never fires again and the loop captures zero frames for the
     # rest of the scan.
     #
-    # Observed: a 4.2 s PPM scan at 38 fps captured the first 39
-    # frames over t=0-2070ms (filling the buffer), then ZERO
-    # frames for the remaining 2.3 s (t=2070-4319ms). The stage
-    # was visibly passing through true focus (Z~90) during that
-    # silent window. Gaussian fit on the first-half-only data
-    # picked Z=86.4 and committed a -1.0 um shift AWAY from
-    # focus.
+    # PRIOR DESIGN #2 (mitigated, 2026-05-04): fingerprint sampled
+    # the FIRST 32 bytes of the flat pixel buffer. For a row-major
+    # H*W*C image that is the top-left corner -- exactly where the
+    # JAI prism's optical vignette darkens pixels to near-zero. With
+    # near-uniform dark bytes, fingerprints can collide across
+    # different frames whose centres differ wildly. The current
+    # design samples from FOUR disjoint regions spread across the
+    # buffer (20%/40%/60%/80%) so at least one block lands inside
+    # the in-tissue, well-exposed centre.
     #
-    # Fingerprint approach: peek at get_last_image() every poll;
-    # keep the frame only when its leading bytes differ from the
-    # last one we kept. Pollrate (2 ms) is much faster than frame
-    # period (~26 ms at 38 fps), so dedupe is reliable. CPU cost
-    # of slicing & comparing 32 bytes is negligible.
+    # Observed (PRIOR #1): a 4.2 s PPM scan at 38 fps captured the
+    # first 39 frames over t=0-2070ms (filling the buffer), then
+    # ZERO frames for the remaining 2.3 s (t=2070-4319ms). Gaussian
+    # fit on the first-half-only data picked Z=86.4 and committed a
+    # -1.0 um shift AWAY from focus.
+    #
+    # Pollrate (2 ms) is much faster than frame period (~26 ms at
+    # 38 fps), so dedupe is reliable. CPU cost of slicing & comparing
+    # 128 bytes is negligible.
     last_fingerprint: Optional[bytes] = None
-    FINGERPRINT_BYTES = 32
+    FINGERPRINT_BYTES = 128
+    FINGERPRINT_SAMPLE_FRACTIONS = (0.2, 0.4, 0.6, 0.8)
 
     t0 = time.perf_counter()
     try:
@@ -1268,12 +1275,30 @@ def _run_streaming_scan(
 
         if pixels is not None:
             try:
-                # Cheap fingerprint: leading bytes of the raw
-                # pixel buffer. For a 1024x772x3 frame this is
-                # 32 bytes out of ~2.4 MB, sufficient to
-                # distinguish frames given camera read noise.
+                # Cheap fingerprint: 4 disjoint 32-byte blocks from
+                # 20%/40%/60%/80% through the flat buffer. At least
+                # one block lands inside the in-tissue centre, even
+                # when corners and edges sit in vignette darkness
+                # whose bytes don't change frame-to-frame. ~128
+                # bytes out of ~2.4 MB; CPU cost negligible.
                 arr = np.asarray(pixels)
-                fp = bytes(arr.reshape(-1).view(np.uint8)[:FINGERPRINT_BYTES])
+                flat = arr.reshape(-1).view(np.uint8)
+                n_bytes = flat.size
+                block_size = FINGERPRINT_BYTES // len(FINGERPRINT_SAMPLE_FRACTIONS)
+                if n_bytes >= FINGERPRINT_BYTES:
+                    parts = []
+                    for frac in FINGERPRINT_SAMPLE_FRACTIONS:
+                        off = int(n_bytes * frac) - (block_size // 2)
+                        if off < 0:
+                            off = 0
+                        if off + block_size > n_bytes:
+                            off = n_bytes - block_size
+                        parts.append(flat[off:off + block_size].tobytes())
+                    fp = b"".join(parts)
+                elif n_bytes > 0:
+                    fp = flat.tobytes()
+                else:
+                    fp = None
             except Exception:
                 fp = None
                 arr = None
