@@ -317,6 +317,7 @@ def handle_wbsimple(conn, client, hardware, settings, **kwargs):
                     "--base_gain",
                     "--exposure_soft_cap_ms",
                     "--boosted_max_gain_db",
+                    "--gain_analog_rb_max",
                     "--target_positive",
                     "--target_negative",
                     "--target_crossed",
@@ -378,6 +379,8 @@ def handle_wbsimple(conn, client, hardware, settings, **kwargs):
                             params["exposure_soft_cap_ms"] = float(value)
                         elif flag == "--boosted_max_gain_db":
                             params["boosted_max_gain_db"] = float(value)
+                        elif flag == "--gain_analog_rb_max":
+                            params["gain_analog_rb_max"] = float(value)
                         elif flag == "--target_positive":
                             params["target_positive"] = float(value)
                         elif flag == "--target_negative":
@@ -423,6 +426,7 @@ def handle_wbsimple(conn, client, hardware, settings, **kwargs):
                         max_iterations=params.get("max_iterations"),
                         calibrate_black_level=params.get("calibrate_black_level"),
                         base_gain=params.get("base_gain"),
+                        gain_analog_rb_max=params.get("gain_analog_rb_max"),
                     )
 
                     # Rotate to uncrossed (90 deg) for first calibration
@@ -812,6 +816,7 @@ def handle_wbppm(conn, client, hardware, settings, **kwargs):
                     "--base_gain",
                     "--exposure_soft_cap_ms",
                     "--boosted_max_gain_db",
+                    "--gain_analog_rb_max",
                 ]
 
                 # Helper to find a flag as a complete word (followed by space)
@@ -890,6 +895,8 @@ def handle_wbppm(conn, client, hardware, settings, **kwargs):
                             params["exposure_soft_cap_ms"] = float(value)
                         elif flag == "--boosted_max_gain_db":
                             params["boosted_max_gain_db"] = float(value)
+                        elif flag == "--gain_analog_rb_max":
+                            params["gain_analog_rb_max"] = float(value)
 
                 # Validate required parameters
                 required = [
@@ -997,6 +1004,7 @@ def handle_wbppm(conn, client, hardware, settings, **kwargs):
                         max_iterations=params.get("max_iterations"),
                         calibrate_black_level=params.get("calibrate_black_level"),
                         base_gain=params.get("base_gain"),
+                        gain_analog_rb_max=params.get("gain_analog_rb_max"),
                     )
 
                     # Update imageprocessing config for each angle
