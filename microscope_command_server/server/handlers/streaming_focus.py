@@ -1845,11 +1845,52 @@ def _attempt_one_scan(
             f"focus device '{focus_device}' has no writable speed property",
         )
 
+    # 2026-05-06: Acceleration / SCurve throttle. On Prior ProScan
+    # ZStage at PPM, MaxSpeed=1 (the lowest accepted integer) only
+    # gets the cruise velocity down to ~10 um/s -- not slow enough
+    # for streaming AF to capture useful samples (a 20 um scan
+    # finishes in ~2 s, leaving only ~70 frames at 38 fps and only
+    # ~50 useable after head_discard). Property-survey diagnostic
+    # confirmed the device has Acceleration and SCurve properties
+    # also at the maximum 100; lowering them forces a slower
+    # acceleration ramp so short moves never reach cruise velocity.
+    # Both restored in the finally block so non-AF code keeps the
+    # fast settings.
+    THROTTLE_PROPERTIES = ("Acceleration", "SCurve")
+    THROTTLE_SLOW_VALUE = "1"
+    saved_throttle: dict = {}
+    for tprop in THROTTLE_PROPERTIES:
+        try:
+            cur = core.get_property(focus_device, tprop)
+            saved_throttle[tprop] = cur
+        except Exception:
+            saved_throttle[tprop] = None
+
     try:
-        # Positioning seed at full speed.
+        # Positioning seed at full speed (with original throttle settings).
         _try_set(core, focus_device, speed_prop, normal_value)
         core.set_position(focus_device, z_start)
         _wait_via_busy(core, focus_device, target_z=z_start)
+
+        # Drop the acceleration / scurve throttles BEFORE setting the
+        # slow speed so the very first slow move hits the dampened
+        # ramp profile. Failures here are non-fatal: we still try the
+        # slow speed below; the user just gets a faster scan than
+        # ideal.
+        for tprop in THROTTLE_PROPERTIES:
+            if saved_throttle.get(tprop) is None:
+                continue
+            if _try_set(core, focus_device, tprop, THROTTLE_SLOW_VALUE):
+                logger.info(
+                    "STREAM_AF:%sthrottled %s.%s: %s -> %s",
+                    tag_prefix, focus_device, tprop,
+                    saved_throttle[tprop], THROTTLE_SLOW_VALUE,
+                )
+            else:
+                logger.debug(
+                    "STREAM_AF:%scould not throttle %s.%s to %s",
+                    tag_prefix, focus_device, tprop, THROTTLE_SLOW_VALUE,
+                )
 
         # Drop to slow speed for the scan motion only.
         if not _try_set(core, focus_device, speed_prop, slow_value):
@@ -2178,6 +2219,21 @@ def _attempt_one_scan(
         return _ScanAttemptResult(
             "error", None, 0, 0.0, str(e),
         )
+    finally:
+        # Restore the throttle properties we lowered for the slow scan.
+        # Always runs, even on early returns / exceptions, so non-AF
+        # code (BoundingBox tile capture, Z-stack, time-lapse) sees
+        # the stage at its normal-speed acceleration profile.
+        for tprop, saved_val in saved_throttle.items():
+            if saved_val is None:
+                continue
+            try:
+                core.set_property(focus_device, tprop, saved_val)
+            except Exception:
+                logger.debug(
+                    "STREAM_AF:%scould not restore %s.%s = %s",
+                    tag_prefix, focus_device, tprop, saved_val,
+                )
 
 
 def _brent_fallback_scan(
