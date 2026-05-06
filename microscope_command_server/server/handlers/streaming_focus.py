@@ -1198,6 +1198,7 @@ def _run_streaming_scan(
     hard_deadline_s: float,
     velocity_um_s: float = 11.5,
     metric_name: str = DEFAULT_METRIC_NAME,
+    dump_dir: Optional[Path] = None,
 ) -> List[Tuple[float, float, float]]:
     """Execute the streaming-sample scan and return a list of
     (t_capture_ms, z_interp, metric) triples. Leaves the camera in
@@ -1499,6 +1500,12 @@ def _run_streaming_scan(
 
     # --- Post-scan: reshape + metric computation ---
     samples: List[Tuple[float, float, float]] = []
+    # Parallel list: per-accepted-sample (wall_ms, image_2D_or_3D, metric)
+    # only populated when dump_dir is set, since each entry holds a full
+    # frame and we don't want to keep them in the hot path.
+    dump_records: Optional[List[Tuple[float, np.ndarray, float, float]]] = (
+        [] if dump_dir is not None else None
+    )
     for (wall_ms, arr) in raw_captures:
         try:
             if img_nch <= 1:
@@ -1523,6 +1530,8 @@ def _run_streaming_scan(
             progress_um = (wall_ms / 1000.0) * velocity_um_s * direction
             z_interp = z_start + progress_um
         samples.append((wall_ms, float(z_interp), metric))
+        if dump_records is not None:
+            dump_records.append((wall_ms, img, float(z_interp), metric))
 
     logger.info(
         "STREAM_AF:scan exit at t=%.0fms (motion_end=%.0fms + tail=%.0fms) "
@@ -1531,7 +1540,137 @@ def _run_streaming_scan(
         len(raw_captures), len(samples),
     )
 
+    if dump_dir is not None and dump_records is not None:
+        try:
+            _dump_streaming_scan(
+                dump_dir=dump_dir,
+                dump_records=dump_records,
+                z_poll_samples=z_poll_samples,
+                z_start=z_start,
+                z_end=z_end,
+                velocity_um_s=velocity_um_s,
+                motion_duration_ms=motion_duration_ms,
+                metric_name=metric_name,
+            )
+        except Exception as e:
+            logger.warning(
+                "STREAM_AF:dump_streaming_scan failed (non-fatal): %s", e,
+            )
+
     return samples
+
+
+def _dump_streaming_scan(
+    dump_dir: Path,
+    dump_records: List[Tuple[float, np.ndarray, float, float]],
+    z_poll_samples: List[Tuple[float, float]],
+    z_start: float,
+    z_end: float,
+    velocity_um_s: float,
+    motion_duration_ms: float,
+    metric_name: str,
+) -> None:
+    """Write per-sample TIFs + a CSV trace + a manifest into dump_dir.
+
+    Layout:
+        dump_dir/
+          frames/frame_NNNN_t<ms>_zassumed<um>.tif    -- one per kept sample
+          samples.csv                                  -- (idx, wall_ms, z_assumed_um, z_actual_um, metric)
+          z_poll.csv                                   -- (wall_ms, z_actual_um) raw poll
+          manifest.json                                -- scan params
+
+    z_actual is the polled stage Z linearly interpolated to each sample's
+    wall_ms timestamp from the z_poll_samples trace, so the CSV directly
+    shows the time->space mapping the algorithm assumed vs. what the
+    stage actually did.
+    """
+    import csv
+    import json
+    try:
+        import tifffile
+    except Exception as e:
+        logger.warning("STREAM_AF:dump skipped, tifffile unavailable: %s", e)
+        return
+
+    dump_dir.mkdir(parents=True, exist_ok=True)
+    frames_dir = dump_dir / "frames"
+    frames_dir.mkdir(parents=True, exist_ok=True)
+
+    # Pre-build the sorted z_poll arrays for O(log n) interpolation.
+    poll_t = np.asarray([t for (t, _) in z_poll_samples], dtype=np.float64)
+    poll_z = np.asarray([z for (_, z) in z_poll_samples], dtype=np.float64)
+
+    def _z_actual_at(wall_ms: float) -> Optional[float]:
+        if poll_t.size == 0:
+            return None
+        if wall_ms <= poll_t[0]:
+            return float(poll_z[0])
+        if wall_ms >= poll_t[-1]:
+            return float(poll_z[-1])
+        return float(np.interp(wall_ms, poll_t, poll_z))
+
+    samples_csv_path = dump_dir / "samples.csv"
+    with open(samples_csv_path, "w", newline="") as fh:
+        w = csv.writer(fh)
+        w.writerow(["idx", "wall_ms", "z_assumed_um", "z_actual_um", "metric"])
+        for idx, (wall_ms, img, z_assumed, metric) in enumerate(dump_records):
+            z_actual = _z_actual_at(wall_ms)
+            w.writerow([
+                idx,
+                f"{wall_ms:.2f}",
+                f"{z_assumed:.4f}",
+                "" if z_actual is None else f"{z_actual:.4f}",
+                f"{metric:.6f}",
+            ])
+            tif_name = (
+                f"frame_{idx:04d}_t{int(round(wall_ms)):06d}ms_"
+                f"zass{z_assumed:+09.3f}.tif"
+            ).replace(" ", "0")
+            try:
+                tifffile.imwrite(
+                    str(frames_dir / tif_name), img,
+                    photometric="minisblack" if img.ndim == 2 else "rgb",
+                )
+            except Exception as e:
+                logger.debug(
+                    "STREAM_AF:dump frame %d write failed: %s", idx, e,
+                )
+
+    z_poll_csv_path = dump_dir / "z_poll.csv"
+    with open(z_poll_csv_path, "w", newline="") as fh:
+        w = csv.writer(fh)
+        w.writerow(["wall_ms", "z_actual_um"])
+        for (t_ms, z) in z_poll_samples:
+            w.writerow([f"{t_ms:.2f}", f"{z:.4f}"])
+
+    manifest = {
+        "z_start": z_start,
+        "z_end": z_end,
+        "velocity_um_s_configured": velocity_um_s,
+        "motion_duration_ms": motion_duration_ms,
+        "metric_name": metric_name,
+        "n_kept_samples": len(dump_records),
+        "n_z_poll_samples": len(z_poll_samples),
+    }
+    if z_poll_samples:
+        first_t, first_z = z_poll_samples[0]
+        last_t, last_z = z_poll_samples[-1]
+        observed_dur_s = max((last_t - first_t) / 1000.0, 1e-3)
+        manifest["z_poll_first_t_ms"] = first_t
+        manifest["z_poll_first_z"] = first_z
+        manifest["z_poll_last_t_ms"] = last_t
+        manifest["z_poll_last_z"] = last_z
+        manifest["observed_avg_velocity_um_s"] = (
+            abs(last_z - first_z) / observed_dur_s
+        )
+    with open(dump_dir / "manifest.json", "w") as fh:
+        json.dump(manifest, fh, indent=2)
+
+    logger.info(
+        "STREAM_AF:dump written: %d frames + samples.csv + z_poll.csv "
+        "+ manifest.json under %s",
+        len(dump_records), dump_dir,
+    )
 
 
 # ----- Handler entry point -----
@@ -1578,6 +1717,7 @@ def _attempt_one_scan(
     metric_name: str = "normalized_variance",
     slow_value: str = SLOW_SPEED_VALUE,
     normal_value: str = NORMAL_SPEED_VALUE,
+    dump_dir: Optional[Path] = None,
 ) -> _ScanAttemptResult:
     """Run one streaming AF scan centered on z_center with the given range.
 
@@ -1671,7 +1811,9 @@ def _attempt_one_scan(
             )
             samples = _run_streaming_scan(core, focus_device, speed_prop,
                                         z_start, z_end, hard_deadline_s,
-                                        velocity_um_s=velocity_um_s)
+                                        velocity_um_s=velocity_um_s,
+                                        metric_name=metric_name,
+                                        dump_dir=dump_dir)
         finally:
             if sequence_started_here:
                 try:
@@ -2093,12 +2235,13 @@ def handle_streaming_focus(conn, client, hardware, settings, **kwargs):
 
     params = parse_flags(message,
                           ["--yaml", "--objective", "--range", "--modality",
-                           "--crop-factor"])
+                           "--crop-factor", "--dump"])
     yaml_path = params.get("yaml")
     client_objective = params.get("objective")
     range_override_str = params.get("range")
     client_modality = params.get("modality")
     crop_factor_str = params.get("crop_factor")
+    dump_flag = params.get("dump")
     range_override_um: Optional[float] = None
     if range_override_str:
         try:
@@ -2126,10 +2269,36 @@ def handle_streaming_focus(conn, client, hardware, settings, **kwargs):
             pass
         return
 
+    # Dump mode: when --dump is set (any truthy string), the streaming
+    # scan saves per-sample TIFs + a CSV trace + a manifest under the
+    # config directory's logs subdir. The Test Streaming AF button
+    # in the autofocus editor is the primary caller; the path is sent
+    # back in the SUCCESS response so the UI can surface it.
+    dump_root: Optional[Path] = None
+    dump_enabled = bool(dump_flag) and str(dump_flag).strip().lower() not in (
+        "0", "false", "no",
+    )
+    if dump_enabled:
+        try:
+            timestamp = time.strftime("%Y%m%d_%H%M%S")
+            dump_root = (
+                Path(yaml_path).parent / "logs"
+                / "streaming_af_dumps" / f"streaming_af_{timestamp}"
+            )
+            dump_root.mkdir(parents=True, exist_ok=True)
+            logger.info("STREAM_AF:dump enabled, writing to %s", dump_root)
+        except Exception as e:
+            logger.warning(
+                "STREAM_AF:could not create dump dir (%s); "
+                "continuing without dump", e,
+            )
+            dump_root = None
+
     logger.info("STREAM_AF:request from %s yaml=%s objective=%s modality=%s "
-                "range_override=%s crop_factor=%.2f",
+                "range_override=%s crop_factor=%.2f dump=%s",
                 addr, yaml_path, client_objective, client_modality,
-                range_override_um, crop_factor)
+                range_override_um, crop_factor,
+                dump_root if dump_root else "off")
 
     # Note: focus-metric resolution is deferred until after the
     # autofocus yaml entry is loaded, so the per-objective
@@ -2472,6 +2641,10 @@ def handle_streaming_focus(conn, client, hardware, settings, **kwargs):
                 break
 
             # Run one attempt.
+            attempt_dump_dir = (
+                dump_root / f"attempt_{attempt_idx + 1}"
+                if dump_root is not None else None
+            )
             result = _attempt_one_scan(
                 core, focus_device, speed_prop,
                 current_center, range_um,
@@ -2481,6 +2654,7 @@ def handle_streaming_focus(conn, client, hardware, settings, **kwargs):
                 metric_name=metric_name,
                 slow_value=eff_slow_value,
                 normal_value=eff_normal_value,
+                dump_dir=attempt_dump_dir,
             )
             attempts_log.append(
                 f"{label}: center={current_center:.3f} "
@@ -2717,6 +2891,12 @@ def handle_streaming_focus(conn, client, hardware, settings, **kwargs):
 
             response = (f"SUCCESS:{initial_z:.3f}:{final_z:.3f}:{z_shift:+.3f}:"
                         f"{final_result.n_samples}:{final_result.z_span:.3f}")
+            if dump_root is not None:
+                # Tack on the dump directory so the Test button in the
+                # autofocus editor can render the curves and link the
+                # TIF folder. Path uses the server-local FS layout
+                # (Windows backslashes when the server is on Windows).
+                response += f":dump={dump_root}"
             try:
                 conn.sendall(response.encode())
             except Exception as e:
@@ -2772,8 +2952,11 @@ def handle_streaming_focus(conn, client, hardware, settings, **kwargs):
             logger.warning("STREAM_AF:UNAVAILABLE -- %s", summary)
             for entry in attempts_log:
                 logger.warning("STREAM_AF:attempt log -- %s", entry)
+            unavailable_msg = f"UNAVAILABLE:{summary}"
+            if dump_root is not None:
+                unavailable_msg += f":dump={dump_root}"
             try:
-                conn.sendall(f"UNAVAILABLE:{summary}".encode())
+                conn.sendall(unavailable_msg.encode())
             except Exception as e:
                 logger.error("STREAM_AF:reply send failed: %s", e)
 
