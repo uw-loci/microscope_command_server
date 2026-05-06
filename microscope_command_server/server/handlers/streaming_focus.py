@@ -1499,6 +1499,43 @@ def _run_streaming_scan(
         )
 
     # --- Post-scan: reshape + metric computation ---
+    # Z labeling: prefer the actual polled stage trajectory over the
+    # linear (z_start + wall_ms * velocity_um_s) model. The linear
+    # model is only correct when the stage actually moves at the
+    # configured slow velocity; in practice (PPM 2026-05-06) the
+    # MaxSpeed=1 property no longer produces 1.42 um/s on this rig
+    # and the stage rips through the 20um range in ~2 s. Using the
+    # actual poll trace re-labels each sample with what the stage
+    # was REALLY at when the frame was captured. Falls back to
+    # linear interp if the poll trace is too sparse.
+    poll_t_arr: Optional[np.ndarray] = None
+    poll_z_arr: Optional[np.ndarray] = None
+    if len(z_poll_samples) >= 2:
+        poll_t_arr = np.asarray([t for (t, _) in z_poll_samples],
+                                 dtype=np.float64)
+        poll_z_arr = np.asarray([z for (_, z) in z_poll_samples],
+                                 dtype=np.float64)
+
+    def _z_at(wall_ms: float) -> float:
+        """Z at wall_ms from the polled trajectory (preferred), else
+        linear interp from the configured velocity_um_s.
+        """
+        if poll_t_arr is not None and poll_z_arr is not None:
+            if wall_ms <= poll_t_arr[0]:
+                return float(poll_z_arr[0])
+            if wall_ms >= poll_t_arr[-1]:
+                return float(poll_z_arr[-1])
+            return float(np.interp(wall_ms, poll_t_arr, poll_z_arr))
+        # Fallback: linear time-to-Z (legacy model). Only used when
+        # the poll trace is empty (e.g. ZMQ get_position throwing
+        # every poll), which is rare.
+        if wall_ms <= 0:
+            return z_start
+        if wall_ms >= motion_duration_ms:
+            return z_end
+        progress_um = (wall_ms / 1000.0) * velocity_um_s * direction
+        return z_start + progress_um
+
     samples: List[Tuple[float, float, float]] = []
     # Parallel list: per-accepted-sample (wall_ms, image_2D_or_3D, metric)
     # only populated when dump_dir is set, since each entry holds a full
@@ -1520,18 +1557,10 @@ def _run_streaming_scan(
             logger.debug("STREAM_AF:metric compute failed: %s", e)
             continue
 
-        # Z from wall time * velocity. This is now directly
-        # accurate -- no camera_period back-fill, no inference.
-        if wall_ms <= 0:
-            z_interp = z_start
-        elif wall_ms >= motion_duration_ms:
-            z_interp = z_end
-        else:
-            progress_um = (wall_ms / 1000.0) * velocity_um_s * direction
-            z_interp = z_start + progress_um
-        samples.append((wall_ms, float(z_interp), metric))
+        z_label = _z_at(wall_ms)
+        samples.append((wall_ms, float(z_label), metric))
         if dump_records is not None:
-            dump_records.append((wall_ms, img, float(z_interp), metric))
+            dump_records.append((wall_ms, img, float(z_label), metric))
 
     logger.info(
         "STREAM_AF:scan exit at t=%.0fms (motion_end=%.0fms + tail=%.0fms) "
