@@ -1540,10 +1540,40 @@ def _run_streaming_scan(
                     core.set_property(focus_device, prop_name, saved_val)
                 except Exception:
                     accepts_fractional = "no (rejected)"
+
+                # Probe a range of integer values so we can see the
+                # actual accepted range without relying on the device
+                # adapter's enum metadata (which Prior ProScan does
+                # not expose). For each candidate we try set_property
+                # and read back; values that round-trip identically
+                # are accepted, values that get clamped land at the
+                # boundary, and values that throw are rejected.
+                int_probe_values = (
+                    "0", "1", "2", "3", "5", "10", "20",
+                    "50", "100", "200", "500", "1000",
+                )
+                int_results: list = []
+                for tv in int_probe_values:
+                    try:
+                        core.set_property(focus_device, prop_name, tv)
+                        after = core.get_property(focus_device, prop_name)
+                        if after == tv:
+                            int_results.append(f"{tv}")
+                        else:
+                            int_results.append(f"{tv}->({after})")
+                    except Exception:
+                        int_results.append(f"{tv}!")
+                # Always restore original
+                try:
+                    core.set_property(focus_device, prop_name, cur)
+                except Exception:
+                    pass
                 logger.warning(
                     "STREAM_AF:property survey -- %s.%s = %r (allowed=[%s], "
-                    "accepts 0.5? %s)",
-                    focus_device, prop_name, cur, allowed, accepts_fractional,
+                    "accepts 0.5? %s, integer probes: %s) "
+                    "[N=accepted, N->(M)=clamped to M, N!=rejected]",
+                    focus_device, prop_name, cur, allowed,
+                    accepts_fractional, ", ".join(int_results),
                 )
         elif observed_avg_velocity_um_s > velocity_um_s * 3.0:
             logger.warning(
