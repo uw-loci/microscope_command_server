@@ -89,6 +89,7 @@ cross-check the implementation can find the upstream source.
 
 import logging
 import math
+import threading
 import time
 from pathlib import Path
 from typing import Dict, Any, List, Optional, Tuple
@@ -1331,10 +1332,48 @@ def _run_streaming_scan(
     FINGERPRINT_SAMPLE_FRACTIONS = (0.2, 0.4, 0.6, 0.8)
 
     t0 = time.perf_counter()
+
+    # 2026-05-06: parallel stage-Z polling thread for diagnostics.
+    # Sole purpose: confirm the stage is actually moving at the
+    # configured slow velocity. PPM bug observed today: caller
+    # configures velocity_um_s=1.42 (slow speed), but the user sees
+    # the scan complete "almost instantly" through the eyepiece,
+    # meaning the stage is running at normal speed (~100 um/s) and
+    # finishes the 20 um sweep in ~0.2 s. The remaining ~14 s of
+    # samples are stationary frames at z_end, but the linear
+    # time-to-Z map labels them with intermediate Z values, putting
+    # the metric peak at the wrong end of the scan.
+    #
+    # Polls core.get_position() every Z_POLL_INTERVAL_S during the
+    # scan and stores (wall_ms, z_actual). After the loop, compares
+    # observed velocity to configured velocity_um_s and WARNs loudly
+    # if they diverge, which is the diagnostic signature for
+    # "speed property accepted but had no effect" or "speed property
+    # is in different units than YAML thinks".
+    Z_POLL_INTERVAL_S = 0.05  # 50 ms; fast enough for sub-second motion
+    z_poll_samples: List[Tuple[float, float]] = []
+    z_poll_stop = threading.Event()
+
+    def _z_poll_loop():
+        while not z_poll_stop.is_set():
+            try:
+                z = float(core.get_position(focus_device))
+                t_ms = (time.perf_counter() - t0) * 1000.0
+                z_poll_samples.append((t_ms, z))
+            except Exception:
+                pass
+            if z_poll_stop.wait(Z_POLL_INTERVAL_S):
+                break
+
+    z_poll_thread = threading.Thread(target=_z_poll_loop, daemon=True)
+    z_poll_thread.start()
+
     try:
         core.set_position(focus_device, z_end)
     except Exception as e:
         logger.error("STREAM_AF:non-blocking move to z_end failed: %s", e)
+        z_poll_stop.set()
+        z_poll_thread.join(timeout=0.5)
         return []
 
     deadline = time.perf_counter() + hard_deadline_s
@@ -1385,6 +1424,78 @@ def _run_streaming_scan(
         time.sleep(SCAN_POLL_SLEEP_S)
 
     total_scan_ms = (time.perf_counter() - t0) * 1000.0
+
+    # Stop the Z-polling thread and analyse the actual stage motion
+    # against the configured slow velocity. See the comment block at
+    # thread launch for the bug this catches. Cheap; runs once per
+    # scan and only logs a few lines.
+    z_poll_stop.set()
+    try:
+        z_poll_thread.join(timeout=0.5)
+    except Exception:
+        pass
+
+    if len(z_poll_samples) >= 2:
+        first_t, first_z = z_poll_samples[0]
+        last_t, last_z = z_poll_samples[-1]
+        observed_total_um = abs(last_z - first_z)
+        observed_dur_s = max((last_t - first_t) / 1000.0, 1e-3)
+        observed_avg_velocity_um_s = observed_total_um / observed_dur_s
+
+        # Find when the stage first reached z_end (within 0.25 um). If
+        # this happens long before scan exit, the configured slow speed
+        # didn't take effect and the rest of the scan was stationary.
+        Z_END_REACHED_TOLERANCE_UM = 0.25
+        t_reached_z_end_ms: Optional[float] = None
+        for (t_ms, z) in z_poll_samples:
+            if abs(z - z_end) <= Z_END_REACHED_TOLERANCE_UM:
+                t_reached_z_end_ms = t_ms
+                break
+
+        # Sample the start to confirm we actually started near z_start.
+        z_start_actual = first_z
+
+        logger.info(
+            "STREAM_AF:Z-poll trace: n=%d, first(t=%.0fms, Z=%.3f), "
+            "last(t=%.0fms, Z=%.3f), observed_avg_velocity=%.2f um/s "
+            "(configured %.2f um/s), reached_z_end at t=%s",
+            len(z_poll_samples), first_t, z_start_actual,
+            last_t, last_z, observed_avg_velocity_um_s, velocity_um_s,
+            f"{t_reached_z_end_ms:.0f}ms" if t_reached_z_end_ms is not None
+            else "(not reached during poll window)",
+        )
+
+        # Smoking-gun warning. If the stage reached z_end in less than
+        # half the time we expected (motion_duration_ms), the slow speed
+        # never took effect: the scan is stationary frames being labeled
+        # with a linear-interpolation Z that no longer matches reality.
+        if (t_reached_z_end_ms is not None
+                and t_reached_z_end_ms < motion_duration_ms * 0.5):
+            logger.warning(
+                "STREAM_AF:STAGE SPEED MISMATCH -- expected slow scan to "
+                "take ~%.0fms (velocity_um_s=%.2f, range=%.2fum), but "
+                "stage reached z_end in only %.0fms. Slow-speed property "
+                "did NOT take effect; metric peak will be misplaced "
+                "because samples were Z-labeled by linear time-to-Z "
+                "interpolation while the stage was actually stationary "
+                "at z_end. Verify stage.streaming_af.slow_speed_value, "
+                "slow_speed_um_per_s, and the stage adapter speed-property "
+                "behaviour for this rig.",
+                motion_duration_ms, velocity_um_s, abs(z_end - z_start),
+                t_reached_z_end_ms,
+            )
+        elif observed_avg_velocity_um_s > velocity_um_s * 3.0:
+            logger.warning(
+                "STREAM_AF:STAGE SPEED MISMATCH -- observed avg velocity "
+                "%.2f um/s > 3x configured %.2f um/s. Slow-speed property "
+                "may not be in expected units; verify stage YAML.",
+                observed_avg_velocity_um_s, velocity_um_s,
+            )
+    else:
+        logger.debug(
+            "STREAM_AF:Z-poll trace: only %d samples collected; "
+            "skipping velocity analysis.", len(z_poll_samples),
+        )
 
     # --- Post-scan: reshape + metric computation ---
     samples: List[Tuple[float, float, float]] = []
