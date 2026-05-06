@@ -329,6 +329,36 @@ def _pop_tagged_frame(core) -> Tuple[Optional[np.ndarray], Optional[float]]:
             except (TypeError, ValueError):
                 pass
 
+    # Diagnostic 2026-05-05: detect the stale-trailing-row bug
+    # (TODO_LIST.md). If MM Core's allocated dimensions differ from the
+    # camera's reported per-frame dimensions in the tags, the buffer
+    # has more rows than the camera writes, and the trailing rows are
+    # stale content from prior frames. WARNING fires once per frame
+    # with the diff so the contamination band can be sized exactly.
+    try:
+        tag_h = tags.get("Height")
+        tag_w = tags.get("Width")
+        if tag_h is not None and tag_w is not None:
+            tag_h_int = int(tag_h)
+            tag_w_int = int(tag_w)
+            core_h = int(core.get_image_height())
+            core_w = int(core.get_image_width())
+            if tag_h_int != core_h or tag_w_int != core_w:
+                if not getattr(_pop_tagged_frame, "_dim_warn_logged", False):
+                    logger.warning(
+                        "STREAM_AF:DIMENSION MISMATCH detected -- core says "
+                        "%dx%d, frame tags say %dx%d (delta_rows=%d, "
+                        "delta_cols=%d). This is the stale-trailing-row bug "
+                        "from TODO_LIST.md; trailing rows of every popped "
+                        "frame contain stale content from prior frames. "
+                        "Logged once per session.",
+                        core_w, core_h, tag_w_int, tag_h_int,
+                        core_h - tag_h_int, core_w - tag_w_int,
+                    )
+                    _pop_tagged_frame._dim_warn_logged = True
+    except Exception:
+        pass
+
     # Reshape pixels. Prefer tag-provided geometry for correctness;
     # fall back to core queries if tags don't have it.
     try:
