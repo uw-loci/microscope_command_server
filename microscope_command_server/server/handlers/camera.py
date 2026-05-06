@@ -390,48 +390,85 @@ def handle_setcam(conn, client, hardware, settings, **kwargs):
         except Exception:
             pass
 
-        # 1. Set mode
-        if exp_individual:
-            if not cam.supports_per_channel_exposure():
-                conn.sendall(b"ERR_NSUP")
-                logger.error("Individual exposure not supported by %s", cam.get_name())
-                return
-            cam.enable_individual_exposure()
-        else:
-            cam.disable_individual_exposure()
-        cam.disable_individual_gain()
+        if exp_individual and not cam.supports_per_channel_exposure():
+            conn.sendall(b"ERR_NSUP")
+            logger.error("Individual exposure not supported by %s", cam.get_name())
+            return
 
-        # 2. Set exposures
-        if exp_count == 1:
-            hardware.set_exposure(exposures[0])
-            logger.info("SETCAM: unified exposure %.3fms", exposures[0])
-        elif exp_count >= 3:
-            if cam.supports_per_channel_exposure():
-                cam.set_channel_exposures(
-                    red=exposures[0], green=exposures[1], blue=exposures[2],
-                    auto_enable=False,
-                )
-                logger.info("SETCAM: per-channel R=%.3f G=%.3f B=%.3fms",
-                            exposures[0], exposures[1], exposures[2])
+        # Route through JAICamera.apply_settings when available so the
+        # blue-window contamination mitigation (jai_camera.py 2026-05-06)
+        # and the equal-channel fall-through both fire on EVERY calibration
+        # application path -- not just direct apply_settings callers. Prior
+        # versions of this handler called the property setters one-by-one,
+        # which silently bypassed the mitigations and left users seeing the
+        # bottom-of-frame contamination band after applying a WB preset
+        # whose blue exposure landed in the trigger window (e.g. 4.32 ms).
+        # See claude-reports/2026-05-06_jai-contamination-bar-internal.md.
+        if hasattr(cam, "apply_settings"):
+            if exp_count >= 3:
+                exposures_dict = {
+                    "r": exposures[0],
+                    "g": exposures[1],
+                    "b": exposures[2],
+                }
             else:
-                hardware.set_exposure(exposures[1])
-                logger.info("SETCAM: fallback unified %.3fms (green)", exposures[1])
+                exposures_dict = {"all": exposures[0]}
 
-        # 3. Set gains
-        if gain_count == 1:
-            cam.set_unified_gain(gains[0])
-            logger.info("SETCAM: unified gain %.2f", gains[0])
-        elif gain_count >= 3:
-            cam.set_unified_gain(gains[0])
-            # NB: JAICamera wrapper uses analog_red/analog_blue kwargs
-            # (matching the inner set_rb_analog_gains in jai/properties.py
-            # renamed to analog_* to avoid ambiguity with camera-role
-            # 'red channel' vs analog gain register). Earlier versions
-            # of this handler accidentally used red=/blue= which broke
-            # all per-channel WB presets with ERR_SETC.
-            cam.set_rb_analog_gains(analog_red=gains[1], analog_blue=gains[2])
-            logger.info("SETCAM: unified=%.2f, aR=%.3f, aB=%.3f",
-                        gains[0], gains[1], gains[2])
+            unified_gain = gains[0] if gain_count >= 1 else 1.0
+            analog_red = gains[1] if gain_count >= 3 else 1.0
+            analog_blue = gains[2] if gain_count >= 3 else 1.0
+
+            cam.apply_settings(
+                exposures=exposures_dict,
+                unified_gain=unified_gain,
+                analog_red=analog_red,
+                analog_blue=analog_blue,
+                individual_exposure=exp_individual,
+            )
+            logger.info(
+                "SETCAM via apply_settings: mode=%s, exposures=%s, "
+                "unified_gain=%.2f, aR=%.3f, aB=%.3f",
+                "individual" if exp_individual else "unified",
+                exposures_dict, unified_gain, analog_red, analog_blue,
+            )
+        else:
+            # Non-JAI camera fallback: original direct-property path. No
+            # contamination mitigation needed (mitigation is JAI-specific).
+            if exp_individual:
+                cam.enable_individual_exposure()
+            else:
+                cam.disable_individual_exposure()
+            cam.disable_individual_gain()
+
+            if exp_count == 1:
+                hardware.set_exposure(exposures[0])
+                logger.info("SETCAM: unified exposure %.3fms", exposures[0])
+            elif exp_count >= 3:
+                if cam.supports_per_channel_exposure():
+                    cam.set_channel_exposures(
+                        red=exposures[0], green=exposures[1], blue=exposures[2],
+                        auto_enable=False,
+                    )
+                    logger.info("SETCAM: per-channel R=%.3f G=%.3f B=%.3fms",
+                                exposures[0], exposures[1], exposures[2])
+                else:
+                    hardware.set_exposure(exposures[1])
+                    logger.info("SETCAM: fallback unified %.3fms (green)", exposures[1])
+
+            if gain_count == 1:
+                cam.set_unified_gain(gains[0])
+                logger.info("SETCAM: unified gain %.2f", gains[0])
+            elif gain_count >= 3:
+                cam.set_unified_gain(gains[0])
+                # NB: JAICamera wrapper uses analog_red/analog_blue kwargs
+                # (matching the inner set_rb_analog_gains in jai/properties.py
+                # renamed to analog_* to avoid ambiguity with camera-role
+                # 'red channel' vs analog gain register). Earlier versions
+                # of this handler accidentally used red=/blue= which broke
+                # all per-channel WB presets with ERR_SETC.
+                cam.set_rb_analog_gains(analog_red=gains[1], analog_blue=gains[2])
+                logger.info("SETCAM: unified=%.2f, aR=%.3f, aB=%.3f",
+                            gains[0], gains[1], gains[2])
 
         conn.sendall(b"ACK_____")
         logger.info("SETCAM complete (streaming was %s)",
