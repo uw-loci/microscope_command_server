@@ -1727,9 +1727,46 @@ def _attempt_one_scan(
                 samples_trace=list(in_motion),
             )
 
-        for i, (t, z, m) in enumerate(in_motion):
-            logger.info("STREAM_AF:%ssample %3d  t=%7.1f ms  z=%.3f  metric=%.4f",
-                        tag_prefix, i, t, z, m)
+        # Per-sample trace at DEBUG only -- 268 INFO lines per AF run was
+        # the "spam" the user flagged on 2026-05-05. The summary line
+        # above already names raw_peak/best_z/z_span at INFO; the
+        # detailed trace is for the FLAT-refusal branch (still INFO --
+        # see ~50 lines earlier) and for log-level=DEBUG triage.
+        if logger.isEnabledFor(logging.DEBUG):
+            for i, (t, z, m) in enumerate(in_motion):
+                logger.debug(
+                    "STREAM_AF:%ssample %3d  t=%7.1f ms  z=%.3f  metric=%.4f",
+                    tag_prefix, i, t, z, m,
+                )
+
+        # Concise diagnostic at INFO when the peak looks suspicious so
+        # the operator notices without having to enable DEBUG. "Peak in
+        # first 10% of the sweep with metric flat across the rest" is
+        # the textbook coverslip / stale-buffer signature.
+        try:
+            metrics_arr = [m for (_, _, m) in in_motion]
+            if metrics_arr and raw_peak_idx is not None:
+                head_frac = (raw_peak_idx + 1) / max(len(metrics_arr), 1)
+                tail_metrics = metrics_arr[max(raw_peak_idx + 5, 0):]
+                if tail_metrics:
+                    tail_med = float(np.median(tail_metrics))
+                    tail_range = float(max(tail_metrics) - min(tail_metrics))
+                    tail_var_pct = (tail_range / max(tail_med, 1.0)) * 100.0
+                    peak_metric = float(metrics_arr[raw_peak_idx])
+                    peak_over_tail = (peak_metric / max(tail_med, 1.0))
+                    if head_frac < 0.15 and tail_var_pct < 2.0 and peak_over_tail > 1.3:
+                        logger.warning(
+                            "STREAM_AF:%speak suspicious -- raw peak in first "
+                            "%.0f%% of sweep (idx=%d/%d, Z=%.3f), then metric "
+                            "flat at %.2g (%.1f%% range) across rest. "
+                            "Suggests coverslip / stale-buffer false peak "
+                            "rather than tissue focus.",
+                            tag_prefix, head_frac * 100, raw_peak_idx,
+                            len(metrics_arr), in_motion[raw_peak_idx][1],
+                            tail_med, tail_var_pct,
+                        )
+        except Exception:
+            pass
 
         if n_motion_samples < MIN_FRAMES_FOR_FIT or best_z is None:
             return _ScanAttemptResult(
