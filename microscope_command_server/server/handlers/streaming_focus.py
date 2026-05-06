@@ -1472,19 +1472,79 @@ def _run_streaming_scan(
         # with a linear-interpolation Z that no longer matches reality.
         if (t_reached_z_end_ms is not None
                 and t_reached_z_end_ms < motion_duration_ms * 0.5):
+            # Compute the in-motion velocity (during the actual move
+            # only, NOT averaged over the full poll window). This is
+            # the number you actually want to put into
+            # slow_speed_um_per_s YAML, since the average-over-window
+            # number gets diluted by stationary post-motion samples.
+            in_motion_velocity_um_s = (
+                abs(z_end - z_start) / max(t_reached_z_end_ms / 1000.0, 1e-3)
+            )
             logger.warning(
                 "STREAM_AF:STAGE SPEED MISMATCH -- expected slow scan to "
                 "take ~%.0fms (velocity_um_s=%.2f, range=%.2fum), but "
-                "stage reached z_end in only %.0fms. Slow-speed property "
-                "did NOT take effect; metric peak will be misplaced "
-                "because samples were Z-labeled by linear time-to-Z "
-                "interpolation while the stage was actually stationary "
-                "at z_end. Verify stage.streaming_af.slow_speed_value, "
-                "slow_speed_um_per_s, and the stage adapter speed-property "
-                "behaviour for this rig.",
+                "stage reached z_end in only %.0fms. Actual in-motion "
+                "velocity = %.2f um/s. Slow-speed property is not slowing "
+                "the stage enough; the scan was %.0f%% stationary frames "
+                "post-motion, so only ~%.0f real in-motion samples were "
+                "captured. To find focus reliably we need the stage to "
+                "move at ~1-3 um/s for ~14s (giving ~70-150 in-motion "
+                "samples). Two options: (1) update YAML "
+                "stage.streaming_af.slow_speed_um_per_s to %.2f so the "
+                "loop duration matches reality (algorithm self-corrects "
+                "via Z-poll labelling but loop still over-samples post-"
+                "motion); (2) find a stage property setting that "
+                "actually slows the move -- try setting Acceleration "
+                "and SCurve properties to low values on the focus "
+                "device, or use a fractional MaxSpeed value if the "
+                "adapter accepts it.",
                 motion_duration_ms, velocity_um_s, abs(z_end - z_start),
-                t_reached_z_end_ms,
+                t_reached_z_end_ms, in_motion_velocity_um_s,
+                100.0 * (1.0 - t_reached_z_end_ms / max(observed_dur_s * 1000.0, 1e-3)),
+                max(1, int(round(t_reached_z_end_ms / 1000.0 * 38.0))),
+                in_motion_velocity_um_s,
             )
+
+            # One-shot diagnostic: dump allowed values for every speed-
+            # related property the focus device exposes so the operator
+            # can see which knob to try next. Logged at WARNING because
+            # if the user is looking at the speed-mismatch warning,
+            # they're already in the middle of fixing this and want
+            # the data right next to the warning.
+            for prop_name in ("MaxSpeed", "Velocity", "Speed",
+                               "MaxVelocity", "Acceleration", "SCurve"):
+                try:
+                    cur = core.get_property(focus_device, prop_name)
+                except Exception:
+                    continue  # property doesn't exist
+                allowed = "(no enum)"
+                try:
+                    raw = core.get_allowed_property_values(focus_device, prop_name)
+                    allowed_list = _str_vector_to_list(raw) if raw else None
+                    if allowed_list:
+                        allowed = ", ".join(allowed_list[:20]) + (
+                            "..." if len(allowed_list) > 20 else ""
+                        )
+                except Exception:
+                    pass
+                # Probe whether fractional values are accepted (vendor
+                # adapters often accept arbitrary numbers in a numeric
+                # range even when the GUI shows just "1" through "100").
+                accepts_fractional = "?"
+                try:
+                    saved_val = cur
+                    test_val = "0.5"
+                    core.set_property(focus_device, prop_name, test_val)
+                    after = core.get_property(focus_device, prop_name)
+                    accepts_fractional = ("yes" if after == test_val else f"no (clamped to {after})")
+                    core.set_property(focus_device, prop_name, saved_val)
+                except Exception:
+                    accepts_fractional = "no (rejected)"
+                logger.warning(
+                    "STREAM_AF:property survey -- %s.%s = %r (allowed=[%s], "
+                    "accepts 0.5? %s)",
+                    focus_device, prop_name, cur, allowed, accepts_fractional,
+                )
         elif observed_avg_velocity_um_s > velocity_um_s * 3.0:
             logger.warning(
                 "STREAM_AF:STAGE SPEED MISMATCH -- observed avg velocity "
