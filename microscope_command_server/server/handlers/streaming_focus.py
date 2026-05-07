@@ -2149,18 +2149,34 @@ def _attempt_one_scan(
             )
 
         # Edge-of-window detection.
-        if n_motion_samples >= 3 and raw_peak_idx in (0, n_motion_samples - 1):
-            if raw_peak_idx == 0:
+        # 2026-05-06: was `raw_peak_idx in (0, n_motion_samples - 1)`,
+        # which checked SAMPLE INDEX. That worked when samples were
+        # densely uniform across the scan range, but on PPM today with
+        # ~20 in-motion samples and HEAD_DISCARD_MS=600 eating 35% of
+        # the 1.7 s scan, sample 0 is no longer at the scan edge -- it's
+        # 35% of the way through the move. Falsely flagged true-interior
+        # peaks at Z=-65.97 (6.9 um from the low edge of [-72.9, -52.9])
+        # as edge_low and triggered an unnecessary retry that walked off
+        # focus. Switch to checking the peak's actual Z relative to the
+        # commanded z_start / z_end with a tolerance of max(1 um, 10% of
+        # range).
+        edge_tolerance_um = max(1.0, range_um * 0.10)
+        peak_z = zs[raw_peak_idx]
+        z_lo, z_hi = (min(z_start, z_end), max(z_start, z_end))
+        at_low_edge = peak_z <= z_lo + edge_tolerance_um
+        at_high_edge = peak_z >= z_hi - edge_tolerance_um
+        if n_motion_samples >= 3 and (at_low_edge or at_high_edge):
+            if at_low_edge:
                 status = "edge_low"
                 direction = "more negative Z (below z_start)"
             else:
                 status = "edge_high"
                 direction = "more positive Z (above z_end)"
             reason = (
-                f"peak at edge of scan window (sample {raw_peak_idx} of "
-                f"{n_motion_samples}, z={zs[raw_peak_idx]:.3f}, "
-                f"metric={ms[raw_peak_idx]:.3f}). True focus is likely "
-                f"at {direction}"
+                f"peak Z={peak_z:.3f} within {edge_tolerance_um:.1f} um of "
+                f"scan edge [{z_lo:.3f}, {z_hi:.3f}] (sample idx "
+                f"{raw_peak_idx} of {n_motion_samples}). True focus is "
+                f"likely at {direction}"
             )
             return _ScanAttemptResult(
                 status, None, n_motion_samples, z_span, reason,
