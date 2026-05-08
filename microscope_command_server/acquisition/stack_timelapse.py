@@ -18,7 +18,6 @@ import time
 import logging
 import numpy as np
 from pathlib import Path
-from datetime import datetime
 from typing import List, Dict, Optional, Tuple, Callable
 
 logger = logging.getLogger(__name__)
@@ -107,9 +106,7 @@ def acquire_z_stack(
             f"the parent path exists and the drive is mounted."
         ) from e
     if not output_path.is_dir():
-        raise OSError(
-            f"Output folder did not materialize after mkdir: {output_path!s}"
-        )
+        raise OSError(f"Output folder did not materialize after mkdir: {output_path!s}")
     logger.info(f"Output folder ready: {output_path}")
 
     # Calculate Z positions
@@ -126,12 +123,13 @@ def acquire_z_stack(
     if n_planes == 0:
         raise ValueError(f"No Z positions in range [{z_start}, {z_end}] with step {z_step}")
 
-    logger.info(f"=== Z-STACK ACQUISITION ===")
+    logger.info("=== Z-STACK ACQUISITION ===")
     logger.info(f"Z range: {z_start} to {z_end} um, step={z_step} um, {n_planes} planes")
     logger.info(f"Output: {output_path}")
 
     # Parse angles for PPM
     from microscope_command_server.acquisition.workflow import parse_angles_exposures
+
     angles = [0.0]
     if modality.lower().startswith("ppm"):
         angles, _ = parse_angles_exposures(angles_str, None)
@@ -144,6 +142,7 @@ def acquire_z_stack(
             from microscope_command_server.acquisition.workflow import (
                 load_jai_calibration_from_imageprocessing,
             )
+
             jai_calibration = load_jai_calibration_from_imageprocessing(
                 config_path=Path(yaml_file_path),
                 per_angle=True,
@@ -185,6 +184,7 @@ def acquire_z_stack(
     # Users expect the stage to return to the original position (not sit at
     # the last Z plane of the stack).
     from microscope_control.hardware import Position
+
     try:
         start_position = hardware.get_current_position()
         logger.info(
@@ -202,6 +202,7 @@ def acquire_z_stack(
         from microscope_command_server.acquisition.timepoint_scheduler import (
             TimepointScheduler,
         )
+
         t0 = time.monotonic()
         scheduler = TimepointScheduler(
             t0_monotonic=t0,
@@ -231,9 +232,7 @@ def acquire_z_stack(
             tp_start_wall = time.time()
             tp_elapsed = tp_start_wall - start_time
             if has_t:
-                logger.info(
-                    f"=== Timepoint {t_idx + 1}/{n_timepoints} at T={tp_elapsed:.1f}s ==="
-                )
+                logger.info(f"=== Timepoint {t_idx + 1}/{n_timepoints} at T={tp_elapsed:.1f}s ===")
 
             for plane_idx, z_pos in enumerate(z_positions):
                 step_idx = t_idx * n_planes + plane_idx
@@ -281,7 +280,9 @@ def acquire_z_stack(
                         )
 
                     angle_frames[angle][(t_idx, plane_idx)] = (
-                        actual_z, image, tp_elapsed,
+                        actual_z,
+                        image,
+                        tp_elapsed,
                     )
             actual_n_timepoints = t_idx + 1
     finally:
@@ -368,9 +369,7 @@ def acquire_z_stack(
             )
         file_bytes = out_file.stat().st_size
         if file_bytes <= 0:
-            raise IOError(
-                f"OME-TIFF written but zero-bytes: {out_file!s}"
-            )
+            raise IOError(f"OME-TIFF written but zero-bytes: {out_file!s}")
         saved_files.append(str(out_file))
         logger.info(
             f"Wrote OME-TIFF: {out_file} "
@@ -385,6 +384,7 @@ def acquire_z_stack(
     if projection_name and projection_name != "none" and n_planes > 1:
         try:
             from microscope_command_server.acquisition.projections import get_projection
+
             projection_fn = get_projection(projection_name)
 
             for angle, frames in angle_frames.items():
@@ -396,6 +396,7 @@ def acquire_z_stack(
                 # Group buffer entries by t_idx -> list of (z_idx, image)
                 # then run the projection function on the ordered images.
                 from collections import defaultdict
+
                 by_t: Dict[int, list] = defaultdict(list)
                 for (t_idx, z_idx), (_actual_z, image, _delta_t) in frames.items():
                     by_t[t_idx].append((z_idx, image))
@@ -409,9 +410,7 @@ def acquire_z_stack(
                 is_rgb = ref_img.ndim == 3 and ref_img.shape[2] == 3
 
                 angle_suffix = f"_angle{angle:.0f}" if len(angles) > 1 else ""
-                proj_file = output_path / (
-                    f"zstack_{projection_name}{angle_suffix}.ome.tiff"
-                )
+                proj_file = output_path / (f"zstack_{projection_name}{angle_suffix}.ome.tiff")
 
                 with StackWriter(
                     output_path=proj_file,
@@ -422,9 +421,7 @@ def acquire_z_stack(
                     size_x=size_x,
                     dtype=ref_img.dtype,
                     pixel_size_um=pixel_size_um,
-                    time_increment_s=(
-                        interval_seconds if has_t and interval_seconds > 0 else None
-                    ),
+                    time_increment_s=(interval_seconds if has_t and interval_seconds > 0 else None),
                     channel_names=["RGB" if is_rgb else f"{projection_name}{angle_suffix}"],
                     granularity="single",
                     photometric="rgb" if is_rgb else "minisblack",
@@ -438,8 +435,7 @@ def acquire_z_stack(
 
                 projected_file = str(proj_file)
                 logger.info(
-                    f"Projection ({projection_name}): {proj_file} "
-                    f"(SizeT={actual_n_timepoints})"
+                    f"Projection ({projection_name}): {proj_file} " f"(SizeT={actual_n_timepoints})"
                 )
         except Exception as e:
             logger.warning(f"Projection failed: {e}")
@@ -516,19 +512,18 @@ def acquire_time_lapse(
             f"the parent path exists and the drive is mounted."
         ) from e
     if not output_path.is_dir():
-        raise OSError(
-            f"Output folder did not materialize after mkdir: {output_path!s}"
-        )
+        raise OSError(f"Output folder did not materialize after mkdir: {output_path!s}")
 
     if n_timepoints <= 0:
         raise ValueError(f"n_timepoints must be positive, got {n_timepoints}")
 
-    logger.info(f"=== TIME-LAPSE ACQUISITION ===")
+    logger.info("=== TIME-LAPSE ACQUISITION ===")
     logger.info(f"Timepoints: {n_timepoints}, interval: {interval_seconds}s")
     logger.info(f"Output: {output_path}")
 
     # Parse angles for PPM
     from microscope_command_server.acquisition.workflow import parse_angles_exposures
+
     angles = [0.0]
     if modality.lower().startswith("ppm"):
         angles, _ = parse_angles_exposures(angles_str, None)
@@ -541,6 +536,7 @@ def acquire_time_lapse(
             from microscope_command_server.acquisition.workflow import (
                 load_jai_calibration_from_imageprocessing,
             )
+
             jai_calibration = load_jai_calibration_from_imageprocessing(
                 config_path=Path(yaml_file_path),
                 per_angle=True,
@@ -686,8 +682,10 @@ def acquire_time_lapse(
         )
 
     elapsed = time.time() - start_time
-    logger.info(f"=== TIME-LAPSE COMPLETE: {actual_tp} timepoints, "
-                f"{len(saved_files)} files, {elapsed:.1f}s ===")
+    logger.info(
+        f"=== TIME-LAPSE COMPLETE: {actual_tp} timepoints, "
+        f"{len(saved_files)} files, {elapsed:.1f}s ==="
+    )
 
     if progress_callback:
         progress_callback(n_timepoints, n_timepoints, "Complete")
@@ -703,6 +701,7 @@ def acquire_time_lapse(
 # ------------------------------------------------------------------
 # Helpers
 # ------------------------------------------------------------------
+
 
 def _load_background_images_for_angles(
     enabled: bool,
@@ -732,6 +731,7 @@ def _load_background_images_for_angles(
         from microscope_imageprocessing.correction.background import (
             BackgroundCorrectionUtils,
         )
+
         bg_images, scaling, _wb = BackgroundCorrectionUtils.load_background_images(
             bg_dir, angles, logger
         )
@@ -744,8 +744,7 @@ def _load_background_images_for_angles(
             )
         else:
             logger.warning(
-                "No background images found in %s for angles %s -- "
-                "correction will be skipped",
+                "No background images found in %s for angles %s -- " "correction will be skipped",
                 bg_dir,
                 angles,
             )
@@ -766,13 +765,18 @@ def _apply_bg_correction(image, bg_image, scaling, method: str, angle: float):
         from microscope_imageprocessing.correction.background import (
             BackgroundCorrectionUtils,
         )
+
         return BackgroundCorrectionUtils.apply_flat_field_correction(
-            image, bg_image, scaling, method=method,
+            image,
+            bg_image,
+            scaling,
+            method=method,
         )
     except Exception as e:
         logger.warning(
             "Background correction failed at angle %s: %s -- using raw image",
-            angle, e,
+            angle,
+            e,
         )
         return image
 
@@ -791,7 +795,8 @@ def _resolve_pixel_size_um(config_manager, modality: str, objective, detector) -
     if not objective or not detector:
         logger.warning(
             "Missing objective (%r) or detector (%r); using placeholder pixel_size_um=1.0",
-            objective, detector,
+            objective,
+            detector,
         )
         return 1.0
 
@@ -808,7 +813,8 @@ def _resolve_pixel_size_um(config_manager, modality: str, objective, detector) -
         "Could not resolve pixel_size_um for objective=%s detector=%s; "
         "using placeholder 1.0. Add the pair to "
         "acq_profiles.defaults[*].settings.pixel_size_xy_um in the active config.",
-        objective, detector,
+        objective,
+        detector,
     )
     return 1.0
 
@@ -820,6 +826,7 @@ def _apply_wb_for_snap(hardware, jai_calibration, angle, modality, logger):
             apply_jai_calibration_for_angle,
             angle_to_name,
         )
+
         angle_name = angle_to_name(angle, modality=modality)
         apply_jai_calibration_for_angle(
             hardware=hardware,
@@ -836,13 +843,13 @@ def _save_image(image: np.ndarray, filepath: Path, metadata: dict):
     """Save an image as TIFF with basic metadata."""
     try:
         import tifffile
+
         tifffile.imwrite(str(filepath), image, metadata=metadata)
     except ImportError:
         # Fallback: save as raw numpy
         from PIL import Image as PILImage
-        if image.ndim == 3 and image.shape[2] == 3:
-            PILImage.fromarray(image).save(str(filepath))
-        elif image.ndim == 2:
+
+        if image.ndim == 3 and image.shape[2] == 3 or image.ndim == 2:
             PILImage.fromarray(image).save(str(filepath))
         else:
             np.save(str(filepath).replace(".tif", ".npy"), image)

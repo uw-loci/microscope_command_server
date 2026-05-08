@@ -45,6 +45,7 @@ __all__ = [
 # Per-position hook interface
 # ============================================================
 
+
 class PositionHook(ABC):
     """Hook called at each tile position during acquisition.
 

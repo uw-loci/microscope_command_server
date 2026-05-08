@@ -8,7 +8,6 @@ files used in QuPath for image stitching.
 import pathlib
 import re
 from typing import List, Tuple, Optional
-import numpy as np
 import logging
 
 from microscope_control.hardware import Position
@@ -175,9 +174,13 @@ class TileConfigUtils:
                     x, y, z = pos
                     tile_filename = f"tile_{idx:03d}.tif"
                 else:
-                    raise ValueError(f"Invalid position format: {pos}. Expected (x,y,z) or (filename,x,y,z)")
+                    raise ValueError(
+                        f"Invalid position format: {pos}. Expected (x,y,z) or (filename,x,y,z)"
+                    )
 
                 # Format: filename; ; (x, y, z)
                 f.write(f"{tile_filename}; ; ({x:.3f}, {y:.3f}, {z:.3f})\n")
 
-        logger.info(f"Wrote stage TileConfiguration with {len(tile_positions)} positions to {tileconfig_path}")
+        logger.info(
+            f"Wrote stage TileConfiguration with {len(tile_positions)} positions to {tileconfig_path}"
+        )

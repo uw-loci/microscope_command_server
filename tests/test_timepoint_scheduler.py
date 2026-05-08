@@ -35,10 +35,7 @@ def _load_timepoint_scheduler():
 
     repo_root = Path(__file__).resolve().parent.parent
     scheduler_path = (
-        repo_root
-        / "microscope_command_server"
-        / "acquisition"
-        / "timepoint_scheduler.py"
+        repo_root / "microscope_command_server" / "acquisition" / "timepoint_scheduler.py"
     )
     spec = importlib.util.spec_from_file_location(
         "mcs_timepoint_scheduler_under_test", scheduler_path
@@ -231,14 +228,10 @@ class TestCancellation:
 class TestValidation:
     def test_rejects_negative_interval(self, logger):
         with pytest.raises(ValueError, match="interval_seconds"):
-            TimepointScheduler(
-                t0_monotonic=0.0, interval_seconds=-1.0, logger=logger
-            )
+            TimepointScheduler(t0_monotonic=0.0, interval_seconds=-1.0, logger=logger)
 
     def test_rejects_negative_t_idx(self, logger):
-        sched = TimepointScheduler(
-            t0_monotonic=0.0, interval_seconds=1.0, logger=logger
-        )
+        sched = TimepointScheduler(t0_monotonic=0.0, interval_seconds=1.0, logger=logger)
         with pytest.raises(ValueError, match="t_idx"):
             sched.wait_until(-1)
 

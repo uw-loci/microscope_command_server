@@ -46,7 +46,8 @@ def handle_status(conn, client, hardware, settings, **kwargs):
             conn.sendall(response)
             logger.debug(
                 "Sent FAILED status with message to %s: %s...",
-                addr, error_msg[:50],
+                addr,
+                error_msg[:50],
             )
         # If state is COMPLETED, include final_z and saturation summary
         elif state.value == "COMPLETED" and addr in acquisition_final_z:
@@ -125,7 +126,8 @@ def handle_reqmanf(conn, client, hardware, settings, **kwargs):
         conn.sendall(response)
         logger.debug(
             "Sent manual focus request to %s (retries remaining: %d)",
-            addr, retries,
+            addr,
+            retries,
         )
     else:
         # No manual focus needed (8 bytes exactly)
@@ -218,4 +220,5 @@ def _get_state_enum(state_name, kwargs):
     # TODO: use client.state instead of global dict -- this helper goes away
     # Import the enum from the same module that defines the global dicts
     from microscope_command_server.server.qp_server import AcquisitionState
+
     return AcquisitionState(state_name)

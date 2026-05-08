@@ -5,10 +5,8 @@ TESTAF, TESTADAF, TESTAFV, AFBENCH
 """
 
 import socket
-import time
 import logging
 
-from microscope_command_server.server.protocol import END_MARKER
 from microscope_command_server.server.handlers.utils import read_message_string
 
 logger = logging.getLogger(__name__)
@@ -42,7 +40,7 @@ def handle_testaf(conn, client, hardware, settings, **kwargs):
         if flag in message:
             start_idx = message.index(flag) + len(flag)
             end_idx = len(message)
-            for next_flag in flags[i + 1:]:
+            for next_flag in flags[i + 1 :]:
                 if next_flag in message[start_idx:]:
                     next_pos = message.index(next_flag, start_idx)
                     if next_pos < end_idx:
@@ -88,9 +86,7 @@ def handle_testaf(conn, client, hardware, settings, **kwargs):
         if result["success"]:
             # Format result as: SUCCESS:plot_path|initial_z:final_z:z_shift
             result_data = (
-                f"{result['initial_z']:.2f}:"
-                f"{result['final_z']:.2f}:"
-                f"{result['z_shift']:.2f}"
+                f"{result['initial_z']:.2f}:" f"{result['final_z']:.2f}:" f"{result['z_shift']:.2f}"
             )
             response = f"SUCCESS:{result['plot_path']}|{result_data}".encode()
             conn.sendall(response)
@@ -122,9 +118,7 @@ def handle_testadaf(conn, client, hardware, settings, **kwargs):
     try:
         message = read_message_string(conn)
     except (socket.timeout, ConnectionError, ValueError) as e:
-        logger.error(
-            "Failed to read adaptive autofocus test message from %s: %s", addr, e
-        )
+        logger.error("Failed to read adaptive autofocus test message from %s: %s", addr, e)
         conn.sendall(f"FAILED:{str(e)}".encode())
         return
 
@@ -136,7 +130,7 @@ def handle_testadaf(conn, client, hardware, settings, **kwargs):
         if flag in message:
             start_idx = message.index(flag) + len(flag)
             end_idx = len(message)
-            for next_flag in flags[i + 1:]:
+            for next_flag in flags[i + 1 :]:
                 if next_flag in message[start_idx:]:
                     next_pos = message.index(next_flag, start_idx)
                     if next_pos < end_idx:
@@ -182,9 +176,7 @@ def handle_testadaf(conn, client, hardware, settings, **kwargs):
         if result["success"]:
             # Format result as: SUCCESS:message|initial_z:final_z:z_shift
             result_data = (
-                f"{result['initial_z']:.2f}:"
-                f"{result['final_z']:.2f}:"
-                f"{result['z_shift']:.2f}"
+                f"{result['initial_z']:.2f}:" f"{result['final_z']:.2f}:" f"{result['z_shift']:.2f}"
             )
             response = f"SUCCESS:{result['message']}|{result_data}".encode()
             conn.sendall(response)
@@ -215,9 +207,7 @@ def handle_testafv(conn, client, hardware, settings, **kwargs):
     try:
         message = read_message_string(conn)
     except (socket.timeout, ConnectionError, ValueError) as e:
-        logger.error(
-            "Failed to read autofocus validation message from %s: %s", addr, e
-        )
+        logger.error("Failed to read autofocus validation message from %s: %s", addr, e)
         conn.sendall(f"FAILED:{str(e)}".encode())
         return
 
@@ -229,7 +219,7 @@ def handle_testafv(conn, client, hardware, settings, **kwargs):
         if flag in message:
             start_idx = message.index(flag) + len(flag)
             end_idx = len(message)
-            for next_flag in flags[i + 1:]:
+            for next_flag in flags[i + 1 :]:
                 if next_flag in message[start_idx:]:
                     next_pos = message.index(next_flag, start_idx)
                     if next_pos < end_idx:
@@ -274,12 +264,12 @@ def handle_testafv(conn, client, hardware, settings, **kwargs):
         if result["success"]:
             # Format: SUCCESS:JSON-encoded result
             import json
+
             result_json = json.dumps(result)
             response = f"SUCCESS:{result_json}".encode()
             conn.sendall(response)
             logger.info(
-                "Autofocus validation test completed: "
-                "sweep_delta=%sum, recovery_delta=%sum",
+                "Autofocus validation test completed: " "sweep_delta=%sum, recovery_delta=%sum",
                 result["sweep_delta_um"],
                 result["recovery_delta_um"],
             )
@@ -322,7 +312,7 @@ def handle_afbench(conn, client, hardware, settings, **kwargs):
         if flag in message:
             start_idx = message.index(flag) + len(flag)
             end_idx = len(message)
-            for next_flag in flags[i + 1:]:
+            for next_flag in flags[i + 1 :]:
                 if next_flag in message[start_idx:]:
                     next_pos = message.index(next_flag, start_idx)
                     if next_pos < end_idx:
@@ -336,9 +326,7 @@ def handle_afbench(conn, client, hardware, settings, **kwargs):
                 params["output_folder"] = value
             elif flag == "--distances":
                 # Parse comma-separated distances
-                params["test_distances"] = [
-                    float(d.strip()) for d in value.split(",")
-                ]
+                params["test_distances"] = [float(d.strip()) for d in value.split(",")]
             elif flag == "--quick":
                 params["quick_mode"] = value.lower() in ("true", "1", "yes")
             elif flag == "--objective":

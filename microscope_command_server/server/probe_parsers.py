@@ -14,7 +14,6 @@ nameplate parsing and recommendation selection to this module.
 import re
 from typing import List, Optional, Tuple
 
-
 # ----- Constants used by recommendation logic ----------------------
 
 # Prior-style 1-100 percent fallback values. Used when the speed
@@ -87,7 +86,8 @@ def classify_allowed_values(
         return "velocity_enum", velocity_parsed
     if all_numeric:
         numeric_parsed = sorted(
-            [(v, float(v)) for v in allowed], key=lambda p: p[1],
+            [(v, float(v)) for v in allowed],
+            key=lambda p: p[1],
         )
         return "numeric_enum", [(v, None) for v, _ in numeric_parsed]
     return "unknown", [(v, None) for v in allowed]
@@ -108,23 +108,31 @@ def pick_recommended_values(
     if classification == "velocity_enum" and parsed:
         slow_v, slow_ums = parsed[0]
         fast_v, _ = parsed[-1]
-        return (slow_v, fast_v, slow_ums,
-                f"velocity enum: slow={slow_v}, fast={fast_v}")
+        return (slow_v, fast_v, slow_ums, f"velocity enum: slow={slow_v}, fast={fast_v}")
     if classification == "numeric_enum" and parsed:
         slow_v, _ = parsed[0]
         fast_v, _ = parsed[-1]
-        return (slow_v, fast_v, None,
-                f"numeric enum: slow={slow_v}, fast={fast_v} "
-                f"(velocity to be measured)")
+        return (
+            slow_v,
+            fast_v,
+            None,
+            f"numeric enum: slow={slow_v}, fast={fast_v} " f"(velocity to be measured)",
+        )
     if classification == "empty":
         # Continuous numeric property. Assume Prior-style 1-100
         # percent (the original streaming-AF constants). Live verify
         # will adjust um/s if needed.
-        return (PRIOR_FALLBACK_SLOW, PRIOR_FALLBACK_NORMAL,
-                PRIOR_FALLBACK_SLOW_UM_S,
-                "no allowed-values; Prior-style 1-100 percent fallback")
+        return (
+            PRIOR_FALLBACK_SLOW,
+            PRIOR_FALLBACK_NORMAL,
+            PRIOR_FALLBACK_SLOW_UM_S,
+            "no allowed-values; Prior-style 1-100 percent fallback",
+        )
     # Unknown classification -- best we can do is keep the current
     # value as 'normal' and decline to recommend a slow value.
-    return (None, current_value, None,
-            f"unrecognized allowed values ({len(parsed)} entries); "
-            f"manual override required")
+    return (
+        None,
+        current_value,
+        None,
+        f"unrecognized allowed values ({len(parsed)} entries); " f"manual override required",
+    )

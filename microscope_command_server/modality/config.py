@@ -47,9 +47,7 @@ class ModalityConfig:
     # Angle-range -> target intensity mapping for exposure calibration
     # Keys are (lo, hi) inclusive ranges on abs(angle), values are target intensities
     # If empty, uses generic default (200.0)
-    angle_intensity_targets: Dict[Tuple[float, float], float] = field(
-        default_factory=dict
-    )
+    angle_intensity_targets: Dict[Tuple[float, float], float] = field(default_factory=dict)
 
     # Default target intensity when no angle-specific target matches
     default_target_intensity: float = 200.0

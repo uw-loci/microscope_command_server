@@ -70,6 +70,7 @@ def handle_setlive(conn, client, hardware, settings, **kwargs):
                 if hardware.core.is_sequence_running():
                     hardware.core.stop_sequence_acquisition()
                     import time
+
                     time.sleep(0.05)
                     if hardware.core.is_sequence_running():
                         logger.warning("Sequence still running after stop -- retrying")
@@ -225,16 +226,24 @@ def handle_snap(conn, client, hardware, settings, **kwargs):
 
                 # Parse flags
                 flags = [
-                    "--angle", "--exposure", "--output", "--debayer",
-                    "--white_balance", "--yaml", "--objective", "--detector",
-                    "--exp_r", "--exp_g", "--exp_b",
+                    "--angle",
+                    "--exposure",
+                    "--output",
+                    "--debayer",
+                    "--white_balance",
+                    "--yaml",
+                    "--objective",
+                    "--detector",
+                    "--exp_r",
+                    "--exp_g",
+                    "--exp_b",
                 ]
 
                 for i, flag in enumerate(flags):
                     if flag in message:
                         start_idx = message.index(flag) + len(flag)
                         end_idx = len(message)
-                        for next_flag in flags[i + 1:]:
+                        for next_flag in flags[i + 1 :]:
                             if next_flag in message[start_idx:]:
                                 next_pos = message.index(next_flag, start_idx)
                                 if next_pos < end_idx:
@@ -318,12 +327,12 @@ def handle_snap(conn, client, hardware, settings, **kwargs):
                                 logger.info(
                                     "SNAP: Applied direct per-channel exposures: "
                                     "R=%.2fms, G=%.2fms, B=%.2fms",
-                                    exp_r, exp_g, exp_b,
+                                    exp_r,
+                                    exp_g,
+                                    exp_b,
                                 )
                             except Exception as e:
-                                logger.warning(
-                                    "SNAP: Failed to set per-channel exposures: %s", e
-                                )
+                                logger.warning("SNAP: Failed to set per-channel exposures: %s", e)
                         else:
                             logger.debug(
                                 "SNAP: Per-channel exposures provided but camera "
@@ -350,7 +359,8 @@ def handle_snap(conn, client, hardware, settings, **kwargs):
                         # (or potentially interfere with per-channel mode)
                         logger.debug(
                             "SNAP: Using per-channel exposures from WB calibration "
-                            "(exposure_ms=%.2f ignored)", exposure_ms,
+                            "(exposure_ms=%.2f ignored)",
+                            exposure_ms,
                         )
 
                     # Set rotation angle
@@ -378,8 +388,12 @@ def handle_snap(conn, client, hardware, settings, **kwargs):
                         "angle=%.2fdeg, exposure=%.2fms, "
                         "shape=%s, median=%.1f, "
                         "total_time=%.2fs",
-                        output_path.name, angle, exposure_ms,
-                        image.shape, float(image.mean()), elapsed,
+                        output_path.name,
+                        angle,
+                        exposure_ms,
+                        image.shape,
+                        float(image.mean()),
+                        elapsed,
                     )
 
                     # Send success response
@@ -437,17 +451,22 @@ def _apply_snap_white_balance(hardware, params, angle, exposure_ms, yaml_path, l
         wb_detector = params.get("detector")
         if not wb_objective or not wb_detector:
             if hasattr(hardware, "settings") and hardware.settings:
-                wb_objective = wb_objective or hardware.settings.get(
-                    "objective_in_use"
-                ) or hardware.settings.get("objective")
-                wb_detector = wb_detector or hardware.settings.get(
-                    "detector_in_use"
-                ) or hardware.settings.get("detector")
+                wb_objective = (
+                    wb_objective
+                    or hardware.settings.get("objective_in_use")
+                    or hardware.settings.get("objective")
+                )
+                wb_detector = (
+                    wb_detector
+                    or hardware.settings.get("detector_in_use")
+                    or hardware.settings.get("detector")
+                )
 
         if not wb_objective or not wb_detector:
             logger.warning(
                 "SNAP: Cannot apply WB - missing objective (%s) or detector (%s)",
-                wb_objective, wb_detector,
+                wb_objective,
+                wb_detector,
             )
             return False
 
@@ -488,9 +507,10 @@ def _apply_snap_white_balance(hardware, params, angle, exposure_ms, yaml_path, l
                 if base_exp > 0:
                     exposure_scale = exposure_ms / base_exp
                     logger.debug(
-                        "SNAP: WB exposure scale=%.2fx "
-                        "(adaptive=%.1fms / base=%.1fms)",
-                        exposure_scale, exposure_ms, base_exp,
+                        "SNAP: WB exposure scale=%.2fx " "(adaptive=%.1fms / base=%.1fms)",
+                        exposure_scale,
+                        exposure_ms,
+                        base_exp,
                     )
 
         wb_applied, exp_info = apply_jai_calibration_for_angle(
@@ -504,18 +524,14 @@ def _apply_snap_white_balance(hardware, params, angle, exposure_ms, yaml_path, l
         if wb_applied:
             if exposure_scale is not None and exposure_scale != 1.0:
                 logger.info(
-                    "SNAP: Applied WB with intensity scaling for %.2f deg "
-                    "(scale=%.2fx)",
-                    angle, exposure_scale,
+                    "SNAP: Applied WB with intensity scaling for %.2f deg " "(scale=%.2fx)",
+                    angle,
+                    exposure_scale,
                 )
             else:
-                logger.info(
-                    "SNAP: Applied per-angle white balance for %.2f deg", angle
-                )
+                logger.info("SNAP: Applied per-angle white balance for %.2f deg", angle)
         else:
-            logger.warning(
-                "SNAP: Failed to apply white balance for %.2f deg", angle
-            )
+            logger.warning("SNAP: Failed to apply white balance for %.2f deg", angle)
         return wb_applied
 
     except ImportError as e:

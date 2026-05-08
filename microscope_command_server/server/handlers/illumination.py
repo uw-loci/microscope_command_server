@@ -26,7 +26,7 @@ def handle_getillm(conn, client, hardware, settings, **kwargs):
     """
     logger.debug("Client %s requested illumination state", client.addr)
     try:
-        illum = getattr(hardware, '_illumination', None)
+        illum = getattr(hardware, "_illumination", None)
         if illum is None:
             # Always send 14 bytes (Java client reads exactly 14)
             response = struct.pack(">BfffB", 0x00, 0.0, 0.0, 0.0, 0)
@@ -49,7 +49,10 @@ def handle_getillm(conn, client, hardware, settings, **kwargs):
         conn.sendall(response)
         logger.info(
             "Sent illumination state: power=%.1f, range=(%.1f, %.1f), on=%s",
-            power, power_range[0], power_range[1], is_on,
+            power,
+            power_range[0],
+            power_range[1],
+            is_on,
         )
     except Exception as e:
         logger.error("Failed to get illumination state: %s", e)
@@ -77,7 +80,7 @@ def handle_setillm(conn, client, hardware, settings, **kwargs):
 
         power = struct.unpack(">f", data)[0]
 
-        illum = getattr(hardware, '_illumination', None)
+        illum = getattr(hardware, "_illumination", None)
         if illum is None:
             logger.warning("SETILLM: no illumination configured")
             conn.sendall(b"ERR_ILLM")
@@ -207,8 +210,9 @@ def handle_applypr(conn, client, hardware, settings, **kwargs):
         logger.info("Profile '%s' applied successfully", profile_name)
         conn.sendall(b"ACK_____")
     except Exception as e:
-        logger.error("Failed to apply profile '%s': %s",
-                     profile_name if 'profile_name' in dir() else '?', e)
+        logger.error(
+            "Failed to apply profile '%s': %s", profile_name if "profile_name" in dir() else "?", e
+        )
         conn.sendall(b"ERR_PROF")
 
 
@@ -276,7 +280,8 @@ def handle_applych(conn, client, hardware, settings, **kwargs):
                 hardware._disable_all_modality_illuminations()
                 logger.info(
                     "APPLYCH: deactivated all illumination for profile '%s' (modality '%s')",
-                    profile_name, modality_name,
+                    profile_name,
+                    modality_name,
                 )
                 conn.sendall(b"ACK_____")
             except Exception as e:
@@ -294,7 +299,8 @@ def handle_applych(conn, client, hardware, settings, **kwargs):
         if ch_entry is None:
             logger.error(
                 "APPLYCH: channel '%s' not found in modality '%s' library",
-                channel_id, modality_name,
+                channel_id,
+                modality_name,
             )
             conn.sendall(b"ERR_CHAN")
             return
@@ -336,12 +342,12 @@ def handle_applych(conn, client, hardware, settings, **kwargs):
                     core.set_property(str(dev), str(prop), "0")
                     logger.debug(
                         "APPLYCH: zeroed %s.%s for inactive channel '%s'",
-                        dev, prop, entry.get("id"),
+                        dev,
+                        prop,
+                        entry.get("id"),
                     )
                 except Exception as e:
-                    logger.warning(
-                        "APPLYCH: failed to zero %s.%s: %s", dev, prop, e
-                    )
+                    logger.warning("APPLYCH: failed to zero %s.%s: %s", dev, prop, e)
 
         # Re-enable the modality's state property. Modality teardown via
         # _disable_all_modality_illuminations writes state=0; APPLYCH on a
@@ -360,12 +366,15 @@ def handle_applych(conn, client, hardware, settings, **kwargs):
                         core.set_property(str(state_dev), str(state_prop), "1")
                         logger.debug(
                             "APPLYCH: enabled modality state %s.%s=1",
-                            state_dev, state_prop,
+                            state_dev,
+                            state_prop,
                         )
                     except Exception as e:
                         logger.warning(
                             "APPLYCH: failed to enable modality state %s.%s: %s",
-                            state_dev, state_prop, e,
+                            state_dev,
+                            state_prop,
+                            e,
                         )
 
         # Lazy import to avoid a server -> control circular import when
@@ -373,6 +382,7 @@ def handle_applych(conn, client, hardware, settings, **kwargs):
         from microscope_command_server.acquisition.workflow import (
             apply_channel_hardware_state,
         )
+
         apply_channel_hardware_state(hardware, ch_entry, logger)
 
         # Apply exposure if declared (skip silently if not).
@@ -385,13 +395,17 @@ def handle_applych(conn, client, hardware, settings, **kwargs):
 
         logger.info(
             "APPLYCH: applied channel '%s' from profile '%s' (modality '%s')",
-            channel_id, profile_name, modality_name,
+            channel_id,
+            profile_name,
+            modality_name,
         )
         conn.sendall(b"ACK_____")
     except Exception as e:
         logger.error(
             "APPLYCH failed for profile='%s' channel='%s': %s",
-            profile_name, channel_id, e,
+            profile_name,
+            channel_id,
+            e,
         )
         conn.sendall(b"ERR_CHAN")
 
@@ -447,6 +461,9 @@ def handle_setprop(conn, client, hardware, settings, **kwargs):
     except Exception as e:
         logger.error(
             "SETPROP failed for %s.%s <- %s: %s",
-            device, prop, value, e,
+            device,
+            prop,
+            value,
+            e,
         )
         conn.sendall(b"ERR_PROP")

@@ -58,9 +58,6 @@ from microscope_command_server.server.handlers.streaming_focus import (
     _wait_via_busy,
 )
 from microscope_command_server.server.probe_parsers import (
-    PRIOR_FALLBACK_NORMAL,
-    PRIOR_FALLBACK_SLOW,
-    PRIOR_FALLBACK_SLOW_UM_S,
     classify_allowed_values,
     pick_recommended_values,
 )
@@ -119,11 +116,11 @@ def _measure_velocity_um_s(
     # Z-limit safety: refuse if either direction would exit the
     # configured stage z limits.
     if z_lo is not None and (z0 - VERIFY_MOVE_UM) < (z_lo + Z_LIMIT_BUFFER_UM):
-        return None, (f"too close to z low limit (z={z0:.3f}, "
-                      f"low={z_lo}); skipped live verify")
+        return None, (f"too close to z low limit (z={z0:.3f}, " f"low={z_lo}); skipped live verify")
     if z_hi is not None and (z0 + VERIFY_MOVE_UM) > (z_hi - Z_LIMIT_BUFFER_UM):
-        return None, (f"too close to z high limit (z={z0:.3f}, "
-                      f"high={z_hi}); skipped live verify")
+        return None, (
+            f"too close to z high limit (z={z0:.3f}, " f"high={z_hi}); skipped live verify"
+        )
 
     try:
         # Move +1 um, time it.
@@ -150,11 +147,9 @@ def _measure_velocity_um_s(
     # interval so anything below ~10 ms is suspect).
     half = 0.5 * (forward_s + back_s)
     if half < 0.01:
-        return None, (f"round-trip too fast ({half*1000:.1f}ms half) "
-                      f"for reliable timing")
+        return None, (f"round-trip too fast ({half*1000:.1f}ms half) " f"for reliable timing")
     measured_um_s = VERIFY_MOVE_UM / half
-    return measured_um_s, (f"forward {forward_s*1000:.1f}ms, "
-                           f"back {back_s*1000:.1f}ms")
+    return measured_um_s, (f"forward {forward_s*1000:.1f}ms, " f"back {back_s*1000:.1f}ms")
 
 
 # ----- YAML helpers (Z limits) --------------------------------------
@@ -171,12 +166,13 @@ def _read_z_limits_from_yaml(yaml_path: Optional[str]) -> Tuple[Optional[float],
         return None, None
     try:
         import yaml as _yaml
+
         with open(yaml_path, "r") as fh:
             doc = _yaml.safe_load(fh) or {}
     except Exception as e:
         logger.debug("PRBSAF: could not read z limits from %s: %s", yaml_path, e)
         return None, None
-    z = (((doc.get("stage") or {}).get("limits") or {}).get("z_um") or {})
+    z = ((doc.get("stage") or {}).get("limits") or {}).get("z_um") or {}
     lo = z.get("low")
     hi = z.get("high")
     return (
@@ -204,9 +200,15 @@ def handle_probe_stage_af(conn, client, hardware, settings, **kwargs):
     if message is None:
         message = ""
 
-    params = parse_flags(message, [
-        "--yaml", "--device", "--sweep-range", "--camera-fps",
-    ])
+    params = parse_flags(
+        message,
+        [
+            "--yaml",
+            "--device",
+            "--sweep-range",
+            "--camera-fps",
+        ],
+    )
     yaml_path = params.get("yaml")
     override_device = params.get("device")
     try:
@@ -218,8 +220,14 @@ def handle_probe_stage_af(conn, client, hardware, settings, **kwargs):
     except (TypeError, ValueError):
         camera_fps = DEFAULT_CAMERA_FPS
 
-    logger.info("PRBSAF:request from %s yaml=%s device=%s sweep=%.1fum fps=%.1f",
-                addr, yaml_path, override_device, sweep_range_um, camera_fps)
+    logger.info(
+        "PRBSAF:request from %s yaml=%s device=%s sweep=%.1fum fps=%.1f",
+        addr,
+        yaml_path,
+        override_device,
+        sweep_range_um,
+        camera_fps,
+    )
 
     core = hardware.core
     if override_device:
@@ -268,9 +276,7 @@ def handle_probe_stage_af(conn, client, hardware, settings, **kwargs):
     current_value = _try_get(core, focus_device, speed_prop)
     result["current_value"] = current_value
     try:
-        allowed = _str_vector_to_list(
-            core.get_allowed_property_values(focus_device, speed_prop)
-        )
+        allowed = _str_vector_to_list(core.get_allowed_property_values(focus_device, speed_prop))
     except Exception as e:
         logger.warning("PRBSAF:get_allowed_property_values failed: %s", e)
         allowed = []
@@ -281,20 +287,21 @@ def handle_probe_stage_af(conn, client, hardware, settings, **kwargs):
     classification, parsed = classify_allowed_values(allowed)
     result["classification"] = classification
     slow_v, normal_v, slow_ums_estimate, reason = pick_recommended_values(
-        classification, parsed, current_value,
+        classification,
+        parsed,
+        current_value,
     )
     result["slow_speed_value"] = slow_v
     result["normal_speed_value"] = normal_v
     result["slow_speed_um_per_s"] = slow_ums_estimate
-    logger.info("PRBSAF:%s -> slow=%r normal=%r ums=%s",
-                reason, slow_v, normal_v, slow_ums_estimate)
+    logger.info(
+        "PRBSAF:%s -> slow=%r normal=%r ums=%s", reason, slow_v, normal_v, slow_ums_estimate
+    )
 
     # If we couldn't pick a slow value, return early -- live verify
     # has nothing to set.
     if slow_v is None:
-        result["viability_reason"] = (
-            "no recommended slow value; manual override required"
-        )
+        result["viability_reason"] = "no recommended slow value; manual override required"
         result["warnings"].append(reason)
         conn.sendall(f"SUCCESS:{json.dumps(result)}".encode())
         return
@@ -305,20 +312,20 @@ def handle_probe_stage_af(conn, client, hardware, settings, **kwargs):
     z_lo, z_hi = _read_z_limits_from_yaml(yaml_path)
     set_ok = _try_set(core, focus_device, speed_prop, slow_v)
     if not set_ok:
-        result["warnings"].append(
-            f"could not set {speed_prop}={slow_v!r} during live verify"
-        )
+        result["warnings"].append(f"could not set {speed_prop}={slow_v!r} during live verify")
         result["viability_reason"] = "slow value rejected by stage"
         conn.sendall(f"SUCCESS:{json.dumps(result)}".encode())
         return
 
     measured_um_s, verify_note = _measure_velocity_um_s(
-        core, focus_device, z_lo, z_hi,
+        core,
+        focus_device,
+        z_lo,
+        z_hi,
     )
     result["slow_speed_um_per_s_measured"] = measured_um_s
     result["verify_note"] = verify_note
-    logger.info("PRBSAF:live verify -- measured=%s um/s (%s)",
-                measured_um_s, verify_note)
+    logger.info("PRBSAF:live verify -- measured=%s um/s (%s)", measured_um_s, verify_note)
 
     # Restore speed to the recommended normal value (or the original
     # if we never derived a normal). _try_set is best-effort.
@@ -362,8 +369,9 @@ def handle_probe_stage_af(conn, client, hardware, settings, **kwargs):
             f"at {camera_fps:.0f}fps "
             f"(need >= {VIABILITY_MIN_FRAMES})"
         )
-    logger.info("PRBSAF:viability -> enabled=%s (%s)",
-                result["enabled"], result["viability_reason"])
+    logger.info(
+        "PRBSAF:viability -> enabled=%s (%s)", result["enabled"], result["viability_reason"]
+    )
 
     try:
         conn.sendall(f"SUCCESS:{json.dumps(result)}".encode())

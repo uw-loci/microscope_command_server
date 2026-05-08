@@ -14,48 +14,93 @@ Special return values:
 from microscope_command_server.server.protocol import ExtendedCommand
 
 from microscope_command_server.server.handlers.position import (
-    handle_getxy, handle_getz, handle_getxyz, handle_getfov,
-    handle_getpxsz, handle_getr, handle_getzf,
-    handle_move, handle_movez, handle_movznw, handle_movexyz, handle_mover,
+    handle_getxy,
+    handle_getz,
+    handle_getxyz,
+    handle_getfov,
+    handle_getpxsz,
+    handle_getr,
+    handle_getzf,
+    handle_move,
+    handle_movez,
+    handle_movznw,
+    handle_movexyz,
+    handle_mover,
 )
 from microscope_command_server.server.handlers.camera import (
-    handle_getcam, handle_getmode, handle_setmode,
-    handle_getexp, handle_setexp, handle_getgain, handle_setgain,
-    handle_setcam, handle_getbin, handle_setbin, handle_getcap,
+    handle_getcam,
+    handle_getmode,
+    handle_setmode,
+    handle_getexp,
+    handle_setexp,
+    handle_getgain,
+    handle_setgain,
+    handle_setcam,
+    handle_getbin,
+    handle_setbin,
+    handle_getcap,
 )
 from microscope_command_server.server.handlers.live import (
-    handle_getlive, handle_setlive, handle_getframe,
-    handle_strtseq, handle_stopseq, handle_snap,
+    handle_getlive,
+    handle_setlive,
+    handle_getframe,
+    handle_strtseq,
+    handle_stopseq,
+    handle_snap,
 )
 from microscope_command_server.server.handlers.status import (
-    handle_status, handle_progress, handle_cancel,
-    handle_reqmanf, handle_ackmf, handle_skipaf,
-    handle_reqhwer, handle_ackhwer,
+    handle_status,
+    handle_progress,
+    handle_cancel,
+    handle_reqmanf,
+    handle_ackmf,
+    handle_skipaf,
+    handle_reqhwer,
+    handle_ackhwer,
 )
 from microscope_command_server.server.handlers.autofocus import (
-    handle_testaf, handle_testadaf, handle_testafv, handle_afbench,
+    handle_testaf,
+    handle_testadaf,
+    handle_testafv,
+    handle_afbench,
 )
 from microscope_command_server.server.handlers.calibration import (
-    handle_wbcalibr, handle_wbsimple, handle_wbppm,
-    handle_polcal, handle_ppmsens, handle_ppmbiref, handle_sbcalib,
-    handle_getnoise, handle_noischar,
+    handle_wbcalibr,
+    handle_wbsimple,
+    handle_wbppm,
+    handle_polcal,
+    handle_ppmsens,
+    handle_ppmbiref,
+    handle_sbcalib,
+    handle_getnoise,
+    handle_noischar,
 )
 from microscope_command_server.server.handlers.acquisition import (
-    handle_acquire, handle_bgacquire, handle_zstack, handle_tlapse,
+    handle_acquire,
+    handle_bgacquire,
+    handle_zstack,
+    handle_tlapse,
 )
 from microscope_command_server.server.handlers.illumination import (
-    handle_getillm, handle_setillm, handle_setilmd, handle_setprop,
-    handle_applypr, handle_applych,
+    handle_getillm,
+    handle_setillm,
+    handle_setilmd,
+    handle_setprop,
+    handle_applypr,
+    handle_applych,
 )
 from microscope_command_server.server.handlers.system import (
-    handle_config, handle_reconfig, handle_disconnect, handle_shutdown, handle_siftal,
+    handle_config,
+    handle_reconfig,
+    handle_disconnect,
+    handle_shutdown,
+    handle_siftal,
     handle_siftim,
 )
 from microscope_command_server.server.handlers.probez import handle_probez
 from microscope_command_server.server.handlers.probe_stage_af import handle_probe_stage_af
 from microscope_command_server.server.handlers.streaming_focus import handle_streaming_focus
 from microscope_command_server.server.handlers.rapid_scan import handle_rapid_scan
-
 
 # Map 8-byte command bytes -> handler function
 COMMAND_HANDLERS = {
@@ -72,7 +117,6 @@ COMMAND_HANDLERS = {
     ExtendedCommand.MOVZNW: handle_movznw,
     ExtendedCommand.MOVEXYZ: handle_movexyz,
     ExtendedCommand.MOVER: handle_mover,
-
     # Camera control
     ExtendedCommand.GETCAM: handle_getcam,
     ExtendedCommand.GETMODE: handle_getmode,
@@ -85,7 +129,6 @@ COMMAND_HANDLERS = {
     ExtendedCommand.GETBIN: handle_getbin,
     ExtendedCommand.SETBIN: handle_setbin,
     ExtendedCommand.GETCAP: handle_getcap,
-
     # Live mode & snapshot
     ExtendedCommand.GETLIVE: handle_getlive,
     ExtendedCommand.SETLIVE: handle_setlive,
@@ -93,7 +136,6 @@ COMMAND_HANDLERS = {
     ExtendedCommand.STRTSEQ: handle_strtseq,
     ExtendedCommand.STOPSEQ: handle_stopseq,
     ExtendedCommand.SNAP: handle_snap,
-
     # Status & coordination
     ExtendedCommand.STATUS: handle_status,
     ExtendedCommand.PROGRESS: handle_progress,
@@ -103,13 +145,11 @@ COMMAND_HANDLERS = {
     ExtendedCommand.SKIPAF: handle_skipaf,
     ExtendedCommand.REQHWER: handle_reqhwer,
     ExtendedCommand.ACKHWER: handle_ackhwer,
-
     # Autofocus testing
     ExtendedCommand.TESTAF: handle_testaf,
     ExtendedCommand.TESTADAF: handle_testadaf,
     ExtendedCommand.TESTAFV: handle_testafv,
     ExtendedCommand.AFBENCH: handle_afbench,
-
     # Calibration
     ExtendedCommand.WBCALIBR: handle_wbcalibr,
     ExtendedCommand.WBSIMPLE: handle_wbsimple,
@@ -120,13 +160,11 @@ COMMAND_HANDLERS = {
     ExtendedCommand.SBCALIB: handle_sbcalib,
     ExtendedCommand.GETNOISE: handle_getnoise,
     ExtendedCommand.NOISCHAR: handle_noischar,
-
     # Acquisition
     ExtendedCommand.ACQUIRE: handle_acquire,
     ExtendedCommand.BGACQUIRE: handle_bgacquire,
     ExtendedCommand.ZSTACK: handle_zstack,
     ExtendedCommand.TLAPSE: handle_tlapse,
-
     # Illumination & profile
     ExtendedCommand.GETILLM: handle_getillm,
     ExtendedCommand.SETILLM: handle_setillm,
@@ -134,7 +172,6 @@ COMMAND_HANDLERS = {
     ExtendedCommand.SETPROP: handle_setprop,
     ExtendedCommand.APPLYPR: handle_applypr,
     ExtendedCommand.APPLYCH: handle_applych,
-
     # System & alignment
     ExtendedCommand.CONFIG: handle_config,
     ExtendedCommand.RECONFG: handle_reconfig,
@@ -142,16 +179,12 @@ COMMAND_HANDLERS = {
     ExtendedCommand.SHUTDOWN: handle_shutdown,
     ExtendedCommand.SIFTAL: handle_siftal,
     ExtendedCommand.SIFTIM: handle_siftim,
-
     # Z-stage diagnostic probe
     ExtendedCommand.PROBEZ: handle_probez,
-
     # Setup-wizard stage probe (recommends streaming_af YAML values)
     ExtendedCommand.PRBSAFZ: handle_probe_stage_af,
-
     # Streaming autofocus
     ExtendedCommand.STRMAFZ: handle_streaming_focus,
-
     # Rapid scan
     ExtendedCommand.RPDSCAN: handle_rapid_scan,
 }

@@ -94,9 +94,7 @@ def match_sift(
         clahe = cv2.createCLAHE(clipLimit=float(clahe_clip_limit), tileGridSize=(8, 8))
         gray_micro = clahe.apply(gray_micro)
         gray_wsi = clahe.apply(gray_wsi)
-        logger.info(
-            f"Applied CLAHE (clipLimit={clahe_clip_limit}) to both images"
-        )
+        logger.info(f"Applied CLAHE (clipLimit={clahe_clip_limit}) to both images")
 
     # Apply flips to WSI region to match microscope orientation
     if flip_x and flip_y:
@@ -136,7 +134,9 @@ def match_sift(
         )
 
     if micro_scale >= 0.99 and wsi_scale >= 0.99:
-        logger.info(f"Both images already at or below target resolution ({target_pixel_size:.4f} um/px)")
+        logger.info(
+            f"Both images already at or below target resolution ({target_pixel_size:.4f} um/px)"
+        )
 
     # Both images now at target_pixel_size um/px
     gray_wsi_scaled = gray_wsi
@@ -200,10 +200,7 @@ def match_sift(
         return None
 
     # Calculate offset: where does the center of the microscope image land in the WSI?
-    micro_center = np.float32([[[
-        gray_micro.shape[1] / 2.0,
-        gray_micro.shape[0] / 2.0
-    ]]])
+    micro_center = np.float32([[[gray_micro.shape[1] / 2.0, gray_micro.shape[0] / 2.0]]])
     wsi_center_in_scaled = cv2.perspectiveTransform(micro_center, H)[0][0]
 
     # The WSI region center (in scaled pixels) is where the stage currently points

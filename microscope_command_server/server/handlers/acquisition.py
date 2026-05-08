@@ -95,12 +95,9 @@ def handle_acquire(conn, client, hardware, settings, **kwargs):
             full_message = "".join(message_parts)
             if END_MARKER in full_message:
                 # Remove the end marker
-                message = full_message.replace("," + END_MARKER, "").replace(
-                    END_MARKER, ""
-                )
+                message = full_message.replace("," + END_MARKER, "").replace(END_MARKER, "")
                 logger.debug(
-                    "Received complete acquisition message (%d bytes) "
-                    "in %.2fs",
+                    "Received complete acquisition message (%d bytes) " "in %.2fs",
                     total_bytes,
                     time.time() - start_time,
                 )
@@ -130,7 +127,8 @@ def handle_acquire(conn, client, hardware, settings, **kwargs):
             if total_bytes > 10000:  # 10KB max
                 logger.error(
                     "Acquisition message too large from %s: %d bytes",
-                    addr, total_bytes,
+                    addr,
+                    total_bytes,
                 )
                 with acquisition_locks[addr]:
                     acquisition_states[addr] = AcquisitionState.FAILED
@@ -171,7 +169,9 @@ def handle_bgacquire(conn, client, hardware, settings, **kwargs):
     Response: STARTED:<output_path> then SUCCESS:<output_path>|<exposures>
               or FAILED:<reason>
     """
-    addr = kwargs.get("addr", client if isinstance(client, tuple) else getattr(client, "addr", client))
+    addr = kwargs.get(
+        "addr", client if isinstance(client, tuple) else getattr(client, "addr", client)
+    )
     config_manager = kwargs.get("config_manager")
     acquisition_locks = kwargs.get("acquisition_locks", {})
     acquisition_progress = kwargs.get("acquisition_progress", {})
@@ -190,9 +190,7 @@ def handle_bgacquire(conn, client, hardware, settings, **kwargs):
         while True:
             chunk = conn.recv(1024)
             if not chunk:
-                logger.error(
-                    "Connection closed while reading background acquisition message"
-                )
+                logger.error("Connection closed while reading background acquisition message")
                 conn.sendall(b"FAILED:Connection closed")
                 break
 
@@ -212,7 +210,17 @@ def handle_bgacquire(conn, client, hardware, settings, **kwargs):
 
                 # Split by known flags to avoid issues with spaces in paths
                 # Include --wb-mode as a valued flag
-                flags = ["--yaml", "--output", "--modality", "--angles", "--exposures", "--wb-mode", "--objective", "--detector", "--target-intensity"]
+                flags = [
+                    "--yaml",
+                    "--output",
+                    "--modality",
+                    "--angles",
+                    "--exposures",
+                    "--wb-mode",
+                    "--objective",
+                    "--detector",
+                    "--target-intensity",
+                ]
 
                 for i, flag in enumerate(flags):
                     if flag in message:
@@ -221,7 +229,7 @@ def handle_bgacquire(conn, client, hardware, settings, **kwargs):
 
                         # Find where the next flag starts (or use end of string)
                         end_idx = len(message)
-                        for next_flag in flags[i + 1:]:
+                        for next_flag in flags[i + 1 :]:
                             if next_flag in message[start_idx:]:
                                 next_pos = message.index(next_flag, start_idx)
                                 if next_pos < end_idx:
@@ -261,10 +269,12 @@ def handle_bgacquire(conn, client, hardware, settings, **kwargs):
 
                 # Resolve wb_mode: prefer explicit --wb-mode, fall back to boolean flag
                 if "wb_mode" in params:
-                    logger.info("WB mode for background acquisition: %s", params['wb_mode'])
+                    logger.info("WB mode for background acquisition: %s", params["wb_mode"])
                 elif use_per_angle_wb:
                     params["wb_mode"] = "per_angle"
-                    logger.info("Per-angle white balance enabled for background acquisition (legacy flag)")
+                    logger.info(
+                        "Per-angle white balance enabled for background acquisition (legacy flag)"
+                    )
                 # If neither --wb-mode nor --use_per_angle_wb, leave wb_mode unset
                 # and let simple_background_collection use its default
 
@@ -289,17 +299,19 @@ def handle_bgacquire(conn, client, hardware, settings, **kwargs):
                         logger.warning("CONFIG MISMATCH WARNING")
                         logger.warning("Connection CONFIG:  %s", connection_yaml)
                         logger.warning("ACQUIRE --yaml:     %s", acquire_yaml)
-                        logger.warning("ACQUIRE yaml will override connection config for this acquisition")
-                        logger.warning("This may cause unexpected behavior or hardware misconfiguration!")
+                        logger.warning(
+                            "ACQUIRE yaml will override connection config for this acquisition"
+                        )
+                        logger.warning(
+                            "This may cause unexpected behavior or hardware misconfiguration!"
+                        )
                         logger.warning("=" * 80)
 
                 # Send immediate acknowledgment to prevent client timeout
                 try:
                     ack_response = f"STARTED:{params['output_folder_path']}".encode()
                     conn.sendall(ack_response)
-                    logger.info(
-                        "Sent STARTED acknowledgment for background acquisition"
-                    )
+                    logger.info("Sent STARTED acknowledgment for background acquisition")
 
                     # Execute background acquisition using simplified collection
                     from microscope_command_server.acquisition.workflow import (
@@ -339,12 +351,15 @@ def handle_bgacquire(conn, client, hardware, settings, **kwargs):
                     )
 
                     # Send success response with output path and final exposures
-                    response = f"SUCCESS:{params['output_folder_path']}|{exposures_formatted}".encode()
+                    response = (
+                        f"SUCCESS:{params['output_folder_path']}|{exposures_formatted}".encode()
+                    )
                     conn.sendall(response)
                     requested_angles = params.get("angles_str", "").strip()
-                    is_non_rotation = (
-                        not requested_angles
-                        or requested_angles in ("()", "(0)", "(0.0)")
+                    is_non_rotation = not requested_angles or requested_angles in (
+                        "()",
+                        "(0)",
+                        "(0.0)",
                     )
                     if is_non_rotation and len(final_exposures) == 1:
                         only_exposure = next(iter(final_exposures.values()))
@@ -359,9 +374,7 @@ def handle_bgacquire(conn, client, hardware, settings, **kwargs):
                         )
 
                 except Exception as e:
-                    logger.error(
-                        "Background acquisition failed: %s", str(e), exc_info=True
-                    )
+                    logger.error("Background acquisition failed: %s", str(e), exc_info=True)
                     response = f"FAILED:{str(e)}".encode()
                     conn.sendall(response)
 
@@ -402,7 +415,9 @@ def handle_zstack(conn, client, hardware, settings, **kwargs):
               or FAILED:<reason>
     """
     config_manager = kwargs.get("config_manager")
-    addr = kwargs.get("addr", client if isinstance(client, tuple) else getattr(client, "addr", client))
+    addr = kwargs.get(
+        "addr", client if isinstance(client, tuple) else getattr(client, "addr", client)
+    )
     logger.info("Client %s requested Z-stack acquisition", addr)
 
     try:
@@ -421,37 +436,53 @@ def handle_zstack(conn, client, hardware, settings, **kwargs):
     i = 0
     while i < len(parts):
         if parts[i] == "--output" and i + 1 < len(parts):
-            params["output"] = parts[i + 1]; i += 2
+            params["output"] = parts[i + 1]
+            i += 2
         elif parts[i] == "--z-start" and i + 1 < len(parts):
-            params["z_start"] = float(parts[i + 1]); i += 2
+            params["z_start"] = float(parts[i + 1])
+            i += 2
         elif parts[i] == "--z-end" and i + 1 < len(parts):
-            params["z_end"] = float(parts[i + 1]); i += 2
+            params["z_end"] = float(parts[i + 1])
+            i += 2
         elif parts[i] == "--z-step" and i + 1 < len(parts):
-            params["z_step"] = float(parts[i + 1]); i += 2
+            params["z_step"] = float(parts[i + 1])
+            i += 2
         elif parts[i] == "--modality" and i + 1 < len(parts):
-            params["modality"] = parts[i + 1]; i += 2
+            params["modality"] = parts[i + 1]
+            i += 2
         elif parts[i] == "--angles" and i + 1 < len(parts):
-            params["angles"] = parts[i + 1]; i += 2
+            params["angles"] = parts[i + 1]
+            i += 2
         elif parts[i] == "--wb-mode" and i + 1 < len(parts):
-            params["wb_mode"] = parts[i + 1]; i += 2
+            params["wb_mode"] = parts[i + 1]
+            i += 2
         elif parts[i] == "--yaml" and i + 1 < len(parts):
-            params["yaml"] = parts[i + 1]; i += 2
+            params["yaml"] = parts[i + 1]
+            i += 2
         elif parts[i] == "--objective" and i + 1 < len(parts):
-            params["objective"] = parts[i + 1]; i += 2
+            params["objective"] = parts[i + 1]
+            i += 2
         elif parts[i] == "--detector" and i + 1 < len(parts):
-            params["detector"] = parts[i + 1]; i += 2
+            params["detector"] = parts[i + 1]
+            i += 2
         elif parts[i] == "--projection" and i + 1 < len(parts):
-            params["projection"] = parts[i + 1]; i += 2
+            params["projection"] = parts[i + 1]
+            i += 2
         elif parts[i] == "--bg-correction" and i + 1 < len(parts):
-            params["bg_correction"] = parts[i + 1].lower() == "true"; i += 2
+            params["bg_correction"] = parts[i + 1].lower() == "true"
+            i += 2
         elif parts[i] == "--bg-folder" and i + 1 < len(parts):
-            params["bg_folder"] = parts[i + 1]; i += 2
+            params["bg_folder"] = parts[i + 1]
+            i += 2
         elif parts[i] == "--bg-method" and i + 1 < len(parts):
-            params["bg_method"] = parts[i + 1]; i += 2
+            params["bg_method"] = parts[i + 1]
+            i += 2
         elif parts[i] == "--timepoints" and i + 1 < len(parts):
-            params["timepoints"] = int(parts[i + 1]); i += 2
+            params["timepoints"] = int(parts[i + 1])
+            i += 2
         elif parts[i] == "--interval" and i + 1 < len(parts):
-            params["interval"] = float(parts[i + 1]); i += 2
+            params["interval"] = float(parts[i + 1])
+            i += 2
         else:
             i += 1
 
@@ -464,6 +495,7 @@ def handle_zstack(conn, client, hardware, settings, **kwargs):
     conn.sendall(f"STARTED:{params['output']}".encode())
     try:
         from microscope_command_server.acquisition.stack_timelapse import acquire_z_stack
+
         result = acquire_z_stack(
             hardware=hardware,
             output_folder=params["output"],
@@ -484,16 +516,18 @@ def handle_zstack(conn, client, hardware, settings, **kwargs):
             n_timepoints=params.get("timepoints", 1),
             interval_seconds=params.get("interval", 0.0),
         )
-        response = (f"SUCCESS:{params['output']}|"
-                    f"planes:{result['n_planes']}|"
-                    f"timepoints:{result.get('n_timepoints', 1)}|"
-                    f"files:{len(result['files'])}|"
-                    f"elapsed:{result['elapsed_seconds']:.1f}s")
+        response = (
+            f"SUCCESS:{params['output']}|"
+            f"planes:{result['n_planes']}|"
+            f"timepoints:{result.get('n_timepoints', 1)}|"
+            f"files:{len(result['files'])}|"
+            f"elapsed:{result['elapsed_seconds']:.1f}s"
+        )
         conn.sendall(response.encode())
         logger.info(
             "ZSTACK complete: T=%d, Z=%d",
-            result.get('n_timepoints', 1),
-            result['n_planes'],
+            result.get("n_timepoints", 1),
+            result["n_planes"],
         )
     except Exception as e:
         logger.error("ZSTACK failed: %s", e, exc_info=True)
@@ -510,7 +544,9 @@ def handle_tlapse(conn, client, hardware, settings, **kwargs):
               or FAILED:<reason>
     """
     config_manager = kwargs.get("config_manager")
-    addr = kwargs.get("addr", client if isinstance(client, tuple) else getattr(client, "addr", client))
+    addr = kwargs.get(
+        "addr", client if isinstance(client, tuple) else getattr(client, "addr", client)
+    )
     logger.info("Client %s requested time-lapse acquisition", addr)
 
     try:
@@ -529,29 +565,41 @@ def handle_tlapse(conn, client, hardware, settings, **kwargs):
     i = 0
     while i < len(parts):
         if parts[i] == "--output" and i + 1 < len(parts):
-            params["output"] = parts[i + 1]; i += 2
+            params["output"] = parts[i + 1]
+            i += 2
         elif parts[i] == "--timepoints" and i + 1 < len(parts):
-            params["timepoints"] = int(parts[i + 1]); i += 2
+            params["timepoints"] = int(parts[i + 1])
+            i += 2
         elif parts[i] == "--interval" and i + 1 < len(parts):
-            params["interval"] = float(parts[i + 1]); i += 2
+            params["interval"] = float(parts[i + 1])
+            i += 2
         elif parts[i] == "--modality" and i + 1 < len(parts):
-            params["modality"] = parts[i + 1]; i += 2
+            params["modality"] = parts[i + 1]
+            i += 2
         elif parts[i] == "--angles" and i + 1 < len(parts):
-            params["angles"] = parts[i + 1]; i += 2
+            params["angles"] = parts[i + 1]
+            i += 2
         elif parts[i] == "--wb-mode" and i + 1 < len(parts):
-            params["wb_mode"] = parts[i + 1]; i += 2
+            params["wb_mode"] = parts[i + 1]
+            i += 2
         elif parts[i] == "--yaml" and i + 1 < len(parts):
-            params["yaml"] = parts[i + 1]; i += 2
+            params["yaml"] = parts[i + 1]
+            i += 2
         elif parts[i] == "--objective" and i + 1 < len(parts):
-            params["objective"] = parts[i + 1]; i += 2
+            params["objective"] = parts[i + 1]
+            i += 2
         elif parts[i] == "--detector" and i + 1 < len(parts):
-            params["detector"] = parts[i + 1]; i += 2
+            params["detector"] = parts[i + 1]
+            i += 2
         elif parts[i] == "--bg-correction" and i + 1 < len(parts):
-            params["bg_correction"] = parts[i + 1].lower() == "true"; i += 2
+            params["bg_correction"] = parts[i + 1].lower() == "true"
+            i += 2
         elif parts[i] == "--bg-folder" and i + 1 < len(parts):
-            params["bg_folder"] = parts[i + 1]; i += 2
+            params["bg_folder"] = parts[i + 1]
+            i += 2
         elif parts[i] == "--bg-method" and i + 1 < len(parts):
-            params["bg_method"] = parts[i + 1]; i += 2
+            params["bg_method"] = parts[i + 1]
+            i += 2
         else:
             i += 1
 
@@ -563,6 +611,7 @@ def handle_tlapse(conn, client, hardware, settings, **kwargs):
     conn.sendall(f"STARTED:{params['output']}".encode())
     try:
         from microscope_command_server.acquisition.stack_timelapse import acquire_time_lapse
+
         result = acquire_time_lapse(
             hardware=hardware,
             output_folder=params["output"],
@@ -579,12 +628,14 @@ def handle_tlapse(conn, client, hardware, settings, **kwargs):
             background_folder=params.get("bg_folder"),
             background_correction_method=params.get("bg_method", "divide"),
         )
-        response = (f"SUCCESS:{params['output']}|"
-                    f"timepoints:{result['n_timepoints']}|"
-                    f"files:{len(result['files'])}|"
-                    f"elapsed:{result['elapsed_seconds']:.1f}s")
+        response = (
+            f"SUCCESS:{params['output']}|"
+            f"timepoints:{result['n_timepoints']}|"
+            f"files:{len(result['files'])}|"
+            f"elapsed:{result['elapsed_seconds']:.1f}s"
+        )
         conn.sendall(response.encode())
-        logger.info("TLAPSE complete: %d timepoints", result['n_timepoints'])
+        logger.info("TLAPSE complete: %d timepoints", result["n_timepoints"])
     except Exception as e:
         logger.error("TLAPSE failed: %s", e, exc_info=True)
         conn.sendall(f"FAILED:{str(e)}".encode())

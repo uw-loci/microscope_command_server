@@ -54,9 +54,7 @@ def read_message_string(conn, timeout=5.0, max_bytes=10000, chunk_size=1024):
 
             if END_MARKER in full_message:
                 # Remove the end marker (handle both ",ENDOFSTR" and "ENDOFSTR")
-                message = full_message.replace("," + END_MARKER, "").replace(
-                    END_MARKER, ""
-                ).strip()
+                message = full_message.replace("," + END_MARKER, "").replace(END_MARKER, "").strip()
                 logger.debug(
                     "Read complete message (%d bytes) in %.2fs",
                     total_bytes,
@@ -66,9 +64,7 @@ def read_message_string(conn, timeout=5.0, max_bytes=10000, chunk_size=1024):
 
             # Safety check for message size
             if total_bytes > max_bytes:
-                raise ValueError(
-                    f"Message too large: {total_bytes} bytes (max {max_bytes})"
-                )
+                raise ValueError(f"Message too large: {total_bytes} bytes (max {max_bytes})")
 
             # Timeout check (wall clock, separate from socket timeout)
             if time.time() - start_time > timeout * 2:

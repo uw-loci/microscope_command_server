@@ -153,7 +153,7 @@ BLUR_BUDGET_UM = 0.5
 SATURATION_THRESHOLD_BY_MODALITY = {
     "brightfield": 0.30,  # bright background with dark tissue -- tolerant
     "bf": 0.30,
-    "ppm": 0.05,           # polarized: both channels contribute -- moderate
+    "ppm": 0.05,  # polarized: both channels contribute -- moderate
     "polarized": 0.05,
     "fluorescence": 0.02,  # widefield fluorescence -- strict
     "fluorescent": 0.02,
@@ -353,8 +353,12 @@ def _pop_tagged_frame(core) -> Tuple[Optional[np.ndarray], Optional[float]]:
                         "from TODO_LIST.md; trailing rows of every popped "
                         "frame contain stale content from prior frames. "
                         "Logged once per session.",
-                        core_w, core_h, tag_w_int, tag_h_int,
-                        core_h - tag_h_int, core_w - tag_w_int,
+                        core_w,
+                        core_h,
+                        tag_w_int,
+                        tag_h_int,
+                        core_h - tag_h_int,
+                        core_w - tag_w_int,
                     )
                     _pop_tagged_frame._dim_warn_logged = True
     except Exception:
@@ -456,7 +460,8 @@ def _resolve_metric_name(
             logger.warning(
                 "STREAM_AF: autofocus yaml score_metric=%r is invalid "
                 "(%s); falling back to modality default.",
-                yaml_metric, e,
+                yaml_metric,
+                e,
             )
 
     return modality_default_metric(modality, fallback=DEFAULT_METRIC_NAME)
@@ -477,7 +482,9 @@ def _focus_metric(img, metric_name: str = DEFAULT_METRIC_NAME) -> float:
     except UnknownMetricError as e:
         logger.debug(
             "focus metric '%s' not in manifest (%s); using %s",
-            metric_name, e, DEFAULT_METRIC_NAME,
+            metric_name,
+            e,
+            DEFAULT_METRIC_NAME,
         )
         fn = resolve_metric(DEFAULT_METRIC_NAME)
     try:
@@ -586,13 +593,15 @@ def _load_streaming_af_config(yaml_path: str) -> Dict[str, Any]:
     except Exception as e:
         logger.warning("Failed to parse %s: %s", yaml_path, e)
         return {}
-    block = (((doc.get("stage") or {}).get("streaming_af")) or {})
+    block = ((doc.get("stage") or {}).get("streaming_af")) or {}
     if not isinstance(block, dict):
         return {}
     return block
 
 
-def _resolve_objective(core, settings, client_objective: Optional[str], pixel_tol: float = 0.01) -> Tuple[Optional[str], str]:
+def _resolve_objective(
+    core, settings, client_objective: Optional[str], pixel_tol: float = 0.01
+) -> Tuple[Optional[str], str]:
     """Pick an objective id for this streaming AF run.
 
     Returns (objective_id, source_string). source_string is one of
@@ -703,14 +712,15 @@ def _read_roi(core) -> Optional[Tuple[int, int, int, int]]:
     try:
         return (int(roi.x), int(roi.y), int(roi.width), int(roi.height))
     except Exception as e:
-        logger.warning("STREAM_AF:get_roi() returned %r which is neither "
-                        "iterable nor Rectangle-shaped: %s", type(roi).__name__, e)
+        logger.warning(
+            "STREAM_AF:get_roi() returned %r which is neither " "iterable nor Rectangle-shaped: %s",
+            type(roi).__name__,
+            e,
+        )
         return None
 
 
-def _apply_crop_roi(
-    core, crop_factor: float
-) -> Tuple[Optional[Tuple[int, int, int, int]], bool]:
+def _apply_crop_roi(core, crop_factor: float) -> Tuple[Optional[Tuple[int, int, int, int]], bool]:
     """Save the current camera ROI and install a centered crop.
 
     Returns (saved_roi, sequence_was_running_when_called) where:
@@ -751,8 +761,9 @@ def _apply_crop_roi(
         return (None, False)
     saved = _read_roi(core)
     if saved is None:
-        logger.warning("STREAM_AF:could not query camera ROI for crop "
-                        "(see prior warning); skipping crop")
+        logger.warning(
+            "STREAM_AF:could not query camera ROI for crop " "(see prior warning); skipping crop"
+        )
         return (None, False)
     x0, y0, w0, h0 = saved
 
@@ -779,8 +790,14 @@ def _apply_crop_roi(
     try:
         core.set_roi(new_x, new_y, new_w, new_h)
     except Exception as e:
-        logger.warning("STREAM_AF:could not install centered crop ROI "
-                        "(%d, %d, %d, %d): %s", new_x, new_y, new_w, new_h, e)
+        logger.warning(
+            "STREAM_AF:could not install centered crop ROI " "(%d, %d, %d, %d): %s",
+            new_x,
+            new_y,
+            new_w,
+            new_h,
+            e,
+        )
         # Try to restart the sequence we stopped before bailing.
         if seq_running:
             try:
@@ -797,8 +814,7 @@ def _apply_crop_roi(
             # post-ROI-change frame before the scan starts popping.
             time.sleep(0.15)
         except Exception as e:
-            logger.warning("STREAM_AF:could not restart sequence after "
-                            "ROI crop: %s", e)
+            logger.warning("STREAM_AF:could not restart sequence after " "ROI crop: %s", e)
             # Best-effort restore and bail.
             try:
                 core.set_roi(int(x0), int(y0), int(w0), int(h0))
@@ -806,10 +822,20 @@ def _apply_crop_roi(
                 pass
             return (None, seq_running)
 
-    logger.info("STREAM_AF:cropped camera ROI (%d, %d, %dx%d) -> (%d, %d, %dx%d) "
-                "(factor=%.2f, pixel area %.0f%% of original)",
-                x0, y0, w0, h0, new_x, new_y, new_w, new_h,
-                crop_factor, (crop_factor * crop_factor) * 100.0)
+    logger.info(
+        "STREAM_AF:cropped camera ROI (%d, %d, %dx%d) -> (%d, %d, %dx%d) "
+        "(factor=%.2f, pixel area %.0f%% of original)",
+        x0,
+        y0,
+        w0,
+        h0,
+        new_x,
+        new_y,
+        new_w,
+        new_h,
+        crop_factor,
+        (crop_factor * crop_factor) * 100.0,
+    )
     return ((x0, y0, w0, h0), seq_running)
 
 
@@ -842,8 +868,7 @@ def _restore_roi(
 
     try:
         core.set_roi(int(x0), int(y0), int(w0), int(h0))
-        logger.info("STREAM_AF:restored camera ROI to (%d, %d, %dx%d)",
-                    x0, y0, w0, h0)
+        logger.info("STREAM_AF:restored camera ROI to (%d, %d, %dx%d)", x0, y0, w0, h0)
     except Exception as e:
         # JAI / GenAPI failure mode: when the camera is currently in
         # a cropped state, the GenAPI Width and Height nodes report a
@@ -855,9 +880,12 @@ def _restore_roi(
         # then we re-apply the original ROI only if it wasn't already
         # equal to the full sensor.
         logger.debug(
-            "STREAM_AF:set_roi(%d, %d, %dx%d) failed (%s); "
-            "trying clear_roi + retry",
-            x0, y0, w0, h0, e,
+            "STREAM_AF:set_roi(%d, %d, %dx%d) failed (%s); " "trying clear_roi + retry",
+            x0,
+            y0,
+            w0,
+            h0,
+            e,
         )
         try:
             core.clear_roi()
@@ -866,12 +894,16 @@ def _restore_roi(
                 core.set_roi(int(x0), int(y0), int(w0), int(h0))
             logger.info(
                 "STREAM_AF:restored camera ROI to (%d, %d, %dx%d) via clear_roi",
-                x0, y0, w0, h0,
+                x0,
+                y0,
+                w0,
+                h0,
             )
         except Exception as e2:
             logger.warning(
-                "STREAM_AF:failed to restore camera ROI even after "
-                "clear_roi (%s -> %s)", e, e2,
+                "STREAM_AF:failed to restore camera ROI even after " "clear_roi (%s -> %s)",
+                e,
+                e2,
             )
 
     # Restart the sequence iff:
@@ -889,10 +921,10 @@ def _restore_roi(
             # count doesn't match the restored dimensions, causing a
             # reshape crash (observed on PPM 2026-04-16).
             import time
+
             time.sleep(0.15)
         except Exception as e:
-            logger.warning("STREAM_AF:could not restart sequence after "
-                            "ROI restore: %s", e)
+            logger.warning("STREAM_AF:could not restart sequence after " "ROI restore: %s", e)
 
 
 def _try_get(core, device: str, prop: str) -> Optional[str]:
@@ -902,9 +934,13 @@ def _try_get(core, device: str, prop: str) -> Optional[str]:
         return None
 
 
-def _wait_via_busy(core, device: str, timeout_s: float = 10.0,
-                   target_z: float | None = None,
-                   tolerance_um: float = 0.5) -> None:
+def _wait_via_busy(
+    core,
+    device: str,
+    timeout_s: float = 10.0,
+    target_z: float | None = None,
+    tolerance_um: float = 0.5,
+) -> None:
     """Tight busy-poll wait for the focus device. Mirrors
     microscope_control.hardware.stage._wait_z_via_busy:
       - 5 consecutive not-busy reads required (was 2; bumped 2026-05-05
@@ -954,7 +990,11 @@ def _wait_via_busy(core, device: str, timeout_s: float = 10.0,
                     "actual=%.3f um, err=%.3f um (tol=%.3f um) on '%s'. "
                     "Stage reported not-busy but did not arrive. Falling "
                     "back to wait_for_device.",
-                    target_z, actual_z, err, tolerance_um, device,
+                    target_z,
+                    actual_z,
+                    err,
+                    tolerance_um,
+                    device,
                 )
                 try:
                     core.wait_for_device(device)
@@ -968,7 +1008,9 @@ def _wait_via_busy(core, device: str, timeout_s: float = 10.0,
                             "streaming wait_via_busy STILL off-target: "
                             "target=%.3f, actual=%.3f, err=%.3f um. "
                             "Stage controller may be in a bad state.",
-                            target_z, actual_z2, err2,
+                            target_z,
+                            actual_z2,
+                            err2,
                         )
                 except Exception:
                     pass
@@ -997,8 +1039,10 @@ def _get_z_limits(settings: Dict[str, Any]) -> Tuple[Optional[float], Optional[f
 
 
 def _scan_window_within_limits(
-    z_center: float, range_um: float,
-    z_low: Optional[float], z_high: Optional[float],
+    z_center: float,
+    range_um: float,
+    z_low: Optional[float],
+    z_high: Optional[float],
 ) -> bool:
     """Check that a proposed scan window centered on `z_center` with
     total span `range_um` fits inside [z_low, z_high]. Missing limits
@@ -1069,7 +1113,9 @@ def _gaussian_peak(zs: List[float], ms: List[float]) -> Optional[float]:
     hi_bounds = [np.inf, float(z_arr.max()), z_range, np.inf]
     try:
         popt, _ = curve_fit(
-            gaussian, z_arr, m_arr,
+            gaussian,
+            z_arr,
+            m_arr,
             p0=[A_init, mu_init, sigma_init, C_init],
             bounds=(lo_bounds, hi_bounds),
             maxfev=500,
@@ -1115,7 +1161,7 @@ def _parabolic_peak(zs: List[float], ms: List[float]) -> Optional[float]:
     if abs(denom) < 1e-12:
         return None
     a = (z2 * (m1 - m0) + z1 * (m0 - m2) + z0 * (m2 - m1)) / denom
-    b = (z2 ** 2 * (m0 - m1) + z1 ** 2 * (m2 - m0) + z0 ** 2 * (m1 - m2)) / denom
+    b = (z2**2 * (m0 - m1) + z1**2 * (m2 - m0) + z0**2 * (m1 - m2)) / denom
     if a >= 0:
         # Wrong curvature -- not a maximum.
         return None
@@ -1177,11 +1223,20 @@ def _fit_union_samples(
     logger.info(
         "STREAM_AF:union-fit across %d samples from %d attempts -- "
         "interior argmax at Z=%.3f (idx %d/%d), fit=%s best_z=%.3f, span=%.2f",
-        n, n_attempts_so_far, zs[raw_max_idx], raw_max_idx, n,
-        fit_kind, fit_z, z_span,
+        n,
+        n_attempts_so_far,
+        zs[raw_max_idx],
+        raw_max_idx,
+        n,
+        fit_kind,
+        fit_z,
+        z_span,
     )
     return _ScanAttemptResult(
-        "success", float(fit_z), n, float(z_span),
+        "success",
+        float(fit_z),
+        n,
+        float(z_span),
         f"union-fit {fit_kind} peak at Z={fit_z:.3f} from {n} samples",
     )
 
@@ -1270,8 +1325,9 @@ def _run_streaming_scan(
         core.clear_circular_buffer()
         logger.info("STREAM_AF:flushed circular buffer before firing move")
     except Exception as e:
-        logger.warning("STREAM_AF:clear_circular_buffer failed "
-                        "(continuing with whatever's queued): %s", e)
+        logger.warning(
+            "STREAM_AF:clear_circular_buffer failed " "(continuing with whatever's queued): %s", e
+        )
 
     direction = 1.0 if z_end >= z_start else -1.0
     motion_um = abs(z_end - z_start)
@@ -1409,7 +1465,7 @@ def _run_streaming_scan(
                             off = 0
                         if off + block_size > n_bytes:
                             off = n_bytes - block_size
-                        parts.append(flat[off:off + block_size].tobytes())
+                        parts.append(flat[off : off + block_size].tobytes())
                     fp = b"".join(parts)
                 elif n_bytes > 0:
                     fp = flat.tobytes()
@@ -1448,7 +1504,7 @@ def _run_streaming_scan(
         # didn't take effect and the rest of the scan was stationary.
         Z_END_REACHED_TOLERANCE_UM = 0.25
         t_reached_z_end_ms: Optional[float] = None
-        for (t_ms, z) in z_poll_samples:
+        for t_ms, z in z_poll_samples:
             if abs(z - z_end) <= Z_END_REACHED_TOLERANCE_UM:
                 t_reached_z_end_ms = t_ms
                 break
@@ -1460,26 +1516,31 @@ def _run_streaming_scan(
             "STREAM_AF:Z-poll trace: n=%d, first(t=%.0fms, Z=%.3f), "
             "last(t=%.0fms, Z=%.3f), observed_avg_velocity=%.2f um/s "
             "(configured %.2f um/s), reached_z_end at t=%s",
-            len(z_poll_samples), first_t, z_start_actual,
-            last_t, last_z, observed_avg_velocity_um_s, velocity_um_s,
-            f"{t_reached_z_end_ms:.0f}ms" if t_reached_z_end_ms is not None
-            else "(not reached during poll window)",
+            len(z_poll_samples),
+            first_t,
+            z_start_actual,
+            last_t,
+            last_z,
+            observed_avg_velocity_um_s,
+            velocity_um_s,
+            (
+                f"{t_reached_z_end_ms:.0f}ms"
+                if t_reached_z_end_ms is not None
+                else "(not reached during poll window)"
+            ),
         )
 
         # Smoking-gun warning. If the stage reached z_end in less than
         # half the time we expected (motion_duration_ms), the slow speed
         # never took effect: the scan is stationary frames being labeled
         # with a linear-interpolation Z that no longer matches reality.
-        if (t_reached_z_end_ms is not None
-                and t_reached_z_end_ms < motion_duration_ms * 0.5):
+        if t_reached_z_end_ms is not None and t_reached_z_end_ms < motion_duration_ms * 0.5:
             # Compute the in-motion velocity (during the actual move
             # only, NOT averaged over the full poll window). This is
             # the number you actually want to put into
             # slow_speed_um_per_s YAML, since the average-over-window
             # number gets diluted by stationary post-motion samples.
-            in_motion_velocity_um_s = (
-                abs(z_end - z_start) / max(t_reached_z_end_ms / 1000.0, 1e-3)
-            )
+            in_motion_velocity_um_s = abs(z_end - z_start) / max(t_reached_z_end_ms / 1000.0, 1e-3)
             logger.warning(
                 "STREAM_AF:STAGE SPEED MISMATCH -- expected slow scan to "
                 "take ~%.0fms (velocity_um_s=%.2f, range=%.2fum), but "
@@ -1498,8 +1559,11 @@ def _run_streaming_scan(
                 "and SCurve properties to low values on the focus "
                 "device, or use a fractional MaxSpeed value if the "
                 "adapter accepts it.",
-                motion_duration_ms, velocity_um_s, abs(z_end - z_start),
-                t_reached_z_end_ms, in_motion_velocity_um_s,
+                motion_duration_ms,
+                velocity_um_s,
+                abs(z_end - z_start),
+                t_reached_z_end_ms,
+                in_motion_velocity_um_s,
                 100.0 * (1.0 - t_reached_z_end_ms / max(observed_dur_s * 1000.0, 1e-3)),
                 max(1, int(round(t_reached_z_end_ms / 1000.0 * 38.0))),
                 in_motion_velocity_um_s,
@@ -1511,8 +1575,14 @@ def _run_streaming_scan(
             # if the user is looking at the speed-mismatch warning,
             # they're already in the middle of fixing this and want
             # the data right next to the warning.
-            for prop_name in ("MaxSpeed", "Velocity", "Speed",
-                               "MaxVelocity", "Acceleration", "SCurve"):
+            for prop_name in (
+                "MaxSpeed",
+                "Velocity",
+                "Speed",
+                "MaxVelocity",
+                "Acceleration",
+                "SCurve",
+            ):
                 try:
                     cur = core.get_property(focus_device, prop_name)
                 except Exception:
@@ -1536,7 +1606,7 @@ def _run_streaming_scan(
                     test_val = "0.5"
                     core.set_property(focus_device, prop_name, test_val)
                     after = core.get_property(focus_device, prop_name)
-                    accepts_fractional = ("yes" if after == test_val else f"no (clamped to {after})")
+                    accepts_fractional = "yes" if after == test_val else f"no (clamped to {after})"
                     core.set_property(focus_device, prop_name, saved_val)
                 except Exception:
                     accepts_fractional = "no (rejected)"
@@ -1549,8 +1619,18 @@ def _run_streaming_scan(
                 # are accepted, values that get clamped land at the
                 # boundary, and values that throw are rejected.
                 int_probe_values = (
-                    "0", "1", "2", "3", "5", "10", "20",
-                    "50", "100", "200", "500", "1000",
+                    "0",
+                    "1",
+                    "2",
+                    "3",
+                    "5",
+                    "10",
+                    "20",
+                    "50",
+                    "100",
+                    "200",
+                    "500",
+                    "1000",
                 )
                 int_results: list = []
                 for tv in int_probe_values:
@@ -1572,20 +1652,25 @@ def _run_streaming_scan(
                     "STREAM_AF:property survey -- %s.%s = %r (allowed=[%s], "
                     "accepts 0.5? %s, integer probes: %s) "
                     "[N=accepted, N->(M)=clamped to M, N!=rejected]",
-                    focus_device, prop_name, cur, allowed,
-                    accepts_fractional, ", ".join(int_results),
+                    focus_device,
+                    prop_name,
+                    cur,
+                    allowed,
+                    accepts_fractional,
+                    ", ".join(int_results),
                 )
         elif observed_avg_velocity_um_s > velocity_um_s * 3.0:
             logger.warning(
                 "STREAM_AF:STAGE SPEED MISMATCH -- observed avg velocity "
                 "%.2f um/s > 3x configured %.2f um/s. Slow-speed property "
                 "may not be in expected units; verify stage YAML.",
-                observed_avg_velocity_um_s, velocity_um_s,
+                observed_avg_velocity_um_s,
+                velocity_um_s,
             )
     else:
         logger.debug(
-            "STREAM_AF:Z-poll trace: only %d samples collected; "
-            "skipping velocity analysis.", len(z_poll_samples),
+            "STREAM_AF:Z-poll trace: only %d samples collected; " "skipping velocity analysis.",
+            len(z_poll_samples),
         )
 
     # --- Post-scan: reshape + metric computation ---
@@ -1596,7 +1681,7 @@ def _run_streaming_scan(
     dump_records: Optional[List[Tuple[float, np.ndarray, float, float]]] = (
         [] if dump_dir is not None else None
     )
-    for (wall_ms, arr) in raw_captures:
+    for wall_ms, arr in raw_captures:
         try:
             if img_nch <= 1:
                 img = arr.reshape(img_h, img_w)
@@ -1626,8 +1711,11 @@ def _run_streaming_scan(
     logger.info(
         "STREAM_AF:scan exit at t=%.0fms (motion_end=%.0fms + tail=%.0fms) "
         "captures=%d samples=%d",
-        total_scan_ms, motion_duration_ms, SCAN_TAIL_MS,
-        len(raw_captures), len(samples),
+        total_scan_ms,
+        motion_duration_ms,
+        SCAN_TAIL_MS,
+        len(raw_captures),
+        len(samples),
     )
 
     if dump_dir is not None and dump_records is not None:
@@ -1644,7 +1732,8 @@ def _run_streaming_scan(
             )
         except Exception as e:
             logger.warning(
-                "STREAM_AF:dump_streaming_scan failed (non-fatal): %s", e,
+                "STREAM_AF:dump_streaming_scan failed (non-fatal): %s",
+                e,
             )
 
     return samples
@@ -1676,6 +1765,7 @@ def _dump_streaming_scan(
     """
     import csv
     import json
+
     try:
         import tifffile
     except Exception as e:
@@ -1705,32 +1795,36 @@ def _dump_streaming_scan(
         w.writerow(["idx", "wall_ms", "z_assumed_um", "z_actual_um", "metric"])
         for idx, (wall_ms, img, z_assumed, metric) in enumerate(dump_records):
             z_actual = _z_actual_at(wall_ms)
-            w.writerow([
-                idx,
-                f"{wall_ms:.2f}",
-                f"{z_assumed:.4f}",
-                "" if z_actual is None else f"{z_actual:.4f}",
-                f"{metric:.6f}",
-            ])
+            w.writerow(
+                [
+                    idx,
+                    f"{wall_ms:.2f}",
+                    f"{z_assumed:.4f}",
+                    "" if z_actual is None else f"{z_actual:.4f}",
+                    f"{metric:.6f}",
+                ]
+            )
             tif_name = (
-                f"frame_{idx:04d}_t{int(round(wall_ms)):06d}ms_"
-                f"zass{z_assumed:+09.3f}.tif"
+                f"frame_{idx:04d}_t{int(round(wall_ms)):06d}ms_" f"zass{z_assumed:+09.3f}.tif"
             ).replace(" ", "0")
             try:
                 tifffile.imwrite(
-                    str(frames_dir / tif_name), img,
+                    str(frames_dir / tif_name),
+                    img,
                     photometric="minisblack" if img.ndim == 2 else "rgb",
                 )
             except Exception as e:
                 logger.debug(
-                    "STREAM_AF:dump frame %d write failed: %s", idx, e,
+                    "STREAM_AF:dump frame %d write failed: %s",
+                    idx,
+                    e,
                 )
 
     z_poll_csv_path = dump_dir / "z_poll.csv"
     with open(z_poll_csv_path, "w", newline="") as fh:
         w = csv.writer(fh)
         w.writerow(["wall_ms", "z_actual_um"])
-        for (t_ms, z) in z_poll_samples:
+        for t_ms, z in z_poll_samples:
             w.writerow([f"{t_ms:.2f}", f"{z:.4f}"])
 
     manifest = {
@@ -1750,16 +1844,14 @@ def _dump_streaming_scan(
         manifest["z_poll_first_z"] = first_z
         manifest["z_poll_last_t_ms"] = last_t
         manifest["z_poll_last_z"] = last_z
-        manifest["observed_avg_velocity_um_s"] = (
-            abs(last_z - first_z) / observed_dur_s
-        )
+        manifest["observed_avg_velocity_um_s"] = abs(last_z - first_z) / observed_dur_s
     with open(dump_dir / "manifest.json", "w") as fh:
         json.dump(manifest, fh, indent=2)
 
     logger.info(
-        "STREAM_AF:dump written: %d frames + samples.csv + z_poll.csv "
-        "+ manifest.json under %s",
-        len(dump_records), dump_dir,
+        "STREAM_AF:dump written: %d frames + samples.csv + z_poll.csv " "+ manifest.json under %s",
+        len(dump_records),
+        dump_dir,
     )
 
 
@@ -1784,9 +1876,16 @@ class _ScanAttemptResult:
                                  acquisition to the Brent fallback
         'error'               -- hardware or protocol error mid-scan
     """
-    def __init__(self, status: str, best_z: Optional[float],
-                 n_samples: int, z_span: float, reason: str,
-                 samples_trace: Optional[list] = None):
+
+    def __init__(
+        self,
+        status: str,
+        best_z: Optional[float],
+        n_samples: int,
+        z_span: float,
+        reason: str,
+        samples_trace: Optional[list] = None,
+    ):
         self.status = status
         self.best_z = best_z
         self.n_samples = n_samples
@@ -1837,12 +1936,21 @@ def _attempt_one_scan(
     tag_prefix = f"{attempt_label}: " if attempt_label else ""
     z_start = z_center - range_um / 2.0
     z_end = z_center + range_um / 2.0
-    logger.info("STREAM_AF:%sscan window [%.3f -> %.3f] (center %.3f, range %.2f)",
-                tag_prefix, z_start, z_end, z_center, range_um)
+    logger.info(
+        "STREAM_AF:%sscan window [%.3f -> %.3f] (center %.3f, range %.2f)",
+        tag_prefix,
+        z_start,
+        z_end,
+        z_center,
+        range_um,
+    )
 
     if speed_prop is None:
         return _ScanAttemptResult(
-            "no_slow_speed", None, 0, 0.0,
+            "no_slow_speed",
+            None,
+            0,
+            0.0,
             f"focus device '{focus_device}' has no writable speed property",
         )
 
@@ -1864,12 +1972,18 @@ def _attempt_one_scan(
                 )
                 logger.debug(
                     "STREAM_AF:%sslow-speed set rejected; %s.%s allowed values = %s",
-                    tag_prefix, focus_device, speed_prop, allowed or "(none reported)",
+                    tag_prefix,
+                    focus_device,
+                    speed_prop,
+                    allowed or "(none reported)",
                 )
             except Exception:
                 pass
             return _ScanAttemptResult(
-                "no_slow_speed", None, 0, 0.0,
+                "no_slow_speed",
+                None,
+                0,
+                0.0,
                 f"stage rejected {speed_prop}={slow_value}",
             )
 
@@ -1877,8 +1991,7 @@ def _attempt_one_scan(
         if sequence_was_running_on_entry:
             logger.info("STREAM_AF:%sreusing already-running sequence", tag_prefix)
         else:
-            logger.info("STREAM_AF:%sno active sequence; starting one for the scan",
-                        tag_prefix)
+            logger.info("STREAM_AF:%sno active sequence; starting one for the scan", tag_prefix)
             core.clear_circular_buffer()
             core.start_continuous_sequence_acquisition(0)
             sequence_started_here = True
@@ -1899,11 +2012,17 @@ def _attempt_one_scan(
                 range_um * HARD_DEADLINE_SEC_PER_UM + 2.0,
                 motion_duration_s + 2.0,
             )
-            samples = _run_streaming_scan(core, focus_device, speed_prop,
-                                        z_start, z_end, hard_deadline_s,
-                                        velocity_um_s=velocity_um_s,
-                                        metric_name=metric_name,
-                                        dump_dir=dump_dir)
+            samples = _run_streaming_scan(
+                core,
+                focus_device,
+                speed_prop,
+                z_start,
+                z_end,
+                hard_deadline_s,
+                velocity_um_s=velocity_um_s,
+                metric_name=metric_name,
+                dump_dir=dump_dir,
+            )
         finally:
             if sequence_started_here:
                 try:
@@ -1932,9 +2051,15 @@ def _attempt_one_scan(
                 "STREAM_AF:%spost-scan stage Z=%.3f (expected z_end=%.3f); "
                 "achieved %.2f um of planned %.2f um = %.0f%% (motion_duration_s=%.2f, "
                 "velocity_um_s=%.2f, hard_deadline_s=%.2f)",
-                tag_prefix, actual_z_after_scan, z_end,
-                actual_motion_um, expected_motion_um, motion_ratio * 100.0,
-                motion_duration_s, velocity_um_s, hard_deadline_s,
+                tag_prefix,
+                actual_z_after_scan,
+                z_end,
+                actual_motion_um,
+                expected_motion_um,
+                motion_ratio * 100.0,
+                motion_duration_s,
+                velocity_um_s,
+                hard_deadline_s,
             )
             if motion_ratio < 0.5 or motion_ratio > 1.5:
                 logger.warning(
@@ -1942,13 +2067,17 @@ def _attempt_one_scan(
                     "range. Slow-speed value '%s' on %s.%s may be misconfigured "
                     "for this rig. Verify stage.streaming_af.slow_speed_value and "
                     "stage.streaming_af.slow_speed_um_per_s in YAML.",
-                    tag_prefix, motion_ratio * 100.0,
-                    slow_value, focus_device, speed_prop,
+                    tag_prefix,
+                    motion_ratio * 100.0,
+                    slow_value,
+                    focus_device,
+                    speed_prop,
                 )
         except Exception as e:
             logger.debug(
                 "STREAM_AF:%scould not read post-scan stage Z: %s",
-                tag_prefix, e,
+                tag_prefix,
+                e,
             )
 
         _try_set(core, focus_device, speed_prop, normal_value)
@@ -1978,9 +2107,7 @@ def _attempt_one_scan(
         # window does the right thing in that case (samples after
         # motion_end_ms get dropped, leaving the in-motion samples).
         POST_MOTION_GRACE_MS = 100.0
-        motion_end_ms = (
-            abs(z_end - z_start) / max(velocity_um_s, 0.01) * 1000.0
-        )
+        motion_end_ms = abs(z_end - z_start) / max(velocity_um_s, 0.01) * 1000.0
         time_cutoff_ms = motion_end_ms + POST_MOTION_GRACE_MS
 
         # PRE-MOTION HEAD DISCARD
@@ -2006,15 +2133,21 @@ def _attempt_one_scan(
         # still admit accel artifacts; a fixed floor is safer.
         HEAD_DISCARD_MS = 600.0
 
-        clean = [(t, z, m) for (t, z, m) in samples
-                 if z == z and m == m and math.isfinite(z) and math.isfinite(m)]
-        in_motion = [(t, z, m) for (t, z, m) in clean
-                     if HEAD_DISCARD_MS <= t <= time_cutoff_ms]
+        clean = [
+            (t, z, m)
+            for (t, z, m) in samples
+            if z == z and m == m and math.isfinite(z) and math.isfinite(m)
+        ]
+        in_motion = [(t, z, m) for (t, z, m) in clean if HEAD_DISCARD_MS <= t <= time_cutoff_ms]
         logger.info(
             "STREAM_AF:%sin_motion filter kept %d/%d samples "
             "(head_discard=%.0fms time_cutoff=%.0fms motion_end=%.0fms)",
-            tag_prefix, len(in_motion), len(clean),
-            HEAD_DISCARD_MS, time_cutoff_ms, motion_end_ms,
+            tag_prefix,
+            len(in_motion),
+            len(clean),
+            HEAD_DISCARD_MS,
+            time_cutoff_ms,
+            motion_end_ms,
         )
 
         n_motion_samples = len(in_motion)
@@ -2040,17 +2173,17 @@ def _attempt_one_scan(
             metric_peak = float(max(ms))
             metric_trough = float(min(ms))
             metric_range = metric_peak - metric_trough
-            metric_range_frac = (
-                metric_range / max(abs(metric_peak), 1e-6)
-            )
+            metric_range_frac = metric_range / max(abs(metric_peak), 1e-6)
             if metric_range_frac < FLAT_METRIC_FRACTION:
                 logger.warning(
                     "STREAM_AF:%smetric range %.3f (%.2f%% of peak %.3f) "
                     "is within noise -- scan window is entirely within "
                     "DOF, cannot find focus. Widen --range or use a "
                     "higher-mag objective.",
-                    tag_prefix, metric_range,
-                    metric_range_frac * 100.0, metric_peak,
+                    tag_prefix,
+                    metric_range,
+                    metric_range_frac * 100.0,
+                    metric_peak,
                 )
                 # Dump per-sample trace on the refusal path so the
                 # operator can see whether the metric is genuinely flat
@@ -2061,10 +2194,17 @@ def _attempt_one_scan(
                 for i, (t, z, m) in enumerate(in_motion):
                     logger.info(
                         "STREAM_AF:%sFLAT sample %3d  t=%7.1f ms  z=%.3f  metric=%.4f",
-                        tag_prefix, i, t, z, m,
+                        tag_prefix,
+                        i,
+                        t,
+                        z,
+                        m,
                     )
                 return _ScanAttemptResult(
-                    "metric_flat", None, n_motion_samples, z_span,
+                    "metric_flat",
+                    None,
+                    n_motion_samples,
+                    z_span,
                     f"metric range {metric_range_frac:.2%} of peak is "
                     f"within noise; scan window {z_span:.2f} um is "
                     f"likely inside one depth-of-field. Widen --range "
@@ -2087,15 +2227,25 @@ def _attempt_one_scan(
             else:
                 best_z = raw_peak_z
                 fit_kind = "raw-argmax"
-            logger.info("STREAM_AF:%s%d in-motion samples  raw peak Z=%.3f  "
-                        "fit=%s best_z=%.3f  z_span=%.3f",
-                        tag_prefix, n_motion_samples, raw_peak_z,
-                        fit_kind, best_z, z_span)
+            logger.info(
+                "STREAM_AF:%s%d in-motion samples  raw peak Z=%.3f  "
+                "fit=%s best_z=%.3f  z_span=%.3f",
+                tag_prefix,
+                n_motion_samples,
+                raw_peak_z,
+                fit_kind,
+                best_z,
+                z_span,
+            )
         else:
-            logger.warning("STREAM_AF:%sonly %d in-motion samples -- cannot fit",
-                           tag_prefix, n_motion_samples)
+            logger.warning(
+                "STREAM_AF:%sonly %d in-motion samples -- cannot fit", tag_prefix, n_motion_samples
+            )
             return _ScanAttemptResult(
-                "insufficient_samples", None, n_motion_samples, 0.0,
+                "insufficient_samples",
+                None,
+                n_motion_samples,
+                0.0,
                 f"only {n_motion_samples} usable samples, need {MIN_FRAMES_FOR_FIT}",
                 samples_trace=list(in_motion),
             )
@@ -2109,7 +2259,11 @@ def _attempt_one_scan(
             for i, (t, z, m) in enumerate(in_motion):
                 logger.debug(
                     "STREAM_AF:%ssample %3d  t=%7.1f ms  z=%.3f  metric=%.4f",
-                    tag_prefix, i, t, z, m,
+                    tag_prefix,
+                    i,
+                    t,
+                    z,
+                    m,
                 )
 
         # Concise diagnostic at INFO when the peak looks suspicious so
@@ -2120,13 +2274,13 @@ def _attempt_one_scan(
             metrics_arr = [m for (_, _, m) in in_motion]
             if metrics_arr and raw_peak_idx is not None:
                 head_frac = (raw_peak_idx + 1) / max(len(metrics_arr), 1)
-                tail_metrics = metrics_arr[max(raw_peak_idx + 5, 0):]
+                tail_metrics = metrics_arr[max(raw_peak_idx + 5, 0) :]
                 if tail_metrics:
                     tail_med = float(np.median(tail_metrics))
                     tail_range = float(max(tail_metrics) - min(tail_metrics))
                     tail_var_pct = (tail_range / max(tail_med, 1.0)) * 100.0
                     peak_metric = float(metrics_arr[raw_peak_idx])
-                    peak_over_tail = (peak_metric / max(tail_med, 1.0))
+                    peak_over_tail = peak_metric / max(tail_med, 1.0)
                     if head_frac < 0.15 and tail_var_pct < 2.0 and peak_over_tail > 1.3:
                         logger.warning(
                             "STREAM_AF:%speak suspicious -- raw peak in first "
@@ -2134,16 +2288,23 @@ def _attempt_one_scan(
                             "flat at %.2g (%.1f%% range) across rest. "
                             "Suggests coverslip / stale-buffer false peak "
                             "rather than tissue focus.",
-                            tag_prefix, head_frac * 100, raw_peak_idx,
-                            len(metrics_arr), in_motion[raw_peak_idx][1],
-                            tail_med, tail_var_pct,
+                            tag_prefix,
+                            head_frac * 100,
+                            raw_peak_idx,
+                            len(metrics_arr),
+                            in_motion[raw_peak_idx][1],
+                            tail_med,
+                            tail_var_pct,
                         )
         except Exception:
             pass
 
         if n_motion_samples < MIN_FRAMES_FOR_FIT or best_z is None:
             return _ScanAttemptResult(
-                "insufficient_samples", None, n_motion_samples, z_span,
+                "insufficient_samples",
+                None,
+                n_motion_samples,
+                z_span,
                 f"only {n_motion_samples} usable samples, need {MIN_FRAMES_FOR_FIT}",
                 samples_trace=list(in_motion),
             )
@@ -2179,21 +2340,31 @@ def _attempt_one_scan(
                 f"likely at {direction}"
             )
             return _ScanAttemptResult(
-                status, None, n_motion_samples, z_span, reason,
+                status,
+                None,
+                n_motion_samples,
+                z_span,
+                reason,
                 samples_trace=list(in_motion),
             )
 
         return _ScanAttemptResult(
-            "success", best_z, n_motion_samples, z_span,
+            "success",
+            best_z,
+            n_motion_samples,
+            z_span,
             f"peak at Z={best_z:.3f}",
             samples_trace=list(in_motion),
         )
 
     except Exception as e:
-        logger.error("STREAM_AF:%sunhandled error during scan: %s",
-                     tag_prefix, e, exc_info=True)
+        logger.error("STREAM_AF:%sunhandled error during scan: %s", tag_prefix, e, exc_info=True)
         return _ScanAttemptResult(
-            "error", None, 0, 0.0, str(e),
+            "error",
+            None,
+            0,
+            0.0,
+            str(e),
         )
 
 
@@ -2239,19 +2410,28 @@ def _brent_fallback_scan(
     module docstring for the full citation.
     """
     tag = "brent-fallback"
-    logger.info("STREAM_AF:%s: Brent search over [%.3f, %.3f] metric=%s",
-                tag, z_lo, z_hi, metric_name)
+    logger.info(
+        "STREAM_AF:%s: Brent search over [%.3f, %.3f] metric=%s", tag, z_lo, z_hi, metric_name
+    )
 
     try:
         from scipy.optimize import minimize_scalar
     except Exception as e:
         return _ScanAttemptResult(
-            "error", None, 0, 0.0, f"scipy not available for Brent: {e}",
+            "error",
+            None,
+            0,
+            0.0,
+            f"scipy not available for Brent: {e}",
         )
 
     if z_hi <= z_lo:
         return _ScanAttemptResult(
-            "error", None, 0, 0.0, f"empty Brent bracket [{z_lo}, {z_hi}]",
+            "error",
+            None,
+            0,
+            0.0,
+            f"empty Brent bracket [{z_lo}, {z_hi}]",
         )
 
     # Brent's method needs a 3-point bracket where the middle has a
@@ -2281,8 +2461,7 @@ def _brent_fallback_scan(
             return 0.0
         m = _focus_metric(img, metric_name)
         evals.append((z_actual, m))
-        logger.info("STREAM_AF:%s eval %2d  z=%.3f  metric=%.4f",
-                    tag, len(evals), z_actual, m)
+        logger.info("STREAM_AF:%s eval %2d  z=%.3f  metric=%.4f", tag, len(evals), z_actual, m)
         # minimize_scalar expects a MINIMIZATION objective, so flip
         # the sign: better focus -> lower (more negative) value.
         return -m
@@ -2302,12 +2481,18 @@ def _brent_fallback_scan(
             z_span = max(z for z, _ in evals) - min(z for z, _ in evals)
             return _ScanAttemptResult(
                 "success" if best_m > 0 else "error",
-                best_z, len(evals), z_span,
+                best_z,
+                len(evals),
+                z_span,
                 f"Brent raised ({e}); argmax of {len(evals)} evals",
                 samples_trace=list(evals),
             )
         return _ScanAttemptResult(
-            "error", None, 0, 0.0, f"Brent failed with no evals: {e}",
+            "error",
+            None,
+            0,
+            0.0,
+            f"Brent failed with no evals: {e}",
         )
 
     best_z = float(result.x)
@@ -2315,10 +2500,12 @@ def _brent_fallback_scan(
     best_z = max(z_lo, min(z_hi, best_z))
     z_span = (max(z for z, _ in evals) - min(z for z, _ in evals)) if evals else 0.0
 
-    logger.info("STREAM_AF:%s converged at z=%.3f after %d evals",
-                tag, best_z, len(evals))
+    logger.info("STREAM_AF:%s converged at z=%.3f after %d evals", tag, best_z, len(evals))
     return _ScanAttemptResult(
-        "success", best_z, len(evals), z_span,
+        "success",
+        best_z,
+        len(evals),
+        z_span,
         f"Brent converged at z={best_z:.3f} after {len(evals)} evals",
         samples_trace=list(evals),
     )
@@ -2339,9 +2526,9 @@ def handle_streaming_focus(conn, client, hardware, settings, **kwargs):
             pass
         return
 
-    params = parse_flags(message,
-                          ["--yaml", "--objective", "--range", "--modality",
-                           "--crop-factor", "--dump"])
+    params = parse_flags(
+        message, ["--yaml", "--objective", "--range", "--modality", "--crop-factor", "--dump"]
+    )
     yaml_path = params.get("yaml")
     client_objective = params.get("objective")
     range_override_str = params.get("range")
@@ -2362,11 +2549,13 @@ def handle_streaming_focus(conn, client, hardware, settings, **kwargs):
             if 0.0 < cf <= 1.0:
                 crop_factor = cf
             else:
-                logger.warning("STREAM_AF:--crop-factor=%r out of (0, 1]; "
-                                "using default %.2f", crop_factor_str, DEFAULT_CROP_FACTOR)
+                logger.warning(
+                    "STREAM_AF:--crop-factor=%r out of (0, 1]; " "using default %.2f",
+                    crop_factor_str,
+                    DEFAULT_CROP_FACTOR,
+                )
         except ValueError:
-            logger.warning("STREAM_AF:ignoring non-numeric --crop-factor: %r",
-                            crop_factor_str)
+            logger.warning("STREAM_AF:ignoring non-numeric --crop-factor: %r", crop_factor_str)
 
     if not yaml_path:
         try:
@@ -2382,29 +2571,36 @@ def handle_streaming_focus(conn, client, hardware, settings, **kwargs):
     # back in the SUCCESS response so the UI can surface it.
     dump_root: Optional[Path] = None
     dump_enabled = bool(dump_flag) and str(dump_flag).strip().lower() not in (
-        "0", "false", "no",
+        "0",
+        "false",
+        "no",
     )
     if dump_enabled:
         try:
             timestamp = time.strftime("%Y%m%d_%H%M%S")
             dump_root = (
-                Path(yaml_path).parent / "logs"
-                / "streaming_af_dumps" / f"streaming_af_{timestamp}"
+                Path(yaml_path).parent / "logs" / "streaming_af_dumps" / f"streaming_af_{timestamp}"
             )
             dump_root.mkdir(parents=True, exist_ok=True)
             logger.info("STREAM_AF:dump enabled, writing to %s", dump_root)
         except Exception as e:
             logger.warning(
-                "STREAM_AF:could not create dump dir (%s); "
-                "continuing without dump", e,
+                "STREAM_AF:could not create dump dir (%s); " "continuing without dump",
+                e,
             )
             dump_root = None
 
-    logger.info("STREAM_AF:request from %s yaml=%s objective=%s modality=%s "
-                "range_override=%s crop_factor=%.2f dump=%s",
-                addr, yaml_path, client_objective, client_modality,
-                range_override_um, crop_factor,
-                dump_root if dump_root else "off")
+    logger.info(
+        "STREAM_AF:request from %s yaml=%s objective=%s modality=%s "
+        "range_override=%s crop_factor=%.2f dump=%s",
+        addr,
+        yaml_path,
+        client_objective,
+        client_modality,
+        range_override_um,
+        crop_factor,
+        dump_root if dump_root else "off",
+    )
 
     # Note: focus-metric resolution is deferred until after the
     # autofocus yaml entry is loaded, so the per-objective
@@ -2419,12 +2615,16 @@ def handle_streaming_focus(conn, client, hardware, settings, **kwargs):
             client_modality.strip().lower(),
             DEFAULT_SATURATION_REFUSE_FRACTION,
         )
-        logger.info("STREAM_AF:saturation threshold for modality '%s' = %.2f",
-                    client_modality, sat_threshold)
+        logger.info(
+            "STREAM_AF:saturation threshold for modality '%s' = %.2f",
+            client_modality,
+            sat_threshold,
+        )
     else:
         sat_threshold = DEFAULT_SATURATION_REFUSE_FRACTION
-        logger.info("STREAM_AF:no modality given, using default saturation threshold %.2f",
-                    sat_threshold)
+        logger.info(
+            "STREAM_AF:no modality given, using default saturation threshold %.2f", sat_threshold
+        )
 
     core = hardware.core
     try:
@@ -2444,8 +2644,9 @@ def handle_streaming_focus(conn, client, hardware, settings, **kwargs):
 
     af_entry = _load_autofocus_yaml_for_objective(yaml_path, objective)
     if not af_entry:
-        logger.warning("STREAM_AF:no autofocus yaml entry -- using fallback range %s um",
-                       FALLBACK_RANGE_UM)
+        logger.warning(
+            "STREAM_AF:no autofocus yaml entry -- using fallback range %s um", FALLBACK_RANGE_UM
+        )
 
     # Now that af_entry is known, resolve the focus metric. The
     # yaml's per-objective `score_metric` wins over the modality
@@ -2454,14 +2655,16 @@ def handle_streaming_focus(conn, client, hardware, settings, **kwargs):
     yaml_score_metric = af_entry.get("score_metric") if af_entry else None
     if yaml_score_metric:
         logger.info(
-            "STREAM_AF:focus metric for modality '%s' = '%s' "
-            "(yaml score_metric=%r)",
-            client_modality or "unknown", metric_name, yaml_score_metric,
+            "STREAM_AF:focus metric for modality '%s' = '%s' " "(yaml score_metric=%r)",
+            client_modality or "unknown",
+            metric_name,
+            yaml_score_metric,
         )
     else:
         logger.info(
             "STREAM_AF:focus metric for modality '%s' = '%s' (modality default)",
-            client_modality or "unknown", metric_name,
+            client_modality or "unknown",
+            metric_name,
         )
 
     if range_override_um is not None:
@@ -2485,23 +2688,26 @@ def handle_streaming_focus(conn, client, hardware, settings, **kwargs):
 
     # The handler's per-call effective values. Start from legacy
     # constants; YAML overrides any populated key.
-    eff_slow_value = (str(yaml_slow_value) if yaml_slow_value is not None
-                      else SLOW_SPEED_VALUE)
-    eff_normal_value = (str(yaml_normal_value) if yaml_normal_value is not None
-                        else NORMAL_SPEED_VALUE)
-    eff_slow_um_s = (float(yaml_slow_um_s) if yaml_slow_um_s is not None
-                     else MIN_VELOCITY_UM_S)
+    eff_slow_value = str(yaml_slow_value) if yaml_slow_value is not None else SLOW_SPEED_VALUE
+    eff_normal_value = (
+        str(yaml_normal_value) if yaml_normal_value is not None else NORMAL_SPEED_VALUE
+    )
+    eff_slow_um_s = float(yaml_slow_um_s) if yaml_slow_um_s is not None else MIN_VELOCITY_UM_S
     if sa_cfg:
         logger.info(
             "STREAM_AF:streaming_af config: enabled=%s slow=%r normal=%r um/s=%.2f",
-            yaml_enabled, eff_slow_value, eff_normal_value, eff_slow_um_s,
+            yaml_enabled,
+            eff_slow_value,
+            eff_normal_value,
+            eff_slow_um_s,
         )
     else:
         logger.info(
             "STREAM_AF:no stage.streaming_af YAML block; using legacy "
             "constants (slow=%r normal=%r). Run 'Re-probe Stage AF' to "
             "calibrate for this hardware.",
-            eff_slow_value, eff_normal_value,
+            eff_slow_value,
+            eff_normal_value,
         )
 
     # --- Speed property discovery ---
@@ -2536,7 +2742,8 @@ def handle_streaming_focus(conn, client, hardware, settings, **kwargs):
                 "STREAM_AF:focus device '%s' has no writable speed property "
                 "(searched %s); streaming disabled, using Brent snap-and-stop "
                 "fallback for this acquisition",
-                focus_device, list(SPEED_PROPERTY_CANDIDATES),
+                focus_device,
+                list(SPEED_PROPERTY_CANDIDATES),
             )
             original_speed = None
         else:
@@ -2587,9 +2794,7 @@ def handle_streaming_focus(conn, client, hardware, settings, **kwargs):
         active_cam = None
     if active_cam == "JAICamera":
         try:
-            saved_frame_rate_hz = float(
-                core.get_property("JAICamera", "FrameRateHz")
-            )
+            saved_frame_rate_hz = float(core.get_property("JAICamera", "FrameRateHz"))
         except Exception as e:
             logger.warning("STREAM_AF:could not read JAICamera FrameRateHz: %s", e)
             saved_frame_rate_hz = None
@@ -2610,7 +2815,8 @@ def handle_streaming_focus(conn, client, hardware, settings, **kwargs):
             except Exception as e:
                 logger.warning(
                     "STREAM_AF:could not set JAICamera FrameRateHz=38 mid-stream "
-                    "(%s); scan may still be starved", e,
+                    "(%s); scan may still be starved",
+                    e,
                 )
         elif saved_frame_rate_hz is not None:
             logger.info(
@@ -2631,15 +2837,22 @@ def handle_streaming_focus(conn, client, hardware, settings, **kwargs):
     # MIN_VELOCITY_UM_S (Prior MaxSpeed=1 measurement).
     min_velocity_um_s = eff_slow_um_s
     expected_blur_um = min_velocity_um_s * (exposure_ms / 1000.0) if exposure_ms else 0.0
-    logger.info("STREAM_AF:exposure=%.2fms  est min velocity=%.2f um/s  "
-                "expected blur=%.3f um  budget=%.3f um",
-                exposure_ms, min_velocity_um_s, expected_blur_um, BLUR_BUDGET_UM)
+    logger.info(
+        "STREAM_AF:exposure=%.2fms  est min velocity=%.2f um/s  "
+        "expected blur=%.3f um  budget=%.3f um",
+        exposure_ms,
+        min_velocity_um_s,
+        expected_blur_um,
+        BLUR_BUDGET_UM,
+    )
     if expected_blur_um > BLUR_BUDGET_UM:
-        reason = (f"exposure {exposure_ms:.1f} ms x min velocity {min_velocity_um_s:.1f} "
-                  f"um/s = {expected_blur_um:.2f} um motion blur, exceeds "
-                  f"{BLUR_BUDGET_UM:.2f} um budget. Reduce exposure to "
-                  f"<={BLUR_BUDGET_UM / min_velocity_um_s * 1000:.1f} ms "
-                  f"or use a faster stage")
+        reason = (
+            f"exposure {exposure_ms:.1f} ms x min velocity {min_velocity_um_s:.1f} "
+            f"um/s = {expected_blur_um:.2f} um motion blur, exceeds "
+            f"{BLUR_BUDGET_UM:.2f} um budget. Reduce exposure to "
+            f"<={BLUR_BUDGET_UM / min_velocity_um_s * 1000:.1f} ms "
+            f"or use a faster stage"
+        )
         logger.warning("STREAM_AF:UNAVAILABLE -- %s", reason)
         conn.sendall(f"UNAVAILABLE:{reason}".encode())
         return
@@ -2681,13 +2894,16 @@ def handle_streaming_focus(conn, client, hardware, settings, **kwargs):
         logger.info("STREAM_AF:pre-flight frame via snap_image")
 
     sat_frac = _saturation_fraction(preflight_img)
-    logger.info("STREAM_AF:pre-flight saturation fraction = %.3f (threshold %.2f)",
-                sat_frac, sat_threshold)
+    logger.info(
+        "STREAM_AF:pre-flight saturation fraction = %.3f (threshold %.2f)", sat_frac, sat_threshold
+    )
     if sat_frac > sat_threshold:
-        reason = (f"{sat_frac * 100:.1f}% of pixels saturated (threshold for "
-                  f"'{client_modality or 'unknown'}' modality is "
-                  f"{sat_threshold * 100:.1f}%); focus metric will not "
-                  f"discriminate. Reduce exposure/gain before using streaming autofocus")
+        reason = (
+            f"{sat_frac * 100:.1f}% of pixels saturated (threshold for "
+            f"'{client_modality or 'unknown'}' modality is "
+            f"{sat_threshold * 100:.1f}%); focus metric will not "
+            f"discriminate. Reduce exposure/gain before using streaming autofocus"
+        )
         logger.warning("STREAM_AF:UNAVAILABLE -- %s", reason)
         conn.sendall(f"UNAVAILABLE:{reason}".encode())
         return
@@ -2700,9 +2916,11 @@ def handle_streaming_focus(conn, client, hardware, settings, **kwargs):
     # edge_high we shift up. The shift never crosses outside the
     # stage Z limits from config.
     z_low, z_high = _get_z_limits(settings)
-    logger.info("STREAM_AF:stage Z limits from config: low=%s high=%s",
-                f"{z_low:.3f}" if z_low is not None else "None",
-                f"{z_high:.3f}" if z_high is not None else "None")
+    logger.info(
+        "STREAM_AF:stage Z limits from config: low=%s high=%s",
+        f"{z_low:.3f}" if z_low is not None else "None",
+        f"{z_high:.3f}" if z_high is not None else "None",
+    )
 
     # Check whether the Live Viewer already has a sequence running.
     # Computed once -- attempts share this state since we don't stop
@@ -2733,27 +2951,34 @@ def handle_streaming_focus(conn, client, hardware, settings, **kwargs):
             # limits; the current attempt's center came from a
             # previous edge detection, so this is where we stop
             # walking.
-            if not _scan_window_within_limits(current_center, range_um,
-                                               z_low, z_high):
-                reason = (f"proposed scan window [{current_center - range_um/2:.3f} "
-                          f"-> {current_center + range_um/2:.3f}] on "
-                          f"{label} would exit stage z limits "
-                          f"[{z_low}, {z_high}]")
+            if not _scan_window_within_limits(current_center, range_um, z_low, z_high):
+                reason = (
+                    f"proposed scan window [{current_center - range_um/2:.3f} "
+                    f"-> {current_center + range_um/2:.3f}] on "
+                    f"{label} would exit stage z limits "
+                    f"[{z_low}, {z_high}]"
+                )
                 logger.warning("STREAM_AF:%s", reason)
                 attempts_log.append(f"{label}: out-of-range")
                 final_result = _ScanAttemptResult(
-                    "error", None, 0, 0.0, reason,
+                    "error",
+                    None,
+                    0,
+                    0.0,
+                    reason,
                 )
                 break
 
             # Run one attempt.
             attempt_dump_dir = (
-                dump_root / f"attempt_{attempt_idx + 1}"
-                if dump_root is not None else None
+                dump_root / f"attempt_{attempt_idx + 1}" if dump_root is not None else None
             )
             result = _attempt_one_scan(
-                core, focus_device, speed_prop,
-                current_center, range_um,
+                core,
+                focus_device,
+                speed_prop,
+                current_center,
+                range_um,
                 sequence_was_running,
                 attempt_label=label,
                 velocity_um_s=min_velocity_um_s,
@@ -2788,13 +3013,12 @@ def handle_streaming_focus(conn, client, hardware, settings, **kwargs):
             # alternating shifts ping-pong forever, never landing
             # on the actual peak.
             opposite_edge = (
-                (prev_attempt_status == "edge_low" and result.status == "edge_high")
-                or
-                (prev_attempt_status == "edge_high" and result.status == "edge_low")
-            )
+                prev_attempt_status == "edge_low" and result.status == "edge_high"
+            ) or (prev_attempt_status == "edge_high" and result.status == "edge_low")
             if opposite_edge and len(all_attempt_samples_zm) >= 4:
                 union_result = _fit_union_samples(
-                    all_attempt_samples_zm, len(attempts_log),
+                    all_attempt_samples_zm,
+                    len(attempts_log),
                 )
                 if union_result is not None:
                     final_result = union_result
@@ -2812,14 +3036,16 @@ def handle_streaming_focus(conn, client, hardware, settings, **kwargs):
                 # upper edge equals this one's lower edge -- we cover
                 # new ground without overlap.
                 current_center = current_center - range_um
-                logger.info("STREAM_AF:edge_low -- next attempt center will be %.3f",
-                            current_center)
+                logger.info(
+                    "STREAM_AF:edge_low -- next attempt center will be %.3f", current_center
+                )
                 continue
 
             if result.status == "edge_high":
                 current_center = current_center + range_um
-                logger.info("STREAM_AF:edge_high -- next attempt center will be %.3f",
-                            current_center)
+                logger.info(
+                    "STREAM_AF:edge_high -- next attempt center will be %.3f", current_center
+                )
                 continue
 
             # Any other status (insufficient_samples, error) aborts
@@ -2835,7 +3061,11 @@ def handle_streaming_focus(conn, client, hardware, settings, **kwargs):
         if final_result is None:
             # Should not happen, but defensive fallback.
             final_result = _ScanAttemptResult(
-                "error", None, 0, 0.0, "unknown failure, no attempt completed",
+                "error",
+                None,
+                0,
+                0.0,
+                "unknown failure, no attempt completed",
             )
 
         # --- Union-fit pre-Brent escalation ---
@@ -2847,7 +3077,8 @@ def handle_streaming_focus(conn, client, hardware, settings, **kwargs):
         # interior maximum we can commit it directly.
         if final_result.status in ("edge_low", "edge_high"):
             union_result = _fit_union_samples(
-                all_attempt_samples_zm, len(attempts_log),
+                all_attempt_samples_zm,
+                len(attempts_log),
             )
             if union_result is not None:
                 final_result = union_result
@@ -2894,9 +3125,12 @@ def handle_streaming_focus(conn, client, hardware, settings, **kwargs):
             if z_high is not None:
                 brent_hi = min(brent_hi, z_high)
             if brent_hi - brent_lo >= 2.0:  # need at least 2 um bracket
-                logger.info("STREAM_AF:streaming retries exhausted with edge; "
-                            "escalating to Brent fallback over [%.3f, %.3f]",
-                            brent_lo, brent_hi)
+                logger.info(
+                    "STREAM_AF:streaming retries exhausted with edge; "
+                    "escalating to Brent fallback over [%.3f, %.3f]",
+                    brent_lo,
+                    brent_hi,
+                )
                 try:
                     # Stop the caller's sequence temporarily because
                     # Brent's snap_image conflicts with a running stream.
@@ -2909,8 +3143,12 @@ def handle_streaming_focus(conn, client, hardware, settings, **kwargs):
                         except Exception:
                             pass
                     brent_result = _brent_fallback_scan(
-                        core, focus_device, speed_prop,
-                        brent_lo, brent_hi, metric_name,
+                        core,
+                        focus_device,
+                        speed_prop,
+                        brent_lo,
+                        brent_hi,
+                        metric_name,
                         normal_value=eff_normal_value,
                     )
                     # Restart the sequence if the Live Viewer was
@@ -2920,8 +3158,9 @@ def handle_streaming_focus(conn, client, hardware, settings, **kwargs):
                             core.clear_circular_buffer()
                             core.start_continuous_sequence_acquisition(0)
                         except Exception as e:
-                            logger.warning("STREAM_AF:could not resume sequence "
-                                            "after Brent: %s", e)
+                            logger.warning(
+                                "STREAM_AF:could not resume sequence " "after Brent: %s", e
+                            )
                     attempts_log.append(
                         f"brent-fallback: bracket=[{brent_lo:.3f}, "
                         f"{brent_hi:.3f}] status={brent_result.status} "
@@ -2934,9 +3173,7 @@ def handle_streaming_focus(conn, client, hardware, settings, **kwargs):
                     # but we already projected those to (z, m).
                     for s in brent_result.samples_trace:
                         if len(s) >= 2:
-                            all_attempt_samples_zm.append(
-                                (float(s[0]), float(s[1]))
-                            )
+                            all_attempt_samples_zm.append((float(s[0]), float(s[1])))
                     # Use Brent's best_z if it converged AND its
                     # metric beats our running global best. This
                     # protects against the failure mode where
@@ -2946,7 +3183,8 @@ def handle_streaming_focus(conn, client, hardware, settings, **kwargs):
                     # across all attempts (streaming + Brent) had
                     # the highest metric.
                     global_best = max(
-                        all_attempt_samples_zm, key=lambda zm: zm[1],
+                        all_attempt_samples_zm,
+                        key=lambda zm: zm[1],
                         default=None,
                     )
                     if brent_result.status == "success" and brent_result.best_z is not None:
@@ -2958,18 +3196,21 @@ def handle_streaming_focus(conn, client, hardware, settings, **kwargs):
                         final_result = brent_result
                     elif global_best is not None:
                         gz, gm = global_best
-                        z_span = (
-                            max(zm[0] for zm in all_attempt_samples_zm)
-                            - min(zm[0] for zm in all_attempt_samples_zm)
+                        z_span = max(zm[0] for zm in all_attempt_samples_zm) - min(
+                            zm[0] for zm in all_attempt_samples_zm
                         )
                         logger.info(
                             "STREAM_AF:Brent did not converge; committing "
                             "global argmax across %d collected samples "
                             "at Z=%.3f (metric=%.4f)",
-                            len(all_attempt_samples_zm), gz, gm,
+                            len(all_attempt_samples_zm),
+                            gz,
+                            gm,
                         )
                         final_result = _ScanAttemptResult(
-                            "success", gz, len(all_attempt_samples_zm),
+                            "success",
+                            gz,
+                            len(all_attempt_samples_zm),
                             z_span,
                             f"global argmax across {len(all_attempt_samples_zm)} "
                             f"samples at Z={gz:.3f}",
@@ -2988,15 +3229,22 @@ def handle_streaming_focus(conn, client, hardware, settings, **kwargs):
                 final_z = best_z
 
             z_shift = final_z - initial_z
-            logger.info("STREAM_AF:committed final Z=%.3f  shift=%+.3f  n=%d  span=%.2f  "
-                        "after %d attempt(s)",
-                        final_z, z_shift, final_result.n_samples,
-                        final_result.z_span, len(attempts_log))
+            logger.info(
+                "STREAM_AF:committed final Z=%.3f  shift=%+.3f  n=%d  span=%.2f  "
+                "after %d attempt(s)",
+                final_z,
+                z_shift,
+                final_result.n_samples,
+                final_result.z_span,
+                len(attempts_log),
+            )
             for entry in attempts_log:
                 logger.info("STREAM_AF:attempt log -- %s", entry)
 
-            response = (f"SUCCESS:{initial_z:.3f}:{final_z:.3f}:{z_shift:+.3f}:"
-                        f"{final_result.n_samples}:{final_result.z_span:.3f}")
+            response = (
+                f"SUCCESS:{initial_z:.3f}:{final_z:.3f}:{z_shift:+.3f}:"
+                f"{final_result.n_samples}:{final_result.z_span:.3f}"
+            )
             if dump_root is not None:
                 # Tack on the dump directory so the Test button in the
                 # autofocus editor can render the curves and link the
@@ -3012,10 +3260,10 @@ def handle_streaming_focus(conn, client, hardware, settings, **kwargs):
             # If we have collected samples with a focus slope, move to the
             # global argmax -- it's better than returning to initial_z.
             best_slope_z = None
-            if (final_result.status in ("edge_low", "edge_high")
-                    and all_attempt_samples_zm):
+            if final_result.status in ("edge_low", "edge_high") and all_attempt_samples_zm:
                 global_best = max(
-                    all_attempt_samples_zm, key=lambda zm: zm[1],
+                    all_attempt_samples_zm,
+                    key=lambda zm: zm[1],
                     default=None,
                 )
                 if global_best is not None:
@@ -3026,8 +3274,10 @@ def handle_streaming_focus(conn, client, hardware, settings, **kwargs):
                         logger.info(
                             "STREAM_AF:no peak found but moving to best Z=%.3f "
                             "(slope argmax across %d samples, shift %+.3f)",
-                            best_slope_z, len(all_attempt_samples_zm),
-                            best_slope_z - initial_z)
+                            best_slope_z,
+                            len(all_attempt_samples_zm),
+                            best_slope_z - initial_z,
+                        )
                     except Exception:
                         best_slope_z = None
 
@@ -3040,18 +3290,21 @@ def handle_streaming_focus(conn, client, hardware, settings, **kwargs):
 
             if final_result.status in ("edge_low", "edge_high"):
                 if best_slope_z is not None:
-                    summary = (f"no peak found after {len(attempts_log)} "
-                               f"attempts ({MAX_EDGE_RETRIES + 1} max), "
-                               f"moved to best Z={best_slope_z:.3f} "
-                               f"(shift {best_slope_z - initial_z:+.3f}um)")
+                    summary = (
+                        f"no peak found after {len(attempts_log)} "
+                        f"attempts ({MAX_EDGE_RETRIES + 1} max), "
+                        f"moved to best Z={best_slope_z:.3f} "
+                        f"(shift {best_slope_z - initial_z:+.3f}um)"
+                    )
                 else:
-                    summary = (f"could not find peak after {len(attempts_log)} "
-                               f"attempts ({MAX_EDGE_RETRIES + 1} max). Last attempt: "
-                               f"{final_result.reason}. Try moving Z closer to "
-                               f"focus manually or picking a wider scan range")
+                    summary = (
+                        f"could not find peak after {len(attempts_log)} "
+                        f"attempts ({MAX_EDGE_RETRIES + 1} max). Last attempt: "
+                        f"{final_result.reason}. Try moving Z closer to "
+                        f"focus manually or picking a wider scan range"
+                    )
             elif final_result.status == "insufficient_samples":
-                summary = (f"{final_result.reason}; scan too short or "
-                           f"stage/camera timing off")
+                summary = f"{final_result.reason}; scan too short or " f"stage/camera timing off"
             else:
                 summary = final_result.reason
 
@@ -3122,7 +3375,9 @@ def handle_streaming_focus(conn, client, hardware, settings, **kwargs):
             if saved_frame_rate_hz >= 30.0:
                 try:
                     core.set_property(
-                        "JAICamera", "FrameRateHz", saved_frame_rate_hz,
+                        "JAICamera",
+                        "FrameRateHz",
+                        saved_frame_rate_hz,
                     )
                     logger.info(
                         "STREAM_AF:restored JAICamera FrameRateHz to %.2f",

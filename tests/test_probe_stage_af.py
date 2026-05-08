@@ -22,33 +22,38 @@ from microscope_command_server.server.probe_parsers import (
     pick_recommended_values,
 )
 
-
 # ----- parse_velocity_string -----
 
 
-@pytest.mark.parametrize("raw, expected_um_s", [
-    ("0.50mm/sec", 500.0),
-    ("2.50mm/sec", 2500.0),
-    ("0.25mm/sec", 250.0),
-    ("  1.00 mm/sec  ", 1000.0),    # whitespace tolerant
-    ("1.50 MM/SEC", 1500.0),         # case insensitive
-    ("500um/sec", 500.0),
-    ("11.5 um/sec", 11.5),
-    ("100m/sec", 100.0),             # 'm/sec' caught by um regex too
-])
+@pytest.mark.parametrize(
+    "raw, expected_um_s",
+    [
+        ("0.50mm/sec", 500.0),
+        ("2.50mm/sec", 2500.0),
+        ("0.25mm/sec", 250.0),
+        ("  1.00 mm/sec  ", 1000.0),  # whitespace tolerant
+        ("1.50 MM/SEC", 1500.0),  # case insensitive
+        ("500um/sec", 500.0),
+        ("11.5 um/sec", 11.5),
+        ("100m/sec", 100.0),  # 'm/sec' caught by um regex too
+    ],
+)
 def test_parse_velocity_string_recognized(raw, expected_um_s):
     assert parse_velocity_string(raw) == pytest.approx(expected_um_s)
 
 
-@pytest.mark.parametrize("raw", [
-    "1",                  # numeric: not a velocity string
-    "100",
-    "0.5",
-    "fast",
-    "",
-    "mm/sec",             # missing number
-    "500 cm/sec",         # unsupported unit
-])
+@pytest.mark.parametrize(
+    "raw",
+    [
+        "1",  # numeric: not a velocity string
+        "100",
+        "0.5",
+        "fast",
+        "",
+        "mm/sec",  # missing number
+        "500 cm/sec",  # unsupported unit
+    ],
+)
 def test_parse_velocity_string_unrecognized(raw):
     assert parse_velocity_string(raw) is None
 
@@ -59,9 +64,15 @@ def test_parse_velocity_string_unrecognized(raw):
 def test_classify_velocity_enum_ows3():
     """OWS3 ZDrive: a 9-value mm/sec enum."""
     allowed = [
-        "0.50mm/sec", "0.75mm/sec", "1.00mm/sec",
-        "1.25mm/sec", "1.50mm/sec", "1.70mm/sec",
-        "2.00mm/sec", "2.25mm/sec", "2.50mm/sec",
+        "0.50mm/sec",
+        "0.75mm/sec",
+        "1.00mm/sec",
+        "1.25mm/sec",
+        "1.50mm/sec",
+        "1.70mm/sec",
+        "2.00mm/sec",
+        "2.25mm/sec",
+        "2.50mm/sec",
     ]
     kind, parsed = classify_allowed_values(allowed)
     assert kind == "velocity_enum"
@@ -104,7 +115,9 @@ def test_pick_velocity_enum_picks_slowest_and_fastest():
     allowed = ["0.50mm/sec", "1.00mm/sec", "2.50mm/sec"]
     _, parsed = classify_allowed_values(allowed)
     slow_v, normal_v, slow_ums, reason = pick_recommended_values(
-        "velocity_enum", parsed, current_value="2.50mm/sec",
+        "velocity_enum",
+        parsed,
+        current_value="2.50mm/sec",
     )
     assert slow_v == "0.50mm/sec"
     assert normal_v == "2.50mm/sec"
@@ -116,7 +129,9 @@ def test_pick_numeric_enum_picks_min_and_max_um_s_unknown():
     allowed = ["1", "5", "25", "50", "100"]
     _, parsed = classify_allowed_values(allowed)
     slow_v, normal_v, slow_ums, reason = pick_recommended_values(
-        "numeric_enum", parsed, current_value="100",
+        "numeric_enum",
+        parsed,
+        current_value="100",
     )
     assert slow_v == "1"
     assert normal_v == "100"
@@ -128,7 +143,9 @@ def test_pick_numeric_enum_picks_min_and_max_um_s_unknown():
 def test_pick_empty_uses_prior_fallback():
     """Empty allowed -> Prior 1-100 percent fallback (the legacy default)."""
     slow_v, normal_v, slow_ums, reason = pick_recommended_values(
-        "empty", [], current_value="50",
+        "empty",
+        [],
+        current_value="50",
     )
     assert slow_v == "1"
     assert normal_v == "100"
@@ -140,7 +157,9 @@ def test_pick_unknown_returns_no_slow_value():
     """Unrecognized format -> caller has to override manually."""
     _, parsed = classify_allowed_values(["foo", "bar"])
     slow_v, normal_v, slow_ums, reason = pick_recommended_values(
-        "unknown", parsed, current_value="bar",
+        "unknown",
+        parsed,
+        current_value="bar",
     )
     assert slow_v is None
     assert normal_v == "bar"  # carry the current setting
@@ -155,13 +174,21 @@ def test_ows3_nameplate_translates_to_unviable_streaming():
     """OWS3 slowest is 0.50mm/sec = 500 um/s. Over a 12 um sweep at
     30 fps that's ~0.024 s = 0.7 frames -- not viable for streaming."""
     allowed = [
-        "0.50mm/sec", "0.75mm/sec", "1.00mm/sec",
-        "1.25mm/sec", "1.50mm/sec", "1.70mm/sec",
-        "2.00mm/sec", "2.25mm/sec", "2.50mm/sec",
+        "0.50mm/sec",
+        "0.75mm/sec",
+        "1.00mm/sec",
+        "1.25mm/sec",
+        "1.50mm/sec",
+        "1.70mm/sec",
+        "2.00mm/sec",
+        "2.25mm/sec",
+        "2.50mm/sec",
     ]
     _, parsed = classify_allowed_values(allowed)
     _, _, slow_ums, _ = pick_recommended_values(
-        "velocity_enum", parsed, current_value="2.50mm/sec",
+        "velocity_enum",
+        parsed,
+        current_value="2.50mm/sec",
     )
     sweep_um = 12.0
     fps = 30.0
@@ -174,7 +201,9 @@ def test_ppm_prior_fallback_translates_to_viable_streaming():
     """Prior at MaxSpeed=1 is ~11.5 um/s. Over 12 um at 38 fps that's
     ~1.04 s = ~40 frames -- well above the viability floor."""
     _, _, slow_ums, _ = pick_recommended_values(
-        "empty", [], current_value="50",
+        "empty",
+        [],
+        current_value="50",
     )
     sweep_um = 12.0
     fps = 38.0

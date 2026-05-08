@@ -176,7 +176,10 @@ def handle_getexp(conn, client, hardware, settings, **kwargs):
             conn.sendall(response)
             logger.info(
                 "Sent per-channel exposures: all=%s, R=%s, G=%s, B=%s",
-                all_exp, exposures["red"], exposures["green"], exposures["blue"],
+                all_exp,
+                exposures["red"],
+                exposures["green"],
+                exposures["blue"],
             )
         else:
             exposure = hardware.get_exposure()
@@ -206,9 +209,7 @@ def handle_setexp(conn, client, hardware, settings, **kwargs):
 
         float_data = conn.recv(count * 4)
         if len(float_data) != count * 4:
-            raise ValueError(
-                f"Expected {count * 4} bytes, got {len(float_data)}"
-            )
+            raise ValueError(f"Expected {count * 4} bytes, got {len(float_data)}")
 
         exposures = struct.unpack(f"!{'f' * count}", float_data)
         logger.info("Setting exposures: %s", exposures)
@@ -228,7 +229,9 @@ def handle_setexp(conn, client, hardware, settings, **kwargs):
                 )
                 logger.info(
                     "Set per-channel exposures: R=%s, G=%s, B=%s",
-                    exposures[0], exposures[1], exposures[2],
+                    exposures[0],
+                    exposures[1],
+                    exposures[2],
                 )
             else:
                 # Fall back to unified using green channel value
@@ -236,7 +239,8 @@ def handle_setexp(conn, client, hardware, settings, **kwargs):
                 logger.warning(
                     "Per-channel exposures requested but camera %s does not "
                     "support per-channel mode - using green (%.2f ms) as unified",
-                    cam.get_name(), exposures[1],
+                    cam.get_name(),
+                    exposures[1],
                 )
 
         conn.sendall(b"ACK_____")
@@ -266,7 +270,8 @@ def handle_getgain(conn, client, hardware, settings, **kwargs):
         conn.sendall(response)
         logger.info(
             "Sent gains: unified=%s, analog_red=%s, analog_blue=%s",
-            unified, rb_gains.get("analog_red", 1.0),
+            unified,
+            rb_gains.get("analog_red", 1.0),
             rb_gains.get("analog_blue", 1.0),
         )
     except Exception as e:
@@ -292,9 +297,7 @@ def handle_setgain(conn, client, hardware, settings, **kwargs):
 
         float_data = conn.recv(count * 4)
         if len(float_data) != count * 4:
-            raise ValueError(
-                f"Expected {count * 4} bytes, got {len(float_data)}"
-            )
+            raise ValueError(f"Expected {count * 4} bytes, got {len(float_data)}")
 
         gains = struct.unpack(f"!{'f' * count}", float_data)
         logger.info("Setting gains: %s", gains)
@@ -317,7 +320,9 @@ def handle_setgain(conn, client, hardware, settings, **kwargs):
             cam.set_rb_analog_gains(analog_red=gains[1], analog_blue=gains[2])
             logger.info(
                 "Set gains: unified=%s, analog_red=%s, analog_blue=%s",
-                gains[0], gains[1], gains[2],
+                gains[0],
+                gains[1],
+                gains[2],
             )
 
         conn.sendall(b"ACK_____")
@@ -368,7 +373,8 @@ def handle_setcam(conn, client, hardware, settings, **kwargs):
         logger.info(
             "SETCAM: mode=%s, exposures=%s, gains=%s",
             "individual" if exp_individual else "unified",
-            exposures, gains,
+            exposures,
+            gains,
         )
 
         cam = hardware.camera
@@ -429,7 +435,10 @@ def handle_setcam(conn, client, hardware, settings, **kwargs):
                 "SETCAM via apply_settings: mode=%s, exposures=%s, "
                 "unified_gain=%.2f, aR=%.3f, aB=%.3f",
                 "individual" if exp_individual else "unified",
-                exposures_dict, unified_gain, analog_red, analog_blue,
+                exposures_dict,
+                unified_gain,
+                analog_red,
+                analog_blue,
             )
         else:
             # Non-JAI camera fallback: original direct-property path. No
@@ -446,11 +455,17 @@ def handle_setcam(conn, client, hardware, settings, **kwargs):
             elif exp_count >= 3:
                 if cam.supports_per_channel_exposure():
                     cam.set_channel_exposures(
-                        red=exposures[0], green=exposures[1], blue=exposures[2],
+                        red=exposures[0],
+                        green=exposures[1],
+                        blue=exposures[2],
                         auto_enable=False,
                     )
-                    logger.info("SETCAM: per-channel R=%.3f G=%.3f B=%.3fms",
-                                exposures[0], exposures[1], exposures[2])
+                    logger.info(
+                        "SETCAM: per-channel R=%.3f G=%.3f B=%.3fms",
+                        exposures[0],
+                        exposures[1],
+                        exposures[2],
+                    )
                 else:
                     hardware.set_exposure(exposures[1])
                     logger.info("SETCAM: fallback unified %.3fms (green)", exposures[1])
@@ -467,12 +482,10 @@ def handle_setcam(conn, client, hardware, settings, **kwargs):
                 # of this handler accidentally used red=/blue= which broke
                 # all per-channel WB presets with ERR_SETC.
                 cam.set_rb_analog_gains(analog_red=gains[1], analog_blue=gains[2])
-                logger.info("SETCAM: unified=%.2f, aR=%.3f, aB=%.3f",
-                            gains[0], gains[1], gains[2])
+                logger.info("SETCAM: unified=%.2f, aR=%.3f, aB=%.3f", gains[0], gains[1], gains[2])
 
         conn.sendall(b"ACK_____")
-        logger.info("SETCAM complete (streaming was %s)",
-                     "stopped" if stopped else "not running")
+        logger.info("SETCAM complete (streaming was %s)", "stopped" if stopped else "not running")
 
     except Exception as e:
         logger.error("SETCAM failed: %s", e)
@@ -480,6 +493,7 @@ def handle_setcam(conn, client, hardware, settings, **kwargs):
 
 
 # --- Binning (Camera Control v2 phase 1) -------------------------------
+
 
 def handle_getbin(conn, client, hardware, settings, **kwargs):
     """Return available binning factors and the current factor.
@@ -548,8 +562,11 @@ def handle_setbin(conn, client, hardware, settings, **kwargs):
         hardware.camera.set_binning(value)
 
         conn.sendall(b"ACK_____")
-        logger.info("SETBIN: applied binning=%d (streaming was %s)",
-                    value, "stopped" if stopped else "not running")
+        logger.info(
+            "SETBIN: applied binning=%d (streaming was %s)",
+            value,
+            "stopped" if stopped else "not running",
+        )
     except Exception as e:
         logger.error("SETBIN failed: %s", e)
         conn.sendall(b"ERR_SETB")
@@ -626,14 +643,16 @@ def _build_illumination_descriptors(hardware, modalities):
             is_binary = False
         value_type = "binary" if is_binary else "continuous"
 
-        descriptors.append({
-            "label": getattr(source, "_label", device),
-            "device": device,
-            "power_range": power_range,
-            "current_power": current_power,
-            "is_on": is_on,
-            "value_type": value_type,
-        })
+        descriptors.append(
+            {
+                "label": getattr(source, "_label", device),
+                "device": device,
+                "power_range": power_range,
+                "current_power": current_power,
+                "is_on": is_on,
+                "value_type": value_type,
+            }
+        )
 
     if hardware._illumination is not None:
         _emit(hardware._illumination)
@@ -772,7 +791,9 @@ def handle_getcap(conn, client, hardware, settings, **kwargs):
             gain_range = None
 
         camera_block = {
-            "name": cam.get_name() if hasattr(cam, "get_name") else getattr(cam, "_name", "<unknown>"),
+            "name": (
+                cam.get_name() if hasattr(cam, "get_name") else getattr(cam, "_name", "<unknown>")
+            ),
             "type": _detect_camera_type(hardware),
             "supports_per_channel_exposure": bool(cam.supports_per_channel_exposure()),
             "supports_hardware_white_balance": bool(cam.supports_hardware_white_balance()),

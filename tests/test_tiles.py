@@ -5,9 +5,7 @@ Tests parsing and generation of TileConfiguration.txt files used by
 Fiji/ImageJ for image stitching.
 """
 
-import numpy as np
 import pytest
-from pathlib import Path
 from microscope_command_server.acquisition.tiles import TileConfigUtils
 
 
@@ -88,9 +86,7 @@ tile_2.tif; ; (100.0, 100.0)
 class TestWriteTileconfig:
     """Test generation of TileConfiguration.txt files."""
 
-    def test_write_basic_tileconfiguration(
-        self, sample_tile_positions, temp_output_directory
-    ):
+    def test_write_basic_tileconfiguration(self, sample_tile_positions, temp_output_directory):
         """Test writing basic 2D TileConfiguration file."""
         output_path = temp_output_directory / "output_tiles.txt"
 
@@ -98,7 +94,7 @@ class TestWriteTileconfig:
             str(temp_output_directory),
             sample_tile_positions,
             filename="output_tiles.txt",
-            pixel_size_um=1.0
+            pixel_size_um=1.0,
         )
 
         # Verify file was created
@@ -122,7 +118,7 @@ class TestWriteTileconfig:
             str(temp_output_directory),
             sample_tile_positions,
             filename="scaled_tiles.txt",
-            pixel_size_um=pixel_size
+            pixel_size_um=pixel_size,
         )
 
         # Read back and check coordinates are scaled
@@ -134,9 +130,7 @@ class TestWriteTileconfig:
         # Second position (512.5, 0) um -> (1025.0, 0) pixels at 0.5 um/pixel
         assert "(1025.0, 0.0)" in content
 
-    def test_write_tileconfiguration_custom_id(
-        self, sample_tile_positions, temp_output_directory
-    ):
+    def test_write_tileconfiguration_custom_id(self, sample_tile_positions, temp_output_directory):
         """Test writing TileConfiguration with custom id1 parameter."""
         output_path = temp_output_directory / "custom_id_tiles.txt"
 
@@ -146,7 +140,7 @@ class TestWriteTileconfig:
             filename="custom_id_tiles.txt",
             pixel_size_um=1.0,
             id1=5,  # Start numbering from 5
-            suffix_length=4
+            suffix_length=4,
         )
 
         content = output_path.read_text()
@@ -167,7 +161,7 @@ class TestWriteTileconfig:
             filename="suffix_tiles.txt",
             pixel_size_um=1.0,
             id1=0,
-            suffix_length=5  # 5-digit numbering
+            suffix_length=5,  # 5-digit numbering
         )
 
         content = output_path.read_text()
@@ -184,7 +178,7 @@ class TestWriteTileconfig:
             str(temp_output_directory),
             [],  # Empty list
             filename="empty_tiles.txt",
-            pixel_size_um=1.0
+            pixel_size_um=1.0,
         )
 
         content = output_path.read_text()
@@ -197,16 +191,12 @@ class TestWriteTileconfig:
 class TestWriteTileconfigStage:
     """Test generation of stage coordinate TileConfiguration files (3D)."""
 
-    def test_write_stage_tileconfiguration(
-        self, sample_tile_positions_3d, temp_output_directory
-    ):
+    def test_write_stage_tileconfiguration(self, sample_tile_positions_3d, temp_output_directory):
         """Test writing 3D TileConfiguration with stage coordinates."""
         output_path = temp_output_directory / "stage_tiles.txt"
 
         TileConfigUtils.write_tileconfig_stage(
-            str(temp_output_directory),
-            sample_tile_positions_3d,
-            filename="stage_tiles.txt"
+            str(temp_output_directory), sample_tile_positions_3d, filename="stage_tiles.txt"
         )
 
         # Verify file was created
@@ -227,9 +217,7 @@ class TestWriteTileconfigStage:
         output_path = temp_output_directory / "precision_tiles.txt"
 
         TileConfigUtils.write_tileconfig_stage(
-            str(temp_output_directory),
-            sample_tile_positions_3d,
-            filename="precision_tiles.txt"
+            str(temp_output_directory), sample_tile_positions_3d, filename="precision_tiles.txt"
         )
 
         content = output_path.read_text()
@@ -248,9 +236,7 @@ class TestWriteTileconfigStage:
         output_path = temp_output_directory / "negative_stage_tiles.txt"
 
         TileConfigUtils.write_tileconfig_stage(
-            str(temp_output_directory),
-            positions_3d,
-            filename="negative_stage_tiles.txt"
+            str(temp_output_directory), positions_3d, filename="negative_stage_tiles.txt"
         )
 
         content = output_path.read_text()
@@ -263,9 +249,7 @@ class TestWriteTileconfigStage:
 class TestTileConfigurationRoundTrip:
     """Test round-trip conversion (write then read)."""
 
-    def test_roundtrip_2d_tileconfiguration(
-        self, sample_tile_positions, temp_output_directory
-    ):
+    def test_roundtrip_2d_tileconfiguration(self, sample_tile_positions, temp_output_directory):
         """Test that writing and reading back preserves coordinates."""
         output_path = temp_output_directory / "roundtrip_tiles.txt"
 
@@ -274,7 +258,7 @@ class TestTileConfigurationRoundTrip:
             str(temp_output_directory),
             sample_tile_positions,
             filename="roundtrip_tiles.txt",
-            pixel_size_um=1.0  # No scaling
+            pixel_size_um=1.0,  # No scaling
         )
 
         # Read back
@@ -309,10 +293,7 @@ class TestTileConfigurationEdgeCases:
         output_path = temp_output_directory / "single_tile.txt"
 
         TileConfigUtils.write_tileconfig(
-            str(temp_output_directory),
-            positions,
-            filename="single_tile.txt",
-            pixel_size_um=1.0
+            str(temp_output_directory), positions, filename="single_tile.txt", pixel_size_um=1.0
         )
 
         content = output_path.read_text()
@@ -323,19 +304,12 @@ class TestTileConfigurationEdgeCases:
     def test_large_grid_configuration(self, temp_output_directory):
         """Test TileConfiguration with large grid (performance test)."""
         # Create 100x100 grid
-        positions = [
-            (float(x * 500), float(y * 500))
-            for y in range(100)
-            for x in range(100)
-        ]
+        positions = [(float(x * 500), float(y * 500)) for y in range(100) for x in range(100)]
 
         output_path = temp_output_directory / "large_grid.txt"
 
         TileConfigUtils.write_tileconfig(
-            str(temp_output_directory),
-            positions,
-            filename="large_grid.txt",
-            pixel_size_um=1.0
+            str(temp_output_directory), positions, filename="large_grid.txt", pixel_size_um=1.0
         )
 
         # Should handle 10,000 tiles (indices 0-9999 need 4 digits)
@@ -352,10 +326,7 @@ class TestTileConfigurationEdgeCases:
         output_path = temp_output_directory / "large_coords.txt"
 
         TileConfigUtils.write_tileconfig(
-            str(temp_output_directory),
-            positions,
-            filename="large_coords.txt",
-            pixel_size_um=1.0
+            str(temp_output_directory), positions, filename="large_coords.txt", pixel_size_um=1.0
         )
 
         content = output_path.read_text()

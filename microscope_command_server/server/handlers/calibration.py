@@ -29,6 +29,7 @@ logger = logging.getLogger(__name__)
 # WBCALIBR - Legacy white balance calibration
 # ---------------------------------------------------------------------------
 
+
 def handle_wbcalibr(conn, client, hardware, settings, **kwargs):
     """White balance calibration (legacy JAI per-channel).
 
@@ -57,9 +58,7 @@ def handle_wbcalibr(conn, client, hardware, settings, **kwargs):
         while True:
             chunk = conn.recv(1024)
             if not chunk:
-                logger.error(
-                    "Connection closed while reading white balance message"
-                )
+                logger.error("Connection closed while reading white balance message")
                 conn.sendall(b"FAILED:Connection closed")
                 break
 
@@ -127,9 +126,7 @@ def handle_wbcalibr(conn, client, hardware, settings, **kwargs):
                 try:
                     ack_response = f"STARTED:{params['output_folder_path']}".encode()
                     conn.sendall(ack_response)
-                    logger.info(
-                        "Sent STARTED acknowledgment for white balance calibration"
-                    )
+                    logger.info("Sent STARTED acknowledgment for white balance calibration")
 
                     # Import the calibration module
                     # TODO: JAI-specific -- migrate to camera-agnostic interface
@@ -162,20 +159,33 @@ def handle_wbcalibr(conn, client, hardware, settings, **kwargs):
                     # Set up defocus callback if configured
                     defocus_callback = None
                     if wb_config.defocus_offset_um is not None:
+
                         def create_defocus_callback():
                             def defocus_fn(offset_um):
                                 current_pos = hardware.get_current_position()
                                 original_z = current_pos.z
                                 new_z = original_z + offset_um
                                 hardware.move_to_position(
-                                    Position(hardware.get_current_position().x, hardware.get_current_position().y, new_z)
+                                    Position(
+                                        hardware.get_current_position().x,
+                                        hardware.get_current_position().y,
+                                        new_z,
+                                    )
                                 )
+
                                 def restore():
                                     hardware.move_to_position(
-                                        Position(hardware.get_current_position().x, hardware.get_current_position().y, original_z)
+                                        Position(
+                                            hardware.get_current_position().x,
+                                            hardware.get_current_position().y,
+                                            original_z,
+                                        )
                                     )
+
                                 return original_z, restore
+
                             return defocus_fn
+
                         defocus_callback = create_defocus_callback()
 
                     # Run calibration
@@ -215,9 +225,7 @@ def handle_wbcalibr(conn, client, hardware, settings, **kwargs):
                 break
 
             if total_bytes > 100000:
-                logger.error(
-                    "White balance message exceeds maximum size"
-                )
+                logger.error("White balance message exceeds maximum size")
                 conn.sendall(b"FAILED:Message too large")
                 break
 
@@ -250,6 +258,7 @@ def handle_wbcalibr(conn, client, hardware, settings, **kwargs):
 # WBSIMPLE - Simple white balance (unified exposure per angle)
 # ---------------------------------------------------------------------------
 
+
 def handle_wbsimple(conn, client, hardware, settings, **kwargs):
     """Simple white balance calibration (JAI per-channel).
 
@@ -281,9 +290,7 @@ def handle_wbsimple(conn, client, hardware, settings, **kwargs):
         while True:
             chunk = conn.recv(1024)
             if not chunk:
-                logger.error(
-                    "Connection closed while reading WBSIMPLE message"
-                )
+                logger.error("Connection closed while reading WBSIMPLE message")
                 conn.sendall(b"FAILED:Connection closed")
                 break
 
@@ -401,9 +408,7 @@ def handle_wbsimple(conn, client, hardware, settings, **kwargs):
                 try:
                     ack_response = f"STARTED:{params['output_folder_path']}".encode()
                     conn.sendall(ack_response)
-                    logger.info(
-                        "Sent STARTED acknowledgment for WBSIMPLE"
-                    )
+                    logger.info("Sent STARTED acknowledgment for WBSIMPLE")
 
                     # Import the calibration module
                     # TODO: JAI-specific -- migrate to camera-agnostic interface
@@ -440,9 +445,9 @@ def handle_wbsimple(conn, client, hardware, settings, **kwargs):
                     )
                     logger.info(
                         "Simple WB uncrossed: R=%.2fms, G=%.2fms, B=%.2fms, converged=%s",
-                        uncrossed_result.exposures_ms['red'],
-                        uncrossed_result.exposures_ms['green'],
-                        uncrossed_result.exposures_ms['blue'],
+                        uncrossed_result.exposures_ms["red"],
+                        uncrossed_result.exposures_ms["green"],
+                        uncrossed_result.exposures_ms["blue"],
                         uncrossed_result.converged,
                     )
 
@@ -482,7 +487,8 @@ def handle_wbsimple(conn, client, hardware, settings, **kwargs):
                     for angle_name, angle_deg in remaining_angles:
                         logger.info(
                             "Simple WB: calibrating %s (%.1f deg) with unified exposure...",
-                            angle_name, angle_deg,
+                            angle_name,
+                            angle_deg,
                         )
                         if hasattr(hardware, "set_psg_ticks"):
                             hardware.set_psg_ticks(angle_deg)
@@ -491,7 +497,9 @@ def handle_wbsimple(conn, client, hardware, settings, **kwargs):
                         client_target_key = f"target_{angle_name}"
                         if client_target_key in params:
                             angle_target = params[client_target_key]
-                            logger.info("  Target for %s: %.1f (from client)", angle_name, angle_target)
+                            logger.info(
+                                "  Target for %s: %.1f (from client)", angle_name, angle_target
+                            )
                         elif "yaml_file_path" in params:
                             angle_target = calib_kwargs["target"]
                             try:
@@ -513,8 +521,8 @@ def handle_wbsimple(conn, client, hardware, settings, **kwargs):
                             jai_props.disable_individual_exposure()
                             jai_props.set_unified_gain(uncrossed_result.unified_gain)
                             jai_props.set_rb_analog_gains(
-                                red=uncrossed_result.analog_red,
-                                blue=uncrossed_result.analog_blue)
+                                red=uncrossed_result.analog_red, blue=uncrossed_result.analog_blue
+                            )
                             logger.info(
                                 "  Unified mode: gain=%.2f, aR=%.3f, aB=%.3f",
                                 uncrossed_result.unified_gain,
@@ -536,7 +544,10 @@ def handle_wbsimple(conn, client, hardware, settings, **kwargs):
                                 measured = float(np.mean(image))
                                 logger.info(
                                     "  Iter %d: exp=%.2fms, mean=%.1f (target=%.1f)",
-                                    iteration, exposure_ms, measured, angle_target,
+                                    iteration,
+                                    exposure_ms,
+                                    measured,
+                                    angle_target,
                                 )
                                 if abs(measured - angle_target) <= tolerance:
                                     converged = True
@@ -550,7 +561,11 @@ def handle_wbsimple(conn, client, hardware, settings, **kwargs):
                             # Build result with unified exposure for all channels
                             # (R/G/B all get the same exposure in unified mode)
                             angle_result = WhiteBalanceResult(
-                                exposures_ms={"red": exposure_ms, "green": exposure_ms, "blue": exposure_ms},
+                                exposures_ms={
+                                    "red": exposure_ms,
+                                    "green": exposure_ms,
+                                    "blue": exposure_ms,
+                                },
                                 black_levels={"red": 0, "green": 0, "blue": 0},
                                 final_means={"red": measured, "green": measured, "blue": measured},
                                 target_value=angle_target,
@@ -565,9 +580,9 @@ def handle_wbsimple(conn, client, hardware, settings, **kwargs):
                             logger.info(
                                 "  %s: R=%.2fms, G=%.2fms, B=%.2fms, converged=%s",
                                 angle_name,
-                                angle_result.exposures_ms['red'],
-                                angle_result.exposures_ms['green'],
-                                angle_result.exposures_ms['blue'],
+                                angle_result.exposures_ms["red"],
+                                angle_result.exposures_ms["green"],
+                                angle_result.exposures_ms["blue"],
                                 angle_result.converged,
                             )
                         except Exception as e:
@@ -580,7 +595,9 @@ def handle_wbsimple(conn, client, hardware, settings, **kwargs):
                         wb_modality = params.get("modality", "ppm")
                         logger.info(
                             "Simple WB: saving %d angle(s) with objective=%s, detector=%s",
-                            len(all_results), wb_objective, wb_detector,
+                            len(all_results),
+                            wb_objective,
+                            wb_detector,
                         )
                         for aname, aresult in all_results.items():
                             calibrator.update_imageprocessing_config(
@@ -601,13 +618,17 @@ def handle_wbsimple(conn, client, hardware, settings, **kwargs):
                         from microscope_command_server.acquisition.workflow import (
                             save_simple_wb_to_yaml,
                         )
+
                         uncrossed_for_base = all_results.get("uncrossed")
                         if uncrossed_for_base:
                             simple_wb_cal_results = {}
                             uncrossed_g = uncrossed_for_base.exposures_ms["green"]
                             for aname, aresult in all_results.items():
-                                scale = (aresult.exposures_ms["green"] / uncrossed_g
-                                         if uncrossed_g > 0 else 1.0)
+                                scale = (
+                                    aresult.exposures_ms["green"] / uncrossed_g
+                                    if uncrossed_g > 0
+                                    else 1.0
+                                )
                                 simple_wb_cal_results[aname] = {
                                     "scale": round(scale, 3),
                                     "unified_gain": round(aresult.unified_gain, 3),
@@ -620,7 +641,8 @@ def handle_wbsimple(conn, client, hardware, settings, **kwargs):
                                 "g": round(uncrossed_for_base.exposures_ms["green"], 2),
                                 "b": round(uncrossed_for_base.exposures_ms["blue"], 2),
                                 "unified_exposure_ms": round(
-                                    uncrossed_for_base.exposures_ms["green"], 2),
+                                    uncrossed_for_base.exposures_ms["green"], 2
+                                ),
                                 "gains": {
                                     "unified_gain": round(uncrossed_for_base.unified_gain, 3),
                                     "analog_red": round(uncrossed_for_base.analog_red, 3),
@@ -655,7 +677,9 @@ def handle_wbsimple(conn, client, hardware, settings, **kwargs):
                     status = "CONVERGED" if all_converged else "NOT_CONVERGED"
                     n_angles = len(all_results)
 
-                    response = f"SUCCESS:{output_path}|{status}|{exp_str}|{gain_str}|angles:{n_angles}"
+                    response = (
+                        f"SUCCESS:{output_path}|{status}|{exp_str}|{gain_str}|angles:{n_angles}"
+                    )
 
                     # Append noise stats from uncrossed if available
                     if result.noise_stats is not None:
@@ -667,7 +691,9 @@ def handle_wbsimple(conn, client, hardware, settings, **kwargs):
                         )
 
                     conn.sendall(response.encode())
-                    logger.info("WBSIMPLE completed: %d angles, all_converged=%s", n_angles, all_converged)
+                    logger.info(
+                        "WBSIMPLE completed: %d angles, all_converged=%s", n_angles, all_converged
+                    )
                     _wb_calibration_result = result
 
                 except ImportError as e:
@@ -702,26 +728,25 @@ def handle_wbsimple(conn, client, hardware, settings, **kwargs):
         # the white-balanced image, or reset on failure.
         try:
             cam = hardware.camera
-            if (_wb_calibration_result is not None
-                    and _wb_calibration_result.converged):
+            if _wb_calibration_result is not None and _wb_calibration_result.converged:
                 cam.set_channel_exposures(
-                    red=_wb_calibration_result.exposures_ms['red'],
-                    green=_wb_calibration_result.exposures_ms['green'],
-                    blue=_wb_calibration_result.exposures_ms['blue'],
+                    red=_wb_calibration_result.exposures_ms["red"],
+                    green=_wb_calibration_result.exposures_ms["green"],
+                    blue=_wb_calibration_result.exposures_ms["blue"],
                     auto_enable=True,
                 )
-                cam.set_unified_gain(
-                    _wb_calibration_result.unified_gain)
+                cam.set_unified_gain(_wb_calibration_result.unified_gain)
                 cam.set_rb_analog_gains(
                     analog_red=_wb_calibration_result.analog_red,
-                    analog_blue=_wb_calibration_result.analog_blue)
+                    analog_blue=_wb_calibration_result.analog_blue,
+                )
                 logger.info(
                     "Applied calibration to camera for live view: "
                     "R=%.2f G=%.2f B=%.2f, "
                     "unified=%.2f, aR=%.3f, aB=%.3f",
-                    _wb_calibration_result.exposures_ms['red'],
-                    _wb_calibration_result.exposures_ms['green'],
-                    _wb_calibration_result.exposures_ms['blue'],
+                    _wb_calibration_result.exposures_ms["red"],
+                    _wb_calibration_result.exposures_ms["green"],
+                    _wb_calibration_result.exposures_ms["blue"],
                     _wb_calibration_result.unified_gain,
                     _wb_calibration_result.analog_red,
                     _wb_calibration_result.analog_blue,
@@ -731,8 +756,7 @@ def handle_wbsimple(conn, client, hardware, settings, **kwargs):
                 cam.set_rb_analog_gains(analog_red=1.0, analog_blue=1.0)
                 cam.set_unified_gain(1.0)
                 cam.disable_individual_exposure()
-                logger.debug("Reset camera state after WBSIMPLE "
-                             "(calibration did not converge)")
+                logger.debug("Reset camera state after WBSIMPLE " "(calibration did not converge)")
         except Exception:
             pass
 
@@ -740,6 +764,7 @@ def handle_wbsimple(conn, client, hardware, settings, **kwargs):
 # ---------------------------------------------------------------------------
 # WBPPM - PPM white balance (4 angles)
 # ---------------------------------------------------------------------------
+
 
 def handle_wbppm(conn, client, hardware, settings, **kwargs):
     """PPM white balance calibration at 4 polarizer angles.
@@ -770,9 +795,7 @@ def handle_wbppm(conn, client, hardware, settings, **kwargs):
         while True:
             chunk = conn.recv(1024)
             if not chunk:
-                logger.error(
-                    "Connection closed while reading WBPPM message"
-                )
+                logger.error("Connection closed while reading WBPPM message")
                 conn.sendall(b"FAILED:Connection closed")
                 break
 
@@ -901,10 +924,14 @@ def handle_wbppm(conn, client, hardware, settings, **kwargs):
                 # Validate required parameters
                 required = [
                     "output_folder_path",
-                    "positive_exp", "positive_angle",
-                    "negative_exp", "negative_angle",
-                    "crossed_exp", "crossed_angle",
-                    "uncrossed_exp", "uncrossed_angle",
+                    "positive_exp",
+                    "positive_angle",
+                    "negative_exp",
+                    "negative_angle",
+                    "crossed_exp",
+                    "crossed_angle",
+                    "uncrossed_exp",
+                    "uncrossed_angle",
                 ]
                 missing = [key for key in required if key not in params]
                 if missing:
@@ -917,9 +944,7 @@ def handle_wbppm(conn, client, hardware, settings, **kwargs):
                 try:
                     ack_response = f"STARTED:{params['output_folder_path']}".encode()
                     conn.sendall(ack_response)
-                    logger.info(
-                        "Sent STARTED acknowledgment for WBPPM"
-                    )
+                    logger.info("Sent STARTED acknowledgment for WBPPM")
 
                     # Import the calibration module
                     # TODO: JAI-specific -- migrate to camera-agnostic interface
@@ -955,6 +980,7 @@ def handle_wbppm(conn, client, hardware, settings, **kwargs):
                             from microscope_command_server.acquisition.workflow import (
                                 get_target_intensity_for_angle,
                             )
+
                             for angle_name in ["positive", "negative", "crossed", "uncrossed"]:
                                 if client_targets[angle_name] is not None:
                                     # Client provided explicit value
@@ -970,7 +996,9 @@ def handle_wbppm(conn, client, hardware, settings, **kwargs):
                                     per_angle_targets[angle_name] = target_val
                                     logger.info(
                                         "WB target for %s: %s (from %s)",
-                                        angle_name, target_val, source,
+                                        angle_name,
+                                        target_val,
+                                        source,
                                     )
                             yaml_targets_loaded = True
                         except Exception as e:
@@ -1013,12 +1041,21 @@ def handle_wbppm(conn, client, hardware, settings, **kwargs):
                         wb_objective = params.get("objective")
                         wb_detector = params.get("detector")
                         if not wb_objective or not wb_detector:
-                            if hasattr(hardware, 'settings') and hardware.settings:
-                                wb_objective = wb_objective or hardware.settings.get("objective_in_use") or hardware.settings.get("objective")
-                                wb_detector = wb_detector or hardware.settings.get("detector_in_use") or hardware.settings.get("detector")
+                            if hasattr(hardware, "settings") and hardware.settings:
+                                wb_objective = (
+                                    wb_objective
+                                    or hardware.settings.get("objective_in_use")
+                                    or hardware.settings.get("objective")
+                                )
+                                wb_detector = (
+                                    wb_detector
+                                    or hardware.settings.get("detector_in_use")
+                                    or hardware.settings.get("detector")
+                                )
                         logger.info(
                             "WB calibration: saving to imaging_profiles with objective=%s, detector=%s",
-                            wb_objective, wb_detector,
+                            wb_objective,
+                            wb_detector,
                         )
 
                         wb_modality = params.get("modality", "ppm")
@@ -1092,28 +1129,25 @@ def handle_wbppm(conn, client, hardware, settings, **kwargs):
             cam = hardware.camera
             # Use uncrossed (90 deg) result for live view -- it is
             # the brightest angle and most natural for visual QC.
-            uncrossed = (
-                _wb_rotation_results.get("uncrossed")
-                if _wb_rotation_results else None
-            )
+            uncrossed = _wb_rotation_results.get("uncrossed") if _wb_rotation_results else None
             if uncrossed is not None and uncrossed.converged:
                 cam.set_channel_exposures(
-                    red=uncrossed.exposures_ms['red'],
-                    green=uncrossed.exposures_ms['green'],
-                    blue=uncrossed.exposures_ms['blue'],
+                    red=uncrossed.exposures_ms["red"],
+                    green=uncrossed.exposures_ms["green"],
+                    blue=uncrossed.exposures_ms["blue"],
                     auto_enable=True,
                 )
                 cam.set_unified_gain(uncrossed.unified_gain)
                 cam.set_rb_analog_gains(
-                    analog_red=uncrossed.analog_red,
-                    analog_blue=uncrossed.analog_blue)
+                    analog_red=uncrossed.analog_red, analog_blue=uncrossed.analog_blue
+                )
                 logger.info(
                     "Applied uncrossed calibration to camera for "
                     "live view: R=%.2f G=%.2f B=%.2f, "
                     "unified=%.2f, aR=%.3f, aB=%.3f",
-                    uncrossed.exposures_ms['red'],
-                    uncrossed.exposures_ms['green'],
-                    uncrossed.exposures_ms['blue'],
+                    uncrossed.exposures_ms["red"],
+                    uncrossed.exposures_ms["green"],
+                    uncrossed.exposures_ms["blue"],
                     uncrossed.unified_gain,
                     uncrossed.analog_red,
                     uncrossed.analog_blue,
@@ -1123,8 +1157,7 @@ def handle_wbppm(conn, client, hardware, settings, **kwargs):
                 cam.set_rb_analog_gains(analog_red=1.0, analog_blue=1.0)
                 cam.set_unified_gain(1.0)
                 cam.disable_individual_exposure()
-                logger.debug("Reset camera state after WBPPM "
-                             "(no uncrossed result to apply)")
+                logger.debug("Reset camera state after WBPPM " "(no uncrossed result to apply)")
         except Exception:
             pass
 
@@ -1132,6 +1165,7 @@ def handle_wbppm(conn, client, hardware, settings, **kwargs):
 # ---------------------------------------------------------------------------
 # POLCAL - Polarizer calibration
 # ---------------------------------------------------------------------------
+
 
 def handle_polcal(conn, client, hardware, settings, **kwargs):
     """Polarizer calibration workflow.
@@ -1167,7 +1201,7 @@ def handle_polcal(conn, client, hardware, settings, **kwargs):
         if flag in message:
             start_idx = message.index(flag) + len(flag)
             end_idx = len(message)
-            for next_flag in flags[i + 1:]:
+            for next_flag in flags[i + 1 :]:
                 if next_flag in message[start_idx:]:
                     next_pos = message.index(next_flag, start_idx)
                     if next_pos < end_idx:
@@ -1240,6 +1274,7 @@ def handle_polcal(conn, client, hardware, settings, **kwargs):
 # PPMSENS - PPM rotation sensitivity test
 # ---------------------------------------------------------------------------
 
+
 def handle_ppmsens(conn, client, hardware, settings, **kwargs):
     """PPM rotation sensitivity test.
 
@@ -1266,7 +1301,7 @@ def handle_ppmsens(conn, client, hardware, settings, **kwargs):
         if flag in message:
             start_idx = message.index(flag) + len(flag)
             end_idx = len(message)
-            for next_flag in flags[i + 1:]:
+            for next_flag in flags[i + 1 :]:
                 if next_flag in message[start_idx:]:
                     next_pos = message.index(next_flag, start_idx)
                     if next_pos < end_idx:
@@ -1336,6 +1371,7 @@ def handle_ppmsens(conn, client, hardware, settings, **kwargs):
 # PPMBIREF - PPM birefringence maximization test
 # ---------------------------------------------------------------------------
 
+
 def handle_ppmbiref(conn, client, hardware, settings, **kwargs):
     """PPM birefringence maximization test.
 
@@ -1357,14 +1393,22 @@ def handle_ppmbiref(conn, client, hardware, settings, **kwargs):
 
     # Parse parameters
     params = {}
-    flags = ["--yaml", "--output", "--mode", "--min-angle", "--max-angle",
-             "--step", "--exposure", "--target-intensity"]
+    flags = [
+        "--yaml",
+        "--output",
+        "--mode",
+        "--min-angle",
+        "--max-angle",
+        "--step",
+        "--exposure",
+        "--target-intensity",
+    ]
 
     for i, flag in enumerate(flags):
         if flag in message:
             start_idx = message.index(flag) + len(flag)
             end_idx = len(message)
-            for next_flag in flags[i + 1:]:
+            for next_flag in flags[i + 1 :]:
                 if next_flag in message[start_idx:]:
                     next_pos = message.index(next_flag, start_idx)
                     if next_pos < end_idx:
@@ -1488,6 +1532,7 @@ def handle_ppmbiref(conn, client, hardware, settings, **kwargs):
 # SBCALIB - Sunburst calibration
 # ---------------------------------------------------------------------------
 
+
 def handle_sbcalib(conn, client, hardware, settings, **kwargs):
     """Sunburst calibration for hue-to-angle mapping.
 
@@ -1510,16 +1555,26 @@ def handle_sbcalib(conn, client, hardware, settings, **kwargs):
 
     # Parse parameters
     params = {}
-    flags = ["--yaml", "--output", "--modality", "--spokes",
-             "--saturation", "--value", "--name",
-             "--radius_inner", "--radius_outer",
-             "--image_path", "--center_y", "--center_x"]
+    flags = [
+        "--yaml",
+        "--output",
+        "--modality",
+        "--spokes",
+        "--saturation",
+        "--value",
+        "--name",
+        "--radius_inner",
+        "--radius_outer",
+        "--image_path",
+        "--center_y",
+        "--center_x",
+    ]
 
     for i, flag in enumerate(flags):
         if flag in message:
             start_idx = message.index(flag) + len(flag)
             end_idx = len(message)
-            for next_flag in flags[i + 1:]:
+            for next_flag in flags[i + 1 :]:
                 if next_flag in message[start_idx:]:
                     next_pos = message.index(next_flag, start_idx)
                     if next_pos < end_idx:
@@ -1607,13 +1662,14 @@ def handle_sbcalib(conn, client, hardware, settings, **kwargs):
         # Send result as JSON (always SUCCESS: prefix with
         # full JSON so client gets image_path even on failure)
         import json
+
         result_json = json.dumps(result)
         response = f"SUCCESS:{result_json}".encode()
         conn.sendall(response)
         if result.get("success"):
-            logger.info("Sunburst calibration successful. R^2=%.4f", result.get('r_squared', 0))
+            logger.info("Sunburst calibration successful. R^2=%.4f", result.get("r_squared", 0))
         else:
-            logger.error("Sunburst calibration failed: %s", result.get('error', 'Unknown'))
+            logger.error("Sunburst calibration failed: %s", result.get("error", "Unknown"))
 
     except ImportError as e:
         logger.error("Module not available: %s", e)
@@ -1628,6 +1684,7 @@ def handle_sbcalib(conn, client, hardware, settings, **kwargs):
 # ---------------------------------------------------------------------------
 # GETNOISE - Per-channel noise measurement
 # ---------------------------------------------------------------------------
+
 
 def handle_getnoise(conn, client, hardware, settings, **kwargs):
     """Get per-channel noise statistics via multi-frame analysis.
@@ -1645,10 +1702,9 @@ def handle_getnoise(conn, client, hardware, settings, **kwargs):
 
         # TODO: JAI-specific -- migrate to camera-agnostic interface
         from microscope_control.jai import JAINoiseMeasurement
+
         noise_meter = JAINoiseMeasurement(hardware)
-        stats = noise_meter.measure_noise(
-            num_frames=num_frames, settle_frames=2
-        )
+        stats = noise_meter.measure_noise(num_frames=num_frames, settle_frames=2)
 
         # Pack 9 floats: means (R,G,B), stddevs (R,G,B), SNRs (R,G,B)
         response = struct.pack(
@@ -1666,9 +1722,9 @@ def handle_getnoise(conn, client, hardware, settings, **kwargs):
         conn.sendall(response)
         logger.info(
             "Noise stats sent: R_snr=%.1f, G_snr=%.1f, B_snr=%.1f",
-            stats.channel_snr['red'],
-            stats.channel_snr['green'],
-            stats.channel_snr['blue'],
+            stats.channel_snr["red"],
+            stats.channel_snr["green"],
+            stats.channel_snr["blue"],
         )
     except ImportError as e:
         logger.error("Noise measurement module not available: %s", e)
@@ -1682,6 +1738,7 @@ def handle_getnoise(conn, client, hardware, settings, **kwargs):
 # ---------------------------------------------------------------------------
 # NOISCHAR - JAI noise characterization
 # ---------------------------------------------------------------------------
+
 
 def handle_noischar(conn, client, hardware, settings, **kwargs):
     """JAI noise characterization across gain/exposure grid.
@@ -1710,9 +1767,7 @@ def handle_noischar(conn, client, hardware, settings, **kwargs):
         while True:
             chunk = conn.recv(1024)
             if not chunk:
-                logger.error(
-                    "Connection closed while reading NOISCHAR message"
-                )
+                logger.error("Connection closed while reading NOISCHAR message")
                 conn.sendall(b"FAILED:Connection closed")
                 break
 
@@ -1751,9 +1806,7 @@ def handle_noischar(conn, client, hardware, settings, **kwargs):
                         end_idx = len(message)
                         for next_flag in flags:
                             if next_flag != flag:
-                                next_pos = find_flag_position(
-                                    message[start_idx:], next_flag
-                                )
+                                next_pos = find_flag_position(message[start_idx:], next_flag)
                                 if next_pos >= 0:
                                     actual_pos = start_idx + next_pos
                                     if actual_pos < end_idx:
@@ -1768,29 +1821,17 @@ def handle_noischar(conn, client, hardware, settings, **kwargs):
                         elif flag == "--frames":
                             params["num_frames"] = int(value)
                         elif flag == "--plots":
-                            params["generate_plots"] = (
-                                value.lower() == "true"
-                            )
+                            params["generate_plots"] = value.lower() == "true"
                         elif flag == "--gains":
-                            params["gains"] = [
-                                float(v.strip())
-                                for v in value.split(",")
-                            ]
+                            params["gains"] = [float(v.strip()) for v in value.split(",")]
                         elif flag == "--exposures":
-                            params["exposures"] = [
-                                float(v.strip())
-                                for v in value.split(",")
-                            ]
+                            params["exposures"] = [float(v.strip()) for v in value.split(",")]
 
                 # Validate required parameters
                 required = ["output_path"]
-                missing = [
-                    key for key in required if key not in params
-                ]
+                missing = [key for key in required if key not in params]
                 if missing:
-                    error_msg = (
-                        f"Missing required parameters: {missing}"
-                    )
+                    error_msg = f"Missing required parameters: {missing}"
                     logger.error(error_msg)
                     conn.sendall(f"FAILED:{error_msg}".encode())
                     break
@@ -1802,13 +1843,9 @@ def handle_noischar(conn, client, hardware, settings, **kwargs):
                     output_path = Path(params["output_path"])
                     output_path.mkdir(parents=True, exist_ok=True)
 
-                    ack_response = (
-                        f"STARTED:{params['output_path']}".encode()
-                    )
+                    ack_response = f"STARTED:{params['output_path']}".encode()
                     conn.sendall(ack_response)
-                    logger.info(
-                        "Sent STARTED acknowledgment for NOISCHAR"
-                    )
+                    logger.info("Sent STARTED acknowledgment for NOISCHAR")
 
                     # Increase socket timeout for long-running
                     # characterization (up to 20 minutes)
@@ -1832,18 +1869,15 @@ def handle_noischar(conn, client, hardware, settings, **kwargs):
                     # messages back to the Java client
                     def progress_callback(current, total, msg=""):
                         try:
-                            progress_msg = (
-                                f"PROGRESS:{current}:{total}"
-                            )
+                            progress_msg = f"PROGRESS:{current}:{total}"
                             conn.sendall(progress_msg.encode())
                             logger.debug(
                                 "NOISCHAR progress: %d/%d",
-                                current, total,
+                                current,
+                                total,
                             )
                         except Exception as pe:
-                            logger.warning(
-                                "Failed to send progress: %s", pe
-                            )
+                            logger.warning("Failed to send progress: %s", pe)
 
                     # Determine preset / custom gains+exposures
                     preset = params.get("preset", "full")
@@ -1860,25 +1894,14 @@ def handle_noischar(conn, client, hardware, settings, **kwargs):
                     )
 
                     # Generate report/plots or just CSV
-                    generate_plots = params.get(
-                        "generate_plots", False
-                    )
+                    generate_plots = params.get("generate_plots", False)
                     if generate_plots:
-                        tool.generate_report(
-                            results, output_path
-                        )
-                        logger.info(
-                            "NOISCHAR: generated report with plots"
-                        )
+                        tool.generate_report(results, output_path)
+                        logger.info("NOISCHAR: generated report with plots")
                     else:
                         # Just save CSV
-                        results.to_csv(
-                            output_path
-                            / "noise_characterization.csv"
-                        )
-                        logger.info(
-                            "NOISCHAR: saved CSV results only"
-                        )
+                        results.to_csv(output_path / "noise_characterization.csv")
+                        logger.info("NOISCHAR: saved CSV results only")
 
                     # Find best SNR from unsaturated results
                     best_gain = 0.0
@@ -1889,9 +1912,7 @@ def handle_noischar(conn, client, hardware, settings, **kwargs):
                         if r.saturation_pct > 1.0:
                             continue
                         # Average SNR across channels
-                        avg_snr = (
-                            r.red_snr + r.green_snr + r.blue_snr
-                        ) / 3.0
+                        avg_snr = (r.red_snr + r.green_snr + r.blue_snr) / 3.0
                         if avg_snr > best_snr:
                             best_snr = avg_snr
                             best_gain = r.unified_gain
@@ -1899,9 +1920,7 @@ def handle_noischar(conn, client, hardware, settings, **kwargs):
 
                     # Format: SUCCESS:{path}|{count}|{plots}|
                     #         {bestGain},{bestExp}
-                    plots_str = (
-                        "true" if generate_plots else "false"
-                    )
+                    plots_str = "true" if generate_plots else "false"
                     response = (
                         f"SUCCESS:{output_path}|"
                         f"{total_configs}|"
@@ -1910,16 +1929,14 @@ def handle_noischar(conn, client, hardware, settings, **kwargs):
                     )
                     conn.sendall(response.encode())
                     logger.info(
-                        "NOISCHAR completed: %d configs, best SNR at "
-                        "gain=%s, exp=%sms",
-                        total_configs, best_gain, best_exp,
+                        "NOISCHAR completed: %d configs, best SNR at " "gain=%s, exp=%sms",
+                        total_configs,
+                        best_gain,
+                        best_exp,
                     )
 
                 except ImportError as e:
-                    error_msg = (
-                        f"JAI noise characterization module "
-                        f"not available: {e}"
-                    )
+                    error_msg = f"JAI noise characterization module " f"not available: {e}"
                     logger.error(error_msg)
                     conn.sendall(f"FAILED:{error_msg}".encode())
                 except Exception as e:
@@ -1929,28 +1946,20 @@ def handle_noischar(conn, client, hardware, settings, **kwargs):
                 break
 
             if total_bytes > 100000:
-                logger.error(
-                    "NOISCHAR message exceeds maximum size"
-                )
+                logger.error("NOISCHAR message exceeds maximum size")
                 conn.sendall(b"FAILED:Message too large")
                 break
 
             if time.time() - start_time > 10:
                 logger.error("Timeout reading NOISCHAR message")
-                conn.sendall(
-                    b"FAILED:Timeout waiting for complete message"
-                )
+                conn.sendall(b"FAILED:Timeout waiting for complete message")
                 break
 
     except socket.timeout:
-        logger.error(
-            "Timeout reading NOISCHAR message from %s", addr
-        )
+        logger.error("Timeout reading NOISCHAR message from %s", addr)
         conn.sendall(b"FAILED:Timeout reading message")
     except Exception as e:
-        logger.error(
-            "Error in NOISCHAR: %s", str(e), exc_info=True
-        )
+        logger.error("Error in NOISCHAR: %s", str(e), exc_info=True)
         conn.sendall(f"FAILED:{str(e)}".encode())
     finally:
         conn.settimeout(None)  # Reset to blocking mode

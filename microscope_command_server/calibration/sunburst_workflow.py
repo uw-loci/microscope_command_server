@@ -112,9 +112,11 @@ def run_sunburst_calibration(
 
             try:
                 import tifffile
+
                 image = tifffile.imread(str(existing_image_path))
             except ImportError:
                 from PIL import Image as PILImage
+
                 image = np.array(PILImage.open(str(existing_image_path)))
 
             image_path = Path(existing_image_path)

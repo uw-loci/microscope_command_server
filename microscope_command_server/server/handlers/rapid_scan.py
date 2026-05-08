@@ -86,8 +86,17 @@ def handle_rapid_scan(conn, client, hardware, settings, **kwargs):
             i += 1
 
     # Validate required params
-    required = ["output", "center_x", "center_y", "width", "height",
-                "overlap", "exposure", "fov_w", "fov_h"]
+    required = [
+        "output",
+        "center_x",
+        "center_y",
+        "width",
+        "height",
+        "overlap",
+        "exposure",
+        "fov_w",
+        "fov_h",
+    ]
     for req in required:
         if req not in params:
             flag_name = req.replace("_", "-")
@@ -123,8 +132,9 @@ def handle_rapid_scan(conn, client, hardware, settings, **kwargs):
             progress_dict=progress_dict,
         )
 
-        response = (f"SUCCESS:{result['n_tiles']}:{result['elapsed_seconds']:.1f}"
-                    f":{result['binning']}")
+        response = (
+            f"SUCCESS:{result['n_tiles']}:{result['elapsed_seconds']:.1f}" f":{result['binning']}"
+        )
         conn.sendall(response.encode())
         logger.info(
             "RPDSCAN complete: %d tiles in %.1fs (binning=%d)",

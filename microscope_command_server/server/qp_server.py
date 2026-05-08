@@ -16,19 +16,15 @@ Enhanced Features:
 
 import socket
 import threading
-import struct
 import sys
 import pathlib
-import time
 import enum
 from threading import Lock
 import logging
 from datetime import datetime
 
-import numpy as np
 
 from microscope_control.config import ConfigManager
-from microscope_command_server.modality import get_config as get_modality_config
 
 
 def check_for_existing_server(host: str, port: int, timeout: float = 0.5) -> bool:
@@ -74,16 +70,16 @@ def check_for_existing_server(host: str, port: int, timeout: float = 0.5) -> boo
             test_socket.close()
         except Exception:
             pass
-from microscope_control.hardware import Position
+
+
 from microscope_control.hardware.pycromanager import (
     PycromanagerHardware,
     init_pycromanager,
     MicroManagerConnectionError,
 )
-from microscope_command_server.server.protocol import ExtendedCommand, TCP_PORT, END_MARKER
+from microscope_command_server.server.protocol import TCP_PORT
 from microscope_command_server.acquisition.workflow import _acquisition_workflow
-from microscope_command_server.version_info import collect_versions, format_log_header
-
+from microscope_command_server.version_info import format_log_header
 
 # Configure logging - boot/pre-connection logging goes to console + fallback file
 current_file_path = pathlib.Path(__file__).resolve()
@@ -150,9 +146,9 @@ def _start_session_logging(config_path: str) -> None:
 
         handler = FlushingFileHandler(session_log_file, encoding="utf-8")
         handler.setLevel(logging.DEBUG)
-        handler.setFormatter(logging.Formatter(
-            "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
-        ))
+        handler.setFormatter(
+            logging.Formatter("%(asctime)s - %(name)s - %(levelname)s - %(message)s")
+        )
 
         # Add to root logger so all child loggers are captured
         logging.getLogger().addHandler(handler)
@@ -241,7 +237,6 @@ sequence_op_lock = Lock()
 active_ip_connections = set()  # Set of (ip, port) tuples from the active IP
 
 
-
 def init_pycromanager_with_logger():
     """
     Initialize Pycro-Manager connection to Micro-Manager.
@@ -264,7 +259,7 @@ def init_pycromanager_with_logger():
         logger.error("MICRO-MANAGER CONNECTION FAILED")
         logger.error("=" * 70)
         logger.error("")
-        for line in str(e).split('\n'):
+        for line in str(e).split("\n"):
             logger.error(line)
         logger.error("")
         logger.error("=" * 70)
@@ -310,14 +305,14 @@ else:
             "limits": {
                 "x_um": {"low": -100000, "high": 100000},
                 "y_um": {"low": -100000, "high": 100000},
-                "z_um": {"low": -20000, "high": 20000}
-            }
+                "z_um": {"low": -20000, "high": 20000},
+            },
         },
         "modalities": {},
         "hardware": {},
         "id_stage": {},
         "id_detector": {},
-        "id_camera": {}
+        "id_camera": {},
     }
 
 # Load LOCI resources if available (for device lookup during ACQUIRE)
@@ -335,7 +330,9 @@ logger.info("Initializing Micro-Manager connection...")
 core, studio = init_pycromanager_with_logger()
 hardware = PycromanagerHardware(core, studio, startup_settings)
 logger.info("Hardware initialized with generic config")
-logger.info("Server ready - microscope-specific config will be loaded from ACQUIRE --yaml parameter")
+logger.info(
+    "Server ready - microscope-specific config will be loaded from ACQUIRE --yaml parameter"
+)
 
 
 def acquisitionWorkflow(message, client_addr):
@@ -345,8 +342,12 @@ def acquisitionWorkflow(message, client_addr):
         with acquisition_locks[client_addr]:
             acquisition_progress[client_addr] = (current, total)
 
-    def _set_state(state_str: str, error_message: str = None, final_z: float = None,
-                   saturation_summary: str = None):
+    def _set_state(
+        state_str: str,
+        error_message: str = None,
+        final_z: float = None,
+        saturation_summary: str = None,
+    ):
         with acquisition_locks[client_addr]:
             try:
                 new_state = AcquisitionState[state_str]
@@ -377,7 +378,9 @@ def acquisitionWorkflow(message, client_addr):
         Returns:
             str: User's choice - "retry", "skip", or "cancel"
         """
-        logger.info(f"Manual focus requested for client {client_addr} (retries remaining: {retries_remaining})")
+        logger.info(
+            f"Manual focus requested for client {client_addr} (retries remaining: {retries_remaining})"
+        )
         # Store retries remaining so REQMANF can return it
         manual_focus_retries_remaining[client_addr] = retries_remaining
         # Set request event to signal client
@@ -551,31 +554,29 @@ def handle_client(conn, addr):
             result = handler(conn, client, hardware, startup_settings, **handler_kwargs)
 
             # Handle special return values from handlers
-            if result == 'DISCONNECT':
+            if result == "DISCONNECT":
                 logger.info(f"Client {addr} requested to disconnect")
                 break
-            elif result == 'SHUTDOWN':
+            elif result == "SHUTDOWN":
                 logger.warning(f"Client {addr} requested server shutdown")
                 shutdown_event.set()
                 break
             elif isinstance(result, dict):
                 # CONFIG handler returns updated server state
-                if 'server_configured' in result:
-                    server_configured = result['server_configured']
-                if 'active_connection_addr' in result:
-                    active_connection_addr = result['active_connection_addr']
-                if 'active_connection_config_path' in result:
-                    active_connection_config_path = result['active_connection_config_path']
-                if 'settings' in result:
-                    startup_settings = result['settings']
+                if "server_configured" in result:
+                    server_configured = result["server_configured"]
+                if "active_connection_addr" in result:
+                    active_connection_addr = result["active_connection_addr"]
+                if "active_connection_config_path" in result:
+                    active_connection_config_path = result["active_connection_config_path"]
+                if "settings" in result:
+                    startup_settings = result["settings"]
             elif isinstance(result, threading.Thread):
                 # ACQUIRE handler returns the spawned acquisition thread
                 acquisition_thread = result
 
             # All commands dispatched via COMMAND_HANDLERS above
             # (old 4,300-line if/elif chain removed -- see handlers/ modules)
-
-
 
     except Exception as e:
         logger.error(f"Error handling client {addr}: {str(e)}", exc_info=True)
@@ -623,7 +624,9 @@ def handle_client(conn, addr):
                     )
                 else:
                     # No more connections from this IP -- truly unconfigure
-                    logger.info(f"All connections from {active_ip} disconnected - server now UNCONFIGURED")
+                    logger.info(
+                        f"All connections from {active_ip} disconnected - server now UNCONFIGURED"
+                    )
                     logger.info("Next connection will need to provide CONFIG command")
                     # Stop any orphaned sequence acquisition left running by
                     # the departed client. If the live viewer crashed or the
@@ -638,9 +641,7 @@ def handle_client(conn, addr):
                             )
                             hardware.core.stop_sequence_acquisition()
                     except Exception as stop_err:
-                        logger.error(
-                            "Failed to stop orphaned sequence acquisition: %s", stop_err
-                        )
+                        logger.error("Failed to stop orphaned sequence acquisition: %s", stop_err)
                     _stop_session_logging()
                     server_configured = False
                     active_connection_addr = None
@@ -681,7 +682,7 @@ def main():
 
     logger.info("No existing server instance found. Proceeding with startup...")
 
-    logger.info(f"Server configuration:")
+    logger.info("Server configuration:")
     logger.info(f"  Host: {HOST}")
     logger.info(f"  Port: {PORT}")
     logger.info(f"  Micro-Manager core: {'Connected' if core else 'Not connected'}")

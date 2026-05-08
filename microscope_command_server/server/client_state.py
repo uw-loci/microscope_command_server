@@ -15,6 +15,7 @@ logger = logging.getLogger(__name__)
 
 class AcquisitionState(enum.Enum):
     """States for the acquisition lifecycle."""
+
     IDLE = "IDLE"
     RUNNING = "RUNNING"
     CANCELLING = "CANCELLING"

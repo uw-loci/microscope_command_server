@@ -104,7 +104,9 @@ def main():
         help="Absolute path to the microscope config YAML (e.g. config_PPM.yml)",
     )
     parser.add_argument("--host", default="127.0.0.1", help="Server host (default 127.0.0.1)")
-    parser.add_argument("--port", type=int, default=TCP_PORT, help=f"Server port (default {TCP_PORT})")
+    parser.add_argument(
+        "--port", type=int, default=TCP_PORT, help=f"Server port (default {TCP_PORT})"
+    )
     args = parser.parse_args()
 
     print(f"Connecting to {args.host}:{args.port}")

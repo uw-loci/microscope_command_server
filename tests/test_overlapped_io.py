@@ -15,12 +15,12 @@ that don't require hardware imports.
 import sys
 import threading
 import pytest
-from unittest.mock import MagicMock, patch
-
+from unittest.mock import MagicMock
 
 # ── _TileWritePool tests ───────────────────────────────────────────────
 # Import _TileWritePool carefully -- workflow.py has transitive hardware deps.
 # We mock the heavy imports to allow importing just the pool class.
+
 
 @pytest.fixture(autouse=True)
 def mock_hardware_imports():
@@ -52,6 +52,7 @@ def mock_hardware_imports():
 def _get_pool_class():
     """Import _TileWritePool with mocked deps."""
     from microscope_command_server.acquisition.workflow import _TileWritePool
+
     return _TileWritePool
 
 

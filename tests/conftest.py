@@ -38,14 +38,7 @@ def sample_tile_positions():
     Returns:
         list: List of (x, y) tuples representing tile positions
     """
-    return [
-        (0.0, 0.0),
-        (512.5, 0.0),
-        (1025.0, 0.0),
-        (0.0, 512.5),
-        (512.5, 512.5),
-        (1025.0, 512.5)
-    ]
+    return [(0.0, 0.0), (512.5, 0.0), (1025.0, 0.0), (0.0, 512.5), (512.5, 512.5), (1025.0, 512.5)]
 
 
 @pytest.fixture
@@ -62,7 +55,7 @@ def sample_tile_positions_3d():
         (2025.0, 2000.0, 5000.0),
         (1000.0, 2512.5, 5000.0),
         (1512.5, 2512.5, 5000.0),
-        (2025.0, 2512.5, 5000.0)
+        (2025.0, 2512.5, 5000.0),
     ]
 
 
@@ -87,15 +80,15 @@ def sample_protocol_command_bytes():
         dict: Dictionary mapping command names to byte values
     """
     return {
-        'GETXY': b'GETXY___',
-        'GETZ': b'GETZ____',
-        'GETR': b'GETR____',
-        'MOVEXY': b'MOVEXY__',
-        'MOVEZ': b'MOVEZ___',
-        'MOVER': b'MOVER___',
-        'TESTAF': b'TESTAF__',
-        'PPMSENS': b'PPMSENS_',
-        'PPMBIREF': b'PPMBIREF'
+        "GETXY": b"GETXY___",
+        "GETZ": b"GETZ____",
+        "GETR": b"GETR____",
+        "MOVEXY": b"MOVEXY__",
+        "MOVEZ": b"MOVEZ___",
+        "MOVER": b"MOVER___",
+        "TESTAF": b"TESTAF__",
+        "PPMSENS": b"PPMSENS_",
+        "PPMBIREF": b"PPMBIREF",
     }
 
 
@@ -108,25 +101,19 @@ def sample_microscope_config():
         dict: Microscope configuration dictionary
     """
     return {
-        'microscope': {
-            'name': 'TestMicroscope',
-            'objectives': {
-                '10x': {
-                    'magnification': 10,
-                    'pixel_size_um': 0.65
-                },
-                '20x': {
-                    'magnification': 20,
-                    'pixel_size_um': 0.325
+        "microscope": {
+            "name": "TestMicroscope",
+            "objectives": {
+                "10x": {"magnification": 10, "pixel_size_um": 0.65},
+                "20x": {"magnification": 20, "pixel_size_um": 0.325},
+            },
+            "stage": {
+                "limits": {
+                    "x": {"min": 0.0, "max": 100000.0},
+                    "y": {"min": 0.0, "max": 75000.0},
+                    "z": {"min": 0.0, "max": 10000.0},
                 }
             },
-            'stage': {
-                'limits': {
-                    'x': {'min': 0.0, 'max': 100000.0},
-                    'y': {'min': 0.0, 'max': 75000.0},
-                    'z': {'min': 0.0, 'max': 10000.0}
-                }
-            }
         }
     }
 
@@ -140,11 +127,11 @@ def sample_acquisition_params():
         dict: Acquisition parameter dictionary
     """
     return {
-        'objective': '20x',
-        'modality': 'ppm_20x',
-        'exposure_ms': 100,
-        'overlap_percent': 10,
-        'z_stack': False,
-        'tile_width_um': 664.0,
-        'tile_height_um': 558.0
+        "objective": "20x",
+        "modality": "ppm_20x",
+        "exposure_ms": 100,
+        "overlap_percent": 10,
+        "z_stack": False,
+        "tile_width_um": 664.0,
+        "tile_height_um": 558.0,
     }

@@ -13,7 +13,7 @@ import logging
 import math
 import time
 from pathlib import Path
-from typing import List, Optional, Tuple
+from typing import List, Tuple
 
 import numpy as np
 
@@ -123,9 +123,7 @@ def acquire_rapid_scan(
     output_path.mkdir(parents=True, exist_ok=True)
 
     if exposure_ms > 0.5:
-        raise ValueError(
-            f"Exposure {exposure_ms}ms exceeds 0.5ms limit for rapid scan"
-        )
+        raise ValueError(f"Exposure {exposure_ms}ms exceeds 0.5ms limit for rapid scan")
 
     # Set camera exposure
     logger.info("Setting exposure to %.3f ms", exposure_ms)
@@ -180,12 +178,19 @@ def acquire_rapid_scan(
         "Rapid scan (streaming): %d rows, Y step=%.1f um, "
         "X sweep=%.1f um, binning=%d, effective fps=%.0f, "
         "target velocity=%.0f um/s (%.1f mm/s)",
-        n_rows, step_y, row_distance, binning, effective_fps,
-        target_velocity, target_velocity / 1000.0,
+        n_rows,
+        step_y,
+        row_distance,
+        binning,
+        effective_fps,
+        target_velocity,
+        target_velocity / 1000.0,
     )
     logger.info(
         "  Target tile step: %.1f um at ~%.0f fps -> %.1f%% overlap",
-        target_step_x, effective_fps, overlap_percent,
+        target_step_x,
+        effective_fps,
+        overlap_percent,
     )
 
     # ---- Hardware setup ----
@@ -273,7 +278,9 @@ def acquire_rapid_scan(
         if _try_set(core, xy_device, speed_prop, str(speed_pct)):
             logger.info(
                 "Set XY stage %s=%d (target %.0f um/s)",
-                speed_prop, speed_pct, target_velocity,
+                speed_prop,
+                speed_pct,
+                target_velocity,
             )
         else:
             logger.warning("Could not set XY stage speed")
@@ -311,8 +318,13 @@ def acquire_rapid_scan(
 
             logger.info(
                 "Row %d/%d: (%.1f, %.1f) -> (%.1f, %.1f), %.0f um",
-                row_idx + 1, n_rows,
-                row_x_start, row_y, row_x_end, row_y, row_distance,
+                row_idx + 1,
+                n_rows,
+                row_x_start,
+                row_y,
+                row_x_end,
+                row_y,
+                row_distance,
             )
 
             # ---- Frame capture loop ----
@@ -396,12 +408,17 @@ def acquire_rapid_scan(
                 tile_idx += 1
                 saved_this_row += 1
 
-            actual_velocity = row_distance / (motion_duration_ms / 1000.0) if motion_duration_ms > 0 else 0
+            actual_velocity = (
+                row_distance / (motion_duration_ms / 1000.0) if motion_duration_ms > 0 else 0
+            )
             logger.info(
                 "  row %d: %d frames kept (%d stationary discarded), "
                 "%.0fms motion, %.0f um/s actual, %.1f fps",
-                row_idx + 1, saved_this_row, n_stationary,
-                motion_duration_ms, actual_velocity,
+                row_idx + 1,
+                saved_this_row,
+                n_stationary,
+                motion_duration_ms,
+                actual_velocity,
                 saved_this_row / (motion_duration_ms / 1000.0) if motion_duration_ms > 0 else 0,
             )
 
@@ -441,8 +458,9 @@ def acquire_rapid_scan(
         # Return stage to starting position
         try:
             hardware.stage.move_xy(start_stage_x, start_stage_y)
-            logger.info("Returned stage to starting position (%.1f, %.1f)",
-                        start_stage_x, start_stage_y)
+            logger.info(
+                "Returned stage to starting position (%.1f, %.1f)", start_stage_x, start_stage_y
+            )
         except Exception as e:
             logger.warning("Could not return stage to start: %s", e)
 
@@ -471,7 +489,9 @@ def acquire_rapid_scan(
 
     logger.info(
         "Rapid scan complete: %d tiles across %d rows, %.1fs (%.2fs/tile)",
-        n_tiles, n_rows, elapsed,
+        n_tiles,
+        n_rows,
+        elapsed,
         elapsed / n_tiles if n_tiles > 0 else 0,
     )
 

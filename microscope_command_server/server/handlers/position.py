@@ -49,7 +49,8 @@ def _pause_sequence_for_move(hardware, tag):
         except Exception as stop_err:
             logger.warning(
                 "%s: failed to stop sequence (proceeding with contention risk): %s",
-                tag, stop_err,
+                tag,
+                stop_err,
             )
             sequence_was_running = False
 
@@ -63,8 +64,11 @@ def _pause_sequence_for_move(hardware, tag):
             except Exception as resume_err:
                 logger.error(
                     "%s: failed to resume sequence acquisition: %s",
-                    tag, resume_err, exc_info=True,
+                    tag,
+                    resume_err,
+                    exc_info=True,
                 )
+
 
 # GETXY / GETZ / GETXYZ handlers serve the live position display in
 # QuPath's StageControlPanel and the live-viewer overlay. Both poll

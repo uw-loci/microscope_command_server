@@ -60,9 +60,7 @@ class TimepointScheduler:
         sleep: Callable[[float], None] = time.sleep,
     ) -> None:
         if interval_seconds < 0:
-            raise ValueError(
-                f"interval_seconds must be >= 0 (got {interval_seconds})"
-            )
+            raise ValueError(f"interval_seconds must be >= 0 (got {interval_seconds})")
         self.t0 = float(t0_monotonic)
         self.interval_seconds = float(interval_seconds)
         self.logger = logger
@@ -111,8 +109,7 @@ class TimepointScheduler:
         while True:
             if check_cancel():
                 self.logger.info(
-                    "TimepointScheduler: cancellation detected while "
-                    "waiting for timepoint %d",
+                    "TimepointScheduler: cancellation detected while " "waiting for timepoint %d",
                     t_idx,
                 )
                 return 0.0

@@ -14,7 +14,6 @@ from concurrent.futures import ThreadPoolExecutor
 from importlib.metadata import version as _get_version
 from pathlib import Path
 
-
 # Package names as registered in pyproject.toml [project].name
 _PACKAGES = [
     ("microscope-command-server", "Microscope Command Server"),

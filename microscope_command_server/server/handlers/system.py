@@ -6,12 +6,10 @@ CONFIG, RECONFG, DISCONNECT, SHUTDOWN, SIFTAL, SIFTIM
 
 import struct
 import socket
-import time
 import logging
 
 import yaml
 
-from microscope_command_server.server.protocol import END_MARKER
 from microscope_command_server.server.handlers.utils import read_message_string
 
 logger = logging.getLogger(__name__)
@@ -26,7 +24,9 @@ def handle_disconnect(conn, client, hardware, settings, **kwargs):
     Returns:
         str: 'DISCONNECT' to signal the caller to close the connection.
     """
-    addr = kwargs.get("addr", client if isinstance(client, tuple) else getattr(client, "addr", client))
+    addr = kwargs.get(
+        "addr", client if isinstance(client, tuple) else getattr(client, "addr", client)
+    )
     logger.info("Client %s requested to disconnect", addr)
     return "DISCONNECT"
 
@@ -45,7 +45,9 @@ def handle_shutdown(conn, client, hardware, settings, **kwargs):
     Returns:
         str: 'SHUTDOWN' to signal the caller to close the connection.
     """
-    addr = kwargs.get("addr", client if isinstance(client, tuple) else getattr(client, "addr", client))
+    addr = kwargs.get(
+        "addr", client if isinstance(client, tuple) else getattr(client, "addr", client)
+    )
     shutdown_event = kwargs.get("shutdown_event")
     logger.warning("Client %s requested server shutdown", addr)
     if shutdown_event is not None:
@@ -169,7 +171,10 @@ def handle_config(conn, client, hardware, settings, **kwargs):
                             "connection %s is actively running acquisition "
                             "(state=%s). New connection %s will be rejected "
                             "to protect the in-flight workflow.",
-                            current_active_addr, acquiring_addr, active_state, addr,
+                            current_active_addr,
+                            acquiring_addr,
+                            active_state,
+                            addr,
                         )
                         error_msg = (
                             f"BLOCKED: Active acquisition on {acquiring_addr}; "
@@ -179,7 +184,9 @@ def handle_config(conn, client, hardware, settings, **kwargs):
                         conn.sendall(b"CFG_BLCK" + error_length + error_msg)
                         return None
 
-                    logger.warning("CONFIG: Same IP reconnecting - taking over from %s", current_active_addr)
+                    logger.warning(
+                        "CONFIG: Same IP reconnecting - taking over from %s", current_active_addr
+                    )
                     logger.warning("CONFIG: Previous connection may have been improperly closed")
                     # Stop any orphaned sequence acquisition left running by
                     # the dead client. Without this the camera can stay
@@ -234,8 +241,12 @@ def handle_config(conn, client, hardware, settings, **kwargs):
                     current_active_addr = None
                 else:
                     # Different IP - reject this CONFIG
-                    logger.warning("CONFIG: Rejected - connection %s already active", current_active_addr)
-                    error_msg = f"BLOCKED: Active connection from {current_active_addr}".encode("utf-8")
+                    logger.warning(
+                        "CONFIG: Rejected - connection %s already active", current_active_addr
+                    )
+                    error_msg = f"BLOCKED: Active connection from {current_active_addr}".encode(
+                        "utf-8"
+                    )
                     error_length = struct.pack("!I", len(error_msg))
                     conn.sendall(b"CFG_BLCK" + error_length + error_msg)
                     return None
@@ -265,11 +276,12 @@ def handle_config(conn, client, hardware, settings, **kwargs):
         # can exceed the client's 5s read timeout and corrupt both
         # connections (see OWS3 incident 2026-04-09).
         hardware.settings = new_settings
-        path_changed = (current_active_config_path != config_path)
+        path_changed = current_active_config_path != config_path
         if path_changed:
             logger.info(
                 "CONFIG: Config path changed (%s -> %s), rebuilding hardware",
-                current_active_config_path, config_path,
+                current_active_config_path,
+                config_path,
             )
             hardware._camera_name = hardware._detect_camera_name()
             hardware._camera_registry = hardware._build_camera_registry()
@@ -303,6 +315,7 @@ def handle_config(conn, client, hardware, settings, **kwargs):
         # Send success response with version info payload
         import json
         from microscope_command_server.version_info import collect_versions
+
         version_json = json.dumps(collect_versions()).encode("utf-8")
         version_length = struct.pack("!I", len(version_json))
         conn.sendall(b"CFG___OK" + version_length + version_json)
@@ -410,7 +423,9 @@ def handle_siftal(conn, client, hardware, settings, **kwargs):
     Response: SUCCESS:<offset_x>,<offset_y>|inliers:<n>|confidence:<f>
               or FAILED:<reason>
     """
-    addr = kwargs.get("addr", client if isinstance(client, tuple) else getattr(client, "addr", client))
+    addr = kwargs.get(
+        "addr", client if isinstance(client, tuple) else getattr(client, "addr", client)
+    )
     logger.info("Client %s requested SIFT auto-alignment", addr)
 
     try:
@@ -428,35 +443,50 @@ def handle_siftal(conn, client, hardware, settings, **kwargs):
     i = 0
     while i < len(parts):
         if parts[i] == "--wsi-region" and i + 1 < len(parts):
-            params["wsi_region_path"] = parts[i + 1]; i += 2
+            params["wsi_region_path"] = parts[i + 1]
+            i += 2
         elif parts[i] == "--micro-px" and i + 1 < len(parts):
-            params["micro_px"] = float(parts[i + 1]); i += 2
+            params["micro_px"] = float(parts[i + 1])
+            i += 2
         elif parts[i] == "--wsi-px" and i + 1 < len(parts):
-            params["wsi_px"] = float(parts[i + 1]); i += 2
+            params["wsi_px"] = float(parts[i + 1])
+            i += 2
         elif parts[i] == "--min-px" and i + 1 < len(parts):
-            params["min_px"] = float(parts[i + 1]); i += 2
+            params["min_px"] = float(parts[i + 1])
+            i += 2
         elif parts[i] == "--ratio" and i + 1 < len(parts):
-            params["ratio_threshold"] = float(parts[i + 1]); i += 2
+            params["ratio_threshold"] = float(parts[i + 1])
+            i += 2
         elif parts[i] == "--min-matches" and i + 1 < len(parts):
-            params["min_match_count"] = int(parts[i + 1]); i += 2
+            params["min_match_count"] = int(parts[i + 1])
+            i += 2
         elif parts[i] == "--contrast" and i + 1 < len(parts):
-            params["contrast_threshold"] = float(parts[i + 1]); i += 2
+            params["contrast_threshold"] = float(parts[i + 1])
+            i += 2
         elif parts[i] == "--nfeatures" and i + 1 < len(parts):
-            params["nfeatures"] = int(parts[i + 1]); i += 2
+            params["nfeatures"] = int(parts[i + 1])
+            i += 2
         elif parts[i] == "--mono-norm" and i + 1 < len(parts):
-            params["mono_normalization"] = parts[i + 1]; i += 2
+            params["mono_normalization"] = parts[i + 1]
+            i += 2
         elif parts[i] == "--pct-low" and i + 1 < len(parts):
-            params["percentile_low"] = float(parts[i + 1]); i += 2
+            params["percentile_low"] = float(parts[i + 1])
+            i += 2
         elif parts[i] == "--pct-high" and i + 1 < len(parts):
-            params["percentile_high"] = float(parts[i + 1]); i += 2
+            params["percentile_high"] = float(parts[i + 1])
+            i += 2
         elif parts[i] == "--clahe" and i + 1 < len(parts):
-            params["clahe_enabled"] = parts[i + 1].lower() in ("1", "true", "yes"); i += 2
+            params["clahe_enabled"] = parts[i + 1].lower() in ("1", "true", "yes")
+            i += 2
         elif parts[i] == "--clahe-clip" and i + 1 < len(parts):
-            params["clahe_clip_limit"] = float(parts[i + 1]); i += 2
+            params["clahe_clip_limit"] = float(parts[i + 1])
+            i += 2
         elif parts[i] == "--flip-x":
-            params["flip_x"] = True; i += 1
+            params["flip_x"] = True
+            i += 1
         elif parts[i] == "--flip-y":
-            params["flip_y"] = True; i += 1
+            params["flip_y"] = True
+            i += 1
         else:
             i += 1
 
@@ -506,10 +536,20 @@ def handle_siftal(conn, client, hardware, settings, **kwargs):
             "SIFT: micro_px=%s, wsi_px=%s, min_px=%s, flip=(%s,%s), "
             "ratio=%s, min_matches=%s, contrast=%s, nfeatures=%s, "
             "mono_norm=%s, pct=(%s,%s), clahe=%s clip=%s",
-            micro_px, wsi_px, min_px, flip_x, flip_y,
-            ratio_threshold, min_match_count, contrast_threshold, nfeatures,
-            mono_normalization, percentile_low, percentile_high,
-            clahe_enabled, clahe_clip_limit,
+            micro_px,
+            wsi_px,
+            min_px,
+            flip_x,
+            flip_y,
+            ratio_threshold,
+            min_match_count,
+            contrast_threshold,
+            nfeatures,
+            mono_normalization,
+            percentile_low,
+            percentile_high,
+            clahe_enabled,
+            clahe_clip_limit,
         )
 
         result = match_sift(
@@ -535,12 +575,17 @@ def handle_siftal(conn, client, hardware, settings, **kwargs):
             conn.sendall(b"FAILED:SIFT matching failed - insufficient features or matches")
         else:
             offset_x, offset_y, n_inliers, confidence = result
-            response = (f"SUCCESS:{offset_x:.2f},{offset_y:.2f}|"
-                        f"inliers:{n_inliers}|confidence:{confidence:.3f}")
+            response = (
+                f"SUCCESS:{offset_x:.2f},{offset_y:.2f}|"
+                f"inliers:{n_inliers}|confidence:{confidence:.3f}"
+            )
             conn.sendall(response.encode())
             logger.info(
                 "SIFTAL complete: offset=(%.1f, %.1f) um, inliers=%d, confidence=%.2f",
-                offset_x, offset_y, n_inliers, confidence,
+                offset_x,
+                offset_y,
+                n_inliers,
+                confidence,
             )
 
     except ImportError as e:
@@ -568,7 +613,9 @@ def handle_siftim(conn, client, hardware, settings, **kwargs):
     Response: SUCCESS:<offset_x>,<offset_y>|inliers:<n>|confidence:<f>
               or FAILED:<reason>
     """
-    addr = kwargs.get("addr", client if isinstance(client, tuple) else getattr(client, "addr", client))
+    addr = kwargs.get(
+        "addr", client if isinstance(client, tuple) else getattr(client, "addr", client)
+    )
     logger.info("Client %s requested SIFT image-vs-image match", addr)
 
     try:
@@ -585,37 +632,53 @@ def handle_siftim(conn, client, hardware, settings, **kwargs):
     i = 0
     while i < len(parts):
         if parts[i] == "--image-a" and i + 1 < len(parts):
-            params["image_a_path"] = parts[i + 1]; i += 2
+            params["image_a_path"] = parts[i + 1]
+            i += 2
         elif parts[i] == "--image-b" and i + 1 < len(parts):
-            params["image_b_path"] = parts[i + 1]; i += 2
+            params["image_b_path"] = parts[i + 1]
+            i += 2
         elif parts[i] == "--pixel-size-a" and i + 1 < len(parts):
-            params["pixel_size_a"] = float(parts[i + 1]); i += 2
+            params["pixel_size_a"] = float(parts[i + 1])
+            i += 2
         elif parts[i] == "--pixel-size-b" and i + 1 < len(parts):
-            params["pixel_size_b"] = float(parts[i + 1]); i += 2
+            params["pixel_size_b"] = float(parts[i + 1])
+            i += 2
         elif parts[i] == "--min-px" and i + 1 < len(parts):
-            params["min_px"] = float(parts[i + 1]); i += 2
+            params["min_px"] = float(parts[i + 1])
+            i += 2
         elif parts[i] == "--ratio" and i + 1 < len(parts):
-            params["ratio_threshold"] = float(parts[i + 1]); i += 2
+            params["ratio_threshold"] = float(parts[i + 1])
+            i += 2
         elif parts[i] == "--min-matches" and i + 1 < len(parts):
-            params["min_match_count"] = int(parts[i + 1]); i += 2
+            params["min_match_count"] = int(parts[i + 1])
+            i += 2
         elif parts[i] == "--contrast" and i + 1 < len(parts):
-            params["contrast_threshold"] = float(parts[i + 1]); i += 2
+            params["contrast_threshold"] = float(parts[i + 1])
+            i += 2
         elif parts[i] == "--nfeatures" and i + 1 < len(parts):
-            params["nfeatures"] = int(parts[i + 1]); i += 2
+            params["nfeatures"] = int(parts[i + 1])
+            i += 2
         elif parts[i] == "--mono-norm" and i + 1 < len(parts):
-            params["mono_normalization"] = parts[i + 1]; i += 2
+            params["mono_normalization"] = parts[i + 1]
+            i += 2
         elif parts[i] == "--pct-low" and i + 1 < len(parts):
-            params["percentile_low"] = float(parts[i + 1]); i += 2
+            params["percentile_low"] = float(parts[i + 1])
+            i += 2
         elif parts[i] == "--pct-high" and i + 1 < len(parts):
-            params["percentile_high"] = float(parts[i + 1]); i += 2
+            params["percentile_high"] = float(parts[i + 1])
+            i += 2
         elif parts[i] == "--clahe" and i + 1 < len(parts):
-            params["clahe_enabled"] = parts[i + 1].lower() in ("1", "true", "yes"); i += 2
+            params["clahe_enabled"] = parts[i + 1].lower() in ("1", "true", "yes")
+            i += 2
         elif parts[i] == "--clahe-clip" and i + 1 < len(parts):
-            params["clahe_clip_limit"] = float(parts[i + 1]); i += 2
+            params["clahe_clip_limit"] = float(parts[i + 1])
+            i += 2
         elif parts[i] == "--flip-x":
-            params["flip_x"] = True; i += 1
+            params["flip_x"] = True
+            i += 1
         elif parts[i] == "--flip-y":
-            params["flip_y"] = True; i += 1
+            params["flip_y"] = True
+            i += 1
         else:
             i += 1
 
@@ -655,11 +718,22 @@ def handle_siftim(conn, client, hardware, settings, **kwargs):
             "SIFTIM: image-a=%s (px=%s), image-b=%s (px=%s), min_px=%s, flip=(%s,%s), "
             "ratio=%s, min_matches=%s, contrast=%s, nfeatures=%s, mono_norm=%s, "
             "pct=(%s,%s), clahe=%s clip=%s",
-            params["image_a_path"], pixel_size_a, params["image_b_path"], pixel_size_b,
-            min_px, flip_x, flip_y,
-            ratio_threshold, min_match_count, contrast_threshold, nfeatures,
-            mono_normalization, percentile_low, percentile_high,
-            clahe_enabled, clahe_clip_limit,
+            params["image_a_path"],
+            pixel_size_a,
+            params["image_b_path"],
+            pixel_size_b,
+            min_px,
+            flip_x,
+            flip_y,
+            ratio_threshold,
+            min_match_count,
+            contrast_threshold,
+            nfeatures,
+            mono_normalization,
+            percentile_low,
+            percentile_high,
+            clahe_enabled,
+            clahe_clip_limit,
         )
 
         # match_sift signature treats microscope_image as the snap (image B in
@@ -691,12 +765,17 @@ def handle_siftim(conn, client, hardware, settings, **kwargs):
             conn.sendall(b"FAILED:SIFT matching failed - insufficient features or matches")
         else:
             offset_x, offset_y, n_inliers, confidence = result
-            response = (f"SUCCESS:{offset_x:.2f},{offset_y:.2f}|"
-                        f"inliers:{n_inliers}|confidence:{confidence:.3f}")
+            response = (
+                f"SUCCESS:{offset_x:.2f},{offset_y:.2f}|"
+                f"inliers:{n_inliers}|confidence:{confidence:.3f}"
+            )
             conn.sendall(response.encode())
             logger.info(
                 "SIFTIM complete: offset=(%.1f, %.1f) um, inliers=%d, confidence=%.2f",
-                offset_x, offset_y, n_inliers, confidence,
+                offset_x,
+                offset_y,
+                n_inliers,
+                confidence,
             )
 
     except ImportError as e:
