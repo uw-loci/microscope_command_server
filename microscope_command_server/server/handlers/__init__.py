@@ -49,6 +49,7 @@ from microscope_command_server.server.handlers.illumination import (
 )
 from microscope_command_server.server.handlers.system import (
     handle_config, handle_reconfig, handle_disconnect, handle_shutdown, handle_siftal,
+    handle_siftim,
 )
 from microscope_command_server.server.handlers.probez import handle_probez
 from microscope_command_server.server.handlers.probe_stage_af import handle_probe_stage_af
@@ -140,6 +141,7 @@ COMMAND_HANDLERS = {
     ExtendedCommand.DISCONNECT: handle_disconnect,
     ExtendedCommand.SHUTDOWN: handle_shutdown,
     ExtendedCommand.SIFTAL: handle_siftal,
+    ExtendedCommand.SIFTIM: handle_siftim,
 
     # Z-stage diagnostic probe
     ExtendedCommand.PROBEZ: handle_probez,

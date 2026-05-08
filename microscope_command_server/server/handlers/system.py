@@ -1,7 +1,7 @@
 """System and alignment command handlers.
 
 Handles connection management, configuration, and alignment commands:
-CONFIG, RECONFG, DISCONNECT, SHUTDOWN, SIFTAL
+CONFIG, RECONFG, DISCONNECT, SHUTDOWN, SIFTAL, SIFTIM
 """
 
 import struct
@@ -547,4 +547,160 @@ def handle_siftal(conn, client, hardware, settings, **kwargs):
         conn.sendall(f"FAILED:OpenCV not available: {e}".encode())
     except Exception as e:
         logger.error("SIFTAL failed: %s", e, exc_info=True)
+        conn.sendall(f"FAILED:{str(e)}".encode())
+
+
+def handle_siftim(conn, client, hardware, settings, **kwargs):
+    """SIFT image-vs-image: match two on-disk image files (no camera snap).
+
+    Mirrors handle_siftal but reads both sides from disk. Used by the QPSC
+    propagation refinement workflow to remove residuals from 3-point alignment
+    fits.
+
+    Reads --image-a, --image-b, --pixel-size-a, --pixel-size-b, --min-px,
+    --ratio, --min-matches, --contrast, --nfeatures, --mono-norm,
+    --pct-low, --pct-high, --clahe, --clahe-clip, --flip-x, --flip-y.
+
+    Image A is the reference (e.g. base WSI region); image B is matched
+    against it. Offsets are returned in um in image-A's frame: positive X/Y
+    means image B's content is shifted right/down relative to image A.
+
+    Response: SUCCESS:<offset_x>,<offset_y>|inliers:<n>|confidence:<f>
+              or FAILED:<reason>
+    """
+    addr = kwargs.get("addr", client if isinstance(client, tuple) else getattr(client, "addr", client))
+    logger.info("Client %s requested SIFT image-vs-image match", addr)
+
+    try:
+        message = read_message_string(conn, chunk_size=4096)
+    except (socket.timeout, ConnectionError, ValueError) as e:
+        logger.error("Failed to read SIFTIM message from %s: %s", addr, e)
+        conn.sendall(f"FAILED:{str(e)}".encode())
+        return
+
+    logger.info("SIFTIM message: %s", message)
+
+    params = {}
+    parts = message.split()
+    i = 0
+    while i < len(parts):
+        if parts[i] == "--image-a" and i + 1 < len(parts):
+            params["image_a_path"] = parts[i + 1]; i += 2
+        elif parts[i] == "--image-b" and i + 1 < len(parts):
+            params["image_b_path"] = parts[i + 1]; i += 2
+        elif parts[i] == "--pixel-size-a" and i + 1 < len(parts):
+            params["pixel_size_a"] = float(parts[i + 1]); i += 2
+        elif parts[i] == "--pixel-size-b" and i + 1 < len(parts):
+            params["pixel_size_b"] = float(parts[i + 1]); i += 2
+        elif parts[i] == "--min-px" and i + 1 < len(parts):
+            params["min_px"] = float(parts[i + 1]); i += 2
+        elif parts[i] == "--ratio" and i + 1 < len(parts):
+            params["ratio_threshold"] = float(parts[i + 1]); i += 2
+        elif parts[i] == "--min-matches" and i + 1 < len(parts):
+            params["min_match_count"] = int(parts[i + 1]); i += 2
+        elif parts[i] == "--contrast" and i + 1 < len(parts):
+            params["contrast_threshold"] = float(parts[i + 1]); i += 2
+        elif parts[i] == "--nfeatures" and i + 1 < len(parts):
+            params["nfeatures"] = int(parts[i + 1]); i += 2
+        elif parts[i] == "--mono-norm" and i + 1 < len(parts):
+            params["mono_normalization"] = parts[i + 1]; i += 2
+        elif parts[i] == "--pct-low" and i + 1 < len(parts):
+            params["percentile_low"] = float(parts[i + 1]); i += 2
+        elif parts[i] == "--pct-high" and i + 1 < len(parts):
+            params["percentile_high"] = float(parts[i + 1]); i += 2
+        elif parts[i] == "--clahe" and i + 1 < len(parts):
+            params["clahe_enabled"] = parts[i + 1].lower() in ("1", "true", "yes"); i += 2
+        elif parts[i] == "--clahe-clip" and i + 1 < len(parts):
+            params["clahe_clip_limit"] = float(parts[i + 1]); i += 2
+        elif parts[i] == "--flip-x":
+            params["flip_x"] = True; i += 1
+        elif parts[i] == "--flip-y":
+            params["flip_y"] = True; i += 1
+        else:
+            i += 1
+
+    if "image_a_path" not in params or "image_b_path" not in params:
+        conn.sendall(b"FAILED:Missing --image-a or --image-b")
+        return
+
+    try:
+        import cv2
+        from microscope_command_server.alignment.sift_matcher import match_sift
+
+        image_a = cv2.imread(params["image_a_path"], cv2.IMREAD_UNCHANGED)
+        if image_a is None:
+            conn.sendall(f"FAILED:Could not read image-a: {params['image_a_path']}".encode())
+            return
+        image_b = cv2.imread(params["image_b_path"], cv2.IMREAD_UNCHANGED)
+        if image_b is None:
+            conn.sendall(f"FAILED:Could not read image-b: {params['image_b_path']}".encode())
+            return
+
+        pixel_size_a = params.get("pixel_size_a", 0.25)
+        pixel_size_b = params.get("pixel_size_b", 0.173)
+        min_px = params.get("min_px", 1.0)
+        flip_x = params.get("flip_x", False)
+        flip_y = params.get("flip_y", False)
+        ratio_threshold = params.get("ratio_threshold", 0.7)
+        min_match_count = params.get("min_match_count", 10)
+        contrast_threshold = params.get("contrast_threshold", 0.04)
+        nfeatures = params.get("nfeatures", 0)
+        mono_normalization = params.get("mono_normalization", "PERCENTILE")
+        percentile_low = params.get("percentile_low", 2.0)
+        percentile_high = params.get("percentile_high", 98.0)
+        clahe_enabled = params.get("clahe_enabled", True)
+        clahe_clip_limit = params.get("clahe_clip_limit", 2.0)
+
+        logger.info(
+            "SIFTIM: image-a=%s (px=%s), image-b=%s (px=%s), min_px=%s, flip=(%s,%s), "
+            "ratio=%s, min_matches=%s, contrast=%s, nfeatures=%s, mono_norm=%s, "
+            "pct=(%s,%s), clahe=%s clip=%s",
+            params["image_a_path"], pixel_size_a, params["image_b_path"], pixel_size_b,
+            min_px, flip_x, flip_y,
+            ratio_threshold, min_match_count, contrast_threshold, nfeatures,
+            mono_normalization, percentile_low, percentile_high,
+            clahe_enabled, clahe_clip_limit,
+        )
+
+        # match_sift signature treats microscope_image as the snap (image B in
+        # our framing) and wsi_region as the reference (image A). The function
+        # returns the offset that, applied to the camera position, would land
+        # the camera content on the WSI reference. For the SIFTIM use case we
+        # interpret this as: how far image-B is offset from image-A in image-A
+        # micrometers. Same sign convention.
+        result = match_sift(
+            microscope_image=image_b,
+            wsi_region=image_a,
+            microscope_pixel_size_um=pixel_size_b,
+            wsi_pixel_size_um=pixel_size_a,
+            flip_x=flip_x,
+            flip_y=flip_y,
+            min_match_count=min_match_count,
+            ratio_threshold=ratio_threshold,
+            min_pixel_size_um=min_px,
+            contrast_threshold=contrast_threshold,
+            nfeatures=nfeatures,
+            mono_normalization=mono_normalization,
+            percentile_low=percentile_low,
+            percentile_high=percentile_high,
+            clahe_enabled=clahe_enabled,
+            clahe_clip_limit=clahe_clip_limit,
+        )
+
+        if result is None:
+            conn.sendall(b"FAILED:SIFT matching failed - insufficient features or matches")
+        else:
+            offset_x, offset_y, n_inliers, confidence = result
+            response = (f"SUCCESS:{offset_x:.2f},{offset_y:.2f}|"
+                        f"inliers:{n_inliers}|confidence:{confidence:.3f}")
+            conn.sendall(response.encode())
+            logger.info(
+                "SIFTIM complete: offset=(%.1f, %.1f) um, inliers=%d, confidence=%.2f",
+                offset_x, offset_y, n_inliers, confidence,
+            )
+
+    except ImportError as e:
+        conn.sendall(f"FAILED:OpenCV not available: {e}".encode())
+    except Exception as e:
+        logger.error("SIFTIM failed: %s", e, exc_info=True)
         conn.sendall(f"FAILED:{str(e)}".encode())
