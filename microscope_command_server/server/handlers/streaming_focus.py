@@ -2855,6 +2855,11 @@ def handle_streaming_focus(conn, client, hardware, settings, **kwargs):
         )
         logger.warning("STREAM_AF:UNAVAILABLE -- %s", reason)
         conn.sendall(f"UNAVAILABLE:{reason}".encode())
+        # The crop ROI was applied above; UNAVAILABLE returns are
+        # outside the main try/finally that calls _restore_roi, so
+        # restore here or the Live Viewer keeps showing the cropped
+        # area on subsequent frame polls.
+        _restore_roi(core, saved_roi, roi_seq_was_running)
         return
 
     # --- Pre-flight: saturation check ---
@@ -2906,6 +2911,11 @@ def handle_streaming_focus(conn, client, hardware, settings, **kwargs):
         )
         logger.warning("STREAM_AF:UNAVAILABLE -- %s", reason)
         conn.sendall(f"UNAVAILABLE:{reason}".encode())
+        # Same caveat as the blur-budget early return above: this
+        # bypasses the main try/finally block, so restore the camera
+        # ROI explicitly or the Live Viewer keeps showing the cropped
+        # area indefinitely.
+        _restore_roi(core, saved_roi, roi_seq_was_running)
         return
 
     # --- Execute scan with edge-retry loop ---
