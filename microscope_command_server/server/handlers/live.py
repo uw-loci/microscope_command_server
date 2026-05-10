@@ -130,6 +130,169 @@ def handle_getframe(conn, client, hardware, settings, **kwargs):
             pass
 
 
+def handle_correctframe(conn, client, hardware, settings, **kwargs):
+    """Get latest frame with server-side flat-field correction applied.
+
+    Same wire format as GETFRAME on success: 20-byte header
+    (5 big-endian ints: w, h, channels, bpp, data_len) followed by raw
+    pixel bytes. On any configuration failure (no background folder,
+    missing per-angle file, shape mismatch) the server replies with a
+    textual ``FAILED:<reason>`` payload instead so the Java client can
+    fall back to an uncorrected snap with a clear status message.
+
+    The Java side is expected to have already validated settings-match
+    (modality / objective / detector / WB mode / current angle) before
+    issuing this command -- those are the same checks ACQUIRE runs in
+    AcquisitionConfigurationBuilder. This handler is the second line of
+    defense for racy YAML edits during a session.
+
+    Args (via kwargs):
+        active_connection_config_path: Path to the active config_<scope>.yml
+            from which the imageprocessing_<scope>.yml peer file is derived.
+    """
+    from pathlib import Path
+
+    addr = client.addr
+    logger.info("Client %s requested corrected frame", addr)
+
+    def _fail(reason):
+        try:
+            conn.sendall(f"FAILED:{reason}".encode("ascii", errors="replace"))
+        except Exception as send_err:
+            logger.error("CORRECTFRAME: could not send FAILED response: %s", send_err)
+
+    try:
+        # Step 1: pull current frame (identical to GETFRAME).
+        image, _ = hardware.get_live_frame()
+        if image is None:
+            # No frame available -- behave like GETFRAME and send a zero
+            # header. The Java client treats this as "skip the snap".
+            conn.sendall(struct.pack(">5i", 0, 0, 0, 0, 0))
+            return
+
+        # Step 2: resolve modality, objective, detector from the cached
+        # CONFIG settings.
+        if not hasattr(hardware, "settings") or not hardware.settings:
+            _fail("Server has no CONFIG settings loaded")
+            return
+        mscope = hardware.settings.get("microscope", {}) or {}
+        modality = mscope.get("modality_in_use") or mscope.get("default_modality")
+        objective = mscope.get("objective_in_use") or mscope.get("objective")
+        detector = mscope.get("detector_in_use") or mscope.get("detector")
+        if not modality:
+            _fail("No active modality (microscope.modality_in_use)")
+            return
+        if not objective:
+            _fail("No active objective (microscope.objective_in_use)")
+            return
+        if not detector:
+            _fail("No active detector (microscope.detector_in_use)")
+            return
+
+        # Step 3: locate the background folder via the imageprocessing config.
+        config_path_str = kwargs.get("active_connection_config_path")
+        if not config_path_str:
+            _fail("No active CONFIG path on the server")
+            return
+        config_path = Path(config_path_str)
+        ip_path = (
+            config_path.parent / f"imageprocessing_{config_path.stem.replace('config_', '')}.yml"
+        )
+        if not ip_path.exists():
+            _fail(f"No imageprocessing config at {ip_path}")
+            return
+        try:
+            from microscope_command_server.utils import config_manager
+
+            ip_config = config_manager.load_config_file(str(ip_path))
+        except Exception as e:
+            _fail(f"Could not load imageprocessing config: {e}")
+            return
+        bc_root = (ip_config or {}).get("background_correction", {})
+        bc_settings = bc_root.get(modality) or bc_root.get(_strip_mag_suffix(modality)) or {}
+        if not bc_settings.get("enabled"):
+            _fail(f"Background correction not enabled for modality '{modality}'")
+            return
+        bg_base = bc_settings.get("base_folder")
+        if not bg_base:
+            _fail(f"No base_folder configured for modality '{modality}'")
+            return
+
+        # Step 4: determine current rotation angle (0 for non-rotation modalities).
+        try:
+            angle = float(hardware.get_rotation_position())
+        except Exception:
+            angle = 0.0
+        method = bc_settings.get("method", "divide")
+
+        # Step 5: load the matching background image.
+        try:
+            from microscope_imageprocessing.correction.background import (
+                BackgroundCorrectionUtils,
+            )
+        except Exception as e:
+            _fail(f"BackgroundCorrectionUtils unavailable: {e}")
+            return
+        bg_root = Path(bg_base)
+        backgrounds, scaling_factors, _ = BackgroundCorrectionUtils.load_background_images(
+            bg_root, [angle], logger
+        )
+        if not backgrounds or angle not in backgrounds:
+            _fail(f"No background image for angle {angle} in {bg_root} " f"(modality={modality})")
+            return
+
+        # Step 6: apply correction.
+        try:
+            corrected = BackgroundCorrectionUtils.apply_flat_field_correction(
+                image,
+                backgrounds[angle],
+                scaling_factors.get(angle, 1.0),
+                method=method,
+            )
+        except Exception as e:
+            _fail(f"apply_flat_field_correction failed: {e}")
+            return
+
+        # Step 7: send back same wire format as GETFRAME.
+        h, w = corrected.shape[:2]
+        channels = 1 if corrected.ndim == 2 else corrected.shape[2]
+        bpp = corrected.dtype.itemsize
+
+        if corrected.dtype == np.uint16:
+            corrected = corrected.astype(">u2")
+        raw_bytes = np.ascontiguousarray(corrected).tobytes()
+        header = struct.pack(">5i", w, h, channels, bpp, len(raw_bytes))
+        conn.sendall(header + raw_bytes)
+        logger.info(
+            "CORRECTFRAME OK: %dx%d, %d ch, %d-bit (modality=%s, angle=%s)",
+            w,
+            h,
+            channels,
+            bpp * 8,
+            modality,
+            angle,
+        )
+    except Exception as e:
+        logger.exception("CORRECTFRAME failed: %s", e)
+        try:
+            _fail(f"Internal error: {e}")
+        except Exception:
+            pass
+
+
+def _strip_mag_suffix(modality):
+    """Strip a trailing _<n>x magnification suffix from a modality id.
+
+    e.g. ``ppm_20x`` -> ``ppm``. Mirrors ``HardwareKey.stripMagnificationSuffix``
+    in the Java side so the same modality lookup keys work in both halves.
+    """
+    if not modality:
+        return modality
+    import re
+
+    return re.sub(r"_\d+x$", "", modality, flags=re.IGNORECASE)
+
+
 def handle_strtseq(conn, client, hardware, settings, **kwargs):
     """Start continuous sequence acquisition (core-level, bypasses MM live window).
 

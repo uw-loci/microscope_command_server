@@ -123,6 +123,11 @@ class ExtendedCommand:
 
     # Live Viewer Commands (core-level, bypasses MM studio/live window)
     GETFRAME = b"getframe"  # Get latest frame from MM circular buffer
+    # Latest frame with server-side flat-field correction applied. Same wire
+    # format as GETFRAME on success; replies with a textual FAILED:<reason>
+    # payload when correction cannot be applied (e.g. no background folder,
+    # missing per-angle file, shape mismatch).
+    CORRECTFRAME = b"crctfram"
     STRTSEQ = b"strtseq_"  # Start continuous sequence acquisition (core-level)
     STOPSEQ = b"stopseq_"  # Stop continuous sequence acquisition (core-level)
 
