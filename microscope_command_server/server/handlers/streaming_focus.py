@@ -151,8 +151,15 @@ BLUR_BUDGET_UM = 0.5
 # not per-rig calibrated. A future follow-up may move these into
 # config_<scope>.yml per modality.
 SATURATION_THRESHOLD_BY_MODALITY = {
-    "brightfield": 0.30,  # bright background with dark tissue -- tolerant
-    "bf": 0.30,
+    # Brightfield: very tolerant. Bare glass / illumination field /
+    # specular highlights routinely saturate >30% of pixels with the
+    # tissue features still dark and informative for focus. The
+    # operator's reaction to repeated cancellations at modest
+    # saturation has been "why are we cancelling again?" -- so the
+    # threshold sits at 0.50 to only refuse when saturation is so
+    # heavy the metric really has no discrimination left.
+    "brightfield": 0.50,
+    "bf": 0.50,
     "ppm": 0.05,  # polarized: both channels contribute -- moderate
     "polarized": 0.05,
     "fluorescence": 0.02,  # widefield fluorescence -- strict
@@ -197,7 +204,30 @@ MIN_FRAMES_FOR_FIT = 6
 # 4-5% range the gaussian fit minimum-quality is below useful;
 # refusing the commit and asking the user to widen the scan or
 # focus manually is more honest than landing 1+ DOFs off.
-FLAT_METRIC_FRACTION = 0.08
+#
+# 2026-05-06: dropped back to 4% as a hard floor, but added a
+# gaussian-fit shape check (FLAT_METRIC_GAUSSIAN_R2) that lets a
+# clean peak through even if amplitude is low. At 10x with
+# low-contrast tissue the metric range is routinely 5-8% of peak
+# but the curve is a clean Gaussian; rejecting on amplitude alone
+# refused real focus repeatedly. The new logic is: refuse only if
+# the metric range is below the hard floor AND the gaussian fit
+# quality is poor (or the fit didn't converge at all).
+FLAT_METRIC_FRACTION = 0.04
+
+# Minimum gaussian-fit R^2 required to trust a low-amplitude scan.
+# When the metric range is between FLAT_METRIC_FRACTION and
+# FLAT_METRIC_AMPLITUDE_TRUSTED, we additionally require that the
+# gaussian fit explains at least this fraction of the variance and
+# that sigma is well below the scan range (i.e. it's actually
+# peak-shaped, not a flat baseline that happens to satisfy R^2 by
+# coincidence). 0.7 is conservative -- a clean low-contrast peak
+# routinely fits at 0.85-0.95 in 10x test data.
+FLAT_METRIC_GAUSSIAN_R2 = 0.70
+
+# Above this metric range fraction we always trust the fit, no R^2
+# check needed -- the peak is unambiguous.
+FLAT_METRIC_AMPLITUDE_TRUSTED = 0.15
 
 # Maximum number of edge-retry attempts beyond the first scan. Each
 # retry shifts the scan window one full range in the direction of
@@ -1057,19 +1087,27 @@ def _scan_window_within_limits(
     return True
 
 
-def _gaussian_peak(zs: List[float], ms: List[float]) -> Optional[float]:
+def _gaussian_peak(zs: List[float], ms: List[float]) -> Optional[Tuple[float, float, float]]:
     """Fit a Gaussian A*exp(-(z-mu)^2 / 2 sigma^2) + C to all samples
-    and return mu, the peak location. Returns None on any failure
-    (insufficient samples, degenerate z values, fitter non-convergence,
-    out-of-bracket mu).
+    and return (mu, r_squared, sigma) where mu is the peak location,
+    r_squared is the coefficient of determination of the fit (0..1,
+    1 = perfect), and sigma is the fitted Gaussian width in microns.
+    Returns None on any failure (insufficient samples, degenerate z
+    values, fitter non-convergence, out-of-bracket mu).
+
+    R^2 is exposed so the caller can distinguish a low-amplitude but
+    well-shaped peak (real focus, weak texture) from a flat noise
+    field with no recoverable peak. At 10x with low-contrast tissue
+    the metric range can be 5-8% of peak yet the curve is still a
+    clean Gaussian -- rejecting on amplitude alone refuses real
+    focus. Sigma is also returned so the caller can sanity-check
+    that the fit is actually peak-shaped (sigma << z_range) rather
+    than a degenerate baseline-fit (sigma == z_range bound).
 
     Full-sample fit (uses all N samples) instead of a 3-point
     parabola. Uses more of the scan data than _parabolic_peak
     does -- the parabolic fit only considers the 3 samples around
-    the argmax, discarding all the rest. The Gaussian fit averages
-    over all N samples, so a single noisy point near the peak
-    doesn't distort the result, and we get a natural sigma
-    estimate we could use later to reject flat curves.
+    the argmax, discarding all the rest.
 
     Falls back to the parabolic fit path when scipy is unavailable
     or when the Gaussian doesn't converge within reasonable bounds.
@@ -1124,12 +1162,26 @@ def _gaussian_peak(zs: List[float], ms: List[float]) -> Optional[float]:
         logger.debug("gaussian curve_fit failed: %s", e)
         return None
 
+    A_fit = float(popt[0])
     mu_fit = float(popt[1])
-    if not math.isfinite(mu_fit):
+    sigma_fit = float(popt[2])
+    C_fit = float(popt[3])
+    if not (math.isfinite(mu_fit) and math.isfinite(sigma_fit) and math.isfinite(A_fit)):
         return None
     if mu_fit < z_arr.min() or mu_fit > z_arr.max():
         return None
-    return mu_fit
+
+    # R^2 = 1 - SS_res / SS_tot. A perfect fit gives 1; pure noise
+    # gives ~0 (or negative, clamped to 0). SS_tot can be ~0 for a
+    # totally flat metric -- guard with a small floor.
+    predicted = gaussian(z_arr, A_fit, mu_fit, sigma_fit, C_fit)
+    ss_res = float(np.sum((m_arr - predicted) ** 2))
+    ss_tot = float(np.sum((m_arr - m_arr.mean()) ** 2))
+    if ss_tot < 1e-12:
+        r_squared = 0.0
+    else:
+        r_squared = max(0.0, 1.0 - ss_res / ss_tot)
+    return mu_fit, r_squared, sigma_fit
 
 
 def _parabolic_peak(zs: List[float], ms: List[float]) -> Optional[float]:
@@ -1210,7 +1262,10 @@ def _fit_union_samples(
 
     # Try Gaussian first (uses all samples), fall back to parabolic
     # around the argmax, fall back to raw argmax.
-    fit_z: Optional[float] = _gaussian_peak(zs, ms)
+    gauss_result = _gaussian_peak(zs, ms)
+    fit_z: Optional[float] = None
+    if gauss_result is not None:
+        fit_z = gauss_result[0]
     fit_kind = "gaussian"
     if fit_z is None or fit_z < zs[0] or fit_z > zs[-1]:
         fit_z = _parabolic_peak(zs, ms)
@@ -2158,39 +2213,56 @@ def _attempt_one_scan(
             raw_peak_idx = int(np.argmax(ms))
             raw_peak_z = zs[raw_peak_idx]
 
+            # Run the gaussian fit early so the flat-metric refusal
+            # can use the fit quality (R^2 and sigma) as a sanity
+            # check on low-amplitude scans.
+            gaussian_fit = _gaussian_peak(zs, ms) if n_motion_samples >= 4 else None
+            parabolic = _parabolic_peak(zs, ms) if n_motion_samples >= 3 else None
+
             # --- Flat-metric refusal ---
             # If the metric range across all samples is within noise
-            # of the metric peak, there is no findable peak and any
-            # "argmax" is whichever sample won a coin flip. This is
-            # the dominant failure mode at 10x where the configured
-            # scan range is smaller than the depth of field: the
-            # entire scan sits inside one DOF and normalized_variance
-            # varies by <1% which is indistinguishable from noise.
-            # Committing such a fit produces a ~random small shift
-            # that drifts the tile off focus over time; refusing with
-            # a specific reason lets the operator choose to widen
-            # --range or fall back to Sweep.
+            # of the metric peak AND the gaussian fit is poor, there
+            # is no findable peak and any "argmax" is whichever
+            # sample won a coin flip. Two-condition check because at
+            # 10x with low-contrast tissue the metric range can be
+            # 5-8% of peak yet the curve is a clean Gaussian -- a
+            # pure-amplitude refusal rejected real focus repeatedly.
             metric_peak = float(max(ms))
             metric_trough = float(min(ms))
             metric_range = metric_peak - metric_trough
             metric_range_frac = metric_range / max(abs(metric_peak), 1e-6)
-            if metric_range_frac < FLAT_METRIC_FRACTION:
+
+            shape_ok = False
+            r2 = 0.0
+            sigma_fit = 0.0
+            if gaussian_fit is not None:
+                _mu, r2, sigma_fit = gaussian_fit
+                # Peak-shaped if R^2 is high enough AND sigma is
+                # narrow vs the scan window (fitted sigma at the
+                # upper bound = degenerate baseline fit).
+                shape_ok = r2 >= FLAT_METRIC_GAUSSIAN_R2 and sigma_fit < 0.45 * max(z_span, 1e-6)
+
+            amplitude_trusted = metric_range_frac >= FLAT_METRIC_AMPLITUDE_TRUSTED
+            amplitude_above_floor = metric_range_frac >= FLAT_METRIC_FRACTION
+
+            if not amplitude_trusted and not (amplitude_above_floor and shape_ok):
                 logger.warning(
                     "STREAM_AF:%smetric range %.3f (%.2f%% of peak %.3f) "
-                    "is within noise -- scan window is entirely within "
-                    "DOF, cannot find focus. Widen --range or use a "
-                    "higher-mag objective.",
+                    "is within noise -- gaussian R^2=%.2f sigma=%.2f um "
+                    "(span %.2f um) does not show a clear peak. "
+                    "Widen --range or use a higher-mag objective.",
                     tag_prefix,
                     metric_range,
                     metric_range_frac * 100.0,
                     metric_peak,
+                    r2,
+                    sigma_fit,
+                    z_span,
                 )
                 # Dump per-sample trace on the refusal path so the
                 # operator can see whether the metric is genuinely flat
                 # across the swept Z range, or whether all samples
                 # collapsed to the same Z (stage not actually moving).
-                # Without this, metric_flat looks identical from the log
-                # whether the stage is stuck or the sample is featureless.
                 for i, (t, z, m) in enumerate(in_motion):
                     logger.info(
                         "STREAM_AF:%sFLAT sample %3d  t=%7.1f ms  z=%.3f  metric=%.4f",
@@ -2206,9 +2278,9 @@ def _attempt_one_scan(
                     n_motion_samples,
                     z_span,
                     f"metric range {metric_range_frac:.2%} of peak is "
-                    f"within noise; scan window {z_span:.2f} um is "
-                    f"likely inside one depth-of-field. Widen --range "
-                    f"or switch to Sweep Focus.",
+                    f"within noise (gaussian R^2={r2:.2f}); scan window "
+                    f"{z_span:.2f} um is likely inside one depth-of-field. "
+                    f"Widen --range or switch to Sweep Focus.",
                     samples_trace=list(in_motion),
                 )
 
@@ -2216,10 +2288,8 @@ def _attempt_one_scan(
             # robust to a single noisy point), fall back to 3-point
             # parabolic (uses only the argmax neighborhood), fall
             # back to raw argmax.
-            gaussian_fit = _gaussian_peak(zs, ms) if n_motion_samples >= 4 else None
-            parabolic = _parabolic_peak(zs, ms) if n_motion_samples >= 3 else None
             if gaussian_fit is not None:
-                best_z = gaussian_fit
+                best_z = gaussian_fit[0]
                 fit_kind = "gaussian"
             elif parabolic is not None:
                 best_z = parabolic
@@ -2229,13 +2299,16 @@ def _attempt_one_scan(
                 fit_kind = "raw-argmax"
             logger.info(
                 "STREAM_AF:%s%d in-motion samples  raw peak Z=%.3f  "
-                "fit=%s best_z=%.3f  z_span=%.3f",
+                "fit=%s best_z=%.3f  z_span=%.3f  range_frac=%.2f%%  R^2=%.2f  sigma=%.2f",
                 tag_prefix,
                 n_motion_samples,
                 raw_peak_z,
                 fit_kind,
                 best_z,
                 z_span,
+                metric_range_frac * 100.0,
+                r2,
+                sigma_fit,
             )
         else:
             logger.warning(
