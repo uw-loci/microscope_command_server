@@ -854,9 +854,7 @@ def _apply_crop_roi(core, crop_factor: float) -> Tuple[Optional[Tuple[int, int, 
         core.clear_roi()
         cleared_ok = True
     except Exception as e:
-        logger.warning(
-            "STREAM_AF:clear_roi() failed (%s); falling back to relative crop", e
-        )
+        logger.warning("STREAM_AF:clear_roi() failed (%s); falling back to relative crop", e)
 
     if cleared_ok:
         full = _read_roi(core)
@@ -882,9 +880,7 @@ def _apply_crop_roi(core, crop_factor: float) -> Tuple[Optional[Tuple[int, int, 
         # safest we can do without a working clear path.
         baseline = entry_roi if entry_roi is not None else _read_roi(core)
         if baseline is None:
-            logger.warning(
-                "STREAM_AF:no ROI baseline available; skipping crop"
-            )
+            logger.warning("STREAM_AF:no ROI baseline available; skipping crop")
             if seq_running:
                 try:
                     core.start_continuous_sequence_acquisition(0)
@@ -1021,8 +1017,9 @@ def _restore_roi(
         # because _apply_crop_roi always stores the full-sensor ROI.
         if saved_roi is not None and post is not None and tuple(saved_roi) != tuple(post):
             try:
-                core.set_roi(int(saved_roi[0]), int(saved_roi[1]),
-                             int(saved_roi[2]), int(saved_roi[3]))
+                core.set_roi(
+                    int(saved_roi[0]), int(saved_roi[1]), int(saved_roi[2]), int(saved_roi[3])
+                )
                 logger.info(
                     "STREAM_AF:re-applied non-full saved ROI (%d, %d, %dx%d)",
                     saved_roi[0],
@@ -1044,8 +1041,9 @@ def _restore_roi(
         # the safest action when clear_roi is unavailable.
         if saved_roi is not None:
             try:
-                core.set_roi(int(saved_roi[0]), int(saved_roi[1]),
-                             int(saved_roi[2]), int(saved_roi[3]))
+                core.set_roi(
+                    int(saved_roi[0]), int(saved_roi[1]), int(saved_roi[2]), int(saved_roi[3])
+                )
                 logger.info(
                     "STREAM_AF:restored camera ROI to (%d, %d, %dx%d) "
                     "via set_roi fallback (clear_roi unavailable)",
@@ -1056,8 +1054,7 @@ def _restore_roi(
                 )
             except Exception as e2:
                 logger.warning(
-                    "STREAM_AF:failed to restore camera ROI via "
-                    "set_roi fallback either: %s",
+                    "STREAM_AF:failed to restore camera ROI via " "set_roi fallback either: %s",
                     e2,
                 )
 
