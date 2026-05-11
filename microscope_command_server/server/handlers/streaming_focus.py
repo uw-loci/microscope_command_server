@@ -60,7 +60,12 @@ Specifically:
   ``cropFactor`` parameter in ``OughtaFocus.java`` (MM plugin
   ``plugins/AutofocusFunctions``). MM uses it to cut per-frame
   transfer cost during a scan; we use it the same way for the
-  continuous-stream case.
+  continuous-stream case. Our implementation anchors absolutely on
+  the full sensor (clear_roi -> crop -> clear_roi to restore),
+  unlike MM's which preserves the entry ROI -- this prevents a
+  cropped state from persisting across runs when an exit path is
+  unexpectedly bypassed. See ``_apply_crop_roi`` docstring for the
+  2026-05-11 rationale.
 
 - ``_focus_metric_volath5`` (Volath's F5 autocorrelation metric)
   and ``_focus_metric_tenengrad`` (Sobel-squared sum) are
@@ -751,21 +756,48 @@ def _read_roi(core) -> Optional[Tuple[int, int, int, int]]:
 
 
 def _apply_crop_roi(core, crop_factor: float) -> Tuple[Optional[Tuple[int, int, int, int]], bool]:
-    """Save the current camera ROI and install a centered crop.
+    """Anchor on full sensor, then install a centered crop.
 
     Returns (saved_roi, sequence_was_running_when_called) where:
-      - saved_roi is (x, y, w, h) tuple of the ORIGINAL ROI for
-        later restoration, or None if the crop didn't apply
+      - saved_roi is the FULL-SENSOR (x, y, w, h) tuple, used by
+        _restore_roi as a sanity check; None if we could not
+        establish a clean full-sensor baseline.
       - sequence_was_running_when_called is True if we had to
         stop+restart a running sequence to set the ROI (callers
-        of _restore_roi must pass this back)
+        of _restore_roi must pass this back).
+
+    Absolute-anchoring rationale (2026-05-11):
+        The previous version stored "whatever ROI is current" as
+        saved_roi and cropped 50% relative to it. If the camera
+        entered streaming AF in an already-cropped state (e.g. from
+        a pre-2026-05-08 UNAVAILABLE leak that never restored, a
+        manual MM Property Browser action, or a hypothetical bug in
+        another code path), every "restore" preserved the entry
+        crop instead of going back to full sensor. The Live Viewer
+        was then stuck on a cropped view indefinitely, and downstream
+        workflows acquired against the cropped frame -- a bug that
+        cost ~4 hours of acquisition on PPM on 2026-05-10.
+
+        The fix: always ``clear_roi()`` first to reset GenAPI Width
+        and Height Max nodes to the absolute sensor maximum, then
+        crop relative to THAT known-absolute baseline. The contract
+        is now: streaming AF temporarily crops to the center 50% of
+        the full sensor and unconditionally returns to full sensor
+        on every exit path, regardless of entry state.
+
+        Operator-set custom MM ROI (set via Property Browser before
+        Live Viewer) is intentionally not preserved -- the workflow-
+        level ``QPScopeChecks.validateCameraRoi`` gate
+        (qupath-extension-qpsc commit ``a7dce28``) catches custom
+        ROIs at workflow start and prompts the operator to clear
+        them. See the TROUBLESHOOTING entry for the rationale.
 
     JAI / GenAPI cameras lock the Width and Height properties as
-    "not writable" while a sequence acquisition is running. So
-    the only way to install a new ROI is:
+    "not writable" while a sequence acquisition is running. So the
+    only way to install a new ROI is:
 
       1. Stop the sequence
-      2. Set the ROI
+      2. clear_roi() + set_roi() the centered crop
       3. Restart the sequence (with the new ROI in effect)
 
     This costs ~150 ms of camera warmup vs. the unstop-able path,
@@ -777,33 +809,28 @@ def _apply_crop_roi(core, crop_factor: float) -> Tuple[Optional[Tuple[int, int, 
     crop_factor=1.0 (no crop) is a no-op that returns (None, False)
     with no camera state changes.
 
-    Restoration is symmetric: caller's finally block invokes
-    _restore_roi() which stops the sequence again, sets the
-    original ROI, and restarts. The Live Viewer's frame poller
-    sees a brief gap in frames and recovers automatically.
-
     Adapted from: Micro-Manager's OughtaFocus.java ``cropFactor``
     parameter and the surrounding save/restore pattern. See the
     "Attribution / Prior art" section in the module docstring for
     the full citation.
     """
+    # Always log the entry ROI -- diagnostic smoking gun if the
+    # full-sensor anchoring is ever defeated by a future regression.
+    entry_roi = _read_roi(core)
+    if entry_roi is not None:
+        logger.info(
+            "STREAM_AF:entry camera ROI = (%d, %d, %dx%d)",
+            entry_roi[0],
+            entry_roi[1],
+            entry_roi[2],
+            entry_roi[3],
+        )
+
     if crop_factor <= 0.0 or crop_factor >= 1.0:
         return (None, False)
-    saved = _read_roi(core)
-    if saved is None:
-        logger.warning(
-            "STREAM_AF:could not query camera ROI for crop " "(see prior warning); skipping crop"
-        )
-        return (None, False)
-    x0, y0, w0, h0 = saved
-
-    new_w = max(1, int(round(w0 * crop_factor)))
-    new_h = max(1, int(round(h0 * crop_factor)))
-    new_x = x0 + (w0 - new_w) // 2
-    new_y = y0 + (h0 - new_h) // 2
 
     # JAI / GenAPI requires the sequence to be stopped before ROI
-    # changes. Stop, set, restart.
+    # changes. Stop first.
     seq_running = False
     try:
         seq_running = bool(core.is_sequence_running())
@@ -817,6 +844,60 @@ def _apply_crop_roi(core, crop_factor: float) -> Tuple[Optional[Tuple[int, int, 
             logger.warning("STREAM_AF:could not stop sequence for ROI crop: %s", e)
             return (None, False)
 
+    # Clear to full sensor first -- this is the absolute anchor.
+    # If clear_roi() raises (hypothetical adapter that doesn't
+    # support it), fall back to the legacy relative-crop behavior
+    # by treating the pre-clear ROI as the baseline. That's strictly
+    # not worse than the pre-2026-05-11 code.
+    cleared_ok = False
+    try:
+        core.clear_roi()
+        cleared_ok = True
+    except Exception as e:
+        logger.warning(
+            "STREAM_AF:clear_roi() failed (%s); falling back to relative crop", e
+        )
+
+    if cleared_ok:
+        full = _read_roi(core)
+        if full is None:
+            logger.warning(
+                "STREAM_AF:could not query camera ROI after clear_roi; "
+                "skipping crop and leaving camera at full sensor"
+            )
+            # Restart sequence (if we stopped one) at full sensor.
+            if seq_running:
+                try:
+                    core.clear_circular_buffer()
+                    core.start_continuous_sequence_acquisition(0)
+                    time.sleep(0.15)
+                except Exception:
+                    pass
+            return (None, seq_running)
+        x0, y0, w0, h0 = full
+    else:
+        # clear_roi failed -- fall back to current ROI as baseline.
+        # This is the pre-2026-05-11 behavior and inherits its
+        # known weakness (stuck-crop preservation), but it's the
+        # safest we can do without a working clear path.
+        baseline = entry_roi if entry_roi is not None else _read_roi(core)
+        if baseline is None:
+            logger.warning(
+                "STREAM_AF:no ROI baseline available; skipping crop"
+            )
+            if seq_running:
+                try:
+                    core.start_continuous_sequence_acquisition(0)
+                except Exception:
+                    pass
+            return (None, seq_running)
+        x0, y0, w0, h0 = baseline
+
+    new_w = max(1, int(round(w0 * crop_factor)))
+    new_h = max(1, int(round(h0 * crop_factor)))
+    new_x = x0 + (w0 - new_w) // 2
+    new_y = y0 + (h0 - new_h) // 2
+
     try:
         core.set_roi(new_x, new_y, new_w, new_h)
     except Exception as e:
@@ -829,9 +910,15 @@ def _apply_crop_roi(core, crop_factor: float) -> Tuple[Optional[Tuple[int, int, 
             e,
         )
         # Try to restart the sequence we stopped before bailing.
+        # Camera is at full sensor (post clear_roi); _restore_roi
+        # called with saved_roi=full is a no-op so signal that with
+        # None and stash the full ROI in our return for diagnostic
+        # purposes (caller doesn't use it).
         if seq_running:
             try:
+                core.clear_circular_buffer()
                 core.start_continuous_sequence_acquisition(0)
+                time.sleep(0.15)
             except Exception:
                 pass
         return (None, seq_running)
@@ -845,16 +932,16 @@ def _apply_crop_roi(core, crop_factor: float) -> Tuple[Optional[Tuple[int, int, 
             time.sleep(0.15)
         except Exception as e:
             logger.warning("STREAM_AF:could not restart sequence after " "ROI crop: %s", e)
-            # Best-effort restore and bail.
+            # Best-effort restore to full sensor and bail.
             try:
-                core.set_roi(int(x0), int(y0), int(w0), int(h0))
+                core.clear_roi()
             except Exception:
                 pass
             return (None, seq_running)
 
     logger.info(
         "STREAM_AF:cropped camera ROI (%d, %d, %dx%d) -> (%d, %d, %dx%d) "
-        "(factor=%.2f, pixel area %.0f%% of original)",
+        "(factor=%.2f, pixel area %.0f%% of full sensor)",
         x0,
         y0,
         w0,
@@ -874,16 +961,23 @@ def _restore_roi(
     saved_roi: Optional[Tuple[int, int, int, int]],
     sequence_was_running: bool,
 ) -> None:
-    """Put the camera ROI back to what _apply_crop_roi() saved.
+    """Unconditionally return the camera to full sensor.
 
-    Symmetric inverse of _apply_crop_roi: stops the sequence (if
-    we had stopped one to install the crop), restores the ROI,
-    and restarts. No-op if saved_roi is None.
+    The symmetric inverse of the 2026-05-11 _apply_crop_roi: stops the
+    sequence (if one is currently running), clears the ROI to full
+    sensor, optionally re-applies a non-full saved_roi (currently
+    unused -- _apply_crop_roi always anchors on full sensor, so
+    saved_roi here is always either None or the full-sensor extent),
+    and restarts.
+
+    Always clearing first (rather than only on set_roi failure as the
+    pre-2026-05-11 code did) ensures the camera ends at full sensor
+    regardless of the entry state of the AF run. This is the
+    proactive complement to the qupath-extension-qpsc workflow gate
+    `QPScopeChecks.validateCameraRoi` (commit ``a7dce28``): the gate
+    refuses workflows if the camera is cropped at start, this fix
+    makes that condition unreachable from the streaming-AF code path.
     """
-    if saved_roi is None:
-        return
-    x0, y0, w0, h0 = saved_roi
-
     # Stop the sequence again to allow the ROI change. Use the
     # current state, not the saved sequence_was_running flag,
     # because the sequence may have been stopped/restarted in
@@ -896,45 +990,76 @@ def _restore_roi(
     except Exception:
         pass
 
+    # Primary path: clear_roi() resets to full sensor and resets the
+    # GenAPI Width/Height Max nodes to their absolute maximum. This
+    # is the new normal exit -- the camera is at full sensor after
+    # this call regardless of where it was on entry.
+    cleared_ok = False
     try:
-        core.set_roi(int(x0), int(y0), int(w0), int(h0))
-        logger.info("STREAM_AF:restored camera ROI to (%d, %d, %dx%d)", x0, y0, w0, h0)
+        core.clear_roi()
+        cleared_ok = True
     except Exception as e:
-        # JAI / GenAPI failure mode: when the camera is currently in
-        # a cropped state, the GenAPI Width and Height nodes report a
-        # Max equal to the *current* (cropped) extent, not the full
-        # sensor. set_roi() back to the full-sensor original then
-        # fails with "Value=2064 must be <= Max=1552" or similar.
-        # Recovery: clear_roi() resets the camera to its full sensor
-        # (which restores Width/Height Max to the absolute maximum),
-        # then we re-apply the original ROI only if it wasn't already
-        # equal to the full sensor.
-        logger.debug(
-            "STREAM_AF:set_roi(%d, %d, %dx%d) failed (%s); " "trying clear_roi + retry",
-            x0,
-            y0,
-            w0,
-            h0,
-            e,
+        logger.warning(
+            "STREAM_AF:clear_roi() failed during restore (%s); falling back to set_roi", e
         )
-        try:
-            core.clear_roi()
-            full_roi = _read_roi(core)
-            if full_roi != (x0, y0, w0, h0):
-                core.set_roi(int(x0), int(y0), int(w0), int(h0))
+
+    if cleared_ok:
+        # Verify we landed at the expected dimensions (diagnostic only;
+        # do not abort on mismatch since the camera is in *some* known
+        # state regardless).
+        post = _read_roi(core)
+        if post is not None:
             logger.info(
-                "STREAM_AF:restored camera ROI to (%d, %d, %dx%d) via clear_roi",
-                x0,
-                y0,
-                w0,
-                h0,
+                "STREAM_AF:restored camera ROI to (%d, %d, %dx%d) [full sensor]",
+                post[0],
+                post[1],
+                post[2],
+                post[3],
             )
-        except Exception as e2:
-            logger.warning(
-                "STREAM_AF:failed to restore camera ROI even after " "clear_roi (%s -> %s)",
-                e,
-                e2,
-            )
+        # If saved_roi was a non-full extent (currently unused -- see
+        # docstring), re-apply it. Today this branch never fires
+        # because _apply_crop_roi always stores the full-sensor ROI.
+        if saved_roi is not None and post is not None and tuple(saved_roi) != tuple(post):
+            try:
+                core.set_roi(int(saved_roi[0]), int(saved_roi[1]),
+                             int(saved_roi[2]), int(saved_roi[3]))
+                logger.info(
+                    "STREAM_AF:re-applied non-full saved ROI (%d, %d, %dx%d)",
+                    saved_roi[0],
+                    saved_roi[1],
+                    saved_roi[2],
+                    saved_roi[3],
+                )
+            except Exception as e:
+                logger.warning(
+                    "STREAM_AF:could not re-apply non-full saved ROI (%s); "
+                    "camera left at full sensor",
+                    e,
+                )
+    else:
+        # Fallback: clear_roi failed (hypothetical adapter that
+        # doesn't support it). Best-effort set_roi to the saved
+        # extent. This is the pre-2026-05-11 behavior and inherits
+        # its known weakness (stuck crops not recovered), but it's
+        # the safest action when clear_roi is unavailable.
+        if saved_roi is not None:
+            try:
+                core.set_roi(int(saved_roi[0]), int(saved_roi[1]),
+                             int(saved_roi[2]), int(saved_roi[3]))
+                logger.info(
+                    "STREAM_AF:restored camera ROI to (%d, %d, %dx%d) "
+                    "via set_roi fallback (clear_roi unavailable)",
+                    saved_roi[0],
+                    saved_roi[1],
+                    saved_roi[2],
+                    saved_roi[3],
+                )
+            except Exception as e2:
+                logger.warning(
+                    "STREAM_AF:failed to restore camera ROI via "
+                    "set_roi fallback either: %s",
+                    e2,
+                )
 
     # Restart the sequence iff:
     #   (a) we just stopped it for the restore, OR
@@ -950,8 +1075,6 @@ def _restore_roi(
             # get_live_frame call can pull a stale frame whose pixel
             # count doesn't match the restored dimensions, causing a
             # reshape crash (observed on PPM 2026-04-16).
-            import time
-
             time.sleep(0.15)
         except Exception as e:
             logger.warning("STREAM_AF:could not restart sequence after " "ROI restore: %s", e)
