@@ -2442,66 +2442,72 @@ def _attempt_one_scan(
                 # it, and we fall through to refusal -- losing the
                 # directional information the slope is screaming at us.
                 #
-                # Repeatable test cases (PPM 10x, 2026-05-12 13:50 and
-                # 14:26): focus ~14 um past Z=+25, scan from Z=0 with
-                # range=50. Metric rises monotonically from 172.3 at
-                # z=-17.3 to 179.7 at z=+17 (3.9-4.05% range). Gaussian
-                # fit returns sigma~42 um (~ z_span), shape_ok=False,
-                # mu-at-boundary doesn't fire.
+                # Repeatable test cases (PPM 10x, 2026-05-12):
+                #  - 13:50 / 14:26: focus ~14 um past Z=+25, scan from
+                #    Z=0 with range=50. Amplitude 3.92-4.05%, sigma~42um
+                #    (== z_span -> degenerate).
+                #  - 14:30: started at Z=10, focus far above Z=+35.
+                #    Amplitude only 2.39% but the metric rises cleanly
+                #    from 176 at z=-7 to 180 at z=+35 with R^2 ~0.85
+                #    on a linear fit.
                 #
-                # Gating: only run the slope check when the gaussian fit
-                # is degenerate (sigma >= 0.45 * z_span) or didn't
-                # converge. That filters out interior-peak cases (yest's
-                # z=-16.9 in [-58.5, -8.5]: sigma=3.19 << 0.45*42.71 =
-                # 19.2 -> NOT degenerate -> slope check skipped -> refuse
-                # as metric_flat, correct). An asymmetric interior peak
-                # closer to one end would also have a narrow sigma and
-                # would correctly be skipped.
+                # Criterion: Pearson correlation between z and metric.
+                # Captures monotonicity DIRECTLY, independent of raw
+                # amplitude. ~0 for noise, ~0 for centered interior
+                # peaks (rises then falls cancel out), ~+/-1 for clean
+                # monotonic slopes regardless of slope magnitude.
                 #
-                # Threshold: quartile-median delta compresses the raw
-                # peak-trough range by ~1.5-2x (medians don't see the
-                # extreme samples), so the 4% raw-amplitude floor maps
-                # to ~2% on this metric. SLOPE_QUARTILE_FRACTION=0.02.
-                # Random noise has matching head/tail medians regardless
-                # of amplitude floor -- the delta near zero rules it out
-                # without an explicit noise gate.
+                # Gating: sigma_degenerate (sigma >= 0.45*z_span OR
+                # gaussian failed) screens out interior peaks -- those
+                # have narrow sigma so the slope detector never runs
+                # on them. That preserves yesterday's z=-16.9 case
+                # (sigma=3.19 << 19.2 -> not degenerate -> slope check
+                # skipped -> ambiguous interior peak refused, correct)
+                # and the 2026-05-06 regression case.
                 #
-                # Existing safety nets keep this bounded: MAX_EDGE_RETRIES
-                # caps the walk to 3 attempts (1 + 2 retries) = 3 * range
-                # total span; stage z-limit gate refuses windows past the
-                # configured bounds; opposite-edge oscillation
-                # short-circuit catches ping-pong.
-                SLOPE_QUARTILE_FRACTION = 0.02
+                # Floor: SLOPE_MIN_AMPLITUDE = 0.005 (0.5% of peak).
+                # Just enough to reject "metric is constant to 4
+                # decimal places but happens to land sigma_degenerate
+                # because gaussian failed to converge on flat noise."
+                #
+                # Existing safety nets keep the retry walk bounded:
+                # MAX_EDGE_RETRIES caps to 3 attempts total; stage
+                # z-limit gate refuses windows past configured bounds;
+                # opposite-edge oscillation short-circuit catches
+                # ping-pong; union-fit recovers if a real interior peak
+                # was visible in any attempt.
+                SLOPE_PEARSON_R_THRESHOLD = 0.5
+                SLOPE_MIN_AMPLITUDE = 0.005
                 sigma_degenerate = gaussian_fit is None or sigma_fit >= 0.45 * max(z_span, 1e-6)
                 if sigma_degenerate and n_motion_samples >= 8:
-                    sorted_by_z = sorted(in_motion, key=lambda s: s[1])
-                    quartile = max(2, n_motion_samples // 4)
-                    low_quartile_metrics = [m for _, _, m in sorted_by_z[:quartile]]
-                    high_quartile_metrics = [m for _, _, m in sorted_by_z[-quartile:]]
-                    low_q_median = float(np.median(low_quartile_metrics))
-                    high_q_median = float(np.median(high_quartile_metrics))
-                    slope_amplitude = abs(high_q_median - low_q_median)
-                    slope_frac = slope_amplitude / max(abs(metric_peak), 1e-6)
-                    if slope_frac >= SLOPE_QUARTILE_FRACTION:
-                        if high_q_median > low_q_median:
+                    zs_arr = np.asarray([s[1] for s in in_motion])
+                    ms_arr = np.asarray([s[2] for s in in_motion])
+                    if float(np.std(zs_arr)) > 1e-6 and float(np.std(ms_arr)) > 1e-12:
+                        pearson_r = float(np.corrcoef(zs_arr, ms_arr)[0, 1])
+                    else:
+                        pearson_r = 0.0
+                    amplitude_above_floor_for_slope = metric_range_frac >= SLOPE_MIN_AMPLITUDE
+                    if (
+                        abs(pearson_r) >= SLOPE_PEARSON_R_THRESHOLD
+                        and amplitude_above_floor_for_slope
+                    ):
+                        if pearson_r > 0:
                             slope_status = "edge_high"
                             slope_direction = "more positive Z (above z_end)"
                         else:
                             slope_status = "edge_low"
                             slope_direction = "more negative Z (below z_start)"
                         logger.info(
-                            "STREAM_AF:%smonotonic slope detected: low-z "
-                            "quartile median=%.3f, high-z quartile median=%.3f "
-                            "(delta=%.3f, %.2f%% of peak >= %.2f%% threshold). "
-                            "Gaussian fit degenerate (sigma=%.2f um vs 0.45*span="
-                            "%.2f um) but head-to-tail trend is clear. Classifying "
-                            "as %s -- retry will shift toward %s.",
+                            "STREAM_AF:%smonotonic slope detected: Pearson "
+                            "r=%+.3f across %d samples (amplitude %.2f%% of "
+                            "peak). Gaussian fit degenerate (sigma=%.2f um vs "
+                            "0.45*span=%.2f um) but head-to-tail trend is "
+                            "clear. Classifying as %s -- retry will shift "
+                            "toward %s.",
                             tag_prefix,
-                            low_q_median,
-                            high_q_median,
-                            high_q_median - low_q_median,
-                            slope_frac * 100.0,
-                            SLOPE_QUARTILE_FRACTION * 100.0,
+                            pearson_r,
+                            n_motion_samples,
+                            metric_range_frac * 100.0,
                             sigma_fit,
                             0.45 * z_span,
                             slope_status,
@@ -2513,9 +2519,8 @@ def _attempt_one_scan(
                             n_motion_samples,
                             z_span,
                             f"monotonic slope across scan "
-                            f"(low-quartile median {low_q_median:.3f} -> "
-                            f"high-quartile median {high_q_median:.3f}, "
-                            f"{slope_frac:.2%} of peak). True focus is "
+                            f"(Pearson r={pearson_r:+.3f}, amplitude "
+                            f"{metric_range_frac:.2%}). True focus is "
                             f"likely at {slope_direction}",
                             samples_trace=list(in_motion),
                         )
