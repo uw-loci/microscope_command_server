@@ -2433,35 +2433,47 @@ def _attempt_one_scan(
 
                 # 2026-05-12 follow-up: monotonic-slope detector.
                 #
-                # The mu-at-boundary check above only fires when the gaussian
-                # converges to a peak-shaped fit (shape_ok). When the true
-                # peak is FAR outside the scan window the metric across the
-                # scan is a clean monotonic slope, the gaussian fit goes
-                # degenerate (sigma == z_span, fitter saturated at upper
-                # bound), shape_ok rejects it, and we fall through to
-                # refusal -- losing the directional information the slope
-                # is screaming at us.
+                # The mu-at-boundary check above only fires when the
+                # gaussian converges to a peak-shaped fit (shape_ok).
+                # When the true peak is FAR outside the scan window the
+                # metric across the scan is a clean monotonic slope, the
+                # gaussian fit goes degenerate (sigma >= 0.45 * z_span,
+                # fitter saturated at the upper bound), shape_ok rejects
+                # it, and we fall through to refusal -- losing the
+                # directional information the slope is screaming at us.
                 #
-                # Repeatable test case (PPM 10x, 2026-05-12 13:50): focus
-                # well above Z=+25, scan from Z=0 with range=50. Metric
-                # rises monotonically from 172.3 at z=-17.3 to 179.6 at
-                # z=+17 (4.05% range). Gaussian fit returns sigma=41.87 um
-                # (~ z_span), shape_ok=False, mu-at-boundary doesn't fire.
+                # Repeatable test cases (PPM 10x, 2026-05-12 13:50 and
+                # 14:26): focus ~14 um past Z=+25, scan from Z=0 with
+                # range=50. Metric rises monotonically from 172.3 at
+                # z=-17.3 to 179.7 at z=+17 (3.9-4.05% range). Gaussian
+                # fit returns sigma~42 um (~ z_span), shape_ok=False,
+                # mu-at-boundary doesn't fire.
                 #
-                # Compare the median of the first quartile (low-z samples)
-                # to the median of the last quartile (high-z samples), both
-                # sorted by z. If they differ by >= FLAT_METRIC_FRACTION,
-                # the metric is monotonic across the scan and focus is
-                # past whichever end is higher. Quartile medians are
-                # robust against single noise spikes -- a one-sample blip
-                # at either extreme can't drive the comparison.
+                # Gating: only run the slope check when the gaussian fit
+                # is degenerate (sigma >= 0.45 * z_span) or didn't
+                # converge. That filters out interior-peak cases (yest's
+                # z=-16.9 in [-58.5, -8.5]: sigma=3.19 << 0.45*42.71 =
+                # 19.2 -> NOT degenerate -> slope check skipped -> refuse
+                # as metric_flat, correct). An asymmetric interior peak
+                # closer to one end would also have a narrow sigma and
+                # would correctly be skipped.
+                #
+                # Threshold: quartile-median delta compresses the raw
+                # peak-trough range by ~1.5-2x (medians don't see the
+                # extreme samples), so the 4% raw-amplitude floor maps
+                # to ~2% on this metric. SLOPE_QUARTILE_FRACTION=0.02.
+                # Random noise has matching head/tail medians regardless
+                # of amplitude floor -- the delta near zero rules it out
+                # without an explicit noise gate.
                 #
                 # Existing safety nets keep this bounded: MAX_EDGE_RETRIES
                 # caps the walk to 3 attempts (1 + 2 retries) = 3 * range
                 # total span; stage z-limit gate refuses windows past the
                 # configured bounds; opposite-edge oscillation
                 # short-circuit catches ping-pong.
-                if n_motion_samples >= 8:
+                SLOPE_QUARTILE_FRACTION = 0.02
+                sigma_degenerate = gaussian_fit is None or sigma_fit >= 0.45 * max(z_span, 1e-6)
+                if sigma_degenerate and n_motion_samples >= 8:
                     sorted_by_z = sorted(in_motion, key=lambda s: s[1])
                     quartile = max(2, n_motion_samples // 4)
                     low_quartile_metrics = [m for _, _, m in sorted_by_z[:quartile]]
@@ -2470,7 +2482,7 @@ def _attempt_one_scan(
                     high_q_median = float(np.median(high_quartile_metrics))
                     slope_amplitude = abs(high_q_median - low_q_median)
                     slope_frac = slope_amplitude / max(abs(metric_peak), 1e-6)
-                    if slope_frac >= FLAT_METRIC_FRACTION:
+                    if slope_frac >= SLOPE_QUARTILE_FRACTION:
                         if high_q_median > low_q_median:
                             slope_status = "edge_high"
                             slope_direction = "more positive Z (above z_end)"
@@ -2480,17 +2492,18 @@ def _attempt_one_scan(
                         logger.info(
                             "STREAM_AF:%smonotonic slope detected: low-z "
                             "quartile median=%.3f, high-z quartile median=%.3f "
-                            "(delta=%.3f, %.2f%% of peak). Gaussian fit "
-                            "degenerate (sigma=%.2f um vs span=%.2f um) but "
-                            "head-to-tail trend is clear. Classifying as "
-                            "%s -- retry will shift toward %s.",
+                            "(delta=%.3f, %.2f%% of peak >= %.2f%% threshold). "
+                            "Gaussian fit degenerate (sigma=%.2f um vs 0.45*span="
+                            "%.2f um) but head-to-tail trend is clear. Classifying "
+                            "as %s -- retry will shift toward %s.",
                             tag_prefix,
                             low_q_median,
                             high_q_median,
                             high_q_median - low_q_median,
                             slope_frac * 100.0,
+                            SLOPE_QUARTILE_FRACTION * 100.0,
                             sigma_fit,
-                            z_span,
+                            0.45 * z_span,
                             slope_status,
                             slope_direction,
                         )
