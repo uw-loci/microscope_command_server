@@ -2366,6 +2366,71 @@ def _attempt_one_scan(
             amplitude_above_floor = metric_range_frac >= FLAT_METRIC_FRACTION
 
             if not amplitude_trusted and not (amplitude_above_floor and shape_ok):
+                # 2026-05-12: Before refusing as metric_flat, check whether
+                # the gaussian fit's mu landed pinned at a sample boundary
+                # with a peak-shaped fit. _gaussian_peak constrains mu to
+                # [z_arr.min(), z_arr.max()]; when the true peak sits
+                # OUTSIDE the sampled range, curve_fit pushes mu to the
+                # nearest boundary. So "shape_ok + mu within sigma of a
+                # boundary + low amplitude" is the signature of a peak
+                # just past the scan edge -- exactly the case the edge-
+                # retry loop is designed to recover (shift the next
+                # window's center by one full range in that direction).
+                #
+                # Repeatable test case (PPM 10x, 2026-05-12): focus at
+                # Z=-29.4, scan from Z=0 with range=50 -> window [-25,
+                # +25]. Head-discard eats the first ~7 um so the first
+                # in-motion sample is at z=-18. Gaussian fit pins mu near
+                # -18 with R^2=0.93, sigma~3 um. The legacy raw-argmax-
+                # position edge check (line ~2517) misses this because
+                # peak_z=-18.1 is 6.9 um from commanded z_lo=-25, outside
+                # the 5 um tolerance. mu-at-boundary correctly flags it
+                # as edge_low; retry shifts to center=-50, finds focus.
+                if shape_ok and not amplitude_above_floor:
+                    z_min_sampled = float(min(zs))
+                    z_max_sampled = float(max(zs))
+                    mu_fit = float(gaussian_fit[0]) if gaussian_fit is not None else 0.0
+                    boundary_tol = max(sigma_fit, 0.5)
+                    mu_at_low = abs(mu_fit - z_min_sampled) <= boundary_tol
+                    mu_at_high = abs(mu_fit - z_max_sampled) <= boundary_tol
+                    if mu_at_low != mu_at_high:
+                        edge_status = "edge_low" if mu_at_low else "edge_high"
+                        direction = (
+                            "more negative Z (below z_start)"
+                            if mu_at_low
+                            else "more positive Z (above z_end)"
+                        )
+                        logger.info(
+                            "STREAM_AF:%sgaussian mu=%.3f pinned within %.2f um "
+                            "of sampled %s boundary [%.3f, %.3f]; amplitude "
+                            "low (%.2f%%) but shape clean (R^2=%.2f sigma=%.2f "
+                            "um). Classifying as %s -- retry will shift toward "
+                            "%s.",
+                            tag_prefix,
+                            mu_fit,
+                            boundary_tol,
+                            "low" if mu_at_low else "high",
+                            z_min_sampled,
+                            z_max_sampled,
+                            metric_range_frac * 100.0,
+                            r2,
+                            sigma_fit,
+                            edge_status,
+                            direction,
+                        )
+                        return _ScanAttemptResult(
+                            edge_status,
+                            None,
+                            n_motion_samples,
+                            z_span,
+                            f"gaussian mu={mu_fit:.3f} pinned at sampled "
+                            f"{'low' if mu_at_low else 'high'} boundary "
+                            f"(R^2={r2:.2f}, sigma={sigma_fit:.2f}um, "
+                            f"amplitude {metric_range_frac:.2%}). True focus "
+                            f"is likely at {direction}",
+                            samples_trace=list(in_motion),
+                        )
+
                 logger.warning(
                     "STREAM_AF:%smetric range %.3f (%.2f%% of peak %.3f) "
                     "is within noise -- gaussian R^2=%.2f sigma=%.2f um "
