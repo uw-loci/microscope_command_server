@@ -2661,6 +2661,85 @@ def _attempt_one_scan(
                 samples_trace=list(in_motion),
             )
 
+        # 2026-05-12 follow-up #2: sampled-boundary edge detection.
+        #
+        # The legacy edge check below uses raw_peak_z vs the COMMANDED
+        # z_start/z_end with a fixed 10%-of-range tolerance. After
+        # HEAD_DISCARD_MS removes the first ~7 um at v=11.5 um/s, the
+        # first in-motion sample sits ~7 um inside z_start -- so a
+        # fitted peak whose mu lands at the actual sampled boundary
+        # gets classified as "interior by ~7 um" against the commanded
+        # boundary and falsely commits.
+        #
+        # _gaussian_peak constrains mu to [z_arr.min(), z_arr.max()];
+        # when the true peak extends past the sampled range, curve_fit
+        # pushes mu to the nearest boundary. So "mu within sigma_fit of
+        # a sampled boundary" is the signature of a peak whose actual
+        # center is past the boundary -- regardless of whether the
+        # observed amplitude is high or low.
+        #
+        # Repeatable test cases (PPM 10x with brenner_gradient, 2026-
+        # 05-12 23:00):
+        #  - Start Z=0, scan [-25, 25]: fits mu=-16.7, sigma=4.99,
+        #    amplitude 34%, R^2=0.97. First in-motion sample ~ z=-18.
+        #    |mu - z_min_sampled| = 1.4 um <= 4.99 -> mu pinned at low
+        #    boundary. Legacy check used commanded z_lo=-25 -> distance
+        #    8.3 um > 5 um tolerance -> classified as interior ->
+        #    committed -16.7. True focus at -26.
+        #  - Start Z=10, scan [-15, 35]: fits mu=-6.9, sigma=8.62,
+        #    amplitude 11.3%, R^2=0.96. First in-motion ~ z=-8.1.
+        #    |mu - z_min_sampled| = 1.2 um <= 8.62. Same failure.
+        #
+        # Returns best_z = mu_fit so the retry loop's post-loop
+        # fallback can commit to this peak if the walk doesn't find
+        # anything better. Yesterday's z=-16.9 in [-58.5, -8.5] case
+        # still passes through: sigma=3.19, distance from mu to
+        # nearest sampled boundary >= 8.4 um >> 3.19 -> NOT at boundary.
+        if gaussian_fit is not None and shape_ok and n_motion_samples >= 3:
+            z_min_sampled = float(min(zs))
+            z_max_sampled = float(max(zs))
+            mu_fit = float(gaussian_fit[0])
+            boundary_tol = max(sigma_fit, 0.5)
+            mu_at_low_sampled = abs(mu_fit - z_min_sampled) <= boundary_tol
+            mu_at_high_sampled = abs(mu_fit - z_max_sampled) <= boundary_tol
+            if mu_at_low_sampled != mu_at_high_sampled:
+                edge_status = "edge_low" if mu_at_low_sampled else "edge_high"
+                direction = (
+                    "more negative Z (below z_start)"
+                    if mu_at_low_sampled
+                    else "more positive Z (above z_end)"
+                )
+                logger.info(
+                    "STREAM_AF:%sgaussian mu=%.3f pinned within %.2f um of "
+                    "sampled %s boundary [%.3f, %.3f] (sigma=%.2f, R^2=%.2f, "
+                    "amplitude=%.2f%%). Peak likely extends past sampled "
+                    "range. Classifying as %s with best_z=%.3f as fallback "
+                    "if retry finds nothing better.",
+                    tag_prefix,
+                    mu_fit,
+                    boundary_tol,
+                    "low" if mu_at_low_sampled else "high",
+                    z_min_sampled,
+                    z_max_sampled,
+                    sigma_fit,
+                    r2,
+                    metric_range_frac * 100.0,
+                    edge_status,
+                    mu_fit,
+                )
+                return _ScanAttemptResult(
+                    edge_status,
+                    mu_fit,
+                    n_motion_samples,
+                    z_span,
+                    f"gaussian mu={mu_fit:.3f} pinned at sampled "
+                    f"{'low' if mu_at_low_sampled else 'high'} boundary "
+                    f"(sigma={sigma_fit:.2f}um, amplitude="
+                    f"{metric_range_frac:.2%}, R^2={r2:.2f}). True focus "
+                    f"is likely at {direction}",
+                    samples_trace=list(in_motion),
+                )
+
         # Edge-of-window detection.
         # 2026-05-06: was `raw_peak_idx in (0, n_motion_samples - 1)`,
         # which checked SAMPLE INDEX. That worked when samples were
@@ -3302,6 +3381,13 @@ def handle_streaming_focus(conn, client, hardware, settings, **kwargs):
     # losing the streaming data.
     all_attempt_samples_zm: List[Tuple[float, float]] = []
     prev_attempt_status: Optional[str] = None
+    # 2026-05-12: track the best (peak_metric, peak_z) seen across all
+    # attempts so far -- includes mu values from edge_low/edge_high
+    # results when the mu-at-sampled-boundary check fires with a clean
+    # gaussian fit. If the retry loop terminates without committing a
+    # success, we fall back to this peak instead of refusing.
+    fallback_peak_z: Optional[float] = None
+    fallback_peak_metric: float = -float("inf")
 
     try:
         for attempt_idx in range(MAX_EDGE_RETRIES + 1):
@@ -3360,6 +3446,21 @@ def handle_streaming_focus(conn, client, hardware, settings, **kwargs):
             for s in result.samples_trace:
                 if len(s) >= 3:
                     all_attempt_samples_zm.append((float(s[1]), float(s[2])))
+
+            # 2026-05-12: track the best peak across attempts. When mu-at-
+            # sampled-boundary fires, _attempt_one_scan sets best_z=mu_fit
+            # even though it returns edge_low/edge_high. If retries don't
+            # find anything better, the post-loop dispatch commits to the
+            # peak with the highest metric value observed across all
+            # attempts (samples_trace contains all in-motion samples).
+            if result.best_z is not None and result.samples_trace:
+                metric_at_best = max(
+                    (float(s[2]) for s in result.samples_trace if len(s) >= 3),
+                    default=-float("inf"),
+                )
+                if metric_at_best > fallback_peak_metric:
+                    fallback_peak_metric = metric_at_best
+                    fallback_peak_z = float(result.best_z)
 
             if result.status == "success":
                 final_result = result
@@ -3579,6 +3680,45 @@ def handle_streaming_focus(conn, client, hardware, settings, **kwargs):
                         )
                 except Exception as e:
                     logger.error("STREAM_AF:Brent fallback raised: %s", e, exc_info=True)
+
+        # 2026-05-12: mu-at-sampled-boundary fallback.
+        #
+        # If we still don't have a success and any earlier attempt had a
+        # gaussian-fit peak (recorded in fallback_peak_z when the mu-at-
+        # boundary check fired), commit to that peak instead of refusing.
+        # The walk found nothing better, so the original peak -- even if
+        # pinned to a boundary -- is the best information we have.
+        #
+        # Concretely: attempt 1 fits a clean peak at mu=-16.7 (pinned at
+        # low boundary) and returns edge_low with best_z=-16.7. Retry
+        # shifts the window and either finds a better peak (we commit
+        # there) or returns metric_flat / nothing. In the latter case
+        # the original -16.7 is still a real focus point in the FOV --
+        # just not necessarily the global tissue focus the operator
+        # wanted. Better than UNAVAILABLE.
+        if final_result.status != "success" and fallback_peak_z is not None:
+            # Only commit if the fallback peak's metric beats anything
+            # else we've seen across all attempts. Otherwise the union-
+            # fit / global-argmax path above already handled it.
+            global_best_metric = max((m for _, m in all_attempt_samples_zm), default=-float("inf"))
+            if fallback_peak_metric >= global_best_metric * 0.95:
+                logger.info(
+                    "STREAM_AF:no better peak found across %d attempts; "
+                    "falling back to earlier mu-at-boundary peak at "
+                    "Z=%.3f (metric=%.4f, global best metric=%.4f)",
+                    len(attempts_log),
+                    fallback_peak_z,
+                    fallback_peak_metric,
+                    global_best_metric,
+                )
+                final_result = _ScanAttemptResult(
+                    "success",
+                    fallback_peak_z,
+                    final_result.n_samples,
+                    final_result.z_span,
+                    f"mu-at-boundary fallback peak at Z={fallback_peak_z:.3f} "
+                    f"(no better peak found in {len(attempts_log)} attempts)",
+                )
 
         if final_result.status == "success":
             # Commit the peak Z.
