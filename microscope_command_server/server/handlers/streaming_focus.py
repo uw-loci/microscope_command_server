@@ -1705,11 +1705,38 @@ def _run_streaming_scan(
             ),
         )
 
-        # Smoking-gun warning. If the stage reached z_end in less than
-        # half the time we expected (motion_duration_ms), the slow speed
-        # never took effect: the scan is stationary frames being labeled
-        # with a linear-interpolation Z that no longer matches reality.
-        if t_reached_z_end_ms is not None and t_reached_z_end_ms < motion_duration_ms * 0.5:
+        # Smoking-gun warning. Two signals must agree before firing:
+        # (a) the Z-poll trace shows the stage *appeared* to reach
+        # z_end in less than half the expected time, AND
+        # (b) the average velocity across the full poll window is
+        # also at least 2x the configured slow speed.
+        #
+        # Both signals are required because some stage adapters
+        # occasionally return the commanded destination Z from
+        # get_position() during the move, which produces a single
+        # spurious sample at z_end early in the trace. In that case
+        # the avg velocity over the whole trace still matches
+        # configured -- the early reached_z_end timestamp is noise,
+        # not a real fast-move. (Observed on the ASI ZDrive 2026-05-13:
+        # reached_z_end at t=306ms but avg_velocity = 6.03 um/s vs
+        # configured 6.08 um/s, with a clean Pearson r=-0.927 metric
+        # slope confirming the stage really did move slowly.)
+        reached_z_end_early = (
+            t_reached_z_end_ms is not None and t_reached_z_end_ms < motion_duration_ms * 0.5
+        )
+        avg_velocity_high = observed_avg_velocity_um_s > velocity_um_s * 2.0
+        if reached_z_end_early and not avg_velocity_high:
+            logger.debug(
+                "STREAM_AF:Z-poll glitch suppressed -- reached_z_end at "
+                "t=%.0fms looks early vs motion_duration_ms=%.0f, but "
+                "observed_avg_velocity=%.2f um/s matches configured "
+                "%.2f um/s. Likely a single spurious Z reading; ignoring.",
+                t_reached_z_end_ms,
+                motion_duration_ms,
+                observed_avg_velocity_um_s,
+                velocity_um_s,
+            )
+        if reached_z_end_early and avg_velocity_high:
             # Compute the in-motion velocity (during the actual move
             # only, NOT averaged over the full poll window). This is
             # the number you actually want to put into
