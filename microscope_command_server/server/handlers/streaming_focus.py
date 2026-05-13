@@ -34,6 +34,14 @@ Protocol (reuses the existing "--flag value" text payload pattern):
              --yaml <path>           (required; path to the active config yaml)
              --objective <id>        (optional; preferred source of truth)
              --range <um>            (optional override of sweep_range_um)
+             --modality <name>       (optional; selects metric/threshold profile)
+             --crop-factor <0..1]    (optional override of DEFAULT_CROP_FACTOR)
+             --dump 1                (optional; per-sample TIF + CSV diagnostic)
+             --max-attempts <N>      (optional; caps the edge-retry walk to N
+                                      scans. Default MAX_EDGE_RETRIES+1=3. Pass
+                                      1 from acquisition tile-AF so a tight
+                                      single scan replaces the multi-attempt
+                                      walk.)
 
     Response: SUCCESS:<initial>:<final>:<shift>:<n_samples>:<span>
               UNAVAILABLE:<reason>
@@ -2988,7 +2996,16 @@ def handle_streaming_focus(conn, client, hardware, settings, **kwargs):
         return
 
     params = parse_flags(
-        message, ["--yaml", "--objective", "--range", "--modality", "--crop-factor", "--dump"]
+        message,
+        [
+            "--yaml",
+            "--objective",
+            "--range",
+            "--modality",
+            "--crop-factor",
+            "--dump",
+            "--max-attempts",
+        ],
     )
     yaml_path = params.get("yaml")
     client_objective = params.get("objective")
@@ -2996,12 +3013,28 @@ def handle_streaming_focus(conn, client, hardware, settings, **kwargs):
     client_modality = params.get("modality")
     crop_factor_str = params.get("crop_factor")
     dump_flag = params.get("dump")
+    max_attempts_str = params.get("max_attempts")
     range_override_um: Optional[float] = None
     if range_override_str:
         try:
             range_override_um = float(range_override_str)
         except ValueError:
             logger.warning("STREAM_AF:ignoring non-numeric --range: %r", range_override_str)
+
+    # --max-attempts overrides MAX_EDGE_RETRIES+1 for callers that want a
+    # tighter retry budget. Acquisition tile-AF passes 1 to skip the walk
+    # entirely (the previous tile's Z is a tight seed; the peak should fit
+    # in one scan). Live Viewer leaves it unset to keep the default 3.
+    max_attempts = MAX_EDGE_RETRIES + 1
+    if max_attempts_str:
+        try:
+            requested = int(max_attempts_str)
+            if requested >= 1:
+                max_attempts = requested
+            else:
+                logger.warning("STREAM_AF:ignoring --max-attempts < 1: %r", max_attempts_str)
+        except ValueError:
+            logger.warning("STREAM_AF:ignoring non-integer --max-attempts: %r", max_attempts_str)
 
     crop_factor = DEFAULT_CROP_FACTOR
     if crop_factor_str:
@@ -3380,9 +3413,10 @@ def handle_streaming_focus(conn, client, hardware, settings, **kwargs):
         return
 
     # --- Execute scan with edge-retry loop ---
-    # Up to (MAX_EDGE_RETRIES + 1) attempts. Each attempt runs one
-    # scan centered on a candidate Z with the current range. On
-    # edge_low we shift the next attempt's center down by one full
+    # Up to max_attempts attempts (default MAX_EDGE_RETRIES + 1, or
+    # whatever the caller passed via --max-attempts). Each attempt
+    # runs one scan centered on a candidate Z with the current range.
+    # On edge_low we shift the next attempt's center down by one full
     # range (covering new ground further in the -Z direction); on
     # edge_high we shift up. The shift never crosses outside the
     # stage Z limits from config.
@@ -3420,9 +3454,9 @@ def handle_streaming_focus(conn, client, hardware, settings, **kwargs):
     fallback_peak_metric: float = -float("inf")
 
     try:
-        for attempt_idx in range(MAX_EDGE_RETRIES + 1):
+        for attempt_idx in range(max_attempts):
             attempt_num = attempt_idx + 1
-            label = f"attempt {attempt_num}/{MAX_EDGE_RETRIES + 1}"
+            label = f"attempt {attempt_num}/{max_attempts}"
 
             # Check Z limits before each attempt. Refuse if the
             # proposed window would step outside the configured stage
@@ -3621,7 +3655,7 @@ def handle_streaming_focus(conn, client, hardware, settings, **kwargs):
                 brent_lo = best_z_so_far - range_um
                 brent_hi = best_z_so_far + range_um
             else:
-                total_span = range_um * (MAX_EDGE_RETRIES + 1)
+                total_span = range_um * max_attempts
                 brent_lo = initial_z - total_span / 2.0
                 brent_hi = initial_z + total_span / 2.0
             if z_low is not None:
@@ -3835,14 +3869,14 @@ def handle_streaming_focus(conn, client, hardware, settings, **kwargs):
                 if best_slope_z is not None:
                     summary = (
                         f"no peak found after {len(attempts_log)} "
-                        f"attempts ({MAX_EDGE_RETRIES + 1} max), "
+                        f"attempts ({max_attempts} max), "
                         f"moved to best Z={best_slope_z:.3f} "
                         f"(shift {best_slope_z - initial_z:+.3f}um)"
                     )
                 else:
                     summary = (
                         f"could not find peak after {len(attempts_log)} "
-                        f"attempts ({MAX_EDGE_RETRIES + 1} max). Last attempt: "
+                        f"attempts ({max_attempts} max). Last attempt: "
                         f"{final_result.reason}. Try moving Z closer to "
                         f"focus manually or picking a wider scan range"
                     )
