@@ -2565,12 +2565,15 @@ def _attempt_one_scan(
                     sigma_fit,
                     z_span,
                 )
-                # Dump per-sample trace on the refusal path so the
-                # operator can see whether the metric is genuinely flat
-                # across the swept Z range, or whether all samples
+                # Dump per-sample trace on the refusal path so a
+                # developer can confirm whether the metric is genuinely
+                # flat across the swept Z range, or whether all samples
                 # collapsed to the same Z (stage not actually moving).
+                # Logged at DEBUG so production operator logs are not
+                # flooded with 100s of lines per refusal; the WARNING
+                # summary line above is enough for operator visibility.
                 for i, (t, z, m) in enumerate(in_motion):
-                    logger.info(
+                    logger.debug(
                         "STREAM_AF:%sFLAT sample %3d  t=%7.1f ms  z=%.3f  metric=%.4f",
                         tag_prefix,
                         i,
@@ -3565,7 +3568,18 @@ def handle_streaming_focus(conn, client, hardware, settings, **kwargs):
         # (e.g. ran out of attempts on three same-direction edges,
         # or hit the stage limit). If the union has a clean
         # interior maximum we can commit it directly.
-        if final_result.status in ("edge_low", "edge_high"):
+        #
+        # metric_flat is included because a typical "walked past
+        # focus" sequence is edge_low / edge_low / metric_flat:
+        # the first two attempts catch the slope via Pearson, the
+        # third lands in the flat region beyond focus and looks
+        # noise-bounded on its own. But the *union* of all 3 still
+        # has a clean interior maximum near the boundary between
+        # the slope and the flat region. _fit_union_samples returns
+        # None when the union argmax sits at an edge, so this is
+        # safe -- worst case we fall through to Brent or UNAVAILABLE
+        # exactly as before.
+        if final_result.status in ("edge_low", "edge_high", "metric_flat"):
             union_result = _fit_union_samples(
                 all_attempt_samples_zm,
                 len(attempts_log),
