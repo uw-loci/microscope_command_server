@@ -1390,19 +1390,44 @@ def _fit_union_samples(
 
     # Try Gaussian first (uses all samples), fall back to parabolic
     # around the argmax, fall back to raw argmax.
+    #
+    # Sanity gate on the gaussian: when the union is mostly noise the
+    # gaussian fit will slide far from the argmax toward whichever
+    # boundary the noise weighting drags it to (observed 2026-05-13:
+    # argmax at Z=1842, gaussian best_z=1856, ~14um drift on 46um
+    # span). The raw argmax is *on real data*; the gaussian only beats
+    # it when the curve is well-shaped. Reject the gaussian and fall
+    # back when fit_z drifts more than UNION_FIT_MAX_DRIFT_FRAC of the
+    # z span away from the argmax z.
+    UNION_FIT_MAX_DRIFT_FRAC = 0.25
+    z_span = zs[-1] - zs[0]
+    argmax_z = zs[raw_max_idx]
     gauss_result = _gaussian_peak(zs, ms)
     fit_z: Optional[float] = None
     if gauss_result is not None:
         fit_z = gauss_result[0]
     fit_kind = "gaussian"
-    if fit_z is None or fit_z < zs[0] or fit_z > zs[-1]:
+    gaussian_drift_too_far = (
+        fit_z is not None and abs(fit_z - argmax_z) > UNION_FIT_MAX_DRIFT_FRAC * z_span
+    )
+    if fit_z is None or fit_z < zs[0] or fit_z > zs[-1] or gaussian_drift_too_far:
+        if gaussian_drift_too_far:
+            logger.info(
+                "STREAM_AF:union-fit rejecting gaussian fit_z=%.3f -- drift "
+                "%.2f um from argmax %.3f exceeds %.0f%% of z_span %.2f um. "
+                "Falling back to parabolic / raw argmax.",
+                fit_z,
+                abs(fit_z - argmax_z),
+                argmax_z,
+                UNION_FIT_MAX_DRIFT_FRAC * 100.0,
+                z_span,
+            )
         fit_z = _parabolic_peak(zs, ms)
         fit_kind = "parabolic"
     if fit_z is None:
-        fit_z = zs[raw_max_idx]
+        fit_z = argmax_z
         fit_kind = "raw-argmax"
 
-    z_span = zs[-1] - zs[0]
     logger.info(
         "STREAM_AF:union-fit across %d samples from %d attempts -- "
         "interior argmax at Z=%.3f (idx %d/%d), fit=%s best_z=%.3f, span=%.2f",
@@ -3452,6 +3477,13 @@ def handle_streaming_focus(conn, client, hardware, settings, **kwargs):
     # success, we fall back to this peak instead of refusing.
     fallback_peak_z: Optional[float] = None
     fallback_peak_metric: float = -float("inf")
+    # 2026-05-13: track whether any prior attempt found slope evidence
+    # (edge_low / edge_high). This gates the metric_flat -> union-fit
+    # path so genuinely flat data (sparse fluorescence, dim BF, sample
+    # depth-of-field exceeding the scan range) does not commit a noise-
+    # driven gaussian peak when union-fit is called with one flat
+    # attempt's worth of samples.
+    any_slope_attempt_seen = False
 
     try:
         for attempt_idx in range(max_attempts):
@@ -3557,6 +3589,8 @@ def handle_streaming_focus(conn, client, hardware, settings, **kwargs):
                     break
 
             prev_attempt_status = result.status
+            if result.status in ("edge_low", "edge_high"):
+                any_slope_attempt_seen = True
 
             if result.status == "edge_low":
                 # Shift down by one full range so the next window's
@@ -3603,17 +3637,29 @@ def handle_streaming_focus(conn, client, hardware, settings, **kwargs):
         # or hit the stage limit). If the union has a clean
         # interior maximum we can commit it directly.
         #
-        # metric_flat is included because a typical "walked past
-        # focus" sequence is edge_low / edge_low / metric_flat:
-        # the first two attempts catch the slope via Pearson, the
-        # third lands in the flat region beyond focus and looks
-        # noise-bounded on its own. But the *union* of all 3 still
-        # has a clean interior maximum near the boundary between
-        # the slope and the flat region. _fit_union_samples returns
-        # None when the union argmax sits at an edge, so this is
-        # safe -- worst case we fall through to Brent or UNAVAILABLE
-        # exactly as before.
-        if final_result.status in ("edge_low", "edge_high", "metric_flat"):
+        # metric_flat is included ONLY when an earlier attempt found
+        # slope evidence (edge_low / edge_high). That covers the
+        # "walked past focus" sequence (edge_low / edge_low /
+        # metric_flat) -- prior attempts saw real signal, the final
+        # attempt landed in the flat region beyond focus, the union
+        # has a clean interior peak at the slope/flat boundary.
+        # When the FIRST attempt is metric_flat with no prior slope
+        # evidence (sparse fluorescence, dim BF, sample depth-of-
+        # field exceeds the scan range), the union is just one flat
+        # attempt's worth of noise. _fit_union_samples does not gate
+        # on R^2 / sigma, so a gaussian on noise produces a noise-
+        # driven "peak" that gets committed -- worse than UNAVAILABLE
+        # because the operator has no signal that sweep is needed.
+        # So: skip the union-fit for first-attempt metric_flat and
+        # let UNAVAILABLE propagate so the caller can fall back to
+        # sweep. _fit_union_samples still returns None when the
+        # argmax sits at an edge, but its argmax check is necessary,
+        # not sufficient -- the slope-prior gate adds the
+        # sufficient-condition leg.
+        try_union_fit = final_result.status in ("edge_low", "edge_high") or (
+            final_result.status == "metric_flat" and any_slope_attempt_seen
+        )
+        if try_union_fit:
             union_result = _fit_union_samples(
                 all_attempt_samples_zm,
                 len(attempts_log),
