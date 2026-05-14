@@ -141,6 +141,67 @@ BGACQUIRE commands that do not pass `--channels` fall through unchanged:
 Modalities whose YAML has no `channels:` library never enter the channel
 branch, so existing profiles keep working without any YAML edits.
 
+## Acquisition Loop Ordering (--inner-axis)
+
+The BGACQUIRE (and ACQUIRE) acquisition message parser accepts an optional
+`--inner-axis` flag to control the nesting order of hardware sweeps. This
+affects performance by changing the frequency of expensive hardware transitions
+(rotation moves for PPM, filter-cube changes for widefield).
+
+### Flag syntax
+
+```
+--inner-axis <value>
+```
+
+Allowed values:
+- `z` -- Z-position is the innermost loop
+- `channel` -- Channel is the innermost loop
+- `angle` -- Rotation angle is the innermost loop
+
+### PPM (Multi-Angle) Acquisition
+
+Default behavior (`--inner-axis angle` or omitted): **z-outer / angle-inner**
+- Outer loop: z-planes
+- Inner loop: angles
+- **Effect**: At each z-plane, every angle is re-acquired before z advances.
+  Tight per-z registration across angles, but a 5-z x 4-angle field pays
+  20 rotation-stage moves per tile. This is the historical PPM ordering.
+
+Alternative mode (`--inner-axis z`): **angle-outer / z-inner**
+- Outer loop: angles
+- Inner loop: z-planes
+- **Effect**: Each angle sweeps its full z-stack before rotating to the next
+  angle. Fewer rotation moves (one per angle per tile instead of one per
+  angle-z pair). The per-angle WB / JAI-calibration / exposure block also
+  hoists outside the inner z loop. Faster for thicker tissue z-stacks
+  (especially at 40x).
+
+### Widefield (Multi-Channel) Acquisition
+
+Default behavior (`--inner-axis z` or omitted): **channel-outer / z-inner**
+- Outer loop: channels
+- Inner loop: z-planes
+- **Effect**: Each channel sweeps its full z-stack before switching to the
+  next channel. Fewer filter-cube changes (one per channel per tile instead
+  of one per channel-z pair). Optimized for fixed slides where focus drift
+  is not a concern.
+
+Alternative mode (`--inner-axis channel`): **z-outer / channel-inner**
+- Outer loop: z-planes
+- Inner loop: channels
+- **Effect**: At each z-plane, every channel is re-acquired before z advances.
+  Tighter per-channel z registration -- right for live-cell or drifting
+  samples where minutes between channel acquisitions could cause axial
+  decorrelation. Costs channels x z_planes filter switches per tile.
+
+### Backward compatibility
+
+Omitting `--inner-axis` preserves byte-identical behavior to pre-flag
+acquisitions:
+- PPM defaults to z-outer / angle-inner (the historical ordering)
+- Widefield defaults to channel-outer / z-inner (fewer filter changes)
+
 ## Installation
 
 **Part of [QPSC (QuPath Scope Control)](https://github.com/uw-loci/QPSC)**

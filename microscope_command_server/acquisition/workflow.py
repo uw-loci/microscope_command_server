@@ -4342,9 +4342,7 @@ def _acquire_tile_angles_angle_outer(
                     sw_gain = angle_sw.get("unified_gain", 1.0)
                     hardware.camera.apply_settings(
                         exposures=(
-                            {"all": exp_g}
-                            if is_unified
-                            else {"r": exp_r, "g": exp_g, "b": exp_b}
+                            {"all": exp_g} if is_unified else {"r": exp_r, "g": exp_g, "b": exp_b}
                         ),
                         unified_gain=sw_gain,
                         analog_red=ctx.simple_wb_analog_red,
@@ -4367,9 +4365,7 @@ def _acquire_tile_angles_angle_outer(
                     if angle_idx < len(params["exposures"]):
                         hardware.set_exposure(params["exposures"][angle_idx])
             else:
-                logger.info(
-                    f"  Simple WB: no data for {angle_name}, using calibration with scale"
-                )
+                logger.info(f"  Simple WB: no data for {angle_name}, using calibration with scale")
                 if ctx.jai_calibration is not None:
                     applied, _ = apply_jai_calibration_for_angle(
                         hardware=hardware,
@@ -4496,9 +4492,7 @@ def _acquire_tile_angles_angle_outer(
                 t_mkdir = time.perf_counter()
                 if not raw_image_path.parent.exists():
                     raw_image_path.parent.mkdir(parents=True, exist_ok=True)
-                t_mkdir = log_timing(
-                    logger, f"Create directories at {angle}deg z{z_idx}", t_mkdir
-                )
+                t_mkdir = log_timing(logger, f"Create directories at {angle}deg z{z_idx}", t_mkdir)
                 try:
                     write_position_metadata(
                         ctx.metadata_txt_for_positions,
@@ -4613,7 +4607,9 @@ def _acquire_tile_angles_angle_outer(
             ctx.update_progress(ctx.image_count, ctx.total_images)
 
         angle_elapsed_ms = (time.perf_counter() - angle_start) * 1000
-        logger.debug(f"  [TIMING] Total for angle {angle}deg (all z planes): {angle_elapsed_ms:.1f}ms")
+        logger.debug(
+            f"  [TIMING] Total for angle {angle}deg (all z planes): {angle_elapsed_ms:.1f}ms"
+        )
 
     # Z-stack projection -- identical to the default body, just runs after
     # the angle-outer sweep finishes. Populates angle_images for birefringence.
