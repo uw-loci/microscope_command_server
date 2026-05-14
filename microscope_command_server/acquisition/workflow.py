@@ -2106,6 +2106,25 @@ def parse_acquisition_message(message: str) -> dict:
             elif parts[i] == "--z-projection" and i + 1 < len(parts):
                 params["z_projection"] = parts[i + 1]
                 i += 2
+            elif parts[i] == "--inner-axis" and i + 1 < len(parts):
+                # Loop nesting axis for the per-tile snap loop. Allowed values:
+                #   'z'       -- z is the inner loop (current widefield default,
+                #                outer iterates channels). Also the natural choice
+                #                for PPM when speed > registration: outer iterates
+                #                angles, fewer rotation-stage moves per tile.
+                #   'channel' -- channel is the inner loop (drift-tolerant widefield
+                #                mode: re-image every channel at each z plane).
+                #   'angle'   -- angle is the inner loop (current PPM default).
+                # Per-modality defaults are applied below if the flag is omitted.
+                raw = parts[i + 1].strip().lower()
+                if raw not in ("z", "channel", "angle"):
+                    logger.warning(
+                        "Unknown --inner-axis value %r; falling back to per-modality default",
+                        raw,
+                    )
+                    raw = None
+                params["inner_axis"] = raw
+                i += 2
             # LSM / multiphoton flags
             elif parts[i] == "--laser-power" and i + 1 < len(parts):
                 params["laser_power"] = float(parts[i + 1])
@@ -2227,6 +2246,10 @@ def parse_acquisition_message(message: str) -> dict:
         params.setdefault("n_timepoints", 1)
         params.setdefault("interval_seconds", 0.0)
         params.setdefault("output_format", "ome-per-t")
+        # Loop-order toggle default: None = use per-modality default applied by
+        # the per-tile helpers ('z' for widefield, 'angle' for PPM). This keeps
+        # callers that omit --inner-axis byte-identical to pre-toggle behavior.
+        params.setdefault("inner_axis", None)
 
         # Validate required parameters
         required = [
@@ -4248,6 +4271,413 @@ def _handle_tile_autofocus(
     )
 
 
+def _acquire_tile_angles_angle_outer(
+    ctx: AcquisitionContext,
+    pos_idx: int,
+    pos,
+    filename: str,
+    current_stage_pos,
+    xy_move_pending: bool,
+) -> Tuple[dict, dict, dict, bool]:
+    """Angle-outer / z-inner variant of PPM acquisition.
+
+    Each angle sweeps its full z-stack before rotating to the next, so the
+    rotation-stage move + WB/JAI-calibration block runs once per angle per
+    tile instead of once per (angle, z, tile). For a 5-z x 4-angle field
+    this is 4 rotation moves per tile instead of 20.
+
+    Used when --inner-axis z is set. The post-sweep birefringence creation,
+    z-stack projection, and saturation/stats aggregation semantics match
+    the default _acquire_tile_angles body.
+    """
+    logger = ctx.logger
+    hardware = ctx.hardware
+    params = ctx.params
+    tile_worst_sat = {"R": 0.0, "G": 0.0, "B": 0.0}
+    tile_role_sat = {
+        SATURATION_ROLE_LOW: 0.0,
+        SATURATION_ROLE_HIGH: 0.0,
+        SATURATION_ROLE_NORMAL: 0.0,
+    }
+    tile_stats: dict = {}
+
+    center_z = current_stage_pos.z
+    z_stack_images: dict = {}
+    angle_images: dict = {}
+
+    for angle_idx, angle in enumerate(params["angles"]):
+        if ctx.is_cancelled():
+            raise _AcquisitionCancelled()
+
+        angle_start = time.perf_counter()
+        t_rot = time.perf_counter()
+        hardware.set_psg_ticks_no_wait(angle)
+        t_exp = time.perf_counter()
+
+        # Per-angle hardware setup: WB / JAI calibration / exposure. Hoisted
+        # outside the z loop so it runs once per angle per tile, not once
+        # per (angle, z, tile) the way the default z-outer body does.
+        if ctx.wb_mode == "camera_awb":
+            if angle_idx < len(params["exposures"]):
+                exposure_ms = params["exposures"][angle_idx]
+                hardware.set_exposure(exposure_ms)
+            angle_name = angle_to_name(angle, modality=ctx.modality)
+            if ctx.camera_awb_gains and angle_name in ctx.camera_awb_gains:
+                try:
+                    gain_val = ctx.camera_awb_gains[angle_name]
+                    hardware.camera.set_unified_gain(gain_val)
+                    logger.info(f"  Camera AWB: unified gain={gain_val:.2f} for {angle_name}")
+                except Exception as e:
+                    logger.debug(f"Could not set unified gain: {e}")
+        elif ctx.wb_mode == "simple" and ctx.simple_wb_data:
+            angle_name = angle_to_name(angle, modality=ctx.modality)
+            sw_angles = ctx.simple_wb_data.get("angles", {})
+            if angle_name in sw_angles:
+                angle_sw = sw_angles[angle_name]
+                try:
+                    exp_r = angle_sw["r"]
+                    exp_g = angle_sw["g"]
+                    exp_b = angle_sw["b"]
+                    is_unified = abs(exp_r - exp_g) < 0.01 and abs(exp_g - exp_b) < 0.01
+                    sw_gain = angle_sw.get("unified_gain", 1.0)
+                    hardware.camera.apply_settings(
+                        exposures=(
+                            {"all": exp_g}
+                            if is_unified
+                            else {"r": exp_r, "g": exp_g, "b": exp_b}
+                        ),
+                        unified_gain=sw_gain,
+                        analog_red=ctx.simple_wb_analog_red,
+                        analog_blue=ctx.simple_wb_analog_blue,
+                        individual_exposure=not is_unified,
+                    )
+                    logger.debug(
+                        "  Simple WB: R=%.1fms, G=%.1fms, B=%.1fms "
+                        "(scale=%sx, gain=%.2f, aR=%.3f, aB=%.3f)",
+                        exp_r,
+                        exp_g,
+                        exp_b,
+                        angle_sw.get("scale", "?"),
+                        sw_gain,
+                        ctx.simple_wb_analog_red,
+                        ctx.simple_wb_analog_blue,
+                    )
+                except Exception as e:
+                    logger.warning(f"Simple WB failed for {angle_name}: {e}")
+                    if angle_idx < len(params["exposures"]):
+                        hardware.set_exposure(params["exposures"][angle_idx])
+            else:
+                logger.info(
+                    f"  Simple WB: no data for {angle_name}, using calibration with scale"
+                )
+                if ctx.jai_calibration is not None:
+                    applied, _ = apply_jai_calibration_for_angle(
+                        hardware=hardware,
+                        jai_calibration=ctx.jai_calibration,
+                        angle=angle,
+                        per_angle=False,
+                        logger=logger,
+                    )
+                    if not applied and angle_idx < len(params["exposures"]):
+                        hardware.set_exposure(params["exposures"][angle_idx])
+                elif angle_idx < len(params["exposures"]):
+                    hardware.set_exposure(params["exposures"][angle_idx])
+        elif ctx.wb_mode == "simple" and ctx.jai_calibration is not None:
+            applied, _ = apply_jai_calibration_for_angle(
+                hardware=hardware,
+                jai_calibration=ctx.jai_calibration,
+                angle=angle,
+                per_angle=False,
+                logger=logger,
+            )
+            if not applied and angle_idx < len(params["exposures"]):
+                hardware.set_exposure(params["exposures"][angle_idx])
+        elif ctx.jai_calibration is not None:
+            applied, _ = apply_jai_calibration_for_angle(
+                hardware=hardware,
+                jai_calibration=ctx.jai_calibration,
+                angle=angle,
+                per_angle=ctx.white_balance_per_angle,
+                logger=logger,
+            )
+            if not applied and angle_idx < len(params["exposures"]):
+                try:
+                    hardware.camera.disable_individual_exposure()
+                    hardware.camera.disable_individual_gain()
+                    hardware.camera.set_rb_analog_gains(analog_red=1.0, analog_blue=1.0)
+                except Exception:
+                    pass
+                exposure_ms = params["exposures"][angle_idx]
+                hardware.set_exposure(exposure_ms)
+                logger.info(f"  JAI calibration failed, using single exposure: {exposure_ms}ms")
+        elif angle_idx < len(params["exposures"]):
+            exposure_ms = params["exposures"][angle_idx]
+            hardware.set_exposure(exposure_ms)
+        t_exp = log_timing(logger, f"Set exposure for angle {angle}deg", t_exp)
+
+        hardware.wait_for_rotation()
+        t_rot = log_timing(logger, f"Rotation to {angle}deg", t_rot)
+
+        # Inner z-loop: each plane snaps + saves under the current angle.
+        for z_idx, z_offset in enumerate(ctx.z_offsets):
+            if ctx.is_cancelled():
+                raise _AcquisitionCancelled()
+
+            if ctx.z_stack_enabled and z_offset != 0.0:
+                target_z = center_z + z_offset
+                hardware.move_to_position(Position(z=target_z))
+                logger.debug(
+                    "Angle %sdeg Z-stack: plane %d/%d, Z=%.2f (offset=%+.1f)",
+                    angle,
+                    z_idx + 1,
+                    len(ctx.z_offsets),
+                    target_z,
+                    z_offset,
+                )
+
+            if xy_move_pending:
+                hardware.wait_for_xy()
+                xy_move_pending = False
+
+            t_snap = time.perf_counter()
+            image, metadata = hardware.snap_image(debayering=False)
+            t_snap = log_timing(
+                logger,
+                f"Snap image at {angle}deg z{z_idx} (includes camera+USB+internal processing)",
+                t_snap,
+            )
+
+            if image is None:
+                logger.error(f"Failed to acquire image at angle {angle} z{z_idx}")
+                continue
+
+            t_stats = time.perf_counter()
+            img_mean = image.mean((0, 1))
+            t_stats = log_timing(logger, f"Calculate image stats at {angle}deg z{z_idx}", t_stats)
+            logger.debug(f"  Image shape: {image.shape}, mean: {img_mean}")
+
+            sat_warn_threshold = 101.0 if ctx.sat_monitor.should_suppress_warnings(angle) else 1.0
+            sat_result = _check_saturation(
+                image,
+                f"tile {filename} at {angle}deg z{z_idx}",
+                logger,
+                threshold_pct=sat_warn_threshold,
+            )
+            if sat_result:
+                for ch in ("R", "G", "B"):
+                    if sat_result.get(ch, 0) > tile_worst_sat[ch]:
+                        tile_worst_sat[ch] = sat_result[ch]
+                role = _saturation_role_for(ctx.modality, angle)
+                worst_this_angle = max(sat_result.values()) if sat_result else 0.0
+                if worst_this_angle > tile_role_sat.get(role, 0.0):
+                    tile_role_sat[role] = worst_this_angle
+
+            try:
+                _accumulate_tile_stats(tile_stats, _compute_tile_stats(image))
+            except Exception as stats_err:
+                logger.debug(f"  Stats compute failed at {angle}deg z{z_idx}: {stats_err}")
+
+            if ctx.sat_monitor.check_tile(
+                sat_result,
+                angle,
+                pos_idx,
+                filename,
+                stage_x=current_stage_pos.x,
+                stage_y=current_stage_pos.y,
+                stage_z=current_stage_pos.z,
+            ):
+                ctx.sat_monitor.log_summary()
+                raise RuntimeError(ctx.sat_monitor.abort_reason)
+
+            # Save raw image
+            if ctx.save_raw_tiles:
+                raw_output_path = ctx.output_path.parent / "Raw" / ctx.output_path.name
+                raw_image_path = raw_output_path / str(angle) / filename
+                t_mkdir = time.perf_counter()
+                if not raw_image_path.parent.exists():
+                    raw_image_path.parent.mkdir(parents=True, exist_ok=True)
+                t_mkdir = log_timing(
+                    logger, f"Create directories at {angle}deg z{z_idx}", t_mkdir
+                )
+                try:
+                    write_position_metadata(
+                        ctx.metadata_txt_for_positions,
+                        raw_image_path,
+                        hardware,
+                        ctx.modality,
+                    )
+                    raw_pixel_size = hardware.get_pixel_size_um()
+                    ctx.write_pool.submit(
+                        ome_tiff_writer,
+                        filename=str(raw_image_path),
+                        pixel_size_um=raw_pixel_size,
+                        data=image,
+                    )
+                    logger.info(f"  Queued raw image write: {raw_image_path}")
+                except Exception as e:
+                    logger.warning(f"  Failed to queue raw image: {e}")
+
+            # Background correction (same as default body).
+            if (
+                ctx.background_correction_enabled
+                and angle in ctx.background_images
+                and angle not in ctx.background_disabled_angles
+            ):
+                bg_img = ctx.background_images[angle]
+                logger.debug(f"  Applying background correction for {angle} degrees")
+                logger.debug(
+                    f"    Background stats: mean={bg_img.mean():.1f}, std={bg_img.std():.1f}"
+                )
+                t_bg = time.perf_counter()
+                image = BackgroundCorrectionUtils.apply_flat_field_correction(
+                    image,
+                    ctx.background_images[angle],
+                    ctx.background_scaling_factors[angle],
+                    method=ctx.background_correction_method,
+                )
+                t_bg = log_timing(logger, f"Background correction at {angle}deg z{z_idx}", t_bg)
+                logger.debug(
+                    f"    Correction applied with method: {ctx.background_correction_method}"
+                )
+                logger.debug(f"    Post-correction RGB means: {image.mean(axis=(0,1))}")
+                if not ctx.sat_monitor._is_uncrossed(angle):
+                    _check_saturation(
+                        image,
+                        f"post-correction tile {filename} at {angle}deg z{z_idx}",
+                        logger,
+                    )
+            elif ctx.background_correction_enabled and angle in ctx.background_disabled_angles:
+                logger.info(
+                    f"  Background correction SKIPPED for {angle} deg "
+                    "(disabled by acquisition parameters - exposure mismatch or missing background)"
+                )
+            elif ctx.background_correction_enabled and angle not in ctx.background_images:
+                logger.info(
+                    f"  Background correction SKIPPED for {angle} deg "
+                    "(no background image available)"
+                )
+
+            # Software white balance (skip when hardware WB is active).
+            if (
+                ctx.white_balance_enabled
+                and ctx.jai_calibration is None
+                and ctx.wb_mode not in ("camera_awb", "simple")
+            ):
+                if angle in ctx.angles_wb:
+                    wb_profile = ctx.angles_wb[angle]
+                else:
+                    wb_profile = [1.0, 1.0, 1.0]
+                    logger.warning(f"    No white balance profile for {angle} deg, using neutral")
+                t_wb = time.perf_counter()
+                gain = calculate_luminance_gain(*wb_profile)
+                image = hardware.white_balance(image, white_balance_profile=wb_profile, gain=gain)
+                t_wb = log_timing(logger, f"White balance at {angle}deg z{z_idx}", t_wb)
+                logger.info(
+                    f"  Applied software white balance: R={wb_profile[0]:.2f}, "
+                    f"G={wb_profile[1]:.2f}, B={wb_profile[2]:.2f}"
+                )
+            elif ctx.white_balance_enabled and (
+                ctx.jai_calibration is not None or ctx.wb_mode in ("camera_awb", "simple")
+            ):
+                logger.debug(
+                    f"  Software WB skipped (hardware WB active for {angle} deg, mode={ctx.wb_mode})"
+                )
+
+            # Save (2D) or accumulate (z-stack).
+            if not ctx.z_stack_enabled:
+                image_path = ctx.output_path / str(angle) / filename
+                if image_path.parent.exists():
+                    proc_pixel_size = hardware.get_pixel_size_um()
+                    ctx.write_pool.submit(
+                        ome_tiff_writer,
+                        filename=str(image_path),
+                        pixel_size_um=proc_pixel_size,
+                        data=image,
+                    )
+                    angle_images[angle] = image
+                else:
+                    logger.error(f"Failed to save {image_path} - parent directory missing")
+            else:
+                z_stack_images.setdefault(angle, []).append(image)
+                if ctx.save_raw_tiles:
+                    z_plane_path = ctx.output_path / str(angle) / f"z{z_idx:03d}" / filename
+                    z_plane_path.parent.mkdir(parents=True, exist_ok=True)
+                    ctx.write_pool.submit(
+                        ome_tiff_writer,
+                        filename=str(z_plane_path),
+                        pixel_size_um=hardware.get_pixel_size_um(),
+                        data=image,
+                    )
+
+            ctx.image_count += 1
+            ctx.update_progress(ctx.image_count, ctx.total_images)
+
+        angle_elapsed_ms = (time.perf_counter() - angle_start) * 1000
+        logger.debug(f"  [TIMING] Total for angle {angle}deg (all z planes): {angle_elapsed_ms:.1f}ms")
+
+    # Z-stack projection -- identical to the default body, just runs after
+    # the angle-outer sweep finishes. Populates angle_images for birefringence.
+    if ctx.z_stack_enabled and ctx.projection_fn is not None:
+        for angle in params["angles"]:
+            if angle in z_stack_images and len(z_stack_images[angle]) > 0:
+                projected = ctx.projection_fn(z_stack_images[angle])
+                angle_images[angle] = projected
+                image_path = ctx.output_path / str(angle) / filename
+                if image_path.parent.exists():
+                    ctx.write_pool.submit(
+                        ome_tiff_writer,
+                        filename=str(image_path),
+                        pixel_size_um=hardware.get_pixel_size_um(),
+                        data=projected,
+                    )
+        logger.info(
+            "Z-stack projection (%s) computed for %d angles (z-inner mode)",
+            params.get("z_projection", "max"),
+            len(z_stack_images),
+        )
+        hardware.move_to_position(Position(z=center_z))
+
+    # Birefringence creation -- identical to the default body.
+    positive_angles = [a for a in angle_images if a > 0 and a != 90]
+    negative_angles = [a for a in angle_images if a < 0]
+    logger.debug(
+        f"Biref check: angle_images keys={list(angle_images.keys())}, "
+        f"positive={positive_angles}, negative={negative_angles}"
+    )
+
+    if positive_angles and negative_angles:
+        pos_angle = min(positive_angles)
+        neg_angle = max(negative_angles)
+        biref_dir = ctx.output_path / f"{pos_angle}.biref"
+        tile_config_source = ctx.output_path / str(pos_angle) / "TileConfiguration.txt"
+
+        from ppm_library.imaging.writer import TifWriterUtils as PpmWriterUtils
+
+        biref_pixel_size = hardware.get_pixel_size_um()
+        biref_pos_img = angle_images[pos_angle]
+        biref_neg_img = angle_images[neg_angle]
+        ctx.write_pool.submit(
+            PpmWriterUtils.create_normalized_birefringence_tile,
+            pos_image=biref_pos_img,
+            neg_image=biref_neg_img,
+            output_dir=biref_dir,
+            filename=filename,
+            pixel_size_um=biref_pixel_size,
+            tile_config_source=tile_config_source,
+            logger=logger,
+            min_intensity=params.get("biref_min_intensity", 0),
+        )
+    else:
+        logger.warning(
+            f"Skipping birefringence for tile {filename}: "
+            f"need both positive (>0, !=90) and negative (<0) angles "
+            f"but got angles={list(angle_images.keys())}"
+        )
+
+    tile_stats.pop("__counts__", None)
+    return tile_worst_sat, tile_role_sat, tile_stats, xy_move_pending
+
+
 def _acquire_tile_angles(
     ctx: AcquisitionContext,
     pos_idx: int,
@@ -4265,7 +4695,26 @@ def _acquire_tile_angles(
     intentionally bright. tile_stats collects p1/p99/mean/std/dynamic_range
     per channel, aggregated across angles -- p1 is min seen, p99 + dynamic
     range are max seen, mean and std are angle-averaged.
+
+    Dispatches on the per-acquisition --inner-axis flag (parsed into
+    ctx.params["inner_axis"]):
+      - "angle" (default, current behavior): z-outer / angle-inner. Every
+        angle is re-acquired at each z plane before z advances. Tight
+        per-z registration across angles.
+      - "z": angle-outer / z-inner. Each angle sweeps its full z-stack
+        before rotating to the next angle. Fewer rotation-stage moves per
+        tile (angles instead of angles x z_planes); faster when z-stacking
+        thicker tissue slides on a 40x objective.
     """
+    inner_axis = ctx.params.get("inner_axis") or "angle"
+    if inner_axis == "z":
+        return _acquire_tile_angles_angle_outer(
+            ctx, pos_idx, pos, filename, current_stage_pos, xy_move_pending
+        )
+    # Fall through to the default z-outer / angle-inner body below for
+    # inner_axis in {"angle", None, anything-else}. Preserves byte-identical
+    # behavior for callers that don't set --inner-axis.
+
     logger = ctx.logger
     hardware = ctx.hardware
     params = ctx.params
@@ -4647,6 +5096,221 @@ def _acquire_tile_angles(
     return tile_worst_sat, tile_role_sat, tile_stats, xy_move_pending
 
 
+def _acquire_tile_channels_z_outer(
+    ctx: AcquisitionContext, pos, filename: str, current_stage_pos
+) -> Tuple[dict, dict, dict]:
+    """Z-outer / channel-inner variant of widefield acquisition.
+
+    Acquires every channel at each Z plane, then steps Z. Used when
+    --inner-axis channel is set. Trades hardware-switch cost (now
+    channels x z_planes filter changes per tile instead of channels)
+    for tight per-channel z registration -- right for live or
+    drifting samples where channels acquired minutes apart at the
+    same nominal z would otherwise decorrelate.
+
+    Mirrors the saturation, projection and metadata semantics of the
+    default _acquire_tile_channels body, but accumulators live outside
+    the z loop so projection runs once at the end per channel.
+    """
+    logger = ctx.logger
+    hardware = ctx.hardware
+    tile_worst_sat = {}
+    tile_role_sat = {
+        SATURATION_ROLE_LOW: 0.0,
+        SATURATION_ROLE_HIGH: 0.0,
+        SATURATION_ROLE_NORMAL: 0.0,
+    }
+    tile_stats: dict = {}
+
+    CHANNEL_SAT_RUNAWAY_N = 3
+    CHANNEL_SAT_PCT_THRESHOLD = 5.0
+
+    channel_plan = resolve_channel_plan(
+        ctx.ppm_settings,
+        ctx.params.get("scan_type", ""),
+        ctx.params.get("channels", []) or [],
+        ctx.params.get("channel_exposures", []) or [],
+        channel_intensity_overrides=ctx.params.get("channel_intensities") or None,
+    )
+
+    center_z = current_stage_pos.z
+
+    # Per-channel state retained outside the z loop so projection and
+    # saturation aggregation happen after the full sweep completes.
+    per_channel_state: dict = {}
+    for ch_entry in channel_plan:
+        ch_id = ch_entry["id"]
+        per_channel_state[ch_id] = {
+            "entry": ch_entry,
+            "z_stack_planes": [],
+            "worst_sat_for_channel": {},
+        }
+
+    for z_idx, z_offset in enumerate(ctx.z_offsets):
+        if ctx.z_stack_enabled and z_offset != 0.0:
+            target_z = center_z + z_offset
+            hardware.move_to_position(Position(z=target_z))
+            logger.debug(
+                "Z-outer: plane %d/%d, Z=%.2f (offset=%+.1f)",
+                z_idx + 1,
+                len(ctx.z_offsets),
+                target_z,
+                z_offset,
+            )
+
+        for ch_entry in channel_plan:
+            ch_id = ch_entry["id"]
+            state = per_channel_state[ch_id]
+
+            # Re-apply per-channel hardware on every visit -- the previous
+            # channel at this z plane changed cube / light source. Exposure
+            # is per-channel and must be re-set too.
+            apply_channel_hardware_state(
+                hardware, ch_entry, logger, preset_cache=ctx.channel_preset_cache
+            )
+            exposure_ms = float(ch_entry.get("exposure_ms") or 0)
+            if exposure_ms > 0:
+                hardware.set_exposure(exposure_ms)
+                logger.debug("Channel %s: set exposure to %.2f ms", ch_id, exposure_ms)
+
+            image, metadata = hardware.snap_image()
+
+            # Per-channel flat-field correction (same as the default path).
+            if ctx.channel_background_images and ch_id in ctx.channel_background_images:
+                try:
+                    image = BackgroundCorrectionUtils.apply_flat_field_correction(
+                        image,
+                        ctx.channel_background_images[ch_id],
+                        scaling_factor=1.0,
+                        method=ctx.background_correction_method or "divide",
+                    )
+                    logger.debug(
+                        "  Applied %s background for channel %s",
+                        ctx.background_correction_method or "divide",
+                        ch_id,
+                    )
+                except Exception as bg_e:
+                    logger.warning("  Channel %s background correction failed: %s", ch_id, bg_e)
+
+            sat_result = _check_saturation(image, f"tile[{ch_id}]", logger)
+            if sat_result:
+                for ch_key, pct in sat_result.items():
+                    if pct > state["worst_sat_for_channel"].get(ch_key, 0):
+                        state["worst_sat_for_channel"][ch_key] = pct
+                worst_this_channel = max(sat_result.values()) if sat_result else 0.0
+                if worst_this_channel > tile_role_sat[SATURATION_ROLE_NORMAL]:
+                    tile_role_sat[SATURATION_ROLE_NORMAL] = worst_this_channel
+
+            try:
+                _accumulate_tile_stats(tile_stats, _compute_tile_stats(image))
+            except Exception as stats_err:
+                logger.debug(f"  Stats compute failed for {ch_id}: {stats_err}")
+
+            if not ctx.z_stack_enabled:
+                # 2D mode: save directly. (Z-outer collapses to the same
+                # write path as the default mode here -- no projection.)
+                image_path = ctx.output_path / str(ch_id) / filename
+                if image_path.parent.exists():
+                    bf_pixel_size = hardware.get_pixel_size_um()
+                    ctx.write_pool.submit(
+                        ome_tiff_writer,
+                        filename=str(image_path),
+                        pixel_size_um=bf_pixel_size,
+                        data=image,
+                    )
+                    ctx.image_count += 1
+                    ctx.update_progress(ctx.image_count, ctx.total_images)
+                try:
+                    write_position_metadata(
+                        ctx.metadata_txt_for_positions, image_path, hardware, ctx.modality
+                    )
+                except Exception as e:
+                    logger.warning(
+                        f"  Failed to write position text {ctx.metadata_txt_for_positions}: {e}"
+                    )
+            else:
+                # Z-stack: accumulate planes for end-of-sweep projection.
+                state["z_stack_planes"].append(image)
+                if ctx.save_raw_tiles:
+                    z_plane_path = ctx.output_path / str(ch_id) / f"z{z_idx:03d}" / filename
+                    z_plane_path.parent.mkdir(parents=True, exist_ok=True)
+                    ctx.write_pool.submit(
+                        ome_tiff_writer,
+                        filename=str(z_plane_path),
+                        pixel_size_um=hardware.get_pixel_size_um(),
+                        data=image,
+                    )
+                ctx.image_count += 1
+                ctx.update_progress(ctx.image_count, ctx.total_images)
+
+    # Post-sweep: per-channel projection (z-stack only).
+    if ctx.z_stack_enabled and ctx.projection_fn is not None:
+        for ch_entry in channel_plan:
+            ch_id = ch_entry["id"]
+            planes = per_channel_state[ch_id]["z_stack_planes"]
+            if not planes:
+                continue
+            projected = ctx.projection_fn(planes)
+            image_path = ctx.output_path / str(ch_id) / filename
+            if image_path.parent.exists():
+                ctx.write_pool.submit(
+                    ome_tiff_writer,
+                    filename=str(image_path),
+                    pixel_size_um=hardware.get_pixel_size_um(),
+                    data=projected,
+                )
+            logger.info(
+                "Channel %s Z-stack projection (%s) computed for %d planes (z-outer mode)",
+                ch_id,
+                ctx.params.get("z_projection", "max"),
+                len(planes),
+            )
+            try:
+                write_position_metadata(
+                    ctx.metadata_txt_for_positions, image_path, hardware, ctx.modality
+                )
+            except Exception as e:
+                logger.warning(
+                    f"  Failed to write position text {ctx.metadata_txt_for_positions}: {e}"
+                )
+
+    # Per-channel saturation aggregation + runaway detection. Same logic
+    # as the default path but applied once after the full sweep.
+    for ch_entry in channel_plan:
+        ch_id = ch_entry["id"]
+        worst_sat_for_channel = per_channel_state[ch_id]["worst_sat_for_channel"]
+        if worst_sat_for_channel:
+            for ch_key, pct in worst_sat_for_channel.items():
+                key = f"{ch_id}/{ch_key}"
+                if pct > tile_worst_sat.get(key, 0):
+                    tile_worst_sat[key] = pct
+            worst_channel_sat = max(worst_sat_for_channel.values(), default=0.0)
+            if worst_channel_sat > CHANNEL_SAT_PCT_THRESHOLD:
+                ctx.channel_consecutive_saturated[ch_id] = (
+                    ctx.channel_consecutive_saturated.get(ch_id, 0) + 1
+                )
+                if ctx.channel_consecutive_saturated[ch_id] == CHANNEL_SAT_RUNAWAY_N:
+                    logger.error(
+                        "CHANNEL SATURATION RUNAWAY: channel %s has "
+                        "exceeded %.1f%% worst-channel saturation on "
+                        "%d consecutive tiles (current: %.1f%%). "
+                        "Consider cancelling and lowering the %s "
+                        "intensity before more imaging time is wasted.",
+                        ch_id,
+                        CHANNEL_SAT_PCT_THRESHOLD,
+                        CHANNEL_SAT_RUNAWAY_N,
+                        worst_channel_sat,
+                        ch_id,
+                    )
+            else:
+                ctx.channel_consecutive_saturated[ch_id] = 0
+        else:
+            ctx.channel_consecutive_saturated[ch_id] = 0
+
+    tile_stats.pop("__counts__", None)
+    return tile_worst_sat, tile_role_sat, tile_stats
+
+
 def _acquire_tile_channels(
     ctx: AcquisitionContext, pos, filename: str, current_stage_pos
 ) -> Tuple[dict, dict, dict]:
@@ -4655,7 +5319,25 @@ def _acquire_tile_channels(
     Returns (tile_worst_sat, tile_role_sat, tile_stats).
     Channel-based modalities have no angle concept, so all saturation is
     reported under SaturationRole.SIGNAL_NORMAL.
+
+    Dispatches on the per-acquisition --inner-axis flag (parsed into
+    ctx.params["inner_axis"]):
+      - "z" (default, current behavior): channel-outer / z-inner. One channel
+        sweeps its full z-stack before the cube/light path switches to the
+        next channel. Minimizes filter-cube changes; right for fixed slides.
+      - "channel": z-outer / channel-inner. Every channel is re-acquired at
+        each z plane before z advances. Tight per-channel z registration at
+        the cost of channels x z_planes hardware switches per tile; right
+        for live samples or anything where focus drift could decorrelate
+        channels acquired minutes apart.
     """
+    inner_axis = ctx.params.get("inner_axis") or "z"
+    if inner_axis == "channel":
+        return _acquire_tile_channels_z_outer(ctx, pos, filename, current_stage_pos)
+    # Fall through to the default channel-outer / z-inner body below for
+    # inner_axis in {"z", None, anything-else}. Preserves byte-identical
+    # behavior for callers that don't set --inner-axis.
+
     logger = ctx.logger
     hardware = ctx.hardware
     tile_worst_sat = {}
