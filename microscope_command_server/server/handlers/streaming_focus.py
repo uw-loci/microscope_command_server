@@ -263,6 +263,18 @@ EDGE_MIN_AMPLITUDE = 0.025
 # initial Z, comfortably wider than typical drift.
 METRIC_FLAT_WIDEN_FACTOR = 2.0
 
+# Phase D (2026-05-15): no-improvement abort for the metric_flat
+# widening loop. If attempt N's primary amplitude_ratio is not at
+# least this factor larger than attempt N-1's, AND the gaussian fit
+# R^2 stayed below METRIC_FLAT_NO_IMPROVEMENT_R2, abort instead of
+# widening further. A real peak hiding outside the previous window
+# easily produces 5-10x amplitude growth when newly captured; staying
+# within 1.5x amplitude across a 2x range expansion means the sample
+# itself lacks contrast and further widening will burn motion time
+# for the same refusal.
+METRIC_FLAT_AMPLITUDE_GROWTH_FACTOR = 1.5
+METRIC_FLAT_NO_IMPROVEMENT_R2 = 0.15
+
 # Cap for the widened sweep range. The per-objective YAML field
 # `sweep_range_max_um` overrides this when present. Default 5x the
 # starting `sweep_range_um` so the cap scales with operator
@@ -3598,6 +3610,18 @@ def handle_streaming_focus(conn, client, hardware, settings, **kwargs):
     # driven gaussian peak when union-fit is called with one flat
     # attempt's worth of samples.
     any_slope_attempt_seen = False
+    # 2026-05-15: track the previous metric_flat attempt's primary
+    # amplitude_ratio so we can short-circuit widening when 2x range
+    # produces ~the same amplitude. Sparse samples (e.g. PollenIF on
+    # bare agar) cannot grow a peak by widening; widening from 50 ->
+    # 100 -> 200 um at ~6 um/s burns ~60 s of pure motion for a refusal
+    # the operator would get anyway. The gate compares attempt N's
+    # primary amplitude_ratio against attempt N-1's: if widening did
+    # not produce at least METRIC_FLAT_AMPLITUDE_GROWTH_FACTOR x
+    # growth AND the gaussian R^2 is still below
+    # METRIC_FLAT_NO_IMPROVEMENT_R2, abort -- the peak is not hiding
+    # outside the window, the sample lacks contrast.
+    prev_flat_amplitude_ratio: Optional[float] = None
 
     try:
         for attempt_idx in range(max_attempts):
@@ -3819,6 +3843,47 @@ def handle_streaming_focus(conn, client, hardware, settings, **kwargs):
                                 )
                     except Exception as p98_diag_ex:
                         logger.debug("STREAM_AF:p98_p2 diagnostic failed: %s", p98_diag_ex)
+
+                # Phase D (2026-05-15): compute this attempt's primary
+                # amplitude_ratio + R^2 so we can detect "widening did
+                # not reveal a peak" and abort before burning another
+                # scan. See METRIC_FLAT_AMPLITUDE_GROWTH_FACTOR comment.
+                cur_amplitude_ratio: Optional[float] = None
+                cur_r2: Optional[float] = None
+                if result.samples_trace:
+                    ms_pri_gate = [float(s[2]) for s in result.samples_trace if len(s) >= 3]
+                    if ms_pri_gate:
+                        pri_range_gate = max(ms_pri_gate) - min(ms_pri_gate)
+                        cur_amplitude_ratio = pri_range_gate / max(abs(max(ms_pri_gate)), 1e-6)
+                        if len(ms_pri_gate) >= MIN_FRAMES_FOR_FIT:
+                            zs_pri_gate = [float(s[1]) for s in result.samples_trace if len(s) >= 3]
+                            fit_pri_gate = _gaussian_peak(zs_pri_gate, ms_pri_gate)
+                            if fit_pri_gate is not None:
+                                _, cur_r2, _ = fit_pri_gate
+
+                if prev_flat_amplitude_ratio is not None and cur_amplitude_ratio is not None:
+                    grew = cur_amplitude_ratio > (
+                        prev_flat_amplitude_ratio * METRIC_FLAT_AMPLITUDE_GROWTH_FACTOR
+                    )
+                    r2_poor = (cur_r2 is None) or (cur_r2 < METRIC_FLAT_NO_IMPROVEMENT_R2)
+                    if not grew and r2_poor:
+                        logger.info(
+                            "STREAM_AF:%s: metric_flat no-improvement abort -- "
+                            "amplitude %.2f%% vs prior %.2f%% "
+                            "(growth factor %.2fx < %.2fx), R^2=%.2f. "
+                            "Widening cannot reveal a peak; sample likely "
+                            "lacks contrast at this depth.",
+                            label,
+                            cur_amplitude_ratio * 100.0,
+                            prev_flat_amplitude_ratio * 100.0,
+                            cur_amplitude_ratio / max(prev_flat_amplitude_ratio, 1e-9),
+                            METRIC_FLAT_AMPLITUDE_GROWTH_FACTOR,
+                            cur_r2 if cur_r2 is not None else 0.0,
+                        )
+                        final_result = result
+                        break
+
+                prev_flat_amplitude_ratio = cur_amplitude_ratio
 
                 if range_um >= sweep_range_max_um:
                     logger.info(
