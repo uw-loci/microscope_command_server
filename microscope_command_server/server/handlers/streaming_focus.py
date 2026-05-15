@@ -242,6 +242,35 @@ FLAT_METRIC_GAUSSIAN_R2 = 0.70
 # check needed -- the peak is unambiguous.
 FLAT_METRIC_AMPLITUDE_TRUSTED = 0.15
 
+# Minimum amplitude required for the mu-at-boundary edge classifier
+# to fire. A clean R^2 gaussian on pure noise can pin mu to either
+# boundary at sub-2% amplitudes, giving a coin-flip "direction" that
+# the retry loop then walks. Empirical: legitimate low-contrast
+# pinned-edge cases at 10x run 5-8% amplitude (well above this
+# floor); the failure mode that motivates the gate is at 1.66%
+# amplitude with R^2=0.94 on a pure-noise sub-section of a 40x scan
+# whose true focus was hidden in the head-discard region (2026-05-15
+# OWS3 log server_session_20260514_224715.log). 2.5% gives margin
+# above the failure case without rejecting the legitimate ones.
+EDGE_MIN_AMPLITUDE = 0.025
+
+# Phase B (2026-05-15): when an attempt is classified `metric_flat`,
+# the next attempt keeps the same center but multiplies the scan
+# range by this factor. Without widening, retries that shift by
+# range_um also miss focus when initial Z is far from true focus.
+# 2.0x growth captures most realistic offsets within MAX_EDGE_RETRIES
+# attempts (3 total): 20 -> 40 -> 80 um covers 80 um around the
+# initial Z, comfortably wider than typical drift.
+METRIC_FLAT_WIDEN_FACTOR = 2.0
+
+# Cap for the widened sweep range. The per-objective YAML field
+# `sweep_range_max_um` overrides this when present. Default 5x the
+# starting `sweep_range_um` so the cap scales with operator
+# calibration. Hard floor of 50 um so even a tiny configured range
+# can grow into a useful search.
+METRIC_FLAT_WIDEN_DEFAULT_MULTIPLIER = 5.0
+METRIC_FLAT_WIDEN_HARD_FLOOR_UM = 50.0
+
 # Maximum number of edge-retry attempts beyond the first scan. Each
 # retry shifts the scan window one full range in the direction of
 # the previously-detected peak. With 2 retries (MAX_EDGE_RETRIES=2)
@@ -1462,7 +1491,8 @@ def _run_streaming_scan(
     velocity_um_s: float = 11.5,
     metric_name: str = DEFAULT_METRIC_NAME,
     dump_dir: Optional[Path] = None,
-) -> List[Tuple[float, float, float]]:
+    secondary_metric_name: Optional[str] = None,
+) -> List[Tuple[float, float, float, Optional[float]]]:
     """Execute the streaming-sample scan and return a list of
     (t_capture_ms, z_interp, metric) triples. Leaves the camera in
     whatever streaming state it was in on entry (caller is
@@ -1930,6 +1960,21 @@ def _run_streaming_scan(
             logger.debug("STREAM_AF:metric compute failed: %s", e)
             continue
 
+        # Phase C: compute secondary metric in parallel when requested.
+        # The p98_p2 percentile-spread metric has a wider "in range"
+        # window than tenengrad (intensity range persists several DOFs
+        # further than edge sharpness); when the primary metric falls
+        # into noise the secondary can still carry directional signal.
+        # Skipped silently on compute failure so the scan does not abort
+        # on a transient metric error -- the diagnostic log later just
+        # reports "secondary unavailable".
+        secondary = None
+        if secondary_metric_name is not None and secondary_metric_name != metric_name:
+            try:
+                secondary = _focus_metric(img, secondary_metric_name)
+            except Exception:
+                secondary = None
+
         # Z from wall time * velocity. This is now directly
         # accurate -- no camera_period back-fill, no inference.
         if wall_ms <= 0:
@@ -1939,7 +1984,7 @@ def _run_streaming_scan(
         else:
             progress_um = (wall_ms / 1000.0) * velocity_um_s * direction
             z_interp = z_start + progress_um
-        samples.append((wall_ms, float(z_interp), metric))
+        samples.append((wall_ms, float(z_interp), metric, secondary))
         if dump_records is not None:
             dump_records.append((wall_ms, img, float(z_interp), metric))
 
@@ -2142,6 +2187,7 @@ def _attempt_one_scan(
     slow_value: str = SLOW_SPEED_VALUE,
     normal_value: str = NORMAL_SPEED_VALUE,
     dump_dir: Optional[Path] = None,
+    secondary_metric_name: Optional[str] = None,
 ) -> _ScanAttemptResult:
     """Run one streaming AF scan centered on z_center with the given range.
 
@@ -2257,6 +2303,7 @@ def _attempt_one_scan(
                 velocity_um_s=velocity_um_s,
                 metric_name=metric_name,
                 dump_dir=dump_dir,
+                secondary_metric_name=secondary_metric_name,
             )
         finally:
             if sequence_started_here:
@@ -2368,12 +2415,17 @@ def _attempt_one_scan(
         # still admit accel artifacts; a fixed floor is safer.
         HEAD_DISCARD_MS = 600.0
 
-        clean = [
-            (t, z, m)
-            for (t, z, m) in samples
-            if z == z and m == m and math.isfinite(z) and math.isfinite(m)
-        ]
-        in_motion = [(t, z, m) for (t, z, m) in clean if HEAD_DISCARD_MS <= t <= time_cutoff_ms]
+        # Phase C: samples now carry an optional 4th element (secondary
+        # metric, e.g. p98_p2 when running alongside tenengrad). Pass
+        # through unchanged so downstream code can reach into s[3] when
+        # the secondary is available. Existing s[0]/s[1]/s[2] consumers
+        # still work.
+        def _is_clean(s):
+            t, z, m = s[0], s[1], s[2]
+            return z == z and m == m and math.isfinite(z) and math.isfinite(m)
+
+        clean = [s for s in samples if _is_clean(s)]
+        in_motion = [s for s in clean if HEAD_DISCARD_MS <= s[0] <= time_cutoff_ms]
         logger.info(
             "STREAM_AF:%sin_motion filter kept %d/%d samples "
             "(head_discard=%.0fms time_cutoff=%.0fms motion_end=%.0fms)",
@@ -2446,7 +2498,15 @@ def _attempt_one_scan(
                 # peak_z=-18.1 is 6.9 um from commanded z_lo=-25, outside
                 # the 5 um tolerance. mu-at-boundary correctly flags it
                 # as edge_low; retry shifts to center=-50, finds focus.
-                if shape_ok and not amplitude_above_floor:
+                # Phase A (2026-05-15): require amplitude above EDGE_MIN_AMPLITUDE
+                # in addition to shape_ok before extrapolating a directional hint
+                # from a boundary-pinned mu. Below this floor a clean-shaped
+                # gaussian can fit pure noise; the boundary-pin "direction" is
+                # then arbitrary and the retry walks the wrong way. Falling
+                # through here routes the case to the metric_flat refusal path,
+                # which Phase B widens on the next attempt.
+                edge_amplitude_ok = metric_range_frac >= EDGE_MIN_AMPLITUDE
+                if shape_ok and not amplitude_above_floor and edge_amplitude_ok:
                     z_min_sampled = float(min(zs))
                     z_max_sampled = float(max(zs))
                     mu_fit = float(gaussian_fit[0]) if gaussian_fit is not None else 0.0
@@ -2605,7 +2665,8 @@ def _attempt_one_scan(
                 # Logged at DEBUG so production operator logs are not
                 # flooded with 100s of lines per refusal; the WARNING
                 # summary line above is enough for operator visibility.
-                for i, (t, z, m) in enumerate(in_motion):
+                for i, s in enumerate(in_motion):
+                    t, z, m = s[0], s[1], s[2]
                     logger.debug(
                         "STREAM_AF:%sFLAT sample %3d  t=%7.1f ms  z=%.3f  metric=%.4f",
                         tag_prefix,
@@ -2671,7 +2732,8 @@ def _attempt_one_scan(
         # detailed trace is for the FLAT-refusal branch (still INFO --
         # see ~50 lines earlier) and for log-level=DEBUG triage.
         if logger.isEnabledFor(logging.DEBUG):
-            for i, (t, z, m) in enumerate(in_motion):
+            for i, s in enumerate(in_motion):
+                t, z, m = s[0], s[1], s[2]
                 logger.debug(
                     "STREAM_AF:%ssample %3d  t=%7.1f ms  z=%.3f  metric=%.4f",
                     tag_prefix,
@@ -2686,7 +2748,7 @@ def _attempt_one_scan(
         # first 10% of the sweep with metric flat across the rest" is
         # the textbook coverslip / stale-buffer signature.
         try:
-            metrics_arr = [m for (_, _, m) in in_motion]
+            metrics_arr = [s[2] for s in in_motion]
             if metrics_arr and raw_peak_idx is not None:
                 head_frac = (raw_peak_idx + 1) / max(len(metrics_arr), 1)
                 tail_metrics = metrics_arr[max(raw_peak_idx + 5, 0) :]
@@ -3193,6 +3255,58 @@ def handle_streaming_focus(conn, client, hardware, settings, **kwargs):
         range_um = float(af_entry.get("sweep_range_um", FALLBACK_RANGE_UM))
         logger.info("STREAM_AF:using sweep_range_um from yaml = %.2f um", range_um)
 
+    # Phase B: resolve the widening cap. Per-objective YAML override wins;
+    # default is METRIC_FLAT_WIDEN_DEFAULT_MULTIPLIER x the starting range
+    # with a hard floor so a tiny configured range can still grow into a
+    # useful search.
+    initial_range_um = range_um
+    yaml_max_range = af_entry.get("sweep_range_max_um") if af_entry else None
+    if yaml_max_range is not None:
+        try:
+            sweep_range_max_um = max(initial_range_um, float(yaml_max_range))
+        except (TypeError, ValueError):
+            logger.warning(
+                "STREAM_AF:sweep_range_max_um=%r is not numeric; falling back to default cap",
+                yaml_max_range,
+            )
+            sweep_range_max_um = max(
+                METRIC_FLAT_WIDEN_HARD_FLOOR_UM,
+                initial_range_um * METRIC_FLAT_WIDEN_DEFAULT_MULTIPLIER,
+            )
+    else:
+        sweep_range_max_um = max(
+            METRIC_FLAT_WIDEN_HARD_FLOOR_UM,
+            initial_range_um * METRIC_FLAT_WIDEN_DEFAULT_MULTIPLIER,
+        )
+    logger.info(
+        "STREAM_AF:metric_flat widen cap = %.2f um (initial range %.2f um, factor %.1fx)",
+        sweep_range_max_um,
+        initial_range_um,
+        METRIC_FLAT_WIDEN_FACTOR,
+    )
+
+    # Phase C: parallel p98_p2 scoring. The per-objective YAML toggle
+    # `p98_p2_fallback_enabled` (already present on shipped configs)
+    # gates whether we compute the p98_p2 percentile-spread metric
+    # alongside the primary metric on every captured frame. When the
+    # primary metric falls into noise (metric_flat) on an attempt, the
+    # post-attempt diagnostic compares amplitudes between the two so
+    # the operator can see whether p98_p2 would have carried signal
+    # where the primary did not.
+    p98_fallback_enabled = bool(af_entry.get("p98_p2_fallback_enabled", True)) if af_entry else True
+    secondary_metric_name = None
+    if p98_fallback_enabled and metric_name != "p98_p2":
+        secondary_metric_name = "p98_p2"
+        logger.info(
+            "STREAM_AF:p98_p2 fallback scoring enabled " "(primary='%s', secondary='%s')",
+            metric_name,
+            secondary_metric_name,
+        )
+    elif metric_name == "p98_p2":
+        logger.info("STREAM_AF:primary metric is p98_p2; no secondary needed")
+    else:
+        logger.info("STREAM_AF:p98_p2 fallback disabled by yaml (p98_p2_fallback_enabled=false)")
+
     # --- streaming_af YAML config (populated by setup-wizard probe) ---
     # The block at stage.streaming_af in config_<scope>.yml drives the
     # speed values used during the sweep. Each key falls back to the
@@ -3530,6 +3644,7 @@ def handle_streaming_focus(conn, client, hardware, settings, **kwargs):
                 slow_value=eff_slow_value,
                 normal_value=eff_normal_value,
                 dump_dir=attempt_dump_dir,
+                secondary_metric_name=secondary_metric_name,
             )
             attempts_log.append(
                 f"{label}: center={current_center:.3f} "
@@ -3607,6 +3722,119 @@ def handle_streaming_focus(conn, client, hardware, settings, **kwargs):
                 logger.info(
                     "STREAM_AF:edge_high -- next attempt center will be %.3f", current_center
                 )
+                continue
+
+            # Phase B (2026-05-15): metric_flat now triggers a widening
+            # retry instead of aborting. Keep the same center; multiply the
+            # range by METRIC_FLAT_WIDEN_FACTOR, capped at sweep_range_max_um.
+            # The previous "abort on metric_flat" path produced UNAVAILABLE
+            # whenever attempt 1 didn't capture focus -- but the cause is
+            # frequently "scan range too narrow for the initial-Z offset
+            # from true focus", which widening solves directly. If the cap
+            # is already reached we still abort.
+            if result.status == "metric_flat":
+                # Phase C (2026-05-15): when the primary metric is flat
+                # but the secondary (p98_p2) was scored in parallel, run
+                # a gaussian fit on the secondary scores. If it shows
+                # above-floor amplitude with a clean shape, surface mu /
+                # direction as a diagnostic so the operator can switch
+                # score_metric in the per-objective YAML. The retry loop
+                # itself still widens; future work can use the secondary
+                # fit to direct the next center, but for now we log so
+                # the field can confirm whether p98_p2 actually helps
+                # before we commit to auto-switching direction.
+                if secondary_metric_name is not None and result.samples_trace:
+                    try:
+                        zs_sec = [
+                            float(s[1])
+                            for s in result.samples_trace
+                            if len(s) >= 4 and s[3] is not None
+                        ]
+                        ms_sec = [
+                            float(s[3])
+                            for s in result.samples_trace
+                            if len(s) >= 4 and s[3] is not None
+                        ]
+                        if len(zs_sec) >= MIN_FRAMES_FOR_FIT:
+                            peak_sec = max(ms_sec)
+                            trough_sec = min(ms_sec)
+                            range_sec = peak_sec - trough_sec
+                            range_frac_sec = range_sec / max(abs(peak_sec), 1e-6)
+                            fit_sec = _gaussian_peak(zs_sec, ms_sec)
+                            if fit_sec is not None:
+                                mu_sec, r2_sec, sigma_sec = fit_sec
+                                shape_ok_sec = (
+                                    r2_sec >= FLAT_METRIC_GAUSSIAN_R2
+                                    and sigma_sec < 0.45 * max(max(zs_sec) - min(zs_sec), 1e-6)
+                                )
+                                if shape_ok_sec and range_frac_sec >= FLAT_METRIC_FRACTION:
+                                    # Compute primary's amplitude for the
+                                    # log line. The primary samples are
+                                    # accessible via index [2] on each trace
+                                    # entry.
+                                    ms_pri = [
+                                        float(s[2]) for s in result.samples_trace if len(s) >= 3
+                                    ]
+                                    if ms_pri:
+                                        pri_range = max(ms_pri) - min(ms_pri)
+                                        pri_frac = pri_range / max(abs(max(ms_pri)), 1e-6)
+                                    else:
+                                        pri_frac = 0.0
+                                    logger.warning(
+                                        "STREAM_AF:%s: primary metric '%s' flat "
+                                        "(range %.2f%%) but '%s' fit shows "
+                                        "mu=%.3f amplitude=%.2f%% R^2=%.2f "
+                                        "sigma=%.2f -- consider switching "
+                                        "score_metric to '%s' for this "
+                                        "modality+objective.",
+                                        label,
+                                        metric_name,
+                                        pri_frac * 100.0,
+                                        secondary_metric_name,
+                                        mu_sec,
+                                        range_frac_sec * 100.0,
+                                        r2_sec,
+                                        sigma_sec,
+                                        secondary_metric_name,
+                                    )
+                                else:
+                                    logger.info(
+                                        "STREAM_AF:%s: primary flat; '%s' also "
+                                        "weak (amplitude %.2f%%, R^2=%.2f, "
+                                        "sigma=%.2f) -- widening is the right "
+                                        "next step.",
+                                        label,
+                                        secondary_metric_name,
+                                        range_frac_sec * 100.0,
+                                        r2_sec,
+                                        sigma_sec,
+                                    )
+                            else:
+                                logger.info(
+                                    "STREAM_AF:%s: primary flat; '%s' fit "
+                                    "did not converge (amplitude %.2f%%)",
+                                    label,
+                                    secondary_metric_name,
+                                    range_frac_sec * 100.0,
+                                )
+                    except Exception as p98_diag_ex:
+                        logger.debug("STREAM_AF:p98_p2 diagnostic failed: %s", p98_diag_ex)
+
+                if range_um >= sweep_range_max_um:
+                    logger.info(
+                        "STREAM_AF:metric_flat at max range %.2f um -- aborting retry loop",
+                        range_um,
+                    )
+                    final_result = result
+                    break
+                widened_range = min(range_um * METRIC_FLAT_WIDEN_FACTOR, sweep_range_max_um)
+                logger.info(
+                    "STREAM_AF:metric_flat -- widening range %.2f -> %.2f um at same center %.3f",
+                    range_um,
+                    widened_range,
+                    current_center,
+                )
+                range_um = widened_range
                 continue
 
             # Any other status (insufficient_samples, error) aborts
