@@ -1760,13 +1760,43 @@ def _run_streaming_scan(
                 t_reached_z_end_ms = t_ms
                 break
 
+        # 2026-05-16: per-interval velocity + fraction-at-end. The
+        # endpoint-based observed_avg_velocity is fooled when the stage
+        # jumps fast at the start then sits at z_end -- the (start, end)
+        # slope still matches configured slow velocity because the
+        # AVERAGE displacement-over-time is correct. To catch this
+        # failure mode (observed OWS3 Prior Z 2026-05-16: 55 um move
+        # completed in 326ms = 169 um/s, then 8.78 s stationary;
+        # endpoint avg = 6.05 um/s which matched configured 6.08, so
+        # the old check suppressed it as a glitch and let the metric
+        # fit run on identical frames), compute (a) the max
+        # per-interval velocity and (b) the fraction of samples that
+        # ended up at z_end. Both robust signals of the sustained
+        # rapid-jump pattern -- a single spurious encoder reading
+        # contributes one outlier interval but doesn't move
+        # fraction_at_end materially.
+        max_interval_velocity_um_s = 0.0
+        n_at_z_end = 0
+        for i, (t_ms, z) in enumerate(z_poll_samples):
+            if abs(z - z_end) <= Z_END_REACHED_TOLERANCE_UM:
+                n_at_z_end += 1
+            if i > 0:
+                t_prev, z_prev = z_poll_samples[i - 1]
+                dt_ms = t_ms - t_prev
+                if dt_ms > 0:
+                    v = abs(z - z_prev) / (dt_ms / 1000.0)
+                    if v > max_interval_velocity_um_s:
+                        max_interval_velocity_um_s = v
+        fraction_at_end = n_at_z_end / len(z_poll_samples)
+
         # Sample the start to confirm we actually started near z_start.
         z_start_actual = first_z
 
         logger.info(
             "STREAM_AF:Z-poll trace: n=%d, first(t=%.0fms, Z=%.3f), "
             "last(t=%.0fms, Z=%.3f), observed_avg_velocity=%.2f um/s "
-            "(configured %.2f um/s), reached_z_end at t=%s",
+            "(configured %.2f um/s), max_interval=%.1f um/s, "
+            "fraction_at_z_end=%.0f%%, reached_z_end at t=%s",
             len(z_poll_samples),
             first_t,
             z_start_actual,
@@ -1774,6 +1804,8 @@ def _run_streaming_scan(
             last_z,
             observed_avg_velocity_um_s,
             velocity_um_s,
+            max_interval_velocity_um_s,
+            fraction_at_end * 100,
             (
                 f"{t_reached_z_end_ms:.0f}ms"
                 if t_reached_z_end_ms is not None
@@ -1781,38 +1813,35 @@ def _run_streaming_scan(
             ),
         )
 
-        # Smoking-gun warning. Two signals must agree before firing:
-        # (a) the Z-poll trace shows the stage *appeared* to reach
-        # z_end in less than half the expected time, AND
-        # (b) the average velocity across the full poll window is
-        # also at least 2x the configured slow speed.
-        #
-        # Both signals are required because some stage adapters
-        # occasionally return the commanded destination Z from
-        # get_position() during the move, which produces a single
-        # spurious sample at z_end early in the trace. In that case
-        # the avg velocity over the whole trace still matches
-        # configured -- the early reached_z_end timestamp is noise,
-        # not a real fast-move. (Observed on the ASI ZDrive 2026-05-13:
-        # reached_z_end at t=306ms but avg_velocity = 6.03 um/s vs
-        # configured 6.08 um/s, with a clean Pearson r=-0.927 metric
-        # slope confirming the stage really did move slowly.)
+        # Smoking-gun rapid-jump detection. Three independent signals
+        # need to align before firing -- protects against single-poll
+        # glitches like the ASI ZDrive 2026-05-13 case (one spurious
+        # commanded-Z reading early in the trace) while catching the
+        # sustained Prior Z fast-jump pattern (2026-05-16 OWS3):
+        # (a) reached z_end in < 50% of expected motion duration
+        # (b) sustained: > 50% of poll samples are at z_end (not a
+        #     single spurious reading)
+        # (c) at least one inter-poll interval shows velocity > 5x
+        #     configured (the actual fast move)
         reached_z_end_early = (
             t_reached_z_end_ms is not None and t_reached_z_end_ms < motion_duration_ms * 0.5
         )
+        sustained_at_end = fraction_at_end > 0.50
+        had_fast_interval = max_interval_velocity_um_s > velocity_um_s * 5.0
+        # Kept for the legacy log message and the "weak" branch below
         avg_velocity_high = observed_avg_velocity_um_s > velocity_um_s * 2.0
-        if reached_z_end_early and not avg_velocity_high:
+        if reached_z_end_early and not (sustained_at_end and had_fast_interval):
             logger.debug(
                 "STREAM_AF:Z-poll glitch suppressed -- reached_z_end at "
-                "t=%.0fms looks early vs motion_duration_ms=%.0f, but "
-                "observed_avg_velocity=%.2f um/s matches configured "
-                "%.2f um/s. Likely a single spurious Z reading; ignoring.",
+                "t=%.0fms looks early but signal not sustained "
+                "(fraction_at_end=%.0f%%, max_interval=%.1f um/s vs %.1f "
+                "configured). Likely a spurious Z reading; ignoring.",
                 t_reached_z_end_ms,
-                motion_duration_ms,
-                observed_avg_velocity_um_s,
+                fraction_at_end * 100,
+                max_interval_velocity_um_s,
                 velocity_um_s,
             )
-        if reached_z_end_early and avg_velocity_high:
+        if reached_z_end_early and sustained_at_end and had_fast_interval:
             # Compute the in-motion velocity (during the actual move
             # only, NOT averaged over the full poll window). This is
             # the number you actually want to put into
@@ -1937,6 +1966,23 @@ def _run_streaming_scan(
                     accepts_fractional,
                     ", ".join(int_results),
                 )
+
+            # Raise so the caller can return UNAVAILABLE with an
+            # actionable message instead of running the metric fit on
+            # essentially-identical frames captured during the post-
+            # motion stationary period. Retrying with a wider range
+            # cannot help; the stage will just jump faster.
+            raise _RapidJumpDetected(
+                f"Z stage made a rapid jump rather than slow continuous motion -- "
+                f"completed {abs(z_end - z_start):.1f}um move in "
+                f"{t_reached_z_end_ms:.0f}ms ({in_motion_velocity_um_s:.0f}um/s actual, "
+                f"vs configured {velocity_um_s:.1f}um/s). The slow_speed_value "
+                f"YAML setting is not being honored by this stage's non-blocking-move "
+                f"path. Use Sweep Focus instead (it uses blocking step-and-snap "
+                f"and works on this controller), or find a stage property that "
+                f"actually slows continuous motion -- see property survey "
+                f"WARNINGs above. Re-running streaming AF will fail the same way."
+            )
         elif observed_avg_velocity_um_s > velocity_um_s * 3.0:
             logger.warning(
                 "STREAM_AF:STAGE SPEED MISMATCH -- observed avg velocity "
@@ -2220,6 +2266,22 @@ def _dump_streaming_scan(
 # ----- Handler entry point -----
 
 
+class _RapidJumpDetected(Exception):
+    """Raised by _run_streaming_scan when the Z-poll trace shows the
+    stage jumped to z_end nearly instantly and then sat there, rather
+    than moving continuously at the configured slow velocity.
+
+    This is a structural failure of the streaming AF approach on the
+    current rig -- the stage controller is ignoring the slow_speed_value
+    property for non-blocking moves. Retrying with a wider range will
+    not help; the only fix is operator action (switch to Sweep Focus
+    or find a stage property that actually slows continuous motion).
+
+    Carries an actionable message for the caller to surface to the
+    operator via UNAVAILABLE response.
+    """
+
+
 class _ScanAttemptResult:
     """Result of one _attempt_one_scan call.
 
@@ -2236,6 +2298,12 @@ class _ScanAttemptResult:
                                  for streaming (property absent or value
                                  rejected); caller should route this
                                  acquisition to the Brent fallback
+        'rapid_jump'          -- stage jumped to z_end then sat; the
+                                 slow_speed_value property is not
+                                 controlling continuous motion velocity
+                                 on this rig. No retry can help; the
+                                 operator must use Sweep Focus or
+                                 reconfigure the stage driver.
         'error'               -- hardware or protocol error mid-scan
     """
 
@@ -2375,18 +2443,33 @@ def _attempt_one_scan(
                 range_um * HARD_DEADLINE_SEC_PER_UM + 2.0,
                 motion_duration_s + 2.0,
             )
-            samples = _run_streaming_scan(
-                core,
-                focus_device,
-                speed_prop,
-                z_start,
-                z_end,
-                hard_deadline_s,
-                velocity_um_s=velocity_um_s,
-                metric_name=metric_name,
-                dump_dir=dump_dir,
-                secondary_metric_name=secondary_metric_name,
-            )
+            try:
+                samples = _run_streaming_scan(
+                    core,
+                    focus_device,
+                    speed_prop,
+                    z_start,
+                    z_end,
+                    hard_deadline_s,
+                    velocity_um_s=velocity_um_s,
+                    metric_name=metric_name,
+                    dump_dir=dump_dir,
+                    secondary_metric_name=secondary_metric_name,
+                )
+            except _RapidJumpDetected as rj:
+                # Stage jumped to z_end instead of moving slowly. Surface
+                # the actionable message to the operator and skip the
+                # metric fit -- the captured frames are all at z_end and
+                # any fit would produce garbage. Caller's retry loop
+                # short-circuits on this status.
+                logger.warning("STREAM_AF:%srapid_jump abort -- %s", tag_prefix, rj)
+                return _ScanAttemptResult(
+                    "rapid_jump",
+                    None,
+                    0,
+                    0.0,
+                    str(rj),
+                )
         finally:
             if sequence_started_here:
                 try:
@@ -3769,6 +3852,14 @@ def handle_streaming_focus(conn, client, hardware, settings, **kwargs):
                     fallback_peak_z = float(result.best_z)
 
             if result.status == "success":
+                final_result = result
+                break
+
+            # Rapid-jump short-circuit: stage didn't actually move
+            # slowly. Retrying with a wider range cannot help -- the
+            # stage will still jump to the new z_end then sit. Abort
+            # the whole AF immediately with the actionable message.
+            if result.status == "rapid_jump":
                 final_result = result
                 break
 
