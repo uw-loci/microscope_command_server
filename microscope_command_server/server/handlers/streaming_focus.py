@@ -647,36 +647,19 @@ def _mean_fraction(img) -> float:
 
 
 # Minimum acceptable robust dynamic range (p98-p2 as fraction of full
-# bit depth). NOT the same as strict saturation -- this catches the
-# failure mode where pixel values are squeezed into a narrow band
-# (e.g. 95% of pixels in [50000, 54000] on uint16) without crossing
-# the strict saturation threshold. The focus metric cannot
-# discriminate Z because gradient differences between in-focus and
-# out-of-focus frames don't have enough range to register.
-#
-# Empirical basis (2026-05-15 OWS3 BF seeds analysis): a streaming AF
-# run produced frames with p98-p2 = 4582 counts = 7% of bit depth.
-# Strict saturation was only 0.19% (well under any sane threshold) but
-# 95.7% of pixels were jammed in [50000, 54000]. tenengrad amplitude
-# across a 55 um scan was 0.7%. Standard AF on the same sample at the
-# same Z gave 33-50% tenengrad amplitude -- the metric works on this
-# sample, the streaming pipeline was destroying the contrast. 0.10
-# catches that case with margin; legitimate well-exposed BF/FL frames
-# typically have 30-60%+ dynamic range so the gate has comfortable
-# headroom against false positives.
-MIN_DYNAMIC_RANGE_FRACTION = 0.10
+# bit depth). Below this the focus metric cannot discriminate Z because
+# the histogram is too narrow. 0.05 = 5% of bit depth, which on uint16
+# is ~3300 counts -- below that even brenner_gradient on the highest-
+# contrast in-focus frame produces near-zero variation.
+MIN_DYNAMIC_RANGE_FRACTION = 0.05
 
 # Mean-fraction threshold used to classify a low-range failure as
-# OVEREXPOSED vs LOW-SIGNAL vs LOW-CONTRAST.
-# - mean > OVEREXPOSURE: histogram jammed near top of bit depth ->
-#   reduce exposure or illumination
-# - mean < UNDEREXPOSURE: histogram jammed near zero -> increase
-#   exposure or illumination
-# - mean in middle but range still narrow: low-contrast sample at
-#   this Z -> pick a different region or different metric; no exposure
-#   change will fix it
+# OVEREXPOSED vs LOW-SIGNAL. If mean > this AND dynamic range is below
+# MIN_DYNAMIC_RANGE_FRACTION, the diagnosis is overexposure and the
+# operator should reduce exposure/gain. If mean is also low, the
+# diagnosis is low-signal and the operator should increase exposure or
+# pick a brighter region.
 OVEREXPOSURE_MEAN_THRESHOLD = 0.55
-UNDEREXPOSURE_MEAN_THRESHOLD = 0.15
 
 
 # ----- YAML loader -----
@@ -3772,44 +3755,27 @@ def handle_streaming_focus(conn, client, hardware, settings, **kwargs):
         _restore_roi(core, saved_roi, roi_seq_was_running)
         return
 
-    # Dynamic-range gate. Catches HISTOGRAM COMPRESSION -- distinct
-    # from strict saturation. The pixel histogram is so narrow (p98-p2
-    # span < MIN_DYNAMIC_RANGE_FRACTION of bit depth) that no focus
-    # metric can find Z-dependent gradient differences, even if very
-    # few pixels are at the absolute max. See 2026-05-15 empirical
-    # analysis: streaming AF consumed 9s of motion across a 55um scan
-    # returning amplitude 0.68% because 95.7% of pixels were in
-    # [50000, 54000] (a ~6% band) with only 0.19% strict saturation.
-    # Standard AF on the same sample at the same Z saw 33-50%
-    # amplitude -- the metric works; the streaming pipeline was
-    # destroying the contrast.
-    #
-    # Diagnose based on where the narrow histogram sits:
-    # - high mean   -> overexposure / high baseline   -> reduce exposure
-    # - low mean    -> underexposure / dim region     -> increase exposure
-    # - mid mean    -> genuinely low-contrast sample  -> change region/metric
+    # Dynamic-range gate. Catches the failure mode where the strict
+    # saturation check passes (few pixels at the absolute max) but the
+    # histogram is so narrow that no focus metric can find Z-dependent
+    # variation. See 2026-05-15 empirical analysis: streaming AF
+    # consumed 9s of motion across a 55um scan returning amplitude
+    # 0.68% because pixels were at 79% mean with only 7% dynamic range.
+    # Diagnose as overexposure when mean is also high, low-signal
+    # otherwise.
     if dyn_range_frac < MIN_DYNAMIC_RANGE_FRACTION:
         if mean_frac > OVEREXPOSURE_MEAN_THRESHOLD:
             diagnosis = (
-                f"pixel histogram compressed near top of bit depth "
-                f"(mean {mean_frac * 100:.1f}%, p98-p2 only {dyn_range_frac * 100:.1f}%); "
-                f"camera near full well with no contrast headroom. "
+                f"image overexposed (mean {mean_frac * 100:.1f}% of full well, "
+                f"dynamic range only {dyn_range_frac * 100:.1f}%). "
                 f"Reduce camera exposure or illumination intensity"
-            )
-        elif mean_frac < UNDEREXPOSURE_MEAN_THRESHOLD:
-            diagnosis = (
-                f"pixel histogram compressed near zero "
-                f"(mean {mean_frac * 100:.1f}%, p98-p2 only {dyn_range_frac * 100:.1f}%); "
-                f"signal too dim to use the bit depth. "
-                f"Increase camera exposure or illumination intensity, "
-                f"or pick a region with more signal"
             )
         else:
             diagnosis = (
-                f"pixel histogram narrow at mid-range "
-                f"(mean {mean_frac * 100:.1f}%, p98-p2 only {dyn_range_frac * 100:.1f}%); "
-                f"sample lacks contrast at this Z. "
-                f"Pick a region with more structure or try a different focus metric"
+                f"image too dim (mean {mean_frac * 100:.1f}% of full well, "
+                f"dynamic range only {dyn_range_frac * 100:.1f}%). "
+                f"Increase camera exposure or illumination intensity, "
+                f"or pick a region with more signal"
             )
         reason = (
             f"insufficient pixel-value range for focus discrimination "
