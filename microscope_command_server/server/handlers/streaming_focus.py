@@ -3158,10 +3158,13 @@ def handle_streaming_focus(conn, client, hardware, settings, **kwargs):
         return
 
     # Dump mode: when --dump is set (any truthy string), the streaming
-    # scan saves per-sample TIFs + a CSV trace + a manifest under the
-    # config directory's logs subdir. The Test Streaming AF button
-    # in the autofocus editor is the primary caller; the path is sent
-    # back in the SUCCESS response so the UI can surface it.
+    # scan saves per-sample TIFs + a CSV trace + a manifest. The Test
+    # Streaming AF button in the autofocus editor is the primary caller;
+    # the path is sent back in the SUCCESS response so the UI can
+    # surface it. Output lives next to the Standard/Sweep test outputs
+    # under <yaml_dir>/autofocus_tests/ so operators have one place to
+    # look for all autofocus diagnostics (the editor's three Test
+    # buttons all land here).
     dump_root: Optional[Path] = None
     dump_enabled = bool(dump_flag) and str(dump_flag).strip().lower() not in (
         "0",
@@ -3171,9 +3174,7 @@ def handle_streaming_focus(conn, client, hardware, settings, **kwargs):
     if dump_enabled:
         try:
             timestamp = time.strftime("%Y%m%d_%H%M%S")
-            dump_root = (
-                Path(yaml_path).parent / "logs" / "streaming_af_dumps" / f"streaming_af_{timestamp}"
-            )
+            dump_root = Path(yaml_path).parent / "autofocus_tests" / f"streaming_af_{timestamp}"
             dump_root.mkdir(parents=True, exist_ok=True)
             logger.info("STREAM_AF:dump enabled, writing to %s", dump_root)
         except Exception as e:
