@@ -597,71 +597,6 @@ def _saturation_fraction(img) -> float:
     return float(sat) / float(total)
 
 
-def _dynamic_range_fraction(img) -> float:
-    """Robust dynamic range: (p98 - p2) / dtype_max.
-
-    Complements `_saturation_fraction`. Detects the failure mode where
-    the camera exposure pushes the pixel histogram up against the top
-    of the bit-depth range but few pixels are strictly saturated --
-    e.g. mean at 80% of max with std=2000 means the metric has no
-    contrast left to track focus, but the strict sat-fraction stays
-    under threshold because nothing crosses 99%.
-
-    Documented in 2026-05-15 empirical analysis: streaming AF on OWS3
-    BF seeds produced mean=52071/65535 (79%) with p98-p2=4581 (7%),
-    causing tenengrad to vary only 0.7% across a 55um scan that
-    Standard AF (snap_image at the same Z) found focus on cleanly.
-    """
-    if img is None:
-        return 0.0
-    a = np.asarray(img)
-    if a.dtype == np.uint16:
-        max_val = 65535.0
-    else:
-        max_val = 255.0
-    if a.ndim == 3:
-        a = a[..., 1] if a.shape[-1] >= 2 else a[..., 0]
-    if a.size == 0:
-        return 0.0
-    p2 = float(np.percentile(a, 2))
-    p98 = float(np.percentile(a, 98))
-    return (p98 - p2) / max_val
-
-
-def _mean_fraction(img) -> float:
-    """Mean pixel intensity as a fraction of dtype max. Used with
-    `_dynamic_range_fraction` to distinguish overexposed (high mean,
-    low range) from low-signal (low mean, low range) failure modes."""
-    if img is None:
-        return 0.0
-    a = np.asarray(img)
-    if a.dtype == np.uint16:
-        max_val = 65535.0
-    else:
-        max_val = 255.0
-    if a.ndim == 3:
-        a = a[..., 1] if a.shape[-1] >= 2 else a[..., 0]
-    if a.size == 0:
-        return 0.0
-    return float(np.mean(a)) / max_val
-
-
-# Minimum acceptable robust dynamic range (p98-p2 as fraction of full
-# bit depth). Below this the focus metric cannot discriminate Z because
-# the histogram is too narrow. 0.05 = 5% of bit depth, which on uint16
-# is ~3300 counts -- below that even brenner_gradient on the highest-
-# contrast in-focus frame produces near-zero variation.
-MIN_DYNAMIC_RANGE_FRACTION = 0.05
-
-# Mean-fraction threshold used to classify a low-range failure as
-# OVEREXPOSED vs LOW-SIGNAL. If mean > this AND dynamic range is below
-# MIN_DYNAMIC_RANGE_FRACTION, the diagnosis is overexposure and the
-# operator should reduce exposure/gain. If mean is also low, the
-# diagnosis is low-signal and the operator should increase exposure or
-# pick a brighter region.
-OVEREXPOSURE_MEAN_THRESHOLD = 0.55
-
-
 # ----- YAML loader -----
 
 
@@ -2207,40 +2142,9 @@ def _dump_streaming_scan(
     poll_t = np.asarray([t for (t, _) in z_poll_samples], dtype=np.float64)
     poll_z = np.asarray([z for (_, z) in z_poll_samples], dtype=np.float64)
 
-    # Detect degenerate poll traces. On some controllers (Prior ProScan
-    # observed 2026-05-15) core.get_position(focus_device) returns the
-    # COMMANDED target during in-flight moves rather than the live
-    # encoder position -- the trace then has only 2-6 unique Z values
-    # (bookends + maybe a couple settling samples) across the entire
-    # motion. When this happens, np.interp on the trace produces
-    # nonsense z_actual values: every sample early in the scan gets
-    # tagged with z_end. To avoid writing misleading data to the dump,
-    # detect the degeneracy and fall back to z_assumed for the column.
-    # The raw z_poll.csv is still written -- diagnosis of the polling
-    # itself stays possible.
-    poll_unique_z = int(np.unique(np.round(poll_z, 3)).size) if poll_z.size else 0
-    poll_z_span = float(poll_z.max() - poll_z.min()) if poll_z.size else 0.0
-    expected_z_span = abs(z_end - z_start)
-    # Heuristic: poll trace is good if it has at least 5 unique Z values
-    # AND covers at least 80% of the expected scan span. Either failing
-    # means the controller didn't report intermediate positions reliably.
-    poll_trace_is_usable = poll_unique_z >= 5 and poll_z_span >= 0.8 * max(expected_z_span, 1e-6)
-    if not poll_trace_is_usable and poll_z.size:
-        logger.warning(
-            "STREAM_AF:z_poll trace is degenerate (n_unique=%d, span=%.2fum vs "
-            "expected %.2fum). Driver likely returned commanded position during "
-            "motion. Writing z_assumed (linear motion model) into samples.csv "
-            "z_actual_um column; raw poll trace preserved in z_poll.csv.",
-            poll_unique_z,
-            poll_z_span,
-            expected_z_span,
-        )
-
-    def _z_actual_at(wall_ms: float, z_assumed_fallback: float) -> Optional[float]:
+    def _z_actual_at(wall_ms: float) -> Optional[float]:
         if poll_t.size == 0:
             return None
-        if not poll_trace_is_usable:
-            return z_assumed_fallback
         if wall_ms <= poll_t[0]:
             return float(poll_z[0])
         if wall_ms >= poll_t[-1]:
@@ -2252,7 +2156,7 @@ def _dump_streaming_scan(
         w = csv.writer(fh)
         w.writerow(["idx", "wall_ms", "z_assumed_um", "z_actual_um", "metric"])
         for idx, (wall_ms, img, z_assumed, metric) in enumerate(dump_records):
-            z_actual = _z_actual_at(wall_ms, z_assumed)
+            z_actual = _z_actual_at(wall_ms)
             w.writerow(
                 [
                     idx,
@@ -2590,20 +2494,8 @@ def _attempt_one_scan(
         #
         # Velocity-aware: the alternative head = "first 5% of
         # motion_end_ms" would shrink to ~100ms on a 2um/1s scan and
-        # still admit accel artifacts; a fixed floor is safer in the
-        # general case. BUT a fixed 600ms floor rejects 100% of samples
-        # when motion_duration is short (e.g. 522ms on a 6um sweep at
-        # 11.5um/s -- happens on faster slow_speed presets that we
-        # don't currently use on OWS3 but could appear on other rigs).
-        # Cap the effective discard at HEAD_DISCARD_MAX_FRACTION of
-        # motion_duration_ms so a short scan keeps SOMETHING. The
-        # fixed value still wins when motion is long enough that the
-        # cap doesn't trip, which is the common case.
-        HEAD_DISCARD_MS_FIXED = 600.0
-        HEAD_DISCARD_MAX_FRACTION = 0.30
-        effective_head_discard_ms = min(
-            HEAD_DISCARD_MS_FIXED, motion_end_ms * HEAD_DISCARD_MAX_FRACTION
-        )
+        # still admit accel artifacts; a fixed floor is safer.
+        HEAD_DISCARD_MS = 600.0
 
         # Phase C: samples now carry an optional 4th element (secondary
         # metric, e.g. p98_p2 when running alongside tenengrad). Pass
@@ -2615,19 +2507,14 @@ def _attempt_one_scan(
             return z == z and m == m and math.isfinite(z) and math.isfinite(m)
 
         clean = [s for s in samples if _is_clean(s)]
-        in_motion = [s for s in clean if effective_head_discard_ms <= s[0] <= time_cutoff_ms]
+        in_motion = [s for s in clean if HEAD_DISCARD_MS <= s[0] <= time_cutoff_ms]
         logger.info(
             "STREAM_AF:%sin_motion filter kept %d/%d samples "
-            "(head_discard=%.0fms [fixed=%.0fms cap=%.0fms*%.2f=%.0fms] "
-            "time_cutoff=%.0fms motion_end=%.0fms)",
+            "(head_discard=%.0fms time_cutoff=%.0fms motion_end=%.0fms)",
             tag_prefix,
             len(in_motion),
             len(clean),
-            effective_head_discard_ms,
-            HEAD_DISCARD_MS_FIXED,
-            motion_end_ms,
-            HEAD_DISCARD_MAX_FRACTION,
-            motion_end_ms * HEAD_DISCARD_MAX_FRACTION,
+            HEAD_DISCARD_MS,
             time_cutoff_ms,
             motion_end_ms,
         )
@@ -3728,16 +3615,8 @@ def handle_streaming_focus(conn, client, hardware, settings, **kwargs):
         logger.info("STREAM_AF:pre-flight frame via snap_image")
 
     sat_frac = _saturation_fraction(preflight_img)
-    dyn_range_frac = _dynamic_range_fraction(preflight_img)
-    mean_frac = _mean_fraction(preflight_img)
     logger.info(
-        "STREAM_AF:pre-flight saturation=%.3f (threshold %.2f)  "
-        "dynamic_range=%.3f (threshold %.2f)  mean=%.3f",
-        sat_frac,
-        sat_threshold,
-        dyn_range_frac,
-        MIN_DYNAMIC_RANGE_FRACTION,
-        mean_frac,
+        "STREAM_AF:pre-flight saturation fraction = %.3f (threshold %.2f)", sat_frac, sat_threshold
     )
     if sat_frac > sat_threshold:
         reason = (
@@ -3752,38 +3631,6 @@ def handle_streaming_focus(conn, client, hardware, settings, **kwargs):
         # bypasses the main try/finally block, so restore the camera
         # ROI explicitly or the Live Viewer keeps showing the cropped
         # area indefinitely.
-        _restore_roi(core, saved_roi, roi_seq_was_running)
-        return
-
-    # Dynamic-range gate. Catches the failure mode where the strict
-    # saturation check passes (few pixels at the absolute max) but the
-    # histogram is so narrow that no focus metric can find Z-dependent
-    # variation. See 2026-05-15 empirical analysis: streaming AF
-    # consumed 9s of motion across a 55um scan returning amplitude
-    # 0.68% because pixels were at 79% mean with only 7% dynamic range.
-    # Diagnose as overexposure when mean is also high, low-signal
-    # otherwise.
-    if dyn_range_frac < MIN_DYNAMIC_RANGE_FRACTION:
-        if mean_frac > OVEREXPOSURE_MEAN_THRESHOLD:
-            diagnosis = (
-                f"image overexposed (mean {mean_frac * 100:.1f}% of full well, "
-                f"dynamic range only {dyn_range_frac * 100:.1f}%). "
-                f"Reduce camera exposure or illumination intensity"
-            )
-        else:
-            diagnosis = (
-                f"image too dim (mean {mean_frac * 100:.1f}% of full well, "
-                f"dynamic range only {dyn_range_frac * 100:.1f}%). "
-                f"Increase camera exposure or illumination intensity, "
-                f"or pick a region with more signal"
-            )
-        reason = (
-            f"insufficient pixel-value range for focus discrimination "
-            f"-- {diagnosis} (threshold "
-            f"{MIN_DYNAMIC_RANGE_FRACTION * 100:.0f}% dynamic range)"
-        )
-        logger.warning("STREAM_AF:UNAVAILABLE -- %s", reason)
-        conn.sendall(f"UNAVAILABLE:{reason}".encode())
         _restore_roi(core, saved_roi, roi_seq_was_running)
         return
 
