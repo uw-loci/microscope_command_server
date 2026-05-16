@@ -104,6 +104,7 @@ import logging
 import math
 import threading
 import time
+from concurrent.futures import Future, ThreadPoolExecutor
 from pathlib import Path
 from typing import Dict, Any, List, Optional, Tuple
 
@@ -2011,24 +2012,93 @@ def _run_streaming_scan(
     )
 
     if dump_dir is not None and dump_records is not None:
-        try:
-            _dump_streaming_scan(
-                dump_dir=dump_dir,
-                dump_records=dump_records,
-                z_poll_samples=z_poll_samples,
-                z_start=z_start,
-                z_end=z_end,
-                velocity_um_s=velocity_um_s,
-                motion_duration_ms=motion_duration_ms,
-                metric_name=metric_name,
-            )
-        except Exception as e:
-            logger.warning(
-                "STREAM_AF:dump_streaming_scan failed (non-fatal): %s",
-                e,
-            )
+        # Fire-and-track: writing 300-700 TIFs synchronously inside the
+        # scan path was adding 20-30 s per attempt on slow disks
+        # (observed 24 s for 375 frames = ~750 MB on OWS3 SSD), which
+        # blocked the next widening attempt and the final response.
+        # Hand the write to a single-worker background executor; the
+        # main handler drains pending futures before sending the
+        # SUCCESS / UNAVAILABLE response so the client never sees the
+        # dump path before files exist on disk.
+        fut = _get_dump_executor().submit(
+            _dump_streaming_scan_safe,
+            dump_dir,
+            dump_records,
+            z_poll_samples,
+            z_start,
+            z_end,
+            velocity_um_s,
+            motion_duration_ms,
+            metric_name,
+        )
+        _pending_dump_futures.append(fut)
 
     return samples
+
+
+# --- Background dump executor + pending-future tracking -----------------
+# Single worker: dumps are I/O bound and serializing them avoids thrashing
+# the disk. The order in which attempts' dumps land doesn't matter -- each
+# attempt writes to its own subfolder.
+_DUMP_EXECUTOR: Optional[ThreadPoolExecutor] = None
+_DUMP_EXECUTOR_LOCK = threading.Lock()
+_pending_dump_futures: List[Future] = []
+
+
+def _get_dump_executor() -> ThreadPoolExecutor:
+    global _DUMP_EXECUTOR
+    with _DUMP_EXECUTOR_LOCK:
+        if _DUMP_EXECUTOR is None:
+            _DUMP_EXECUTOR = ThreadPoolExecutor(max_workers=1, thread_name_prefix="strmaf-dump")
+        return _DUMP_EXECUTOR
+
+
+def _dump_streaming_scan_safe(
+    dump_dir,
+    dump_records,
+    z_poll_samples,
+    z_start,
+    z_end,
+    velocity_um_s,
+    motion_duration_ms,
+    metric_name,
+) -> None:
+    """Background wrapper around _dump_streaming_scan that swallows
+    errors so a failed dump can never bubble back into the request
+    thread via Future.result()."""
+    try:
+        _dump_streaming_scan(
+            dump_dir=dump_dir,
+            dump_records=dump_records,
+            z_poll_samples=z_poll_samples,
+            z_start=z_start,
+            z_end=z_end,
+            velocity_um_s=velocity_um_s,
+            motion_duration_ms=motion_duration_ms,
+            metric_name=metric_name,
+        )
+    except Exception as e:
+        logger.warning("STREAM_AF:background dump failed (non-fatal): %s", e)
+
+
+def _drain_pending_dumps(timeout_per_future_s: float = 120.0) -> None:
+    """Wait for all queued dump writes to finish, then clear the list.
+
+    Called by handle_streaming_focus right before each response send so
+    the client only sees the dump path once the folder is fully written.
+    A failed/slow individual dump cannot wedge the whole drain -- the
+    per-future timeout caps the wait, and exceptions are logged and
+    skipped.
+    """
+    if not _pending_dump_futures:
+        return
+    pending = list(_pending_dump_futures)
+    _pending_dump_futures.clear()
+    for fut in pending:
+        try:
+            fut.result(timeout=timeout_per_future_s)
+        except Exception as e:
+            logger.warning("STREAM_AF:drain dump future failed: %s", e)
 
 
 def _dump_streaming_scan(
@@ -4168,6 +4238,9 @@ def handle_streaming_focus(conn, client, hardware, settings, **kwargs):
                 # TIF folder. Path uses the server-local FS layout
                 # (Windows backslashes when the server is on Windows).
                 response += f":dump={dump_root}"
+                # Wait for background dump writes to finish so the
+                # client never sees a dump path before files exist.
+                _drain_pending_dumps()
             try:
                 conn.sendall(response.encode())
             except Exception as e:
@@ -4231,6 +4304,7 @@ def handle_streaming_focus(conn, client, hardware, settings, **kwargs):
             unavailable_msg = f"UNAVAILABLE:{summary}"
             if dump_root is not None:
                 unavailable_msg += f":dump={dump_root}"
+                _drain_pending_dumps()
             try:
                 conn.sendall(unavailable_msg.encode())
             except Exception as e:
@@ -4238,6 +4312,9 @@ def handle_streaming_focus(conn, client, hardware, settings, **kwargs):
 
     except Exception as e:
         logger.error("STREAM_AF:unhandled error in retry loop: %s", e, exc_info=True)
+        # Drain pending dumps so a follow-up Test click doesn't see
+        # leftover futures from a crashed run.
+        _drain_pending_dumps()
         try:
             conn.sendall(f"FAILED:{e}".encode())
         except Exception:
