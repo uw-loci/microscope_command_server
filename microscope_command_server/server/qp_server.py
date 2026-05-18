@@ -81,17 +81,9 @@ from microscope_command_server.server.protocol import TCP_PORT
 from microscope_command_server.acquisition.workflow import _acquisition_workflow
 from microscope_command_server.version_info import format_log_header
 
-# Configure logging - boot/pre-connection logging goes to console + fallback file
-current_file_path = pathlib.Path(__file__).resolve()
-base_dir = current_file_path.parent
-log_dir = base_dir / "server_logfiles"
-log_dir.mkdir(parents=True, exist_ok=True)
-boot_log_filename = log_dir / f'qp_server_boot_{datetime.now().strftime("%Y%m%d_%H%M%S")}.log'
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
-    handlers=[logging.FileHandler(boot_log_filename), logging.StreamHandler()],
-)
+# Boot/pre-connection logging is configured by initialize_server() at startup.
+# The logger itself is defined at import time because module-level functions
+# (e.g. _start_session_logging) reference it in their bodies.
 logger = logging.getLogger(__name__)
 
 # Session log handler - added to root logger when CONFIG provides a config path,
@@ -236,6 +228,17 @@ sequence_op_lock = Lock()
 # when ALL connections from that IP disconnect (Java uses main + aux sockets).
 active_ip_connections = set()  # Set of (ip, port) tuples from the active IP
 
+# Module-level placeholders populated by initialize_server() at startup.
+# They must exist at import time so other modules can safely
+# `from microscope_command_server.server.qp_server import ...` without
+# triggering hardware initialization (see initialize_server docstring).
+config_manager = None
+startup_settings = None
+package_dir = None
+core = None
+studio = None
+hardware = None
+
 
 def init_pycromanager_with_logger():
     """
@@ -280,59 +283,6 @@ def init_pycromanager_with_logger():
         logger.error("Please ensure Micro-Manager is running and responsive.")
         logger.error("=" * 70)
         sys.exit(1)
-
-
-# Initialize hardware connections
-logger.info("Loading generic startup configuration...")
-config_manager = ConfigManager()
-
-## GENERIC CONFIG loaded for exploratory XYZ movements
-# Actual microscope-specific config loaded during ACQUIRE command via --yaml parameter
-package_dir = pathlib.Path(__file__).parent.parent
-
-# Try to load generic config
-generic_config_path = package_dir / "configurations" / "config_generic.yml"
-if generic_config_path.exists():
-    logger.info(f"Loading generic startup config from {generic_config_path}")
-    startup_settings = config_manager.load_config_file(str(generic_config_path))
-else:
-    # Fallback to hardcoded minimal config if file doesn't exist
-    logger.warning("Generic config file not found, using hardcoded minimal defaults")
-    startup_settings = {
-        "microscope": {"name": "Generic", "type": "Unconfigured"},
-        "stage": {
-            "stage_id": "GENERIC_STAGE",
-            "limits": {
-                "x_um": {"low": -100000, "high": 100000},
-                "y_um": {"low": -100000, "high": 100000},
-                "z_um": {"low": -20000, "high": 20000},
-            },
-        },
-        "modalities": {},
-        "hardware": {},
-        "id_stage": {},
-        "id_detector": {},
-        "id_camera": {},
-    }
-
-# Load LOCI resources if available (for device lookup during ACQUIRE)
-loci_rsc_file = package_dir / "configurations" / "resources" / "resources_LOCI.yml"
-if loci_rsc_file.exists():
-    loci_resources = config_manager.load_config_file(str(loci_rsc_file))
-    startup_settings.update(loci_resources)
-    logger.info("Loaded LOCI resources for hardware device lookup")
-else:
-    logger.warning("LOCI resources file not found - device lookups may fail during ACQUIRE")
-
-# Initialize hardware with generic config (will be replaced during ACQUIRE)
-# OPTION 1 (ACTIVE): Fail-fast - require Micro-Manager at startup
-logger.info("Initializing Micro-Manager connection...")
-core, studio = init_pycromanager_with_logger()
-hardware = PycromanagerHardware(core, studio, startup_settings)
-logger.info("Hardware initialized with generic config")
-logger.info(
-    "Server ready - microscope-specific config will be loaded from ACQUIRE --yaml parameter"
-)
 
 
 def acquisitionWorkflow(message, client_addr):
@@ -654,8 +604,86 @@ def handle_client(conn, addr):
         logger.info(f"<<< Client {addr} disconnected and cleaned up")
 
 
+def initialize_server():
+    """Configure boot logging and initialize hardware for the server process.
+
+    Must be called exactly once, by main(), before any handler thread runs.
+    Splitting these side effects out of module top level is what makes
+    `from microscope_command_server.server.qp_server import AcquisitionState`
+    (the lazy import in handlers/status.py) safe -- otherwise Python would
+    re-run hardware init the second time the module is loaded under its
+    package-qualified name, on top of the script-name `__main__` load.
+    """
+    global config_manager, startup_settings, package_dir, core, studio, hardware
+
+    # Configure logging - boot/pre-connection logging goes to console + fallback file
+    current_file_path = pathlib.Path(__file__).resolve()
+    base_dir = current_file_path.parent
+    log_dir = base_dir / "server_logfiles"
+    log_dir.mkdir(parents=True, exist_ok=True)
+    boot_log_filename = log_dir / f'qp_server_boot_{datetime.now().strftime("%Y%m%d_%H%M%S")}.log'
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+        handlers=[logging.FileHandler(boot_log_filename), logging.StreamHandler()],
+    )
+
+    # Initialize hardware connections
+    logger.info("Loading generic startup configuration...")
+    config_manager = ConfigManager()
+
+    ## GENERIC CONFIG loaded for exploratory XYZ movements
+    # Actual microscope-specific config loaded during ACQUIRE command via --yaml parameter
+    package_dir = pathlib.Path(__file__).parent.parent
+
+    # Try to load generic config
+    generic_config_path = package_dir / "configurations" / "config_generic.yml"
+    if generic_config_path.exists():
+        logger.info(f"Loading generic startup config from {generic_config_path}")
+        startup_settings = config_manager.load_config_file(str(generic_config_path))
+    else:
+        # Fallback to hardcoded minimal config if file doesn't exist
+        logger.warning("Generic config file not found, using hardcoded minimal defaults")
+        startup_settings = {
+            "microscope": {"name": "Generic", "type": "Unconfigured"},
+            "stage": {
+                "stage_id": "GENERIC_STAGE",
+                "limits": {
+                    "x_um": {"low": -100000, "high": 100000},
+                    "y_um": {"low": -100000, "high": 100000},
+                    "z_um": {"low": -20000, "high": 20000},
+                },
+            },
+            "modalities": {},
+            "hardware": {},
+            "id_stage": {},
+            "id_detector": {},
+            "id_camera": {},
+        }
+
+    # Load LOCI resources if available (for device lookup during ACQUIRE)
+    loci_rsc_file = package_dir / "configurations" / "resources" / "resources_LOCI.yml"
+    if loci_rsc_file.exists():
+        loci_resources = config_manager.load_config_file(str(loci_rsc_file))
+        startup_settings.update(loci_resources)
+        logger.info("Loaded LOCI resources for hardware device lookup")
+    else:
+        logger.warning("LOCI resources file not found - device lookups may fail during ACQUIRE")
+
+    # Initialize hardware with generic config (will be replaced during ACQUIRE)
+    # OPTION 1 (ACTIVE): Fail-fast - require Micro-Manager at startup
+    logger.info("Initializing Micro-Manager connection...")
+    core, studio = init_pycromanager_with_logger()
+    hardware = PycromanagerHardware(core, studio, startup_settings)
+    logger.info("Hardware initialized with generic config")
+    logger.info(
+        "Server ready - microscope-specific config will be loaded from ACQUIRE --yaml parameter"
+    )
+
+
 def main():
     """Main server loop that accepts client connections and spawns handler threads."""
+    initialize_server()
     logger.info("=" * 60)
     logger.info("Microscope Command Server")
     logger.info("=" * 60)
