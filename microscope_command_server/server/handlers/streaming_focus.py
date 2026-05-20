@@ -174,8 +174,15 @@ SATURATION_THRESHOLD_BY_MODALITY = {
     # heavy the metric really has no discrimination left.
     "brightfield": 0.50,
     "bf": 0.50,
-    "ppm": 0.05,  # polarized: both channels contribute -- moderate
-    "polarized": 0.05,
+    # PPM: streaming AF runs at the configured autofocus angle, which is a
+    # bright, brightfield-like polarization state. A handful of clipped
+    # specular highlights does not hurt the gradient-based focus metric --
+    # the tissue edges that carry focus information stay unsaturated. The
+    # old 0.05 value was too strict (refused usable PPM scenes at ~7%
+    # saturation) and rested on stale "both channels contribute" reasoning
+    # that does not apply to the single-frame preflight. Matches brightfield.
+    "ppm": 0.50,
+    "polarized": 0.50,
     "fluorescence": 0.02,  # widefield fluorescence -- strict
     "fluorescent": 0.02,
     "widefield": 0.02,
