@@ -2381,6 +2381,46 @@ class AcquisitionContext:
     starting_position: Any = None  # Position or None
     channel_consecutive_saturated: dict = field(default_factory=dict)
     progress_warning_fired: bool = False
+    # One-shot latch for the time-lapse "falling behind" warning. Set True
+    # after the first overrunning timepoint so the warning fires exactly once.
+    time_lapse_warning_fired: bool = False
+
+
+def _format_time_lapse_warning(scheduler) -> str:
+    """Build the ASCII-only 'falling behind' message for the first overrun.
+
+    acq = interval + last_overdue_seconds is the wall time the first paced
+    timepoint actually took. ASCII-only (no Unicode) so the string survives
+    Windows cp1252 socket transport.
+    """
+    interval = scheduler.interval_seconds
+    acq = interval + scheduler.last_overdue_seconds
+    return (
+        "Time-lapse falling behind: timepoint 1 took "
+        f"{acq:.1f}s but the interval is {interval:.1f}s. "
+        "Remaining timepoints will start late."
+    )
+
+
+def _maybe_report_time_lapse_warning(
+    ctx: "AcquisitionContext",
+    scheduler,
+    logger,
+    report_time_lapse_warning: Optional[Callable[[str], None]],
+) -> None:
+    """Fire the time-lapse 'falling behind' warning once, for the first overrun.
+
+    No-op unless the scheduler has recorded an overrun and the latch has not
+    fired yet. Sets ctx.time_lapse_warning_fired so subsequent timepoints do
+    not re-report -- only the first overrunning timepoint is surfaced.
+    """
+    if scheduler.overdue_count <= 0 or ctx.time_lapse_warning_fired:
+        return
+    ctx.time_lapse_warning_fired = True
+    msg = _format_time_lapse_warning(scheduler)
+    logger.warning(msg)
+    if report_time_lapse_warning is not None:
+        report_time_lapse_warning(msg)
 
 
 def _acquisition_workflow(
@@ -2395,6 +2435,7 @@ def _acquisition_workflow(
     request_manual_focus: Optional[Callable[[], None]] = None,
     request_hardware_error_recovery: Optional[Callable[[str], str]] = None,
     connection_config_path: Optional[str] = None,
+    report_time_lapse_warning: Optional[Callable[[str], None]] = None,
 ):
     """Execute the main image acquisition workflow with progress and cancellation.
 
@@ -2416,6 +2457,10 @@ def _acquisition_workflow(
                              If None, hardware errors will fail the acquisition.
         connection_config_path: Optional path to config from initial CONFIG command,
                                used to warn if ACQUIRE uses different config.
+        report_time_lapse_warning: Optional callback invoked once with a
+                               human-readable message when the first time-lapse
+                               timepoint overruns the requested interval. If
+                               None, the overrun is only logged.
     """
     ctx = None
     try:
@@ -2466,6 +2511,11 @@ def _acquisition_workflow(
                     logger.warning(f"Acquisition cancelled by client {client_addr}")
                     ctx.set_state("CANCELLED")
                     return
+                # One-shot "falling behind" warning. The first paced wait is
+                # wait_until(1); it overruns when 1-based timepoint 1's work
+                # took longer than the interval. overdue_count > 0 here means
+                # that first timepoint overran -- report it exactly once.
+                _maybe_report_time_lapse_warning(ctx, scheduler, logger, report_time_lapse_warning)
                 logger.info(
                     "=== TIMEPOINT %d/%d starting at t0+%.1fs ===",
                     t_idx + 1,

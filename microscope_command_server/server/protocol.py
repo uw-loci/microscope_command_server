@@ -58,6 +58,7 @@ class ExtendedCommand:
     SKIPAF = b"skipaf__"  # Skip autofocus retry - use current focus
     REQHWER = b"reqhwer_"  # Check if hardware error recovery is requested
     ACKHWER = b"ackhwer_"  # Acknowledge hardware error - retry/skip/cancel
+    REQTWARN = b"reqtwarn"  # Check if a time-lapse "falling behind" warning is pending
     AFBENCH = b"afbench_"  # Run autofocus parameter benchmark
     SNAP = b"snap____"  # Simple snap with fixed exposure (no adaptive)
     ZSTACK = b"zstack__"  # Z-stack acquisition at current XY (multi-Z, single tile)

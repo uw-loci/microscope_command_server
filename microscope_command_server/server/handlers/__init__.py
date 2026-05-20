@@ -58,6 +58,7 @@ from microscope_command_server.server.handlers.status import (
     handle_skipaf,
     handle_reqhwer,
     handle_ackhwer,
+    handle_reqtwarn,
 )
 from microscope_command_server.server.handlers.autofocus import (
     handle_testaf,
@@ -147,6 +148,7 @@ COMMAND_HANDLERS = {
     ExtendedCommand.SKIPAF: handle_skipaf,
     ExtendedCommand.REQHWER: handle_reqhwer,
     ExtendedCommand.ACKHWER: handle_ackhwer,
+    ExtendedCommand.REQTWARN: handle_reqtwarn,
     # Autofocus testing
     ExtendedCommand.TESTAF: handle_testaf,
     ExtendedCommand.TESTADAF: handle_testadaf,

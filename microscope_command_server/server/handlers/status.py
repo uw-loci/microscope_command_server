@@ -1,11 +1,11 @@
 """Acquisition status and coordination command handlers.
 
 Handles acquisition lifecycle queries and user-interaction coordination:
-STATUS, PROGRESS, CANCEL, REQMANF, ACKMF, SKIPAF, REQHWER, ACKHWER
+STATUS, PROGRESS, CANCEL, REQMANF, ACKMF, SKIPAF, REQHWER, ACKHWER, REQTWARN
 
 These commands access per-client state (acquisition status, progress,
-manual focus events, hardware error events) via global dictionaries
-keyed by client address.
+manual focus events, hardware error events, time-lapse warnings) via
+global dictionaries keyed by client address.
 """
 
 import struct
@@ -190,6 +190,37 @@ def handle_reqhwer(conn, client, hardware, settings, **kwargs):
         logger.debug("Sent hardware error to %s: %s", addr, err_msg[:100])
     else:
         conn.sendall(b"IDLE____")  # 8 bytes: no error
+
+
+def handle_reqtwarn(conn, client, hardware, settings, **kwargs):
+    """Check if a time-lapse 'falling behind' warning is pending.
+
+    Response: 'TWARN___' (8 bytes) + 4-byte length (big-endian) + message bytes
+    if a warning is present, or 'IDLE____' (8 bytes) if not.
+
+    The server keeps returning the same warning on every poll until the
+    acquisition ends (the Java client de-dupes); the warning is not cleared
+    after a read.
+    """
+    # TODO: use client.state instead of global dict
+    time_lapse_warnings = kwargs["time_lapse_warnings"]
+    acquisition_locks = kwargs["acquisition_locks"]
+    addr = client.addr
+
+    with acquisition_locks[addr]:
+        warning = time_lapse_warnings.get(addr)
+
+    if warning:
+        # Time-lapse warning present - send message.
+        # Encode as: 8-byte status + 4-byte length (big-endian) + message bytes
+        msg_bytes = warning.encode("utf-8")
+        length = len(msg_bytes)
+        conn.sendall(b"TWARN___")  # 8-byte status: warning present
+        conn.sendall(length.to_bytes(4, "big"))
+        conn.sendall(msg_bytes)
+        logger.debug("Sent time-lapse warning to %s: %s", addr, warning[:100])
+    else:
+        conn.sendall(b"IDLE____")  # 8 bytes: no warning
 
 
 def handle_ackhwer(conn, client, hardware, settings, **kwargs):

@@ -67,6 +67,10 @@ class TimepointScheduler:
         self._clock = clock
         self._sleep = sleep
         self.overdue_count = 0
+        # Positive overrun magnitude (seconds) of the most recent overdue
+        # timepoint. 0.0 when no timepoint has overrun yet. The workflow
+        # reads this to format an accurate "falling behind" warning.
+        self.last_overdue_seconds = 0.0
 
     def wait_until(
         self,
@@ -96,6 +100,7 @@ class TimepointScheduler:
         if delay <= 0:
             if self.interval_seconds > 0 and t_idx > 0:
                 self.overdue_count += 1
+                self.last_overdue_seconds = -delay
                 self.logger.warning(
                     "TimepointScheduler: timepoint %d overdue by %.3fs "
                     "(acq_time > interval); continuing immediately",

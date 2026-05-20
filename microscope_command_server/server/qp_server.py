@@ -207,6 +207,7 @@ hardware_error_request_events = {}  # addr -> Event (set when hardware error nee
 hardware_error_complete_events = {}  # addr -> Event (set when user acknowledges hardware error)
 hardware_error_user_choice = {}  # addr -> str ("retry", "skip", "cancel")
 hardware_error_message = {}  # addr -> str (error message string per client)
+time_lapse_warnings = {}  # addr -> Optional[str] (time-lapse "falling behind" warning)
 
 # Server configuration state - CRITICAL FOR SAFETY
 # NEVER allow hardware operations with generic config - could damage microscope!
@@ -319,6 +320,15 @@ def acquisitionWorkflow(message, client_addr):
     def _is_cancelled() -> bool:
         return acquisition_cancel_events[client_addr].is_set()
 
+    def _report_time_lapse_warning(msg: str):
+        """Store a time-lapse 'falling behind' warning for REQTWARN polling.
+
+        The server keeps returning the same warning on every poll until the
+        acquisition ends; the Java client de-dupes and shows it once.
+        """
+        with acquisition_locks[client_addr]:
+            time_lapse_warnings[client_addr] = msg
+
     def _request_manual_focus(retries_remaining: int):
         """Signal manual focus needed and wait for user acknowledgment.
 
@@ -399,6 +409,7 @@ def acquisitionWorkflow(message, client_addr):
         request_manual_focus=_request_manual_focus,
         request_hardware_error_recovery=_request_hardware_error_recovery,
         connection_config_path=active_connection_config_path,
+        report_time_lapse_warning=_report_time_lapse_warning,
     )
 
 
@@ -434,6 +445,7 @@ def handle_client(conn, addr):
     hardware_error_complete_events[addr] = threading.Event()
     hardware_error_user_choice[addr] = None
     hardware_error_message[addr] = ""
+    time_lapse_warnings[addr] = None
 
     # ClientState object for handlers that use the new pattern
     client = ClientState(addr)
@@ -476,6 +488,7 @@ def handle_client(conn, addr):
         "hardware_error_complete_events": hardware_error_complete_events,
         "hardware_error_user_choice": hardware_error_user_choice,
         "hardware_error_message": hardware_error_message,
+        "time_lapse_warnings": time_lapse_warnings,
         # Acquisition thread tracking
         "acquisition_thread": acquisition_thread,
     }
@@ -552,6 +565,8 @@ def handle_client(conn, addr):
             del acquisition_final_z[addr]
         if addr in acquisition_saturation_summary:
             del acquisition_saturation_summary[addr]
+        if addr in time_lapse_warnings:
+            del time_lapse_warnings[addr]
 
         # Remove this connection from tracking and check if all connections from
         # the active IP are gone before unconfiguring.  Java uses main + aux sockets,

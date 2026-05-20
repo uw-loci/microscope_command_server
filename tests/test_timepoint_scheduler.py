@@ -146,9 +146,26 @@ class TestSlowCase:
         # No sleep should have been requested.
         assert fk.sleep_log == []
         assert sched.overdue_count == 1
+        # 0.3s acquisition with a 0.1s interval -> overrun of ~0.2s.
+        assert sched.last_overdue_seconds == pytest.approx(0.2, abs=1e-9)
         assert any(
             "overdue" in r.getMessage() for r in caplog.records
         ), f"no overdue warning found in records: {caplog.records}"
+
+    def test_last_overdue_seconds_default_is_zero(self, logger):
+        """last_overdue_seconds starts at 0.0 and stays 0.0 until an overrun."""
+        fk = FakeClock(start=0.0)
+        sched = TimepointScheduler(
+            t0_monotonic=0.0,
+            interval_seconds=0.1,
+            logger=logger,
+            clock=fk.clock,
+            sleep=fk.sleep,
+        )
+        assert sched.last_overdue_seconds == 0.0
+        # On-schedule waits do not touch last_overdue_seconds.
+        sched.wait_until(1)
+        assert sched.last_overdue_seconds == 0.0
 
     def test_interval_zero_never_warns(self, logger, caplog):
         """interval=0 means 'back-to-back timepoints'; the delay=0 path
