@@ -4480,3 +4480,135 @@ def handle_streaming_focus(conn, client, hardware, settings, **kwargs):
                     "Live Viewer will now stream at full rate)",
                     saved_frame_rate_hz,
                 )
+
+
+# ----- In-process invoker (for the acquisition --af-benchmark mode) -----
+
+
+class _InProcessConn:
+    """Minimal conn shim so handle_streaming_focus can run in-process.
+
+    handle_streaming_focus is written against a socket: read_message_string
+    needs settimeout()/recv(), the handler needs sendall(). This shim feeds
+    a pre-built flag payload via recv() and captures the response via
+    sendall(), so the whole handler -- including the ROI crop and the
+    restore-to-full-sensor -- runs verbatim without a real socket. The
+    acquisition workflow's --af-benchmark mode uses this to time a true
+    streaming AF run from inside the tile loop.
+    """
+
+    def __init__(self, payload: str):
+        from microscope_command_server.server.protocol import END_MARKER
+
+        self._buf = (payload + END_MARKER).encode("utf-8")
+        self._sent: List[bytes] = []
+
+    def settimeout(self, _timeout):
+        pass
+
+    def recv(self, n):
+        chunk, self._buf = self._buf[:n], self._buf[n:]
+        return chunk
+
+    def sendall(self, data):
+        self._sent.append(data)
+
+    @property
+    def response(self) -> str:
+        return b"".join(self._sent).decode("utf-8", errors="replace")
+
+
+def _parse_streaming_response(resp: str) -> Dict[str, Any]:
+    """Parse a STRMAFZ response string into a result dict.
+
+    SUCCESS:<initial>:<final>:<shift>:<n_samples>:<span>[:dump=<path>]
+    UNAVAILABLE:<reason>
+    FAILED:<reason>
+    """
+    result: Dict[str, Any] = {
+        "status": "error",
+        "reason": resp,
+        "initial_z": None,
+        "final_z": None,
+        "shift": None,
+        "n_samples": 0,
+        "span": None,
+    }
+    if not resp:
+        result["reason"] = "empty response"
+        return result
+    if resp.startswith("SUCCESS:"):
+        body = resp[len("SUCCESS:") :]
+        # Strip the optional ":dump=<path>" suffix before splitting on ":"
+        # (the dump path itself can contain ":" on Windows, e.g. C:\...).
+        dump_at = body.find(":dump=")
+        if dump_at >= 0:
+            body = body[:dump_at]
+        parts = body.split(":")
+        result["status"] = "success"
+        result["reason"] = ""
+        try:
+            result["initial_z"] = float(parts[0])
+            result["final_z"] = float(parts[1])
+            result["shift"] = float(parts[2])
+            result["n_samples"] = int(float(parts[3]))
+            result["span"] = float(parts[4])
+        except (ValueError, IndexError):
+            pass
+        return result
+    if resp.startswith("UNAVAILABLE:"):
+        result["status"] = "unavailable"
+        result["reason"] = resp[len("UNAVAILABLE:") :]
+        return result
+    if resp.startswith("FAILED:"):
+        result["status"] = "failed"
+        result["reason"] = resp[len("FAILED:") :]
+        return result
+    return result
+
+
+def run_streaming_focus_inprocess(
+    hardware,
+    settings,
+    yaml_path: str,
+    *,
+    objective: Optional[str] = None,
+    modality: Optional[str] = None,
+    range_override_um: Optional[float] = None,
+    max_attempts: int = 1,
+) -> Dict[str, Any]:
+    """Run a streaming AF scan in-process and return a parsed result dict.
+
+    Reuses handle_streaming_focus verbatim (objective resolution, config
+    load, ROI crop, scan, restore-to-full-sensor) via _InProcessConn, so
+    wall-time measured around this call reflects the true cost of a
+    streaming AF run. Intended for the acquisition --af-benchmark mode.
+
+    Returns: {status: 'success'|'unavailable'|'failed'|'error', reason,
+    initial_z, final_z, shift, n_samples, span}.
+    """
+    flags = [f"--yaml {yaml_path}"]
+    if objective:
+        flags.append(f"--objective {objective}")
+    if modality:
+        flags.append(f"--modality {modality}")
+    if range_override_um is not None:
+        flags.append(f"--range {range_override_um}")
+    flags.append(f"--max-attempts {max_attempts}")
+    payload = " ".join(flags)
+
+    conn = _InProcessConn(payload)
+    try:
+        handle_streaming_focus(conn, "af-benchmark", hardware, settings)
+    except Exception as e:
+        logger.warning("STREAM_AF:in-process invoke raised: %s", e)
+        return {
+            "status": "error",
+            "reason": str(e),
+            "initial_z": None,
+            "final_z": None,
+            "shift": None,
+            "n_samples": 0,
+            "span": None,
+        }
+    return _parse_streaming_response(conn.response)

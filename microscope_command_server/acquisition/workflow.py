@@ -2076,6 +2076,9 @@ def parse_acquisition_message(message: str) -> dict:
             elif parts[i] == "--af-disabled":
                 params["af_disabled"] = True
                 i += 1
+            elif parts[i] == "--af-benchmark":
+                params["af_benchmark"] = True
+                i += 1
             elif parts[i] == "--save-raw" and i + 1 < len(parts):
                 params["save_raw"] = parts[i + 1].lower() == "true"
                 i += 2
@@ -3998,10 +4001,20 @@ def _handle_tile_autofocus(
     # Determine the best Z for this tile position.
     needs_af = pos_idx in ctx.dynamic_af_positions
 
+    # AF method benchmark: --af-benchmark makes every tile run BOTH sweep
+    # and streaming AF (timed, neither result applied). Force needs_af so
+    # the blocking XYZ move happens and the "not needs_af" early return is
+    # bypassed; the benchmark branch after the stage move returns before
+    # the normal AF logic.
+    af_benchmark = bool(params.get("af_benchmark"))
+    if af_benchmark:
+        needs_af = True
+
     # Skip AF on the last tile -- the corrected Z has no downstream
     # snap to benefit from it, and even a successful drift update
     # would never be applied. Saves ~3-5s per acquisition for free.
-    if needs_af and pos_idx == len(ctx.positions) - 1:
+    # The benchmark wants every tile, including the last.
+    if needs_af and not af_benchmark and pos_idx == len(ctx.positions) - 1:
         logger.info(
             "  Skipping AF at final position %d/%d (no downstream tiles to use the result)",
             pos_idx,
@@ -4115,6 +4128,13 @@ def _handle_tile_autofocus(
 
     xy_move_pending = not needs_af
     log_timing(logger, "Stage XY movement command", t0)
+
+    # AF method benchmark: run sweep + streaming, time both, apply neither,
+    # then return before the normal AF logic. The stage is left at z0 so
+    # the tile capture proceeds at the pre-AF Z.
+    if af_benchmark:
+        af_type_for_this_tile = _run_af_benchmark(ctx, pos_idx, pos)
+        return (True, af_type_for_this_tile, 0.0, False, False)
 
     if not needs_af:
         return (
@@ -4319,6 +4339,148 @@ def _handle_tile_autofocus(
         af_failed_for_this_tile,
         xy_move_pending,
     )
+
+
+def _append_af_benchmark_row(
+    ctx: "AcquisitionContext",
+    pos_idx: int,
+    x: float,
+    y: float,
+    z0: float,
+    sweep_z,
+    sweep_ms: float,
+    sweep_status: str,
+    stream_z,
+    stream_ms: float,
+    stream_status: str,
+    stream_reason: str,
+) -> None:
+    """Append one row to af_benchmark.csv in the acquisition output dir.
+
+    Header is written once on first call. Status/reason text is sanitized
+    so embedded commas/newlines cannot corrupt the CSV.
+    """
+    csv_path = ctx.output_path / "af_benchmark.csv"
+
+    def _clean(s) -> str:
+        return str(s).replace(",", ";").replace("\n", " ").replace("\r", " ").strip()
+
+    def _fmt(v) -> str:
+        return f"{v:.3f}" if isinstance(v, (int, float)) else ""
+
+    try:
+        write_header = not csv_path.exists()
+        with open(csv_path, "a", encoding="utf-8", newline="") as f:
+            if write_header:
+                f.write(
+                    "tile_idx,x_um,y_um,z0_um,"
+                    "sweep_z_um,sweep_ms,sweep_status,"
+                    "stream_z_um,stream_ms,stream_status,stream_reason\n"
+                )
+            f.write(
+                f"{pos_idx},{x:.1f},{y:.1f},{z0:.3f},"
+                f"{_fmt(sweep_z)},{sweep_ms:.1f},{_clean(sweep_status)},"
+                f"{_fmt(stream_z)},{stream_ms:.1f},{_clean(stream_status)},"
+                f"{_clean(stream_reason)}\n"
+            )
+    except Exception as e:
+        ctx.logger.warning("AF-BENCHMARK could not write CSV row: %s", e)
+
+
+def _run_af_benchmark(ctx: "AcquisitionContext", pos_idx: int, pos) -> str:
+    """Run sweep AND streaming AF on one tile, time both, apply neither.
+
+    Used by --af-benchmark mode to compare the two autofocus mechanisms
+    inside a real acquisition loop. The stage is restored to its pre-AF Z
+    (z0) after each method, so both always start from the same Z and the
+    tile capture proceeds at z0 (results are recorded, not applied). Each
+    method is timed end-to-end -- both move the stage to their result Z
+    internally, so the timings are symmetric ("search + arrive"). The
+    streaming timing includes its ROI crop and restore-to-full-sensor.
+
+    Appends one row to af_benchmark.csv. Returns the af_type string.
+    """
+    from microscope_command_server.server.handlers.streaming_focus import (
+        run_streaming_focus_inprocess,
+    )
+
+    logger = ctx.logger
+    hardware = ctx.hardware
+    z0 = hardware.get_current_position().z
+    logger.info(
+        "AF-BENCHMARK tile %d (X=%.0f Y=%.0f): z0=%.3f -- running sweep + streaming",
+        pos_idx,
+        pos.x,
+        pos.y,
+        z0,
+    )
+
+    # --- Sweep drift check (production per-tile settings) ---
+    sweep_z = None
+    sweep_status = "ok"
+    t = time.perf_counter()
+    try:
+        sweep_z = hardware.autofocus_sweep_drift_check(
+            range_um=ctx.af_sweep_range_um,
+            n_steps=ctx.af_sweep_n_steps,
+            score_metric=ctx.af_score_metric_name,
+            max_retries=ctx.af_edge_retries,
+        )
+    except Exception as e:
+        sweep_status = f"error: {e}"
+        logger.warning("AF-BENCHMARK sweep failed: %s", e)
+    sweep_ms = (time.perf_counter() - t) * 1000.0
+    try:
+        hardware.move_to_position(Position(z=z0))
+    except Exception as e:
+        logger.warning("AF-BENCHMARK could not restore z0 after sweep: %s", e)
+
+    # --- Streaming AF (single attempt, like production tile-AF) ---
+    t = time.perf_counter()
+    stream = run_streaming_focus_inprocess(
+        hardware,
+        ctx.ppm_settings,
+        str(ctx.params["yaml_file_path"]),
+        objective=ctx.params.get("objective"),
+        modality=ctx.modality,
+        max_attempts=1,
+    )
+    stream_ms = (time.perf_counter() - t) * 1000.0
+    try:
+        hardware.move_to_position(Position(z=z0))
+    except Exception as e:
+        logger.warning("AF-BENCHMARK could not restore z0 after streaming: %s", e)
+
+    stream_status = stream.get("status", "unknown")
+    stream_z = stream.get("final_z")
+    stream_reason = stream.get("reason", "")
+
+    logger.info(
+        "AF-BENCHMARK tile %d :: sweep %.0f ms (z=%s, %s) | " "streaming %.0f ms (z=%s, %s)",
+        pos_idx,
+        sweep_ms,
+        f"{sweep_z:.3f}" if isinstance(sweep_z, (int, float)) else "n/a",
+        sweep_status,
+        stream_ms,
+        f"{stream_z:.3f}" if isinstance(stream_z, (int, float)) else "n/a",
+        stream_status,
+    )
+
+    _append_af_benchmark_row(
+        ctx,
+        pos_idx,
+        pos.x,
+        pos.y,
+        z0,
+        sweep_z,
+        sweep_ms,
+        sweep_status,
+        stream_z,
+        stream_ms,
+        stream_status,
+        stream_reason,
+    )
+    return "af_benchmark"
 
 
 def _acquire_tile_angles_angle_outer(
