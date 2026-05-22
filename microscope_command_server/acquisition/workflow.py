@@ -7129,6 +7129,146 @@ def _resolve_background_profile_key(
     return None
 
 
+def _channel_intensity_value(ch_entry):
+    """Resolve a channel's illumination intensity from its intensity_property
+    pointer ({device, property}) by looking up the matching device_properties
+    entry. Returns the float value, or None if no intensity knob is declared."""
+    ip = ch_entry.get("intensity_property")
+    if not isinstance(ip, dict):
+        return None
+    dev = ip.get("device")
+    prop = ip.get("property")
+    if not (dev and prop):
+        return None
+    for p in ch_entry.get("device_properties") or []:
+        if isinstance(p, dict) and p.get("device") == dev and p.get("property") == prop:
+            try:
+                return float(p.get("value"))
+            except (TypeError, ValueError):
+                return None
+    return None
+
+
+def _collect_channel_backgrounds(
+    channels,
+    output_folder_path,
+    modality,
+    profile_key,
+    hardware,
+    settings,
+    update_progress,
+    logger,
+    applied_lamp_intensity,
+    lamp_device_label,
+):
+    """Collect one background image per channel for a fluorescence profile.
+
+    For each channel id the channel's hardware state is applied via the same
+    apply_channel_hardware_state() path APPLYCH uses, the channel's profile
+    exposure is set (no adaptive exposure -- the profile exposure is the
+    intended acquisition exposure), an image is snapped and saved as
+    <channelId>.tif. The caller (Java) has already applied the unused-channel
+    rule, so every channel in `channels` is collected.
+
+    Returns the same dict shape as simple_background_collection, with
+    per-channel exposures/intensities populated instead of final_exposures.
+    """
+    output_path = Path(output_folder_path)
+    output_path.mkdir(parents=True, exist_ok=True)
+
+    profiles = (settings or {}).get("acquisition_profiles", {}) or {}
+    profile_cfg = profiles.get(profile_key) or {}
+    modality_name = profile_cfg.get("modality") or modality
+    modalities = (settings or {}).get("modalities", {}) or {}
+    modality_cfg = modalities.get(modality_name) or {}
+    library = modality_cfg.get("channels", []) or []
+    overrides = profile_cfg.get("channel_overrides") or {}
+
+    channel_exposures = {}
+    channel_intensities = {}
+    total = len(channels)
+
+    for idx, channel_id in enumerate(channels):
+        # Resolve the channel entry from the modality library and merge the
+        # profile's channel_overrides (same logic as the APPLYCH handler).
+        ch_entry = None
+        for entry in library:
+            if isinstance(entry, dict) and entry.get("id") == channel_id:
+                ch_entry = dict(entry)
+                break
+        if ch_entry is None:
+            logger.warning(
+                "Channel background: channel '%s' not in modality library; skipping",
+                channel_id,
+            )
+            continue
+        if isinstance(overrides.get(channel_id), dict):
+            for k, v in overrides[channel_id].items():
+                if k == "device_properties" and isinstance(v, list):
+                    base = list(ch_entry.get("device_properties") or [])
+                    base.extend(v)
+                    ch_entry["device_properties"] = base
+                else:
+                    ch_entry[k] = v
+
+        try:
+            apply_channel_hardware_state(hardware, ch_entry, logger)
+        except Exception as e:
+            logger.error(
+                "Channel background: failed to apply state for '%s': %s", channel_id, e
+            )
+            continue
+
+        exposure_ms = ch_entry.get("exposure_ms")
+        if not isinstance(exposure_ms, (int, float)) or exposure_ms <= 0:
+            exposure_ms = 100.0
+        try:
+            hardware.set_exposure(float(exposure_ms))
+        except Exception as e:
+            logger.warning(
+                "Channel background: exposure write failed for '%s': %s", channel_id, e
+            )
+
+        try:
+            image, _ = hardware.snap_image()
+        except Exception as e:
+            logger.error("Channel background: snap failed for '%s': %s", channel_id, e)
+            continue
+
+        background_path = output_path / f"{channel_id}.tif"
+        ome_tiff_writer(
+            filename=str(background_path),
+            pixel_size_um=hardware.get_pixel_size_um(),
+            data=image,
+        )
+        logger.info(
+            "Saved channel background '%s' (exposure=%.2fms) -> %s",
+            channel_id,
+            float(exposure_ms),
+            background_path,
+        )
+
+        channel_exposures[channel_id] = float(exposure_ms)
+        ch_intensity = _channel_intensity_value(ch_entry)
+        if ch_intensity is not None:
+            channel_intensities[channel_id] = ch_intensity
+        update_progress(idx + 1, total)
+
+    logger.info(
+        "=== PER-CHANNEL BACKGROUND COLLECTION COMPLETE: %d/%d channels ===",
+        len(channel_exposures),
+        total,
+    )
+    return {
+        "final_exposures": {},
+        "channel_exposures": channel_exposures,
+        "channel_intensities": channel_intensities,
+        "applied_lamp_intensity": applied_lamp_intensity,
+        "lamp_device_label": lamp_device_label,
+        "resolved_profile": profile_key,
+    }
+
+
 def simple_background_collection(
     yaml_file_path: str,
     output_folder_path: str,
@@ -7144,6 +7284,8 @@ def simple_background_collection(
     objective: str = None,
     detector: str = None,
     target_intensity_override: float = None,
+    profile: str = None,
+    channels=None,
 ):
     """
     Simplified background collection for BackgroundCollectionWorkflow.
@@ -7172,9 +7314,19 @@ def simple_background_collection(
         detector: Detector ID for calibration lookup (e.g., "LOCI_DETECTOR_JAI_001").
                  Required for WB calibration data to be loaded from imageprocessing YAML.
 
+    Args (additional):
+        profile: Acquisition profile key whose illumination_intensity is applied.
+                 If None, the profile is resolved from modality + objective.
+        channels: Optional list of channel ids for per-channel (fluorescence)
+                  background collection. Reserved for the channel path.
+
     Returns:
-        Dict[float, float]: Dictionary mapping angles to final exposure times (ms)
-                           e.g., {90.0: 1.2, 5.0: 45.8, ...}
+        dict: {
+            "final_exposures": Dict[float, float] angle -> exposure ms,
+            "applied_lamp_intensity": float or None (value apply_profile_illumination returned),
+            "lamp_device_label": str or None (illumination device label),
+            "resolved_profile": str or None (acquisition profile key used),
+        }
     """
     # Resolve wb_mode: require explicit choice, never silently pick a mode
     if wb_mode is None:
@@ -7191,6 +7343,12 @@ def simple_background_collection(
     use_per_angle_wb = wb_mode == "per_angle"
     logger.info(f"Background collection wb_mode: {wb_mode}")
     logger.info("=== SIMPLE BACKGROUND COLLECTION STARTED ===")
+
+    # Lamp metadata captured so the caller can record it in background_settings.yml
+    # and the Java side can later validate acquisition-vs-collection consistency.
+    applied_lamp_intensity = None
+    lamp_device_label = None
+    resolved_profile = None
 
     try:
         # Stop live mode if running - JAI camera properties cannot be changed during live streaming
@@ -7219,14 +7377,23 @@ def simple_background_collection(
         # lookup and silently leave whatever lamp level the Live Viewer last
         # used, producing flat-fields against the wrong intensity. Resolve
         # the full profile key here using both modality and objective.
-        resolved_profile = _resolve_background_profile_key(modality, objective, hardware, logger)
+        # Prefer the profile key the client resolved (Java mirror of
+        # _resolve_background_profile_key); fall back to server-side resolution.
+        resolved_profile = profile or _resolve_background_profile_key(
+            modality, objective, hardware, logger
+        )
         profile_to_apply = resolved_profile or modality
         try:
-            applied_intensity = hardware.apply_profile_illumination(profile_to_apply)
-            if applied_intensity is not None:
+            applied_lamp_intensity = hardware.apply_profile_illumination(profile_to_apply)
+            illum = getattr(hardware, "_illumination", None)
+            if illum is not None:
+                lamp_device_label = getattr(illum, "_label", None) or getattr(
+                    illum, "_device", None
+                )
+            if applied_lamp_intensity is not None:
                 logger.info(
                     f"Background collection aligned to profile '{profile_to_apply}' "
-                    f"illumination intensity: {applied_intensity}"
+                    f"illumination intensity: {applied_lamp_intensity}"
                 )
             else:
                 logger.info(
@@ -7284,6 +7451,28 @@ def simple_background_collection(
         if hasattr(hardware, "_initialize_microscope_methods"):
             hardware._initialize_microscope_methods()
             logger.info("Re-initialized hardware methods with updated settings")
+
+        # Per-channel (fluorescence) background collection: when the client
+        # sends --channels, collect one background per channel and return.
+        # This bypasses the angle-based machinery below entirely.
+        if channels:
+            logger.info(
+                "Per-channel background collection requested for %d channel(s): %s",
+                len(channels),
+                channels,
+            )
+            return _collect_channel_backgrounds(
+                channels=channels,
+                output_folder_path=output_folder_path,
+                modality=modality,
+                profile_key=resolved_profile or modality,
+                hardware=hardware,
+                settings=settings,
+                update_progress=update_progress,
+                logger=logger,
+                applied_lamp_intensity=applied_lamp_intensity,
+                lamp_device_label=lamp_device_label,
+            )
 
         # Auto-detect JAI camera and load calibration automatically
         # For JAI cameras, per-channel white balance is REQUIRED for correct flat-field correction
@@ -8019,8 +8208,14 @@ def simple_background_collection(
         # correct unified exposure values from calibration, even if PPM WB later
         # overwrites the shared exposures_ms section.
 
-        # Return final exposures for metadata writing
-        return final_exposures
+        # Return final exposures plus lamp metadata for the caller to record
+        # in background_settings.yml and surface over the BGACQUIRE response.
+        return {
+            "final_exposures": final_exposures,
+            "applied_lamp_intensity": applied_lamp_intensity,
+            "lamp_device_label": lamp_device_label,
+            "resolved_profile": resolved_profile,
+        }
 
     except Exception as e:
         logger.error(f"Simple background collection failed: {str(e)}", exc_info=True)

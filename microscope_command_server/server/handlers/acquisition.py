@@ -220,6 +220,8 @@ def handle_bgacquire(conn, client, hardware, settings, **kwargs):
                     "--objective",
                     "--detector",
                     "--target-intensity",
+                    "--profile",
+                    "--channels",
                 ]
 
                 for i, flag in enumerate(flags):
@@ -266,6 +268,12 @@ def handle_bgacquire(conn, client, hardware, settings, **kwargs):
                                 params["target_intensity"] = float(value)
                             except ValueError:
                                 logger.warning("Invalid --target-intensity value: %s", value)
+                        elif flag == "--profile":
+                            params["profile"] = value
+                        elif flag == "--channels":
+                            params["channels"] = [
+                                c.strip() for c in value.split(",") if c.strip()
+                            ]
 
                 # Resolve wb_mode: prefer explicit --wb-mode, fall back to boolean flag
                 if "wb_mode" in params:
@@ -324,7 +332,7 @@ def handle_bgacquire(conn, client, hardware, settings, **kwargs):
                             with acquisition_locks[addr]:
                                 acquisition_progress[addr] = (current, total)
 
-                    final_exposures = simple_background_collection(
+                    bg_result = simple_background_collection(
                         yaml_file_path=params["yaml_file_path"],
                         output_folder_path=params["output_folder_path"],
                         modality=params["modality"],
@@ -339,7 +347,14 @@ def handle_bgacquire(conn, client, hardware, settings, **kwargs):
                         objective=params.get("objective"),
                         detector=params.get("detector"),
                         target_intensity_override=params.get("target_intensity"),
+                        profile=params.get("profile"),
+                        channels=params.get("channels"),
                     )
+                    final_exposures = bg_result.get("final_exposures", {})
+                    applied_lamp = bg_result.get("applied_lamp_intensity")
+                    lamp_device = bg_result.get("lamp_device_label")
+                    resolved_profile = bg_result.get("resolved_profile")
+                    channel_intensities = bg_result.get("channel_intensities") or {}
 
                     # Format exposures as angle:exposure pairs over the wire
                     # (e.g. "90:137.1,7:245.8,-7:155.2"). Wire format is fixed
@@ -350,9 +365,22 @@ def handle_bgacquire(conn, client, hardware, settings, **kwargs):
                         for angle, exposure in sorted(final_exposures.items())
                     )
 
-                    # Send success response with output path and final exposures
+                    # Third pipe-field: lamp/device/profile metadata. Java tolerates
+                    # its absence (old server), so new clients always get it.
+                    lamp_str = f"{applied_lamp:.2f}" if applied_lamp is not None else "none"
+                    device_str = lamp_device if lamp_device else "none"
+                    profile_str = resolved_profile if resolved_profile else "none"
+                    meta = f"lamp={lamp_str};device={device_str};profile={profile_str}"
+                    if channel_intensities:
+                        chint = ",".join(
+                            f"{cid}:{val:.2f}" for cid, val in channel_intensities.items()
+                        )
+                        meta += f";chint={chint}"
+
+                    # Send success response with output path, exposures, and metadata
                     response = (
-                        f"SUCCESS:{params['output_folder_path']}|{exposures_formatted}".encode()
+                        f"SUCCESS:{params['output_folder_path']}"
+                        f"|{exposures_formatted}|{meta}".encode()
                     )
                     conn.sendall(response)
                     requested_angles = params.get("angles_str", "").strip()
