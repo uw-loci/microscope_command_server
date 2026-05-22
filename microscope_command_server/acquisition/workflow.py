@@ -7214,9 +7214,7 @@ def _collect_channel_backgrounds(
         try:
             apply_channel_hardware_state(hardware, ch_entry, logger)
         except Exception as e:
-            logger.error(
-                "Channel background: failed to apply state for '%s': %s", channel_id, e
-            )
+            logger.error("Channel background: failed to apply state for '%s': %s", channel_id, e)
             continue
 
         exposure_ms = ch_entry.get("exposure_ms")
@@ -7225,9 +7223,7 @@ def _collect_channel_backgrounds(
         try:
             hardware.set_exposure(float(exposure_ms))
         except Exception as e:
-            logger.warning(
-                "Channel background: exposure write failed for '%s': %s", channel_id, e
-            )
+            logger.warning("Channel background: exposure write failed for '%s': %s", channel_id, e)
 
         try:
             image, _ = hardware.snap_image()

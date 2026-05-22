@@ -271,9 +271,7 @@ def handle_bgacquire(conn, client, hardware, settings, **kwargs):
                         elif flag == "--profile":
                             params["profile"] = value
                         elif flag == "--channels":
-                            params["channels"] = [
-                                c.strip() for c in value.split(",") if c.strip()
-                            ]
+                            params["channels"] = [c.strip() for c in value.split(",") if c.strip()]
 
                 # Resolve wb_mode: prefer explicit --wb-mode, fall back to boolean flag
                 if "wb_mode" in params:

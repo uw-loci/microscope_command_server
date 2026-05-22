@@ -34,9 +34,10 @@ Python server's slice of the pipeline.
 
 ### New BGACQUIRE flags
 
-The BGACQUIRE (and ACQUIRE) acquisition message parser accepts two optional
-flags on top of the existing angle-based flags:
+The BGACQUIRE (and ACQUIRE) acquisition message parser accepts optional flags
+on top of the existing angle-based flags:
 
+**For multi-channel acquisition (widefield IF, BF+IF):**
 - `--channels "(id1,id2,...)"` -- ordered list of channel ids to acquire at
   every tile position. Ids must match entries in the modality's channel
   library declared in the microscope YAML.
@@ -45,11 +46,24 @@ flags on top of the existing angle-based flags:
   or non-positive entries fall back to the channel library's default
   `exposure_ms`.
 
-When `--channels` is present the server takes the channel acquisition branch
-in `acquisition/workflow.py`. `--channels` is mutually exclusive with
-`--angles`. If both are supplied (for example, a stale angle field from an
-older client), the server logs a warning and clears the angles so the
-channel path is the single source of truth.
+**For background collection:**
+- `--profile <key>` -- acquisition profile key to apply for background
+  collection (e.g., `profile=Brightfield_10x` or `profile=IF_40x`). If
+  omitted, the profile is resolved automatically from modality and objective.
+  The profile determines which illumination intensity and device properties are
+  applied during background collection.
+- `--channels "(id1,id2,...)"` -- when used with BGACQUIRE, enables
+  per-channel background collection: the server collects one background image
+  per channel instead of per-angle, saving as `{channel_id}.tif` under the
+  output folder. Useful for widefield illumination systems where per-channel
+  backgrounds (with channel-specific optics and illumination) better represent
+  the correction needed during acquisition.
+
+When `--channels` is present for acquisition, the server takes the channel
+acquisition branch in `acquisition/workflow.py`. `--channels` is mutually
+exclusive with `--angles`. If both are supplied (for example, a stale angle
+field from an older client), the server logs a warning and clears the angles
+so the channel path is the single source of truth.
 
 ### How it works
 
