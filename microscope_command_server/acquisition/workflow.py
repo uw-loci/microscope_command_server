@@ -5506,6 +5506,14 @@ def _acquire_tile_channels_z_outer(
                 ctx.image_count += 1
                 ctx.update_progress(ctx.image_count, ctx.total_images)
 
+    # Restore Z to the tile center. The z-sweep leaves the stage parked at
+    # the last plane (the top offset); without this the next tile reads the
+    # current stage Z as its new center_z and the z-stack ratchets up one
+    # z-step per tile until it runs past the stage limit. The channel-outer
+    # path restores per-channel for the same reason.
+    if ctx.z_stack_enabled:
+        hardware.move_to_position(Position(z=center_z))
+
     # Post-sweep: per-channel projection (z-stack only).
     if ctx.z_stack_enabled and ctx.projection_fn is not None:
         for ch_entry in channel_plan:
