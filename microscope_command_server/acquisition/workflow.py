@@ -312,6 +312,10 @@ class SaturationMonitor:
         self._total_warnings_suppressed = dict.fromkeys(self._angles, 0)
         self._aborted = False
         self._abort_reason = ""
+        # Set True once the user chooses to acquire anyway past a saturation
+        # abort; suppresses further birefringence aborts for the rest of the
+        # run while still recording per-tile saturation stats.
+        self._overridden = False
 
         # Per-tile detail records for saturated tiles
         # Each entry: {filename, angle, pos_idx, r_pct, g_pct, b_pct, stage_x, stage_y, stage_z}
@@ -374,7 +378,7 @@ class SaturationMonitor:
         worst = max(sat_result.values())
         tile_num = self._tile_count[angle]
 
-        if worst > self._biref_threshold and tile_num <= self._window:
+        if worst > self._biref_threshold and tile_num <= self._window and not self._overridden:
             self._log.error(
                 f"SATURATION ABORT: tile {filename} at {angle} deg has "
                 f"{worst:.1f}% saturation (threshold: {self._biref_threshold:.1f}%). "
@@ -538,6 +542,22 @@ class SaturationMonitor:
     @property
     def abort_reason(self) -> str:
         return self._abort_reason
+
+    def override_and_continue(self):
+        """Clear a pending abort after the user chose to acquire anyway.
+
+        Stops the monitor from re-triggering for the rest of the run: the
+        birefringence abort check is skipped while overridden. Per-tile
+        saturation stats are still recorded so the saturation report is
+        complete even on an overridden run.
+        """
+        self._aborted = False
+        self._abort_reason = ""
+        self._overridden = True
+        self._log.warning(
+            "Saturation abort overridden by user -- continuing acquisition "
+            "despite saturated initial tiles"
+        )
 
 
 def load_jai_calibration_from_imageprocessing(
@@ -2370,6 +2390,7 @@ class AcquisitionContext:
     is_cancelled: Optional[Callable] = None
     request_manual_focus: Optional[Callable] = None
     request_hardware_error_recovery: Optional[Callable] = None
+    request_saturation_decision: Optional[Callable] = None
 
     # -- Mutable loop state --
     image_count: int = 0
@@ -2426,6 +2447,34 @@ def _maybe_report_time_lapse_warning(
         report_time_lapse_warning(msg)
 
 
+def _resolve_saturation_abort(ctx: "AcquisitionContext", logger) -> bool:
+    """Decide whether a saturation abort is honored or overridden by the user.
+
+    Called when SaturationMonitor.check_tile() reports an abort. If a
+    saturation-decision callback is wired, the client is prompted: on
+    "continue" the monitor is overridden and acquisition proceeds; on
+    "cancel" (any other answer, a callback failure, or no callback at all --
+    e.g. an older client) the abort stands.
+
+    Returns:
+        True  -- user chose to continue; caller must NOT raise.
+        False -- abort stands; caller must raise RuntimeError(abort_reason).
+    """
+    if ctx.request_saturation_decision is None:
+        # No client to ask (older client / headless) -- abort as before.
+        return False
+    try:
+        choice = ctx.request_saturation_decision(ctx.sat_monitor.abort_reason)
+    except Exception as exc:
+        logger.warning(f"Saturation decision callback failed ({exc}); aborting")
+        return False
+    if choice == "continue":
+        ctx.sat_monitor.override_and_continue()
+        return True
+    logger.info(f"Saturation prompt: user chose '{choice}' -- aborting acquisition")
+    return False
+
+
 def _acquisition_workflow(
     message: str,
     client_addr,
@@ -2437,6 +2486,7 @@ def _acquisition_workflow(
     is_cancelled: Callable[[], bool],
     request_manual_focus: Optional[Callable[[], None]] = None,
     request_hardware_error_recovery: Optional[Callable[[str], str]] = None,
+    request_saturation_decision: Optional[Callable[[str], str]] = None,
     connection_config_path: Optional[str] = None,
     report_time_lapse_warning: Optional[Callable[[str], None]] = None,
 ):
@@ -2479,6 +2529,7 @@ def _acquisition_workflow(
             is_cancelled=is_cancelled,
             request_manual_focus=request_manual_focus,
             request_hardware_error_recovery=request_hardware_error_recovery,
+            request_saturation_decision=request_saturation_decision,
             connection_config_path=connection_config_path,
         )
 
@@ -2827,6 +2878,7 @@ def _prepare_acquisition(
     is_cancelled: Callable,
     request_manual_focus: Optional[Callable] = None,
     request_hardware_error_recovery: Optional[Callable] = None,
+    request_saturation_decision: Optional[Callable] = None,
     connection_config_path: Optional[str] = None,
 ) -> AcquisitionContext:
     """Parse message, load configs, setup BG/WB/Z-stack, create output dirs.
@@ -3410,6 +3462,7 @@ def _prepare_acquisition(
         is_cancelled=is_cancelled,
         request_manual_focus=request_manual_focus,
         request_hardware_error_recovery=request_hardware_error_recovery,
+        request_saturation_decision=request_saturation_decision,
         starting_position=starting_position,
     )
 
@@ -4695,7 +4748,8 @@ def _acquire_tile_angles_angle_outer(
                 stage_z=current_stage_pos.z,
             ):
                 ctx.sat_monitor.log_summary()
-                raise RuntimeError(ctx.sat_monitor.abort_reason)
+                if not _resolve_saturation_abort(ctx, logger):
+                    raise RuntimeError(ctx.sat_monitor.abort_reason)
 
             # Save raw image
             if ctx.save_raw_tiles:
@@ -5122,7 +5176,8 @@ def _acquire_tile_angles(
                 stage_z=current_stage_pos.z,
             ):
                 ctx.sat_monitor.log_summary()
-                raise RuntimeError(ctx.sat_monitor.abort_reason)
+                if not _resolve_saturation_abort(ctx, logger):
+                    raise RuntimeError(ctx.sat_monitor.abort_reason)
 
             # Save raw image
             if ctx.save_raw_tiles:

@@ -59,6 +59,8 @@ class ExtendedCommand:
     REQHWER = b"reqhwer_"  # Check if hardware error recovery is requested
     ACKHWER = b"ackhwer_"  # Acknowledge hardware error - retry/skip/cancel
     REQTWARN = b"reqtwarn"  # Check if a time-lapse "falling behind" warning is pending
+    REQSAT = b"reqsat__"  # Check if a saturation continue/cancel decision is pending
+    ACKSAT = b"acksat__"  # Acknowledge saturation prompt - continue/cancel
     AFBENCH = b"afbench_"  # Run autofocus parameter benchmark
     SNAP = b"snap____"  # Simple snap with fixed exposure (no adaptive)
     ZSTACK = b"zstack__"  # Z-stack acquisition at current XY (multi-Z, single tile)

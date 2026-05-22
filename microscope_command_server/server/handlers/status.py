@@ -21,7 +21,7 @@ def handle_status(conn, client, hardware, settings, **kwargs):
     acquisition_failure_messages, acquisition_final_z, acquisition_saturation_summary.
 
     Response formats:
-    - FAILED: 'FAILED: <message>' (up to 250 bytes)
+    - FAILED: 'FAILED: <message>' (up to 500 bytes)
     - COMPLETED: 'COMPLETED|final_z:<z>|sat:<summary>' (variable length)
     - Other: state name padded to 16 bytes
     """
@@ -39,8 +39,11 @@ def handle_status(conn, client, hardware, settings, **kwargs):
         if state.value == "FAILED" and addr in acquisition_failure_messages:
             # Send "FAILED: <message>" format (truncated to fit in response)
             error_msg = acquisition_failure_messages.get(addr) or "Unknown error"
-            # Java client expects to parse this format
-            state_str = f"FAILED: {error_msg}"[:250]  # Reasonable limit for error message
+            # Java client expects to parse this format. The cap matches the
+            # Java client's 512-byte FAILED read window (16 + 496); keep it
+            # below that so long messages (e.g. the saturation-abort reason)
+            # are not truncated mid-word.
+            state_str = f"FAILED: {error_msg}"[:500]
             # Pad to 16 bytes minimum for compatibility, but can be longer
             response = state_str.encode("utf-8")
             conn.sendall(response)
@@ -241,6 +244,51 @@ def handle_ackhwer(conn, client, hardware, settings, **kwargs):
     hardware_error_complete_events[addr].set()
     conn.sendall(b"ACK")
     logger.info("Hardware error acknowledged by %s: %s", addr, choice)
+
+
+def handle_reqsat(conn, client, hardware, settings, **kwargs):
+    """Check if a saturation continue/cancel decision is pending.
+
+    Response: 'SATWARN_' (8 bytes) + 4-byte length (big-endian) + message
+    bytes if a saturation prompt is pending, or 'IDLE____' (8 bytes) if not.
+
+    The server keeps returning the same prompt on every poll until the user
+    answers via ACKSAT; the Java client de-dupes and shows the dialog once.
+    """
+    saturation_request_events = kwargs["saturation_request_events"]
+    saturation_message = kwargs["saturation_message"]
+    addr = client.addr
+
+    if saturation_request_events[addr].is_set():
+        msg = saturation_message.get(addr) or "Saturation limit exceeded"
+        # Encode as: 8-byte status + 4-byte length (big-endian) + message bytes
+        msg_bytes = msg.encode("utf-8")
+        length = len(msg_bytes)
+        conn.sendall(b"SATWARN_")  # 8-byte status: saturation prompt pending
+        conn.sendall(length.to_bytes(4, "big"))
+        conn.sendall(msg_bytes)
+        logger.debug("Sent saturation prompt to %s: %s", addr, msg[:100])
+    else:
+        conn.sendall(b"IDLE____")  # 8 bytes: no prompt pending
+
+
+def handle_acksat(conn, client, hardware, settings, **kwargs):
+    """Acknowledge a saturation prompt - user chose continue/cancel.
+
+    Protocol: 8 bytes (user choice padded with underscores).
+    Response: 'ACK' (3 bytes).
+    """
+    saturation_user_choice = kwargs["saturation_user_choice"]
+    saturation_complete_events = kwargs["saturation_complete_events"]
+    addr = client.addr
+
+    # Read 8 bytes: user choice (padded to 8 with underscores)
+    choice_data = conn.recv(8)
+    choice = choice_data.decode("utf-8").strip().rstrip("_")
+    saturation_user_choice[addr] = choice
+    saturation_complete_events[addr].set()
+    conn.sendall(b"ACK")
+    logger.info("Saturation prompt acknowledged by %s: %s", addr, choice)
 
 
 def _get_state_enum(state_name, kwargs):

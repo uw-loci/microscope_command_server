@@ -207,6 +207,10 @@ hardware_error_request_events = {}  # addr -> Event (set when hardware error nee
 hardware_error_complete_events = {}  # addr -> Event (set when user acknowledges hardware error)
 hardware_error_user_choice = {}  # addr -> str ("retry", "skip", "cancel")
 hardware_error_message = {}  # addr -> str (error message string per client)
+saturation_request_events = {}  # addr -> Event (set when a saturation decision is needed)
+saturation_complete_events = {}  # addr -> Event (set when user answers the saturation prompt)
+saturation_user_choice = {}  # addr -> str ("continue", "cancel")
+saturation_message = {}  # addr -> str (saturation-abort reason shown to the user)
 time_lapse_warnings = {}  # addr -> Optional[str] (time-lapse "falling behind" warning)
 
 # Server configuration state - CRITICAL FOR SAFETY
@@ -397,6 +401,43 @@ def acquisitionWorkflow(message, client_addr):
         logger.info(f"Hardware error resolved, user chose: {user_choice}")
         return user_choice
 
+    def _request_saturation_decision(saturation_reason: str) -> str:
+        """Signal a saturation limit was hit and wait for the user to decide.
+
+        Args:
+            saturation_reason: Human-readable saturation-abort reason.
+
+        Returns:
+            str: User's choice - "continue" (acquire anyway) or "cancel".
+        """
+        logger.info(f"Saturation decision requested for {client_addr}")
+        saturation_message[client_addr] = saturation_reason
+        saturation_request_events[client_addr].set()
+        saturation_user_choice[client_addr] = None
+        # Block the acquisition thread until the user answers. Poll the
+        # complete event alongside the acquisition-cancel event so a CANCEL
+        # sent while the dialog is open short-circuits to "cancel" instead
+        # of hanging forever.
+        logger.info("Waiting for user to resolve saturation prompt...")
+        complete_event = saturation_complete_events[client_addr]
+        cancel_event = acquisition_cancel_events[client_addr]
+        while not complete_event.wait(timeout=0.2):
+            if cancel_event.is_set():
+                logger.info(
+                    "Acquisition cancelled while waiting for saturation "
+                    "decision; treating as user_choice='cancel'"
+                )
+                saturation_user_choice[client_addr] = "cancel"
+                break
+        user_choice = saturation_user_choice[client_addr] or "cancel"
+        # Clear events for next potential use
+        saturation_request_events[client_addr].clear()
+        saturation_complete_events[client_addr].clear()
+        saturation_user_choice[client_addr] = None
+        saturation_message[client_addr] = ""
+        logger.info(f"Saturation prompt resolved, user chose: {user_choice}")
+        return user_choice
+
     return _acquisition_workflow(
         message=message,
         client_addr=client_addr,
@@ -408,6 +449,7 @@ def acquisitionWorkflow(message, client_addr):
         is_cancelled=_is_cancelled,
         request_manual_focus=_request_manual_focus,
         request_hardware_error_recovery=_request_hardware_error_recovery,
+        request_saturation_decision=_request_saturation_decision,
         connection_config_path=active_connection_config_path,
         report_time_lapse_warning=_report_time_lapse_warning,
     )
@@ -445,6 +487,10 @@ def handle_client(conn, addr):
     hardware_error_complete_events[addr] = threading.Event()
     hardware_error_user_choice[addr] = None
     hardware_error_message[addr] = ""
+    saturation_request_events[addr] = threading.Event()
+    saturation_complete_events[addr] = threading.Event()
+    saturation_user_choice[addr] = None
+    saturation_message[addr] = ""
     time_lapse_warnings[addr] = None
 
     # ClientState object for handlers that use the new pattern
@@ -488,6 +534,10 @@ def handle_client(conn, addr):
         "hardware_error_complete_events": hardware_error_complete_events,
         "hardware_error_user_choice": hardware_error_user_choice,
         "hardware_error_message": hardware_error_message,
+        "saturation_request_events": saturation_request_events,
+        "saturation_complete_events": saturation_complete_events,
+        "saturation_user_choice": saturation_user_choice,
+        "saturation_message": saturation_message,
         "time_lapse_warnings": time_lapse_warnings,
         # Acquisition thread tracking
         "acquisition_thread": acquisition_thread,
