@@ -338,6 +338,39 @@ SCAN_TAIL_MS = 100.0
 FALLBACK_RANGE_UM = 6.0
 
 
+# ----- Streaming-AF abort registry (ABORTAF command support) -----
+#
+# Keyed by client IP, NOT (ip, port): the QuPath client uses two sockets --
+# the primary runs the blocking STRMAFZ scan, the auxiliary sends ABORTAF.
+# Both connections share an IP, so the abort signal must be reachable from
+# either one. Entries are created lazily and never removed; one
+# threading.Event per distinct client IP is negligible.
+_af_abort_events: Dict[str, threading.Event] = {}
+_af_abort_lock = threading.Lock()
+
+
+def _get_af_abort_event(ip: str) -> threading.Event:
+    """Get-or-create the streaming-AF abort Event for a client IP."""
+    with _af_abort_lock:
+        ev = _af_abort_events.get(ip)
+        if ev is None:
+            ev = threading.Event()
+            _af_abort_events[ip] = ev
+        return ev
+
+
+def _client_ip(addr) -> Optional[str]:
+    """Extract the client IP from a handler addr.
+
+    addr is an (ip, port) tuple for real socket connections, or a plain
+    string for the in-process AF-benchmark invoker (which cannot be
+    aborted). Returns None in the latter case.
+    """
+    if isinstance(addr, (tuple, list)) and addr:
+        return str(addr[0])
+    return None
+
+
 # ----- Small pixel helpers (duplicated from probez for isolation) -----
 
 
@@ -1512,6 +1545,7 @@ def _run_streaming_scan(
     metric_name: str = DEFAULT_METRIC_NAME,
     dump_dir: Optional[Path] = None,
     secondary_metric_name: Optional[str] = None,
+    abort_event: Optional[threading.Event] = None,
 ) -> List[Tuple[float, float, float, Optional[float]]]:
     """Execute the streaming-sample scan and return a list of
     (t_capture_ms, z_interp, metric) triples. Leaves the camera in
@@ -1693,9 +1727,18 @@ def _run_streaming_scan(
 
     deadline = time.perf_counter() + hard_deadline_s
 
+    # Set when the client requested cancellation mid-scan (ABORTAF).
+    # Checked every poll iteration (~SCAN_POLL_SLEEP_S = 2 ms cadence)
+    # so abort is observed within a frame; the raise happens after the
+    # Z-poll thread is joined so cleanup is not skipped.
+    aborted = False
+
     while time.perf_counter() < deadline:
         t_now_ms = (time.perf_counter() - t0) * 1000.0
         if t_now_ms > scan_exit_at_ms:
+            break
+        if abort_event is not None and abort_event.is_set():
+            aborted = True
             break
 
         try:
@@ -1749,6 +1792,13 @@ def _run_streaming_scan(
         z_poll_thread.join(timeout=0.5)
     except Exception:
         pass
+
+    # Client cancelled the scan. The Z-poll thread is now joined, so it
+    # is safe to bail out -- skip the rapid-jump analysis and metric fit
+    # and let _attempt_one_scan turn this into an 'aborted' result.
+    if aborted:
+        logger.warning("STREAM_AF:scan loop aborted by client request (ABORTAF)")
+        raise _AbortRequested("user cancelled")
 
     if len(z_poll_samples) >= 2:
         first_t, first_z = z_poll_samples[0]
@@ -2289,6 +2339,16 @@ class _RapidJumpDetected(Exception):
     """
 
 
+class _AbortRequested(Exception):
+    """Raised by _run_streaming_scan when the per-IP abort Event is set
+    mid-scan (the client sent ABORTAF on its auxiliary socket).
+
+    _attempt_one_scan catches it and returns an 'aborted' result; the
+    retry loop in handle_streaming_focus then stops, restores Z to the
+    pre-scan position, and replies ABORTED:user-cancelled.
+    """
+
+
 class _ScanAttemptResult:
     """Result of one _attempt_one_scan call.
 
@@ -2311,6 +2371,9 @@ class _ScanAttemptResult:
                                  on this rig. No retry can help; the
                                  operator must use Sweep Focus or
                                  reconfigure the stage driver.
+        'aborted'             -- the client requested cancellation
+                                 (ABORTAF) mid-scan; caller restores Z
+                                 to the pre-scan position
         'error'               -- hardware or protocol error mid-scan
     """
 
@@ -2345,6 +2408,7 @@ def _attempt_one_scan(
     normal_value: str = NORMAL_SPEED_VALUE,
     dump_dir: Optional[Path] = None,
     secondary_metric_name: Optional[str] = None,
+    abort_event: Optional[threading.Event] = None,
 ) -> _ScanAttemptResult:
     """Run one streaming AF scan centered on z_center with the given range.
 
@@ -2462,6 +2526,7 @@ def _attempt_one_scan(
                     metric_name=metric_name,
                     dump_dir=dump_dir,
                     secondary_metric_name=secondary_metric_name,
+                    abort_event=abort_event,
                 )
             except _RapidJumpDetected as rj:
                 # Stage jumped to z_end instead of moving slowly. Surface
@@ -2476,6 +2541,18 @@ def _attempt_one_scan(
                     0,
                     0.0,
                     str(rj),
+                )
+            except _AbortRequested:
+                # Client cancelled mid-scan (ABORTAF). The finally below
+                # stops the sequence if we started it; the caller's retry
+                # loop short-circuits on 'aborted' and restores Z.
+                logger.warning("STREAM_AF:%sscan cancelled by client request", tag_prefix)
+                return _ScanAttemptResult(
+                    "aborted",
+                    None,
+                    0,
+                    0.0,
+                    "user cancelled",
                 )
         finally:
             if sequence_started_here:
@@ -3239,9 +3316,45 @@ def _brent_fallback_scan(
     )
 
 
+def handle_abort_af(conn, client, hardware, settings, **kwargs):
+    """Entry point for the ABORTAF command -- cancel an in-progress
+    streaming autofocus scan.
+
+    The QuPath Live Viewer sends this on its AUXILIARY socket while the
+    blocking STRMAFZ scan occupies the primary socket. It sets the
+    per-IP abort Event; handle_streaming_focus polls that Event between
+    attempts and between frames, tears the scan down, and restores Z to
+    the pre-scan position.
+
+    Response: 'ACK' (3 bytes). Best-effort -- ACK means the request was
+    recorded, not that a scan was actually running.
+    """
+    addr = getattr(client, "addr", client)
+    ip = _client_ip(addr)
+    if ip is None:
+        logger.warning("ABORTAF:could not determine client IP from %r; ignoring", addr)
+    else:
+        _get_af_abort_event(ip).set()
+        logger.warning("ABORTAF:streaming autofocus cancellation requested by %s", addr)
+    try:
+        conn.sendall(b"ACK")
+    except Exception:
+        pass
+
+
 def handle_streaming_focus(conn, client, hardware, settings, **kwargs):
     """Entry point for the STRMAFZ (streaming autofocus) command."""
     addr = getattr(client, "addr", client)
+
+    # Per-IP abort signal for the ABORTAF command. Keyed by IP because
+    # the cancel arrives on the client's auxiliary socket (a different
+    # connection than this primary one). None for the in-process
+    # AF-benchmark invoker, which cannot be cancelled. Clear any stale
+    # signal left set by a previous run before this scan starts.
+    abort_ip = _client_ip(addr)
+    abort_event = _get_af_abort_event(abort_ip) if abort_ip is not None else None
+    if abort_event is not None:
+        abort_event.clear()
 
     # Read the text payload (same framing as other flag-based handlers).
     try:
@@ -3789,6 +3902,15 @@ def handle_streaming_focus(conn, client, hardware, settings, **kwargs):
             attempt_num = attempt_idx + 1
             label = f"attempt {attempt_num}/{max_attempts}"
 
+            # Abort check between attempts -- catches a cancel that
+            # arrived in the gap after the previous attempt returned.
+            # A cancel DURING an attempt is caught inside the scan loop.
+            if abort_event is not None and abort_event.is_set():
+                logger.warning("STREAM_AF:abort detected before %s; stopping", label)
+                attempts_log.append(f"{label}: aborted")
+                final_result = _ScanAttemptResult("aborted", None, 0, 0.0, "user cancelled")
+                break
+
             # Check Z limits before each attempt. Refuse if the
             # proposed window would step outside the configured stage
             # limits; the current attempt's center came from a
@@ -3830,6 +3952,7 @@ def handle_streaming_focus(conn, client, hardware, settings, **kwargs):
                 normal_value=eff_normal_value,
                 dump_dir=attempt_dump_dir,
                 secondary_metric_name=secondary_metric_name,
+                abort_event=abort_event,
             )
             attempts_log.append(
                 f"{label}: center={current_center:.3f} "
@@ -3867,6 +3990,12 @@ def handle_streaming_focus(conn, client, hardware, settings, **kwargs):
             # stage will still jump to the new z_end then sit. Abort
             # the whole AF immediately with the actionable message.
             if result.status == "rapid_jump":
+                final_result = result
+                break
+
+            # Client cancelled mid-scan -- stop immediately; the
+            # post-loop dispatch restores Z to the pre-scan position.
+            if result.status == "aborted":
                 final_result = result
                 break
 
@@ -4155,6 +4284,18 @@ def handle_streaming_focus(conn, client, hardware, settings, **kwargs):
         # converges faster and avoids Brent landing on irrelevant Z
         # far from any actual sample. With no samples (no_slow_speed
         # on first attempt) we search a wider window.
+        #
+        # Abort check before escalating to Brent: a cancel that arrived
+        # while the retry loop was finishing should skip the (snap-based,
+        # multi-second) Brent search rather than run it to completion.
+        if (
+            abort_event is not None
+            and abort_event.is_set()
+            and final_result.status not in ("success", "aborted")
+        ):
+            logger.warning("STREAM_AF:abort detected before Brent fallback; skipping")
+            final_result = _ScanAttemptResult("aborted", None, 0, 0.0, "user cancelled")
+
         if final_result.status in ("edge_low", "edge_high", "no_slow_speed"):
             if all_attempt_samples_zm:
                 # Anchor on the best sample we've already got, then
@@ -4279,7 +4420,11 @@ def handle_streaming_focus(conn, client, hardware, settings, **kwargs):
         # the original -16.7 is still a real focus point in the FOV --
         # just not necessarily the global tissue focus the operator
         # wanted. Better than UNAVAILABLE.
-        if final_result.status != "success" and fallback_peak_z is not None:
+        #
+        # 'aborted' is excluded: a cancelled scan must NOT silently
+        # commit a fallback peak -- the user asked to stop, so Z is
+        # restored to where AF started instead.
+        if final_result.status not in ("success", "aborted") and fallback_peak_z is not None:
             # Only commit if the fallback peak's metric beats anything
             # else we've seen across all attempts. Otherwise the union-
             # fit / global-argmax path above already handled it.
@@ -4341,6 +4486,40 @@ def handle_streaming_focus(conn, client, hardware, settings, **kwargs):
                 _drain_pending_dumps()
             try:
                 conn.sendall(response.encode())
+            except Exception as e:
+                logger.error("STREAM_AF:reply send failed: %s", e)
+        elif final_result.status == "aborted":
+            # The client cancelled the scan (ABORTAF). The stage is
+            # partway through a continuous-velocity move; stop it,
+            # restore normal speed so the recovery move is not crawling,
+            # and return Z to where autofocus started so the stage ends
+            # settled at a known position -- as if AF was never run.
+            try:
+                core.stop(focus_device)
+            except Exception:
+                # Not every stage adapter implements Stop; the absolute
+                # set_position below redirects the move regardless.
+                pass
+            if speed_prop is not None:
+                _try_set(core, focus_device, speed_prop, eff_normal_value)
+            try:
+                core.set_position(focus_device, initial_z)
+                _wait_via_busy(core, focus_device, target_z=initial_z)
+            except Exception as e:
+                logger.warning("STREAM_AF:could not restore Z after abort: %s", e)
+            logger.warning(
+                "STREAM_AF:ABORTED by client after %d attempt(s); Z restored to %.3f",
+                len(attempts_log),
+                initial_z,
+            )
+            for entry in attempts_log:
+                logger.warning("STREAM_AF:attempt log -- %s", entry)
+            aborted_msg = "ABORTED:user-cancelled"
+            if dump_root is not None:
+                aborted_msg += f":dump={dump_root}"
+                _drain_pending_dumps()
+            try:
+                conn.sendall(aborted_msg.encode())
             except Exception as e:
                 logger.error("STREAM_AF:reply send failed: %s", e)
         else:
@@ -4530,6 +4709,7 @@ def _parse_streaming_response(resp: str) -> Dict[str, Any]:
 
     SUCCESS:<initial>:<final>:<shift>:<n_samples>:<span>[:dump=<path>]
     UNAVAILABLE:<reason>
+    ABORTED:<reason>
     FAILED:<reason>
     """
     result: Dict[str, Any] = {
@@ -4566,6 +4746,10 @@ def _parse_streaming_response(resp: str) -> Dict[str, Any]:
     if resp.startswith("UNAVAILABLE:"):
         result["status"] = "unavailable"
         result["reason"] = resp[len("UNAVAILABLE:") :]
+        return result
+    if resp.startswith("ABORTED:"):
+        result["status"] = "aborted"
+        result["reason"] = resp[len("ABORTED:") :]
         return result
     if resp.startswith("FAILED:"):
         result["status"] = "failed"

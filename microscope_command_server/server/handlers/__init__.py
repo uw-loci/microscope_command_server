@@ -101,7 +101,10 @@ from microscope_command_server.server.handlers.system import (
 )
 from microscope_command_server.server.handlers.probez import handle_probez
 from microscope_command_server.server.handlers.probe_stage_af import handle_probe_stage_af
-from microscope_command_server.server.handlers.streaming_focus import handle_streaming_focus
+from microscope_command_server.server.handlers.streaming_focus import (
+    handle_streaming_focus,
+    handle_abort_af,
+)
 from microscope_command_server.server.handlers.rapid_scan import handle_rapid_scan
 
 # Map 8-byte command bytes -> handler function
@@ -189,6 +192,7 @@ COMMAND_HANDLERS = {
     ExtendedCommand.PRBSAFZ: handle_probe_stage_af,
     # Streaming autofocus
     ExtendedCommand.STRMAFZ: handle_streaming_focus,
+    ExtendedCommand.ABORTAF: handle_abort_af,
     # Rapid scan
     ExtendedCommand.RPDSCAN: handle_rapid_scan,
 }

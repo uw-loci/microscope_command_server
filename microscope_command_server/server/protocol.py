@@ -153,6 +153,9 @@ class ExtendedCommand:
     # during non-blocking stage motion. Replaces the stepped sweep
     # drift check on calibrated hardware.
     STRMAFZ = b"strmafz_"  # Streaming autofocus scan
+    # Cancel an in-progress STRMAFZ scan. Sent on the client's AUXILIARY
+    # socket (the primary is blocked running STRMAFZ). Response: 'ACK'.
+    ABORTAF = b"abortaf_"  # Abort streaming autofocus scan
     RPDSCAN = b"rpdscan_"  # Rapid scan -- fast tiled brightfield, no AF, no Z
 
     # Illumination & Profile Commands
