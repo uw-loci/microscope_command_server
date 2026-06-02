@@ -173,6 +173,17 @@ def _stop_session_logging() -> None:
             _session_log_config_path = None
 
 
+def get_session_log_path():
+    """Return the path of the active session log file, or None if none.
+
+    Used by the GETLOG command handler to ship the server's log tail to the
+    QuPath in-app bug reporter.
+    """
+    if _session_log_handler is not None:
+        return getattr(_session_log_handler, "baseFilename", None)
+    return None
+
+
 # Server configuration
 HOST = "0.0.0.0"  # Listen on all interfaces
 PORT = TCP_PORT  # Default: 5000

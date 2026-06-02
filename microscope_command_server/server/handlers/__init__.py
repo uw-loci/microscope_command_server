@@ -100,6 +100,7 @@ from microscope_command_server.server.handlers.system import (
     handle_shutdown,
     handle_siftal,
     handle_siftim,
+    handle_get_log,
 )
 from microscope_command_server.server.handlers.probez import handle_probez
 from microscope_command_server.server.handlers.probe_stage_af import handle_probe_stage_af
@@ -190,6 +191,8 @@ COMMAND_HANDLERS = {
     ExtendedCommand.SHUTDOWN: handle_shutdown,
     ExtendedCommand.SIFTAL: handle_siftal,
     ExtendedCommand.SIFTIM: handle_siftim,
+    # Diagnostics: session-log tail for the in-app bug reporter
+    ExtendedCommand.GETLOG: handle_get_log,
     # Z-stage diagnostic probe
     ExtendedCommand.PROBEZ: handle_probez,
     # Setup-wizard stage probe (recommends streaming_af YAML values)

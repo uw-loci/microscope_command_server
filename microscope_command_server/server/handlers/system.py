@@ -4,6 +4,7 @@ Handles connection management, configuration, and alignment commands:
 CONFIG, RECONFG, DISCONNECT, SHUTDOWN, SIFTAL, SIFTIM
 """
 
+import contextlib
 import struct
 import socket
 import logging
@@ -783,3 +784,75 @@ def handle_siftim(conn, client, hardware, settings, **kwargs):
     except Exception as e:
         logger.error("SIFTIM failed: %s", e, exc_info=True)
         conn.sendall(f"FAILED:{str(e)}".encode())
+
+
+# Banner markers used to keep the version block as the "head" of a trimmed log.
+# The closing marker matches a run of '=' (the banner rule) without matching the
+# short "=== X ===" header lines.
+_LOG_BANNER_START = "=== Python Server Version Info ==="
+_LOG_BANNER_CLOSE = "========="
+_LOG_MAX_CHARS = 20000
+
+
+def _read_log_head_tail(path, max_chars=_LOG_MAX_CHARS):
+    """Read a log file and trim it to max_chars as head (version banner) + tail.
+
+    The head keeps everything through the startup version banner so provenance
+    is always present; the tail keeps the most recent lines (where errors are).
+    Returns "" if the file cannot be read.
+    """
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as f:
+            text = f.read()
+    except OSError:
+        return ""
+
+    if len(text) <= max_chars:
+        return text
+
+    head = ""
+    start = text.find(_LOG_BANNER_START)
+    if start != -1:
+        close = text.find(_LOG_BANNER_CLOSE, start + len(_LOG_BANNER_START))
+        if close != -1:
+            line_end = text.find("\n", close)
+            head_end = (
+                line_end + 1 if line_end != -1 else min(len(text), close + len(_LOG_BANNER_CLOSE))
+            )
+        else:
+            head_end = min(len(text), start + 2000)
+        # Never let the head consume more than a third of the budget.
+        head = text[: min(head_end, max(0, max_chars // 3))]
+
+    sep_reserve = 48
+    tail_chars = max(0, max_chars - len(head) - sep_reserve)
+    tail_start = max(len(head), len(text) - tail_chars)
+    tail = text[tail_start:]
+    omitted = len(text) - len(head) - len(tail)
+    return f"{head}\n... [{omitted} chars omitted] ...\n{tail}"
+
+
+def handle_get_log(conn, client, hardware, settings, **kwargs):
+    """Send the tail of the current session log for the in-app bug reporter.
+
+    Wire format: 4-byte big-endian length, then that many UTF-8 bytes. A length
+    of 0 means there is no active session log. Errors also reply with length 0
+    so the client never blocks waiting for a body.
+    """
+    # Imported lazily to avoid a circular import (qp_server imports this package).
+    from microscope_command_server.server import qp_server
+
+    try:
+        path = qp_server.get_session_log_path()
+        body = _read_log_head_tail(path) if path else ""
+        data = body.encode("utf-8")
+        conn.sendall(struct.pack("!I", len(data)))
+        if data:
+            conn.sendall(data)
+        logger.debug(
+            "Sent session log tail (%d bytes) to %s", len(data), getattr(client, "addr", client)
+        )
+    except Exception as e:
+        logger.error("GETLOG failed: %s", e, exc_info=True)
+        with contextlib.suppress(Exception):
+            conn.sendall(struct.pack("!I", 0))

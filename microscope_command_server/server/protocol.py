@@ -186,3 +186,9 @@ class ExtendedCommand:
     # all illumination for the profile's modality.
     # Payload: 32-byte profile name + 32-byte channel id (null-padded UTF-8).
     APPLYCH = b"applych_"
+
+    # Diagnostics
+    # Fetch the tail of the current session log for the QuPath in-app bug
+    # reporter. Reply: 4-byte big-endian length + that many UTF-8 bytes
+    # (head = version banner, plus the recent tail); length 0 means no log.
+    GETLOG = b"getlog__"
