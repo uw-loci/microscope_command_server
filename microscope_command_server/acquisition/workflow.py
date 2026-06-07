@@ -2376,6 +2376,12 @@ class AcquisitionContext:
     af_positions: list = field(default_factory=list)
     af_min_distance: float = 0.0
     exposure_90: float = 0.0  # mutable: doubled during brightness checks
+    # AF saturation guard (set once per run): scale applied to the AF exposure
+    # (or illumination power) to keep the focus frame below the strategy's
+    # saturation tolerance. None until determined; 1.0 means "no reduction
+    # needed". See _guard_af_saturation.
+    af_saturation_scale: Optional[float] = None
+    af_illumination_power: Optional[float] = None  # remembered reduced AF illumination power
     hint_z: Optional[float] = None
     metadata_txt_for_positions: Optional[Path] = None
 
@@ -3790,6 +3796,140 @@ def _configure_autofocus(ctx: AcquisitionContext) -> None:
     ctx.completed_af_positions = []
 
 
+def _guard_af_saturation(ctx: "AcquisitionContext", hardware, logger) -> None:
+    """Keep the autofocus frame below the strategy's saturation tolerance.
+
+    A saturated focus frame corrupts the focus metric -- clipped highlights
+    flatten the local gradient and can invert the focus curve so it ramps
+    toward defocus instead of peaking at focus. That is what walked PPM 40x
+    from Z=7 to Z=104 um on 2026-05-31 (claude-reports/
+    2026-06-02_autofocus-focus-runaway.md). Autofocus cannot rescue a
+    sample the user has over-exposed, but it CAN take its focus frames at a
+    reduced exposure / illumination so the metric stays usable, without
+    touching the acquisition's own exposure (which is re-applied per tile).
+
+    Strategy-aware: each strategy declares a ``saturation_threshold`` (dense
+    tissue ~10%, sparse beads ~3% because they clip all their signal in a
+    few pixels). The reduction is determined ONCE per run by halving the AF
+    exposure (or, when exposure is not the brightness control, the
+    illumination power) and re-snapping until the strongest channel is under
+    tolerance; later AF calls re-apply the remembered scale cheaply without
+    re-measuring. If halving hits its floor while still saturated, AF
+    proceeds but logs a clear warning -- the user must lower the sample
+    exposure (also surfaced in the end-of-run saturation summary).
+    """
+    strat = getattr(ctx, "af_strategy", None)
+    if strat is None or not hasattr(strat, "saturation_acceptable"):
+        return
+
+    use_exposure = bool(ctx.exposure_90 and ctx.exposure_90 > 0)
+    illum = getattr(hardware, "illumination", None)
+    if not use_exposure and illum is None:
+        return  # no brightness knob to turn
+
+    MAX_HALVINGS = 5
+    MIN_EXPOSURE_MS = 0.05
+
+    # Fast path: reduction already determined this run -> re-apply and return.
+    if ctx.af_saturation_scale is not None:
+        if ctx.af_saturation_scale >= 1.0:
+            return
+        try:
+            if use_exposure:
+                hardware.set_exposure(ctx.exposure_90 * ctx.af_saturation_scale)
+            elif ctx.af_illumination_power is not None:
+                illum.set_power(ctx.af_illumination_power)
+        except Exception as e:
+            logger.warning("AF saturation guard: could not re-apply reduction: %s", e)
+        return
+
+    def _snap_u8():
+        img, _ = hardware.snap_image()
+        if img.dtype in (np.float32, np.float64):
+            if img.max() <= 1.0 and img.min() >= 0.0:
+                img = (img * 255).astype(np.uint8)
+            else:
+                img = np.clip(img, 0, 255).astype(np.uint8)
+        return img
+
+    try:
+        img = _snap_u8()
+        ok, stats = strat.saturation_acceptable(img)
+        if ok:
+            ctx.af_saturation_scale = 1.0
+            return
+
+        base_exposure = float(ctx.exposure_90) if use_exposure else 0.0
+        try:
+            base_power = float(illum.get_power()) if not use_exposure else 0.0
+        except Exception:
+            base_power = 0.0
+        if not use_exposure and base_power <= 0:
+            # Illumination power unreadable -- cannot scale it safely.
+            ctx.af_saturation_scale = 1.0
+            logger.warning(
+                "AF saturation guard: %.1f%% saturated but illumination power "
+                "is unreadable; cannot auto-reduce. Lower the sample exposure. "
+                "(strategy=%s)",
+                stats["saturation_fraction"] * 100.0,
+                ctx.af_strategy_name,
+            )
+            return
+
+        scale = 1.0
+        halvings = 0
+        while not ok and halvings < MAX_HALVINGS:
+            scale *= 0.5
+            halvings += 1
+            if use_exposure:
+                new_exp = max(base_exposure * scale, MIN_EXPOSURE_MS)
+                hardware.set_exposure(new_exp)
+                applied = "exposure %.3fms" % new_exp
+            else:
+                illum.set_power(base_power * scale)
+                applied = "power %.4f" % (base_power * scale)
+            img = _snap_u8()
+            ok, stats = strat.saturation_acceptable(img)
+            logger.warning(
+                "AF saturation guard: halving #%d -> %s, now %.1f%% saturated "
+                "(threshold %.1f%%, strategy=%s)",
+                halvings,
+                applied,
+                stats["saturation_fraction"] * 100.0,
+                stats["saturation_threshold"] * 100.0,
+                ctx.af_strategy_name,
+            )
+
+        ctx.af_saturation_scale = scale
+        if not use_exposure:
+            ctx.af_illumination_power = base_power * scale
+
+        if ok:
+            logger.info(
+                "AF saturation guard: reduced AF %s to %.3fx for this run "
+                "(strategy=%s, now %.1f%% saturated <= %.1f%%)",
+                "exposure" if use_exposure else "illumination",
+                scale,
+                ctx.af_strategy_name,
+                stats["saturation_fraction"] * 100.0,
+                stats["saturation_threshold"] * 100.0,
+            )
+        else:
+            logger.warning(
+                "AF saturation guard: still %.1f%% saturated after %d halvings "
+                "(floor reached); autofocus may be unreliable -- reduce the "
+                "sample exposure/intensity. (strategy=%s)",
+                stats["saturation_fraction"] * 100.0,
+                halvings,
+                ctx.af_strategy_name,
+            )
+    except Exception as e:
+        # Never let the guard break acquisition; fall back to unscaled AF.
+        logger.warning("AF saturation guard failed (%s); proceeding without reduction", e)
+        if ctx.af_saturation_scale is None:
+            ctx.af_saturation_scale = 1.0
+
+
 def _run_pre_acquisition_autofocus(ctx: AcquisitionContext) -> None:
     """Run initial autofocus at first tissue position before main loop.
 
@@ -3982,6 +4122,11 @@ def _run_pre_acquisition_autofocus(ctx: AcquisitionContext) -> None:
             new_xy = np.array([search_pos.x, search_pos.y]) + direction * fov_diagonal
             search_pos = Position(new_xy[0], new_xy[1], search_pos.z)
             logger.info("Moving 1 FOV diagonal toward center for next attempt")
+
+    # Reduce AF exposure/illumination if the focus frame is over-saturated
+    # (determined once here, remembered for the run). A saturated metric
+    # inverts and walks the stage; see _guard_af_saturation.
+    _guard_af_saturation(ctx, hardware, logger)
 
     # Run autofocus (with manual fallback if no tissue found)
     try:
@@ -4271,6 +4416,10 @@ def _handle_tile_autofocus(
             f"AF drift-check exposure adjusted to {ctx.exposure_90:.2f}ms "
             f"(strategy={ctx.af_strategy_name})"
         )
+
+    # Re-apply the per-run AF saturation reduction (the per-angle exposure
+    # was just reset above, so the remembered scale must be re-applied).
+    _guard_af_saturation(ctx, hardware, logger)
 
     # Strategy-aware validity check
     signal_valid, strategy_stats = ctx.af_strategy.is_valid(test_img, logger_=logger)
