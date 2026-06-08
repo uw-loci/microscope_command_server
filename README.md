@@ -216,6 +216,103 @@ acquisitions:
 - PPM defaults to z-outer / angle-inner (the historical ordering)
 - Widefield defaults to channel-outer / z-inner (fewer filter changes)
 
+## Z-Stack Acquisition (--z-stack, --z-projection)
+
+The BGACQUIRE (and ACQUIRE) acquisition message parser accepts optional flags
+to control Z-stack (axial) image acquisition and output format.
+
+### Flag syntax
+
+**Z-stack enable and range:**
+```
+--z-stack true
+--z-start <micrometers>
+--z-end <micrometers>
+--z-step <micrometers>
+```
+
+**Projection and output format:**
+```
+--z-projection <method>
+```
+
+### Z-stack parameters
+
+- `--z-stack true|false` -- Enable Z-stack acquisition (acquire multiple planes
+  at different focal depths). Default: `false`. When enabled, requires
+  `--z-start`, `--z-end`, and `--z-step`.
+- `--z-start <um>` -- Starting Z position (micrometers). Often a negative value
+  (e.g., `-5.0`) to acquire above the focal plane.
+- `--z-end <um>` -- Ending Z position (micrometers). Often a positive value
+  (e.g., `+5.0`) to acquire below the focal plane.
+- `--z-step <um>` -- Distance between successive planes (micrometers). Typical
+  values: `0.5` to `2.0` depending on sample refractive index and objective.
+
+The server computes the number of planes as `ceil(|z_end - z_start| / z_step)`.
+
+### Z-projection methods
+
+- `max` -- Maximum intensity projection (default). Each tile output is a single
+  2D image (the brightest pixel at each xy position across the Z-stack).
+- `mean` -- Mean intensity projection. Single 2D output per tile.
+- `none` -- Preserve individual Z-planes without projection. Output structure
+  changes to a per-plane layout, enabling 5D stitching (x, y, z, channel/angle,
+  time). See "File layout on disk" below.
+
+### File layout on disk
+
+**When `--z-projection max|mean` (default projection behavior):**
+Single 2D image per tile per channel/angle:
+```
+{projectsFolder}/{sample}/{scan_type}/{annotation}/
+    {angle_or_channel}/tile_000.tif
+    {angle_or_channel}/tile_001.tif
+    ...
+```
+
+**When `--z-projection none` (preserve individual planes):**
+Each Z-plane is written to a per-Z-plane subdirectory. For single-timepoint
+acquisitions, the layout is `{group}/z{zz}/{filename}`:
+```
+{projectsFolder}/{sample}/{scan_type}/{annotation}/
+    {angle_or_channel}/z000/tile_000.tif
+    {angle_or_channel}/z000/tile_001.tif
+    {angle_or_channel}/z001/tile_000.tif
+    {angle_or_channel}/z001/tile_001.tif
+    ...
+```
+
+For time-lapse acquisitions (with `--timepoints > 1`), a `t{tt}/` segment is
+added to track each timepoint, enabling reassembly into a true 5D mosaic:
+```
+{projectsFolder}/{sample}/{scan_type}/{annotation}/
+    {angle_or_channel}/t000/z000/tile_000.tif
+    {angle_or_channel}/t000/z001/tile_000.tif
+    ...
+    {angle_or_channel}/t001/z000/tile_000.tif
+    {angle_or_channel}/t001/z001/tile_000.tif
+    ...
+```
+
+The stitcher (`qupath-extension-tiles-to-pyramid`) can then assemble all planes
+(and timepoints) into a unified 5D (x, y, z, channel/angle, time) mosaic by
+reading these directory structures.
+
+### Use case: 5D confocal / light-sheet stacks
+
+Set `--z-projection none` when acquiring thick (volumetric) samples that require
+a full Z-stack for analysis downstream (e.g., volume rendering, 3D
+reconstruction, confocal microscopy). Single-timepoint 3D stacks produce
+`{group}/z{zz}/` layouts byte-identical to the existing `--save-raw`
+behavior. Time-lapse 3D stacks add `t{tt}/` segments for temporal registration
+and 5D reassembly.
+
+### Backward compatibility
+
+Omitting `--z-stack` or setting it to `false` disables Z-stack acquisition
+entirely. Omitting `--z-projection` defaults to `max` (maximum intensity
+projection), preserving the original single-image-per-tile output.
+
 ## Installation
 
 **Part of [QPSC (QuPath Scope Control)](https://github.com/uw-loci/QPSC)**
