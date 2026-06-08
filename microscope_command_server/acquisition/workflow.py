@@ -2347,6 +2347,14 @@ class AcquisitionContext:
     z_offsets: list = field(default_factory=lambda: [0.0])
     projection_fn: Optional[Callable] = None
     save_raw_tiles: bool = False
+    # When True (z_projection == "none"), individual Z-planes are written out
+    # instead of being projected, so the stitcher can assemble a Z-stack (and,
+    # with n_timepoints > 1, a time series) into one 5D mosaic. Planes are
+    # written under {group}/[t{tt}/]z{zz}/{filename}.
+    preserve_z_planes: bool = False
+    # Current timepoint index within the T-outer loop; used for the t{tt}
+    # plane-path segment when preserving a time series.
+    current_timepoint: int = 0
 
     # -- Time-lapse + output format --
     # Defaults preserve the pre-refactor single-pass behavior: n_timepoints=1
@@ -2558,6 +2566,7 @@ def _acquisition_workflow(
             logger=logger,
         )
         for t_idx in range(ctx.n_timepoints):
+            ctx.current_timepoint = t_idx
             if t_idx > 0:
                 # Time-lapse pacing. wait_until() returns 0 if overdue
                 # (acq_time > interval) with a warning, or after the
@@ -2991,6 +3000,7 @@ def _prepare_acquisition(
     z_stack_enabled = params.get("z_stack", False)
     z_offsets = [0.0]
     projection_fn = None
+    preserve_z_planes = False
     logger.info(
         "Z-stack check: z_stack=%s, z_start=%s, z_end=%s, z_step=%s, z_projection=%s",
         z_stack_enabled,
@@ -3033,19 +3043,32 @@ def _prepare_acquisition(
 
             z_offsets = generate_z_offsets(z_total_range, z_step)
             projection_name = params.get("z_projection", "max")
-            try:
-                projection_fn = get_projection(projection_name)
-            except KeyError as e:
-                logger.error("Invalid z_projection: %s. Falling back to 'max'.", e)
-                projection_fn = get_projection("max")
-                projection_name = "max"
-            logger.info(
-                "Z-stack: %d planes over +/-%.1f um (step=%.1f), projection=%s",
-                len(z_offsets),
-                z_total_range / 2,
-                z_step,
-                projection_name,
-            )
+            if projection_name == "none":
+                # Preserve every Z-plane instead of projecting. The stitcher
+                # reassembles them (and timepoints) into a 5D mosaic.
+                projection_fn = None
+                preserve_z_planes = True
+                logger.info(
+                    "Z-stack: %d planes over +/-%.1f um (step=%.1f), projection=none "
+                    "(preserving raw planes for 5D stitching)",
+                    len(z_offsets),
+                    z_total_range / 2,
+                    z_step,
+                )
+            else:
+                try:
+                    projection_fn = get_projection(projection_name)
+                except KeyError as e:
+                    logger.error("Invalid z_projection: %s. Falling back to 'max'.", e)
+                    projection_fn = get_projection("max")
+                    projection_name = "max"
+                logger.info(
+                    "Z-stack: %d planes over +/-%.1f um (step=%.1f), projection=%s",
+                    len(z_offsets),
+                    z_total_range / 2,
+                    z_step,
+                    projection_name,
+                )
 
     # Log background correction configuration
     if background_correction_enabled:
@@ -3458,6 +3481,7 @@ def _prepare_acquisition(
         z_offsets=z_offsets,
         projection_fn=projection_fn,
         save_raw_tiles=save_raw_tiles,
+        preserve_z_planes=preserve_z_planes,
         n_timepoints=n_timepoints,
         interval_seconds=float(params.get("interval_seconds", 0.0)),
         output_format=str(params.get("output_format", "ome-per-t")),
@@ -4685,6 +4709,24 @@ def _run_af_benchmark(ctx: "AcquisitionContext", pos_idx: int, pos) -> str:
     return "af_benchmark"
 
 
+def _plane_path(ctx: AcquisitionContext, group: Optional[str], z_idx: int, filename: str):
+    """Output path for one individual Z-plane.
+
+    Layout: ``{output}/[{group}/][t{tt}/]z{zz}/{filename}``. The ``{group}``
+    segment is the angle tick (PPM) or channel id (widefield), omitted for
+    single-FOV brightfield. The ``t{tt}`` segment is added only when preserving
+    a true time series (n_timepoints > 1), so single-timepoint output stays at
+    ``{group}/z{zz}/`` -- byte-identical to the existing save-raw layout. The
+    stitcher derives z/t from these directory names.
+    """
+    base = ctx.output_path
+    if group is not None:
+        base = base / group
+    if ctx.preserve_z_planes and ctx.n_timepoints > 1:
+        base = base / f"t{ctx.current_timepoint:03d}"
+    return base / f"z{z_idx:03d}" / filename
+
+
 def _acquire_tile_angles_angle_outer(
     ctx: AcquisitionContext,
     pos_idx: int,
@@ -5008,8 +5050,8 @@ def _acquire_tile_angles_angle_outer(
                     logger.error(f"Failed to save {image_path} - parent directory missing")
             else:
                 z_stack_images.setdefault(angle, []).append(image)
-                if ctx.save_raw_tiles:
-                    z_plane_path = ctx.output_path / str(angle) / f"z{z_idx:03d}" / filename
+                if ctx.save_raw_tiles or ctx.preserve_z_planes:
+                    z_plane_path = _plane_path(ctx, str(angle), z_idx, filename)
                     z_plane_path.parent.mkdir(parents=True, exist_ok=True)
                     ctx.write_pool.submit(
                         ome_tiff_writer,
@@ -5430,8 +5472,8 @@ def _acquire_tile_angles(
                     logger.error(f"Failed to save {image_path} - parent directory missing")
             else:
                 z_stack_images.setdefault(angle, []).append(image)
-                if ctx.save_raw_tiles:
-                    z_plane_path = ctx.output_path / str(angle) / f"z{z_idx:03d}" / filename
+                if ctx.save_raw_tiles or ctx.preserve_z_planes:
+                    z_plane_path = _plane_path(ctx, str(angle), z_idx, filename)
                     z_plane_path.parent.mkdir(parents=True, exist_ok=True)
                     ctx.write_pool.submit(
                         ome_tiff_writer,
@@ -5643,8 +5685,8 @@ def _acquire_tile_channels_z_outer(
             else:
                 # Z-stack: accumulate planes for end-of-sweep projection.
                 state["z_stack_planes"].append(image)
-                if ctx.save_raw_tiles:
-                    z_plane_path = ctx.output_path / str(ch_id) / f"z{z_idx:03d}" / filename
+                if ctx.save_raw_tiles or ctx.preserve_z_planes:
+                    z_plane_path = _plane_path(ctx, str(ch_id), z_idx, filename)
                     z_plane_path.parent.mkdir(parents=True, exist_ok=True)
                     ctx.write_pool.submit(
                         ome_tiff_writer,
@@ -5866,8 +5908,8 @@ def _acquire_tile_channels(
             else:
                 # Z-stack mode: accumulate for projection
                 z_stack_planes.append(image)
-                if ctx.save_raw_tiles:
-                    z_plane_path = ctx.output_path / str(ch_id) / f"z{z_idx:03d}" / filename
+                if ctx.save_raw_tiles or ctx.preserve_z_planes:
+                    z_plane_path = _plane_path(ctx, str(ch_id), z_idx, filename)
                     z_plane_path.parent.mkdir(parents=True, exist_ok=True)
                     ctx.write_pool.submit(
                         ome_tiff_writer,
@@ -6037,8 +6079,8 @@ def _acquire_tile_single(
         else:
             # Z-stack mode: accumulate for projection
             z_stack_planes.append(image)
-            if ctx.save_raw_tiles:
-                z_plane_path = ctx.output_path / f"z{z_idx:03d}" / filename
+            if ctx.save_raw_tiles or ctx.preserve_z_planes:
+                z_plane_path = _plane_path(ctx, None, z_idx, filename)
                 z_plane_path.parent.mkdir(parents=True, exist_ok=True)
                 ctx.write_pool.submit(
                     ome_tiff_writer,
