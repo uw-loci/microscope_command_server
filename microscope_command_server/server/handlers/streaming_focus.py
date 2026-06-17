@@ -210,6 +210,18 @@ SCAN_POLL_SLEEP_S = 0.002
 # Fewer than this and we refuse to commit -- caller falls back.
 MIN_FRAMES_FOR_FIT = 6
 
+# Default pre-motion head-discard window (ms). The first samples of a
+# scan capture the stage-acceleration ramp + stale buffer frames whose
+# interpolated Z does not match the true stage position, so they are
+# dropped before fitting. Tuned originally on PPM 40x (a 4.2 s scan, of
+# which 600 ms is a small head). It is rig-dependent -- a stage with a
+# longer accel ramp needs a larger value -- so it is overridable via
+# stage.streaming_af.head_discard_ms in config_<scope>.yml; this is the
+# fallback when that key is absent. NOTE: the scan must last longer than
+# this plus a few frames or every sample is discarded ("0 usable
+# samples"); short sweeps at fast slow-speeds are the trap.
+DEFAULT_HEAD_DISCARD_MS = 600.0
+
 # Minimum metric range (as a fraction of the metric peak value)
 # required to trust the fit. Below this the entire scan sits in
 # what is effectively one depth-of-field and the metric variation
@@ -2409,6 +2421,7 @@ def _attempt_one_scan(
     dump_dir: Optional[Path] = None,
     secondary_metric_name: Optional[str] = None,
     abort_event: Optional[threading.Event] = None,
+    head_discard_ms: float = DEFAULT_HEAD_DISCARD_MS,
 ) -> _ScanAttemptResult:
     """Run one streaming AF scan centered on z_center with the given range.
 
@@ -2662,7 +2675,13 @@ def _attempt_one_scan(
         # Velocity-aware: the alternative head = "first 5% of
         # motion_end_ms" would shrink to ~100ms on a 2um/1s scan and
         # still admit accel artifacts; a fixed floor is safer.
-        HEAD_DISCARD_MS = 600.0
+        #
+        # The floor itself is now rig-configurable (head_discard_ms arg,
+        # from stage.streaming_af.head_discard_ms) -- DEFAULT_HEAD_DISCARD_MS
+        # is the fallback. When the scan is shorter than this window the
+        # filter keeps nothing; the caller widens the range and retries
+        # (see the insufficient_samples branch in the retry loop).
+        HEAD_DISCARD_MS = head_discard_ms
 
         # Phase C: samples now carry an optional 4th element (secondary
         # metric, e.g. p98_p2 when running alongside tenengrad). Pass
@@ -3604,6 +3623,7 @@ def handle_streaming_focus(conn, client, hardware, settings, **kwargs):
     yaml_slow_value = sa_cfg.get("slow_speed_value")
     yaml_slow_um_s = sa_cfg.get("slow_speed_um_per_s")
     yaml_normal_value = sa_cfg.get("normal_speed_value")
+    yaml_head_discard_ms = sa_cfg.get("head_discard_ms")
 
     # The handler's per-call effective values. Start from legacy
     # constants; YAML overrides any populated key.
@@ -3612,13 +3632,18 @@ def handle_streaming_focus(conn, client, hardware, settings, **kwargs):
         str(yaml_normal_value) if yaml_normal_value is not None else NORMAL_SPEED_VALUE
     )
     eff_slow_um_s = float(yaml_slow_um_s) if yaml_slow_um_s is not None else MIN_VELOCITY_UM_S
+    eff_head_discard_ms = (
+        float(yaml_head_discard_ms) if yaml_head_discard_ms is not None else DEFAULT_HEAD_DISCARD_MS
+    )
     if sa_cfg:
         logger.info(
-            "STREAM_AF:streaming_af config: enabled=%s slow=%r normal=%r um/s=%.2f",
+            "STREAM_AF:streaming_af config: enabled=%s slow=%r normal=%r um/s=%.2f "
+            "head_discard_ms=%.0f",
             yaml_enabled,
             eff_slow_value,
             eff_normal_value,
             eff_slow_um_s,
+            eff_head_discard_ms,
         )
     else:
         logger.info(
@@ -3953,6 +3978,7 @@ def handle_streaming_focus(conn, client, hardware, settings, **kwargs):
                 dump_dir=attempt_dump_dir,
                 secondary_metric_name=secondary_metric_name,
                 abort_event=abort_event,
+                head_discard_ms=eff_head_discard_ms,
             )
             attempts_log.append(
                 f"{label}: center={current_center:.3f} "
@@ -4200,8 +4226,42 @@ def handle_streaming_focus(conn, client, hardware, settings, **kwargs):
                 range_um = widened_range
                 continue
 
-            # Any other status (insufficient_samples, error) aborts
-            # the retry loop -- shifting won't help those.
+            # insufficient_samples is usually a too-short scan: the motion
+            # finished inside (or barely past) the head-discard window, so
+            # the in-motion filter kept fewer than MIN_FRAMES_FOR_FIT frames.
+            # Widening the range lengthens the scan in wall-clock time, which
+            # is exactly the fix -- so treat it like metric_flat and retry
+            # wider at the same center rather than aborting after attempt 1
+            # (the previous behaviour, which dead-ended a 6 um / 11.5 um/s
+            # sweep against the 600 ms head discard). Capped at
+            # sweep_range_max_um; if already there, abort.
+            if result.status == "insufficient_samples":
+                if range_um >= sweep_range_max_um:
+                    logger.info(
+                        "STREAM_AF:insufficient_samples at max range %.2f um -- "
+                        "aborting retry loop (scan still too short for "
+                        "head_discard=%.0fms; lower slow_speed_um_per_s or "
+                        "head_discard_ms)",
+                        range_um,
+                        eff_head_discard_ms,
+                    )
+                    final_result = result
+                    break
+                widened_range = min(range_um * METRIC_FLAT_WIDEN_FACTOR, sweep_range_max_um)
+                logger.info(
+                    "STREAM_AF:insufficient_samples -- scan too short for "
+                    "head_discard=%.0fms; widening range %.2f -> %.2f um at "
+                    "same center %.3f",
+                    eff_head_discard_ms,
+                    range_um,
+                    widened_range,
+                    current_center,
+                )
+                range_um = widened_range
+                continue
+
+            # Any other status (error, etc.) aborts the retry loop --
+            # widening or shifting won't help those.
             final_result = result
             break
         else:
