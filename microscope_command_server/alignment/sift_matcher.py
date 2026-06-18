@@ -31,6 +31,8 @@ def match_sift(
     percentile_high: float = 98.0,
     clahe_enabled: bool = True,
     clahe_clip_limit: float = 2.0,
+    coarse_pixel_size_um: float = 0.0,
+    coarse_to_fine_enabled: bool = False,
 ) -> Optional[Tuple[float, float, int, float]]:
     """
     Match a microscope snapshot to a WSI region using SIFT features.
@@ -68,6 +70,19 @@ def match_sift(
         clahe_clip_limit: CLAHE clipLimit. Higher = more aggressive
             equalisation. 2.0 is a safe default; raise to 4.0 if matches
             are still scarce.
+        coarse_pixel_size_um: Target resolution (um/px) for the coarse pass
+            of a coarse-to-fine search. Only used when
+            coarse_to_fine_enabled is True and this value is coarser than
+            the fine target (max of microscope/WSI/min_pixel_size). Typical
+            4.0 (vs. a 1.0 fine target).
+        coarse_to_fine_enabled: When True, run a heavily-downsampled SIFT
+            pass over the whole WSI region first to find a rough offset,
+            then crop both images to a small window around that offset and
+            re-run SIFT at full (fine) resolution for precision. This lets
+            the caller enlarge the search area (a bigger WSI region) without
+            paying the cost of running full-resolution SIFT over the whole
+            region. Falls back to the single full-resolution pass if the
+            coarse pass finds no match.
 
     Returns:
         Tuple of (offset_x_um, offset_y_um, n_inliers, confidence) or None if matching failed.
@@ -104,14 +119,59 @@ def match_sift(
     elif flip_y:
         gray_wsi = cv2.flip(gray_wsi, 0)  # Vertical
 
-    # Downsample both images to a common resolution.
-    # Target = max of (lower resolution image, min_pixel_size_um).
-    # This ensures:
-    #   1. No upscaling (never invent fake detail)
-    #   2. Always at least min_pixel_size_um to suppress JPEG block artifacts,
-    #      sensor noise, and speed up matching
-    target_pixel_size = max(microscope_pixel_size_um, wsi_pixel_size_um, min_pixel_size_um)
+    # gray_micro / gray_wsi are now 8-bit, CLAHE-equalised, and the WSI is
+    # flipped to the microscope orientation. All downstream matching operates
+    # in this common (flipped) full-resolution space, so offsets compose
+    # cleanly across a coarse-to-fine search.
+    fine_target = max(microscope_pixel_size_um, wsi_pixel_size_um, min_pixel_size_um)
 
+    if coarse_to_fine_enabled and coarse_pixel_size_um > fine_target:
+        result = _match_coarse_to_fine(
+            gray_micro,
+            gray_wsi,
+            microscope_pixel_size_um,
+            wsi_pixel_size_um,
+            fine_target,
+            coarse_pixel_size_um,
+            min_match_count=min_match_count,
+            ratio_threshold=ratio_threshold,
+            contrast_threshold=contrast_threshold,
+            nfeatures=nfeatures,
+        )
+        if result is not None:
+            return result
+        logger.info("Coarse-to-fine found no match; falling back to single full-resolution pass")
+
+    return _match_at_resolution(
+        gray_micro,
+        gray_wsi,
+        microscope_pixel_size_um,
+        wsi_pixel_size_um,
+        fine_target,
+        min_match_count=min_match_count,
+        ratio_threshold=ratio_threshold,
+        contrast_threshold=contrast_threshold,
+        nfeatures=nfeatures,
+    )
+
+
+def _match_at_resolution(
+    gray_micro: np.ndarray,
+    gray_wsi: np.ndarray,
+    microscope_pixel_size_um: float,
+    wsi_pixel_size_um: float,
+    target_pixel_size: float,
+    min_match_count: int,
+    ratio_threshold: float,
+    contrast_threshold: float,
+    nfeatures: int,
+) -> Optional[Tuple[float, float, int, float]]:
+    """Downsample both (already gray/CLAHE/flipped) images to target_pixel_size
+    and run a single SIFT match.
+
+    Returns (offset_um_x, offset_um_y, n_inliers, confidence) measured at the
+    centre of gray_wsi, or None if matching failed. Inputs are not mutated.
+    """
     micro_scale = microscope_pixel_size_um / target_pixel_size
     wsi_scale = wsi_pixel_size_um / target_pixel_size
 
@@ -138,7 +198,6 @@ def match_sift(
             f"Both images already at or below target resolution ({target_pixel_size:.4f} um/px)"
         )
 
-    # Both images now at target_pixel_size um/px
     gray_wsi_scaled = gray_wsi
 
     logger.info(
@@ -162,8 +221,8 @@ def match_sift(
         return None
 
     # Match features using FLANN
-    index_params = dict(algorithm=1, trees=5)  # FLANN_INDEX_KDTREE
-    search_params = dict(checks=50)
+    index_params = {"algorithm": 1, "trees": 5}  # FLANN_INDEX_KDTREE
+    search_params = {"checks": 50}
     flann = cv2.FlannBasedMatcher(index_params, search_params)
     matches = flann.knnMatch(des_micro, des_wsi, k=2)
 
@@ -225,6 +284,109 @@ def match_sift(
     )
 
     return (offset_um_x, offset_um_y, n_inliers, confidence)
+
+
+def _match_coarse_to_fine(
+    gray_micro: np.ndarray,
+    gray_wsi: np.ndarray,
+    microscope_pixel_size_um: float,
+    wsi_pixel_size_um: float,
+    fine_target: float,
+    coarse_pixel_size_um: float,
+    min_match_count: int,
+    ratio_threshold: float,
+    contrast_threshold: float,
+    nfeatures: int,
+) -> Optional[Tuple[float, float, int, float]]:
+    """Two-stage SIFT: a coarse pass over the whole region to localise the
+    microscope FOV, then a full-resolution pass over a small crop for
+    precision. Inputs are the common gray/CLAHE/flipped full-resolution
+    images. Returns the composed offset (microns, relative to the centre of
+    gray_wsi) or None if the coarse pass fails.
+    """
+    coarse_target = max(microscope_pixel_size_um, wsi_pixel_size_um, coarse_pixel_size_um)
+    logger.info(
+        f"Coarse-to-fine: coarse pass at {coarse_target:.3f} um/px over full region, "
+        f"fine pass at {fine_target:.3f} um/px"
+    )
+
+    coarse = _match_at_resolution(
+        gray_micro,
+        gray_wsi,
+        microscope_pixel_size_um,
+        wsi_pixel_size_um,
+        coarse_target,
+        min_match_count=min_match_count,
+        ratio_threshold=ratio_threshold,
+        contrast_threshold=contrast_threshold,
+        nfeatures=nfeatures,
+    )
+    if coarse is None:
+        return None
+
+    coarse_off_x_um, coarse_off_y_um, _, _ = coarse
+
+    h_wsi, w_wsi = gray_wsi.shape[:2]
+    wsi_cx = w_wsi / 2.0
+    wsi_cy = h_wsi / 2.0
+
+    # Where the coarse pass says the microscope centre lands, in full-res WSI px.
+    p_x = wsi_cx + coarse_off_x_um / wsi_pixel_size_um
+    p_y = wsi_cy + coarse_off_y_um / wsi_pixel_size_um
+
+    # Fine crop: microscope FOV plus a half-FOV of slack on each side, to
+    # absorb coarse-pass error while staying small relative to the full region.
+    micro_fov_w_um = gray_micro.shape[1] * microscope_pixel_size_um
+    micro_fov_h_um = gray_micro.shape[0] * microscope_pixel_size_um
+    slack_um = max(micro_fov_w_um, micro_fov_h_um) * 0.5
+    half_w_px = (micro_fov_w_um / 2.0 + slack_um) / wsi_pixel_size_um
+    half_h_px = (micro_fov_h_um / 2.0 + slack_um) / wsi_pixel_size_um
+
+    x0 = int(max(0, round(p_x - half_w_px)))
+    y0 = int(max(0, round(p_y - half_h_px)))
+    x1 = int(min(w_wsi, round(p_x + half_w_px)))
+    y1 = int(min(h_wsi, round(p_y + half_h_px)))
+
+    if x1 - x0 < 4 or y1 - y0 < 4:
+        logger.info("Coarse-to-fine: degenerate fine crop, using coarse result")
+        return coarse
+
+    crop = gray_wsi[y0:y1, x0:x1]
+    crop_cx = (x0 + x1) / 2.0
+    crop_cy = (y0 + y1) / 2.0
+    logger.info(
+        f"Coarse-to-fine: coarse offset=({coarse_off_x_um:.1f}, {coarse_off_y_um:.1f}) um; "
+        f"fine crop {crop.shape[1]}x{crop.shape[0]} px at WSI ({x0},{y0})-({x1},{y1})"
+    )
+
+    fine = _match_at_resolution(
+        gray_micro,
+        crop,
+        microscope_pixel_size_um,
+        wsi_pixel_size_um,
+        fine_target,
+        min_match_count=min_match_count,
+        ratio_threshold=ratio_threshold,
+        contrast_threshold=contrast_threshold,
+        nfeatures=nfeatures,
+    )
+    if fine is None:
+        logger.info("Coarse-to-fine: fine pass failed, using coarse result")
+        return coarse
+
+    fine_off_x_um, fine_off_y_um, n_inliers, confidence = fine
+
+    # Compose: the fine offset is relative to the crop centre; shift it back to
+    # the full-region centre. (Handles a clamped crop where crop centre != p.)
+    final_off_x_um = (crop_cx - wsi_cx) * wsi_pixel_size_um + fine_off_x_um
+    final_off_y_um = (crop_cy - wsi_cy) * wsi_pixel_size_um + fine_off_y_um
+
+    logger.info(
+        f"Coarse-to-fine result: offset=({final_off_x_um:.1f}, {final_off_y_um:.1f}) um, "
+        f"inliers={n_inliers}, confidence={confidence:.2f}"
+    )
+
+    return (final_off_x_um, final_off_y_um, n_inliers, confidence)
 
 
 def _to_gray(
