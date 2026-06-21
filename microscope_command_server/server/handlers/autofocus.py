@@ -164,6 +164,21 @@ def handle_testadaf(conn, client, hardware, settings, **kwargs):
             test_adaptive_autofocus_at_current_position,
         )
 
+        # Cooperative cancellation: reuse the per-IP abort event the streaming
+        # AF path already maintains. The client (Live Viewer) sends ABORTAF on
+        # its auxiliary socket while this blocking sweep runs on the primary;
+        # both share an IP, so the sweep loop sees the event via should_abort.
+        from microscope_command_server.server.handlers.streaming_focus import (
+            _get_af_abort_event,
+            _client_ip,
+        )
+
+        client_ip = _client_ip(addr)
+        abort_event = _get_af_abort_event(client_ip) if client_ip else None
+        if abort_event is not None:
+            abort_event.clear()
+        should_abort = (lambda: abort_event.is_set()) if abort_event is not None else None
+
         result = test_adaptive_autofocus_at_current_position(
             hardware=hardware,
             config_manager=config_manager,
@@ -171,9 +186,14 @@ def handle_testadaf(conn, client, hardware, settings, **kwargs):
             output_folder_path=params["output_folder_path"],
             objective=params["objective"],
             logger=logger,
+            should_abort=should_abort,
         )
 
-        if result["success"]:
+        if result.get("cancelled"):
+            response = f"CANCELLED:{result['message']}".encode()
+            conn.sendall(response)
+            logger.info("Adaptive autofocus test cancelled: %s", result["message"])
+        elif result["success"]:
             # Format result as: SUCCESS:message|initial_z:final_z:z_shift
             result_data = (
                 f"{result['initial_z']:.2f}:" f"{result['final_z']:.2f}:" f"{result['z_shift']:.2f}"
