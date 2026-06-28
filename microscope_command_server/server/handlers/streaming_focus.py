@@ -1476,10 +1476,38 @@ def _fit_union_samples(
     ms = [zm[1] for zm in sorted_zm]
     n = len(zs)
 
+    # Reject a union that is flat within noise. The per-attempt scans
+    # already classified these samples as edge/metric_flat at sub-noise
+    # amplitude; fitting a gaussian to that noise produces a "peak"
+    # driven by where the noise happens to weight, not real focus, and
+    # commits it as success. Observed 2026-06-28 (PPM 20x, tenengrad):
+    # three attempts at 0.55% / 0.83% / 1.62% amplitude union-fit to a
+    # bogus Z=-3.7 reported as SUCCESS. _fit_union_samples only sees
+    # (z, metric) pairs, so the per-attempt amplitude verdict is lost
+    # unless we re-derive it here. Gate on EDGE_MIN_AMPLITUDE -- the
+    # same bar a single attempt must clear to count as a real slope.
+    ms_max = max(ms)
+    ms_min = min(ms)
+    union_amplitude_frac = (ms_max - ms_min) / abs(ms_max) if ms_max else 0.0
+    if union_amplitude_frac < EDGE_MIN_AMPLITUDE:
+        logger.info(
+            "STREAM_AF:union-fit rejecting -- combined metric amplitude "
+            "%.2f%% of peak (%d samples) is below the %.1f%% slope floor; "
+            "no recoverable peak, the metric is flat. Falling back.",
+            union_amplitude_frac * 100.0,
+            n,
+            EDGE_MIN_AMPLITUDE * 100.0,
+        )
+        return None
+
     raw_max_idx = int(np.argmax(ms))
-    # Refuse if the union argmax is also at the edge -- we have no
-    # evidence the true peak is inside the data we collected.
-    if raw_max_idx == 0 or raw_max_idx == n - 1:
+    # Refuse if the union argmax is at (or within a few samples of) an
+    # edge -- we have no evidence the true peak is interior to the data
+    # we collected. The literal-endpoint test alone is too weak: an
+    # argmax at idx 2/63 (observed in the same 2026-06-28 case) is
+    # functionally an edge but passed the == 0 / == n-1 check.
+    edge_margin = max(1, int(round(0.05 * n)))
+    if raw_max_idx < edge_margin or raw_max_idx > n - 1 - edge_margin:
         return None
 
     # Try Gaussian first (uses all samples), fall back to parabolic
@@ -3921,6 +3949,13 @@ def handle_streaming_focus(conn, client, hardware, settings, **kwargs):
     # METRIC_FLAT_NO_IMPROVEMENT_R2, abort -- the peak is not hiding
     # outside the window, the sample lacks contrast.
     prev_flat_amplitude_ratio: Optional[float] = None
+    # 2026-06-28: center of the most recent scan window that had to be
+    # clamped to a stage z limit. An edge result shifts the walk a full
+    # range past the limit each attempt; without this the clamp would
+    # re-run the identical boundary window every attempt. Detecting the
+    # re-pin lets us stop walking and escalate to the union-fit / Brent
+    # fallback (both clamp to [z_low, z_high]) instead of refusing.
+    last_clamped_center: Optional[float] = None
 
     try:
         for attempt_idx in range(max_attempts):
@@ -3936,28 +3971,82 @@ def handle_streaming_focus(conn, client, hardware, settings, **kwargs):
                 final_result = _ScanAttemptResult("aborted", None, 0, 0.0, "user cancelled")
                 break
 
-            # Check Z limits before each attempt. Refuse if the
-            # proposed window would step outside the configured stage
-            # limits; the current attempt's center came from a
-            # previous edge detection, so this is where we stop
-            # walking.
+            # Check Z limits before each attempt. The proposed window's
+            # center came from a previous edge detection's full-range
+            # shift, which can walk the window partway (or fully) past a
+            # stage limit. Rather than refuse outright -- which sets
+            # status='error', skipping ALL the union-fit / Brent recovery
+            # below and returning UNAVAILABLE even though usable Z remains
+            # reachable -- clamp the window so it starts flush against the
+            # violated limit and scan the reachable span. Focus that
+            # genuinely lies beyond the limit is unreachable regardless;
+            # the clamped scan plus the post-loop fallback commit the best
+            # in-range Z instead of erroring.
             if not _scan_window_within_limits(current_center, range_um, z_low, z_high):
-                reason = (
-                    f"proposed scan window [{current_center - range_um/2:.3f} "
-                    f"-> {current_center + range_um/2:.3f}] on "
-                    f"{label} would exit stage z limits "
-                    f"[{z_low}, {z_high}]"
+                half = range_um / 2.0
+                clamped_center = current_center
+                if z_low is not None and (current_center - half) < z_low:
+                    clamped_center = z_low + half
+                elif z_high is not None and (current_center + half) > z_high:
+                    clamped_center = z_high - half
+
+                # If the full range is wider than the entire travel, no
+                # clamp can make the window fit -- fall back to the
+                # original refusal so the caller can switch to Sweep.
+                if not _scan_window_within_limits(clamped_center, range_um, z_low, z_high):
+                    reason = (
+                        f"proposed scan window [{current_center - half:.3f} "
+                        f"-> {current_center + half:.3f}] on {label} would "
+                        f"exit stage z limits [{z_low}, {z_high}] and the "
+                        f"{range_um:.1f} um range exceeds the reachable travel"
+                    )
+                    logger.warning("STREAM_AF:%s", reason)
+                    attempts_log.append(f"{label}: out-of-range")
+                    final_result = _ScanAttemptResult("error", None, 0, 0.0, reason)
+                    break
+
+                # Already scanned this exact clamped window on the prior
+                # attempt (an edge result kept pushing past the same
+                # limit) -- re-running it covers no new ground. Stop
+                # walking and synthesize an edge result so the post-loop
+                # union-fit / Brent fallback commits the best reachable Z
+                # instead of refusing.
+                if (
+                    last_clamped_center is not None
+                    and abs(clamped_center - last_clamped_center) <= 1e-6
+                ):
+                    logger.info(
+                        "STREAM_AF:%s window again past z limit after "
+                        "clamping to %.3f; stopping the walk, using best "
+                        "reachable Z",
+                        label,
+                        clamped_center,
+                    )
+                    attempts_log.append(f"{label}: pinned-at-limit")
+                    edge_dir = "edge_low" if clamped_center <= current_center else "edge_high"
+                    final_result = _ScanAttemptResult(
+                        edge_dir,
+                        fallback_peak_z,
+                        0,
+                        0.0,
+                        "scan window pinned at stage z limit",
+                    )
+                    break
+
+                logger.info(
+                    "STREAM_AF:%s proposed window [%.3f -> %.3f] exits z "
+                    "limits [%s, %s]; clamping center %.3f -> %.3f to scan "
+                    "from the limit edge",
+                    label,
+                    current_center - half,
+                    current_center + half,
+                    z_low,
+                    z_high,
+                    current_center,
+                    clamped_center,
                 )
-                logger.warning("STREAM_AF:%s", reason)
-                attempts_log.append(f"{label}: out-of-range")
-                final_result = _ScanAttemptResult(
-                    "error",
-                    None,
-                    0,
-                    0.0,
-                    reason,
-                )
-                break
+                current_center = clamped_center
+                last_clamped_center = clamped_center
 
             # Run one attempt.
             attempt_dump_dir = (
