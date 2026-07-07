@@ -110,7 +110,11 @@ def _compute_tile_stats(image) -> dict:
         if image.ndim == 2:
             ch_keys = [("gray", image)]
         elif image.ndim == 3 and image.shape[2] >= 3:
-            ch_keys = [("R", image[:, :, 0]), ("G", image[:, :, 1]), ("B", image[:, :, 2])]
+            ch_keys = [
+                ("R", image[:, :, 0]),
+                ("G", image[:, :, 1]),
+                ("B", image[:, :, 2]),
+            ]
         else:
             return {}
         for label, ch in ch_keys:
@@ -283,7 +287,13 @@ class SaturationMonitor:
     # For uncrossed angle, only log every Nth saturated tile
     UNCROSSED_LOG_INTERVAL = 50
 
-    def __init__(self, angles, logger=None, biref_abort_threshold_pct=None, monitoring_window=None):
+    def __init__(
+        self,
+        angles,
+        logger=None,
+        biref_abort_threshold_pct=None,
+        monitoring_window=None,
+    ):
         """Initialize the saturation monitor.
 
         Args:
@@ -326,7 +336,14 @@ class SaturationMonitor:
         return abs(abs(angle) - 90.0) < self.UNCROSSED_TOLERANCE
 
     def check_tile(
-        self, sat_result, angle, tile_idx, filename, stage_x=None, stage_y=None, stage_z=None
+        self,
+        sat_result,
+        angle,
+        tile_idx,
+        filename,
+        stage_x=None,
+        stage_y=None,
+        stage_z=None,
     ):
         """Record saturation for a tile and determine if acquisition should abort.
 
@@ -2164,6 +2181,13 @@ def parse_acquisition_message(message: str) -> dict:
             elif parts[i] == "--biref-min-intensity" and i + 1 < len(parts):
                 params["biref_min_intensity"] = int(parts[i + 1])
                 i += 2
+            elif parts[i] == "--ppm-high-bit-depth" and i + 1 < len(parts):
+                # Opt-in: capture PPM angle frames at the camera's higher-bit
+                # PixelFormat so the (already 16-bit) birefringence is computed
+                # from high-precision inputs instead of 8-bit. Absent/false ->
+                # today's 8-bit path, byte-identical.
+                params["ppm_high_bit_depth"] = parts[i + 1].lower() == "true"
+                i += 2
             # Time-lapse + output-format flags (Z-stack + time-lapse refactor).
             # Defaults (timepoints=1, interval=0.0, output_format='ome-per-t')
             # preserve pre-refactor single-pass behavior when the Java side
@@ -2341,6 +2365,16 @@ class AcquisitionContext:
     is_jai_camera: bool = False
     simple_wb_analog_red: float = 1.0
     simple_wb_analog_blue: float = 1.0
+
+    # -- PPM high-bit-depth capture (opt-in) --
+    # When True, PPM angle frames are captured at the camera's higher-bit
+    # PixelFormat (via camera.set_high_bit_mode) so the birefringence is computed
+    # from high-precision inputs. ppm_high_bit_input_max is the full-scale value
+    # of that high-bit data (e.g. 4095 for 12-bit-in-uint16) used to rescale the
+    # biref dark-mask threshold and normalize the sum image. Both default to the
+    # 8-bit path so acquisitions are byte-identical when the flag is off.
+    ppm_high_bit_depth: bool = False
+    ppm_high_bit_input_max: Optional[float] = None
 
     # -- Z-stack --
     z_stack_enabled: bool = False
@@ -2630,11 +2664,27 @@ def _acquisition_workflow(
                 }
                 tile_stats: dict = {}
                 if ctx.params["angles"]:
-                    tile_worst_sat, tile_role_sat, tile_stats, xy_move_pending = (
-                        _acquire_tile_angles(
-                            ctx, pos_idx, pos, filename, current_stage_pos, xy_move_pending
+                    # PPM high-bit-depth capture is scoped to the angle snaps: enter
+                    # the camera's high-bit PixelFormat here (autofocus above already
+                    # ran in 8-bit) and always restore, even on cancel/error, so live
+                    # view and other modalities are never left in 16-bit.
+                    high_bit_active = False
+                    if ctx.ppm_high_bit_depth:
+                        high_bit_active = hardware.camera.set_high_bit_mode(True)
+                    try:
+                        tile_worst_sat, tile_role_sat, tile_stats, xy_move_pending = (
+                            _acquire_tile_angles(
+                                ctx,
+                                pos_idx,
+                                pos,
+                                filename,
+                                current_stage_pos,
+                                xy_move_pending,
+                            )
                         )
-                    )
+                    finally:
+                        if high_bit_active:
+                            hardware.camera.set_high_bit_mode(False)
                 else:
                     # Wait for non-blocking XY move before single-image/channel snap
                     if xy_move_pending:
@@ -3159,7 +3209,9 @@ def _prepare_acquisition(
                                 try:
                                     channel_background_images[cid] = _skio.imread(str(candidate))
                                     logger.info(
-                                        "Loaded channel background for %s from %s", cid, candidate
+                                        "Loaded channel background for %s from %s",
+                                        cid,
+                                        candidate,
                                     )
                                     break
                                 except Exception as load_e:
@@ -3447,6 +3499,31 @@ def _prepare_acquisition(
 
     metadata_txt_for_positions = output_path / "image_positions_metadata.txt"
 
+    # PPM high-bit-depth capture (opt-in). Only honored for PPM on a camera that
+    # implements set_high_bit_mode (the JAI). Resolve the full-scale of the
+    # high-bit data so the biref dark-mask and sum normalization scale correctly.
+    ppm_high_bit_depth = bool(params.get("ppm_high_bit_depth", False))
+    ppm_high_bit_input_max = None
+    if ppm_high_bit_depth:
+        if not hasattr(hardware.camera, "set_high_bit_mode"):
+            logger.warning(
+                "PPM high-bit-depth requested but camera %s has no "
+                "set_high_bit_mode; staying at 8-bit.",
+                getattr(hardware.camera, "get_name", lambda: "?")(),
+            )
+            ppm_high_bit_depth = False
+        else:
+            hb_cfg = getattr(hardware.camera, "_detector_config", {}).get("high_bit_depth", {})
+            data_max = hb_cfg.get("data_max")
+            if data_max is None and hb_cfg.get("bit_depth"):
+                data_max = (2 ** int(hb_cfg["bit_depth"])) - 1
+            ppm_high_bit_input_max = float(data_max) if data_max else None
+            logger.info(
+                "PPM high-bit-depth ENABLED (input_max=%s). PPM angle frames "
+                "will be captured at the camera's high-bit PixelFormat.",
+                ppm_high_bit_input_max,
+            )
+
     # Build and return context
     return AcquisitionContext(
         params=params,
@@ -3477,6 +3554,8 @@ def _prepare_acquisition(
         is_jai_camera=is_jai_camera,
         simple_wb_analog_red=simple_wb_analog_red,
         simple_wb_analog_blue=simple_wb_analog_blue,
+        ppm_high_bit_depth=ppm_high_bit_depth,
+        ppm_high_bit_input_max=ppm_high_bit_input_max,
         z_stack_enabled=z_stack_enabled,
         z_offsets=z_offsets,
         projection_fn=projection_fn,
@@ -5119,6 +5198,7 @@ def _acquire_tile_angles_angle_outer(
             tile_config_source=tile_config_source,
             logger=logger,
             min_intensity=params.get("biref_min_intensity", 0),
+            input_max=ctx.ppm_high_bit_input_max,
         )
     else:
         logger.warning(
@@ -5380,7 +5460,10 @@ def _acquire_tile_angles(
                 t_mkdir = log_timing(logger, f"Create directories at {angle}deg", t_mkdir)
                 try:
                     write_position_metadata(
-                        ctx.metadata_txt_for_positions, raw_image_path, hardware, ctx.modality
+                        ctx.metadata_txt_for_positions,
+                        raw_image_path,
+                        hardware,
+                        ctx.modality,
                     )
                     raw_pixel_size = hardware.get_pixel_size_um()
                     ctx.write_pool.submit(
@@ -5538,6 +5621,7 @@ def _acquire_tile_angles(
             tile_config_source=tile_config_source,
             logger=logger,
             min_intensity=params.get("biref_min_intensity", 0),
+            input_max=ctx.ppm_high_bit_input_max,
         )
     else:
         logger.warning(
@@ -5676,7 +5760,10 @@ def _acquire_tile_channels_z_outer(
                     ctx.update_progress(ctx.image_count, ctx.total_images)
                 try:
                     write_position_metadata(
-                        ctx.metadata_txt_for_positions, image_path, hardware, ctx.modality
+                        ctx.metadata_txt_for_positions,
+                        image_path,
+                        hardware,
+                        ctx.modality,
                     )
                 except Exception as e:
                     logger.warning(
@@ -5899,7 +5986,10 @@ def _acquire_tile_channels(
                     ctx.update_progress(ctx.image_count, ctx.total_images)
                 try:
                     write_position_metadata(
-                        ctx.metadata_txt_for_positions, image_path, hardware, ctx.modality
+                        ctx.metadata_txt_for_positions,
+                        image_path,
+                        hardware,
+                        ctx.modality,
                     )
                 except Exception as e:
                     logger.warning(
@@ -6393,7 +6483,10 @@ def get_target_intensity_for_angle(
             if bg_exposures and "angles" in bg_exposures:
                 angle_data = bg_exposures["angles"].get(angle_name)
                 if angle_data and "achieved_intensity" in angle_data:
-                    return float(angle_data["achieved_intensity"]), "background_exposures"
+                    return (
+                        float(angle_data["achieved_intensity"]),
+                        "background_exposures",
+                    )
 
             # Priority 2: Check configured target_intensities
             target_intensities = cal_targets.get("target_intensities", {})
@@ -8877,7 +8970,8 @@ def polarizer_calibration_workflow(
 
             f.write("Hardware Position (counts), Intensity\n")
             for hw_pos, intensity in zip(
-                primary_result["coarse_hardware_positions"], primary_result["coarse_intensities"]
+                primary_result["coarse_hardware_positions"],
+                primary_result["coarse_intensities"],
             ):
                 f.write(f"{hw_pos:.1f}, {intensity:.2f}\n")
 
@@ -8894,7 +8988,8 @@ def polarizer_calibration_workflow(
                     )
                     f.write("Hardware Position (counts), Intensity\n")
                     for hw_pos, intensity in zip(
-                        fine_result["fine_hw_positions"], fine_result["fine_intensities"]
+                        fine_result["fine_hw_positions"],
+                        fine_result["fine_intensities"],
                     ):
                         f.write(f"{hw_pos:.1f}, {intensity:.2f}\n")
 

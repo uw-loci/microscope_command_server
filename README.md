@@ -313,6 +313,48 @@ Omitting `--z-stack` or setting it to `false` disables Z-stack acquisition
 entirely. Omitting `--z-projection` defaults to `max` (maximum intensity
 projection), preserving the original single-image-per-tile output.
 
+## PPM Acquisition Options (--ppm-high-bit-depth)
+
+The BGACQUIRE (and ACQUIRE) acquisition message parser accepts optional flags
+specific to PPM (polarized-light microscopy) acquisitions.
+
+### High-bit-depth angle capture
+
+```
+--ppm-high-bit-depth true|false
+```
+
+**Parameters:**
+
+- `--ppm-high-bit-depth true|false` -- Enable high-bit-depth capture for PPM
+  angle frames (opt-in). Default: `false`.
+  - When `true`: PPM angle frames are captured at the camera's native
+    high-bit PixelFormat (e.g., 12-bit on JAI cameras) instead of the standard
+    8-bit. This provides higher precision inputs to the birefringence
+    calculation, potentially improving measurement accuracy for low-intensity
+    samples.
+  - When `false` or omitted: Uses the standard 8-bit capture path; behavior is
+    byte-identical to prior releases.
+
+**Constraints:**
+
+- This flag is only honored on cameras that implement
+  `set_high_bit_mode()` (currently the JAI camera interface).
+- If specified on unsupported camera hardware, the server logs a warning and
+  silently falls back to 8-bit capture.
+- Scoped to angle acquisition only: autofocus and non-PPM imaging always use
+  standard 8-bit capture regardless of this flag.
+
+**Use case:** When acquiring PPM images from weakly birefringent samples or at
+high zoom factors, enabling high-bit-depth capture can improve the signal-to-noise
+ratio of birefringence measurements by working with full camera precision
+instead of quantized 8-bit data.
+
+### Backward compatibility
+
+Omitting `--ppm-high-bit-depth` or setting it to `false` preserves the standard
+8-bit capture behavior, ensuring acquisitions are unchanged from prior releases.
+
 ## Installation
 
 **Part of [QPSC (QuPath Scope Control)](https://github.com/uw-loci/QPSC)**
