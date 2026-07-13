@@ -1048,6 +1048,28 @@ def _apply_crop_roi(core, crop_factor: float) -> Tuple[Optional[Tuple[int, int, 
                 pass
             return (None, seq_running)
 
+    # 2026-07-13: read back what the adapter actually granted. Cameras
+    # round ROI geometry to their own increments (JAI: requested
+    # 1032x772 -> delivered 1024x772), and logging the request as if it
+    # were the outcome sent a misleading trail into the 2026-07-13
+    # dimension-mismatch investigation. The AF pop path reshapes by
+    # frame tags so the rounding is harmless here; this is truth in
+    # logging only.
+    granted = _read_roi(core)
+    if granted is not None and tuple(granted) != (new_x, new_y, new_w, new_h):
+        logger.info(
+            "STREAM_AF:camera rounded requested crop (%d, %d, %dx%d) to "
+            "(%d, %d, %dx%d) per its geometry increments",
+            new_x,
+            new_y,
+            new_w,
+            new_h,
+            granted[0],
+            granted[1],
+            granted[2],
+            granted[3],
+        )
+        new_x, new_y, new_w, new_h = granted
     logger.info(
         "STREAM_AF:cropped camera ROI (%d, %d, %dx%d) -> (%d, %d, %dx%d) "
         "(factor=%.2f, pixel area %.0f%% of full sensor)",
