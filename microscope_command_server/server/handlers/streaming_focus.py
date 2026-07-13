@@ -303,6 +303,17 @@ METRIC_FLAT_NO_IMPROVEMENT_R2 = 0.15
 METRIC_FLAT_WIDEN_DEFAULT_MULTIPLIER = 5.0
 METRIC_FLAT_WIDEN_HARD_FLOOR_UM = 50.0
 
+# Monotonic-slope detector thresholds (see the 2026-05-12 comment in
+# _attempt_one_scan). Pearson correlation between z and metric across
+# the in-motion samples: ~0 for noise and for centered interior peaks,
+# ~+/-1 for a clean monotonic slope (focus outside the scan window).
+# Amplitude floor rejects "metric constant to 4 decimals but gaussian
+# failed to converge on flat noise". 2026-07-13: hoisted to module
+# scope so the detector can also run on the high-amplitude success
+# path, not only inside the low-amplitude refusal branch.
+SLOPE_PEARSON_R_THRESHOLD = 0.5
+SLOPE_MIN_AMPLITUDE = 0.005
+
 # Maximum number of edge-retry attempts beyond the first scan. Each
 # retry shifts the scan window one full range in the direction of
 # the previously-detected peak. With 2 retries (MAX_EDGE_RETRIES=2)
@@ -2892,8 +2903,6 @@ def _attempt_one_scan(
                 # opposite-edge oscillation short-circuit catches
                 # ping-pong; union-fit recovers if a real interior peak
                 # was visible in any attempt.
-                SLOPE_PEARSON_R_THRESHOLD = 0.5
-                SLOPE_MIN_AMPLITUDE = 0.005
                 sigma_degenerate = gaussian_fit is None or sigma_fit >= 0.45 * max(z_span, 1e-6)
                 if sigma_degenerate and n_motion_samples >= 8:
                     zs_arr = np.asarray([s[1] for s in in_motion])
@@ -3116,11 +3125,29 @@ def _attempt_one_scan(
         # anything better. Yesterday's z=-16.9 in [-58.5, -8.5] case
         # still passes through: sigma=3.19, distance from mu to
         # nearest sampled boundary >= 8.4 um >> 3.19 -> NOT at boundary.
-        if gaussian_fit is not None and shape_ok and n_motion_samples >= 3:
+        # 2026-07-13: gate on R^2 alone, not shape_ok. shape_ok also
+        # requires sigma < 0.45 * z_span, which silently excluded
+        # degenerate-sigma fits -- but a boundary-pinned mu with a
+        # degenerate sigma is the STRONGEST out-of-window evidence
+        # (the fit is trying to model a monotonic slope). On the
+        # 2026-07-13 PPM 20x failure two consecutive scans fit mu
+        # exactly at the sampled low boundary with sigma just past the
+        # degeneracy line (11.14 vs 10.35 um, 10.83 vs 10.27 um) and
+        # committed as success ~38/~30 um above true focus. For a
+        # degenerate fit sigma spans the window and is useless as a
+        # boundary tolerance (it would flag interior peaks), so use a
+        # tight tolerance instead: curve_fit pins mu essentially ON
+        # the boundary when the true peak lies outside. Full analysis:
+        # claude-reports/2026-07-13_streaming-af-boundary-pin-
+        # degenerate-sigma-false-success.md.
+        if gaussian_fit is not None and r2 >= FLAT_METRIC_GAUSSIAN_R2 and n_motion_samples >= 3:
             z_min_sampled = float(min(zs))
             z_max_sampled = float(max(zs))
             mu_fit = float(gaussian_fit[0])
-            boundary_tol = max(sigma_fit, 0.5)
+            if sigma_fit >= 0.45 * max(z_span, 1e-6):
+                boundary_tol = max(0.10 * z_span, 0.5)
+            else:
+                boundary_tol = max(sigma_fit, 0.5)
             mu_at_low_sampled = abs(mu_fit - z_min_sampled) <= boundary_tol
             mu_at_high_sampled = abs(mu_fit - z_max_sampled) <= boundary_tol
             if mu_at_low_sampled != mu_at_high_sampled:
@@ -3158,6 +3185,68 @@ def _attempt_one_scan(
                     f"(sigma={sigma_fit:.2f}um, amplitude="
                     f"{metric_range_frac:.2%}, R^2={r2:.2f}). True focus "
                     f"is likely at {direction}",
+                    samples_trace=list(in_motion),
+                )
+
+        # 2026-07-13: degenerate-fit monotonic-slope escape on the
+        # success path. The Pearson slope detector above only runs
+        # inside the low-amplitude refusal branch, but p98_p2 tens of
+        # um out of focus produces a HIGH-amplitude monotonic slope
+        # (38.9% of peak on the 2026-07-13 PPM 20x failure, far above
+        # FLAT_METRIC_AMPLITUDE_TRUSTED) -- amplitude says nothing
+        # about peak shape. When the gaussian fit is degenerate (or
+        # failed) and the metric trends monotonically across the scan,
+        # the peak is outside the window; classify as edge instead of
+        # committing whatever the fit produced. Catches the cases the
+        # boundary-pin check above misses: gaussian failed to converge,
+        # R^2 below FLAT_METRIC_GAUSSIAN_R2, or mu not pinned cleanly
+        # at a single boundary.
+        slope_sigma_degenerate = gaussian_fit is None or sigma_fit >= 0.45 * max(z_span, 1e-6)
+        if (
+            slope_sigma_degenerate
+            and n_motion_samples >= 8
+            and metric_range_frac >= SLOPE_MIN_AMPLITUDE
+        ):
+            zs_arr = np.asarray([s[1] for s in in_motion])
+            ms_arr = np.asarray([s[2] for s in in_motion])
+            if float(np.std(zs_arr)) > 1e-6 and float(np.std(ms_arr)) > 1e-12:
+                pearson_r = float(np.corrcoef(zs_arr, ms_arr)[0, 1])
+            else:
+                pearson_r = 0.0
+            if abs(pearson_r) >= SLOPE_PEARSON_R_THRESHOLD:
+                if pearson_r > 0:
+                    slope_status = "edge_high"
+                    slope_direction = "more positive Z (above z_end)"
+                else:
+                    slope_status = "edge_low"
+                    slope_direction = "more negative Z (below z_start)"
+                logger.info(
+                    "STREAM_AF:%smonotonic slope on success path: Pearson "
+                    "r=%+.3f across %d samples (amplitude %.2f%% of peak, "
+                    "gaussian %s). Peak is outside the scan window. "
+                    "Classifying as %s -- retry will shift toward %s.",
+                    tag_prefix,
+                    pearson_r,
+                    n_motion_samples,
+                    metric_range_frac * 100.0,
+                    (
+                        "failed"
+                        if gaussian_fit is None
+                        else "degenerate (sigma=%.2f um vs 0.45*span=%.2f um)"
+                        % (sigma_fit, 0.45 * z_span)
+                    ),
+                    slope_status,
+                    slope_direction,
+                )
+                return _ScanAttemptResult(
+                    slope_status,
+                    None,
+                    n_motion_samples,
+                    z_span,
+                    f"monotonic slope across scan (Pearson "
+                    f"r={pearson_r:+.3f}, amplitude "
+                    f"{metric_range_frac:.2%}, gaussian degenerate). "
+                    f"True focus is likely at {slope_direction}",
                     samples_trace=list(in_motion),
                 )
 
