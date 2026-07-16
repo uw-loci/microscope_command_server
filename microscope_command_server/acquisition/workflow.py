@@ -3819,14 +3819,27 @@ def _configure_autofocus(ctx: AcquisitionContext) -> None:
         )
         af_n_tiles = max(1, af_n_tiles)
 
-    # Map score metric name to function
+    # Map score metric name to function.
+    # NOTE: "p98_p2" MUST be present -- PPM 20x sets score_metric: p98_p2 in
+    # autofocus_PPM.yml, and without a map entry it silently fell through to
+    # laplacian_variance (a gradient metric that reads flat on the bright PPM 20x
+    # background), which never brackets focus and drives the edge-retry sweep into
+    # a multi-minute runaway that trips the client's no-progress watchdog.
     score_metric_map = {
         "laplacian_variance": AutofocusUtils.autofocus_profile_laplacian_variance,
         "sobel": AutofocusUtils.autofocus_profile_sobel,
         "brenner_gradient": AutofocusUtils.autofocus_profile_brenner_gradient,
         "robust_sharpness": AutofocusUtils.autofocus_profile_robust_sharpness_metric,
         "hybrid_sharpness": AutofocusUtils.autofocus_profile_hybrid_sharpness_metric,
+        "p98_p2": AutofocusUtils.autofocus_profile_p98_p2,
     }
+    if af_score_metric_name not in score_metric_map:
+        logger.warning(
+            "Autofocus score_metric '%s' is not mapped to a profile function; "
+            "falling back to laplacian_variance (gradient metrics read flat on "
+            "bright PPM backgrounds -- set a mapped metric such as p98_p2).",
+            af_score_metric_name,
+        )
     af_score_metric = score_metric_map.get(
         af_score_metric_name, AutofocusUtils.autofocus_profile_laplacian_variance
     )
