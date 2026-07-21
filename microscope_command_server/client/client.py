@@ -171,23 +171,30 @@ class QuPathTestClient:
         response = self.socket.recv(4)
         return struct.unpack("!f", response)[0]
 
+    # TODO(stage-move-sync): the fixed 0.5s sleeps below are a move-completion
+    # band-aid, not a real fix. 0.5s is tuned for OUR tested stages and will NOT
+    # generalize -- a slower stage (or a longer move) races past it and reads the
+    # position mid-travel. Replace with a real completion signal: a blocking-move
+    # ack from the server (send MOVE, then wait for a "move done" reply) or a
+    # poll of stage position/busy against the target with a timeout. Must be
+    # fixed before this client is used against untested stages.
     def move_xy(self, x: float, y: float):
         """Move to XY position."""
         self.socket.send(ExtendedCommand.MOVE)
         self.socket.send(struct.pack("!ff", x, y))
-        time.sleep(0.5)
+        time.sleep(0.5)  # TODO(stage-move-sync): replace with a real move-done ack
 
     def move_z(self, z: float):
         """Move to Z position."""
         self.socket.send(ExtendedCommand.MOVEZ)
         self.socket.send(struct.pack("!f", z))
-        time.sleep(0.5)
+        time.sleep(0.5)  # TODO(stage-move-sync): replace with a real move-done ack
 
     def move_rotation(self, angle: float):
         """Move rotation stage to angle."""
         self.socket.send(ExtendedCommand.MOVER)
         self.socket.send(struct.pack("!f", angle))
-        time.sleep(0.5)
+        time.sleep(0.5)  # TODO(stage-move-sync): replace with a real move-done ack
 
     def snap_image(
         self,
