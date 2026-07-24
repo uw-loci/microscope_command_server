@@ -221,17 +221,39 @@ def handle_setexp(conn, client, hardware, settings, **kwargs):
             logger.info("Set unified exposure to %s ms", exposures[0])
         elif count >= 3:
             if cam.supports_per_channel_exposure():
+                r, g, b = exposures[0], exposures[1], exposures[2]
+                # SETEXP is the interactive Live Viewer path (Camera-tab exposure
+                # spinner and PPM angle clicks), which streams in CONTINUOUS mode.
+                # Snap BLUE out of the JAI contamination trigger window HERE:
+                # unlike apply_settings, the thin set_channel_exposures does not,
+                # so a per-angle exposure whose blue lands in (4.0, 5.6) ms would
+                # otherwise show the half-frame contamination bar / freeze in live
+                # view. Snap-mode acquisition is unaffected (it uses apply_settings
+                # and is clean at any value), so this does not change acquired data.
+                snapper = getattr(cam, "snap_exposures_out_of_trigger_window", None)
+                if snapper is not None:
+                    r, g, b, snapped = snapper(r, g, b)
+                    if snapped:
+                        logger.warning(
+                            "SETEXP: blue exposure landed in the JAI contamination "
+                            "trigger window; snapped to a safe edge (R=%.4f G=%.4f "
+                            "B=%.4f ms) to keep live view clean; WB ratio preserved. "
+                            "See claude-reports/2026-07-24_jai-live-exposure-snap-gap.md.",
+                            r,
+                            g,
+                            b,
+                        )
                 cam.set_channel_exposures(
-                    red=exposures[0],
-                    green=exposures[1],
-                    blue=exposures[2],
+                    red=r,
+                    green=g,
+                    blue=b,
                     auto_enable=True,
                 )
                 logger.info(
                     "Set per-channel exposures: R=%s, G=%s, B=%s",
-                    exposures[0],
-                    exposures[1],
-                    exposures[2],
+                    r,
+                    g,
+                    b,
                 )
             else:
                 # Fall back to unified using green channel value
@@ -482,10 +504,18 @@ def handle_setcam(conn, client, hardware, settings, **kwargs):
                 # of this handler accidentally used red=/blue= which broke
                 # all per-channel WB presets with ERR_SETC.
                 cam.set_rb_analog_gains(analog_red=gains[1], analog_blue=gains[2])
-                logger.info("SETCAM: unified=%.2f, aR=%.3f, aB=%.3f", gains[0], gains[1], gains[2])
+                logger.info(
+                    "SETCAM: unified=%.2f, aR=%.3f, aB=%.3f",
+                    gains[0],
+                    gains[1],
+                    gains[2],
+                )
 
         conn.sendall(b"ACK_____")
-        logger.info("SETCAM complete (streaming was %s)", "stopped" if stopped else "not running")
+        logger.info(
+            "SETCAM complete (streaming was %s)",
+            "stopped" if stopped else "not running",
+        )
 
     except Exception as e:
         logger.error("SETCAM failed: %s", e)
