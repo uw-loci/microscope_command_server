@@ -33,6 +33,7 @@ def match_sift(
     clahe_clip_limit: float = 2.0,
     coarse_pixel_size_um: float = 0.0,
     coarse_to_fine_enabled: bool = False,
+    rgb_conversion: str = "GREEN",
 ) -> Optional[Tuple[float, float, int, float]]:
     """
     Match a microscope snapshot to a WSI region using SIFT features.
@@ -83,6 +84,23 @@ def match_sift(
             paying the cost of running full-resolution SIFT over the whole
             region. Falls back to the single full-resolution pass if the
             coarse pass finds no match.
+        rgb_conversion: How to collapse a colour (RGB, e.g. H&E) input to a
+            single channel before matching. Only affects 3/4-channel images --
+            the monochrome microscope snapshot is untouched.
+            "GREEN" (default) takes the green channel: for H&E both
+            hematoxylin (nuclei) and eosin (cytoplasm) absorb green strongly,
+            so green carries the most tissue structure AND keeps the same
+            intensity polarity (tissue dark on a bright transmitted-light
+            background) as a brightfield monochrome camera, which is exactly
+            what makes the two commensurate for SIFT. "LUMINANCE" is the
+            legacy cv2.COLOR_BGR2GRAY weighting (0.299R+0.587G+0.114B); its
+            red term brightens eosin and washes out cytoplasm contrast, so it
+            matches an H&E scan against a mono brightfield camera poorly.
+            NOTE: do NOT use an absorbance/optical-density conversion here --
+            it inverts polarity (tissue bright) and its gradients run opposite
+            to the intensity microscope image, which breaks descriptor
+            matching. Absorbance would only be valid if BOTH images were
+            converted, which this path does not do.
 
     Returns:
         Tuple of (offset_x_um, offset_y_um, n_inliers, confidence) or None if matching failed.
@@ -95,12 +113,14 @@ def match_sift(
         mono_normalization=mono_normalization,
         percentile_low=percentile_low,
         percentile_high=percentile_high,
+        rgb_conversion=rgb_conversion,
     )
     gray_wsi = _to_gray(
         wsi_region,
         mono_normalization=mono_normalization,
         percentile_low=percentile_low,
         percentile_high=percentile_high,
+        rgb_conversion=rgb_conversion,
     )
 
     # Cross-modality contrast normalisation. Applied AFTER the per-image
@@ -394,13 +414,15 @@ def _to_gray(
     mono_normalization: str = "PERCENTILE",
     percentile_low: float = 2.0,
     percentile_high: float = 98.0,
+    rgb_conversion: str = "GREEN",
 ) -> np.ndarray:
     """Convert image to 8-bit grayscale with configurable normalization.
 
-    For multi-channel input (typical 8-bit RGB H&E), this collapses to
-    luminance via OpenCV. For single-channel input above 8-bit (typical
-    12-14 bit camera packed in 16-bit container), this rescales to 8-bit
-    using the requested mode:
+    For multi-channel input (typical 8-bit RGB H&E), this collapses to a
+    single channel per ``rgb_conversion`` ("GREEN" default, or "LUMINANCE"
+    for the legacy BGR2GRAY weighting). For single-channel input above 8-bit
+    (typical 12-14 bit camera packed in 16-bit container), this rescales to
+    8-bit using the requested mode:
 
     - PERCENTILE (default): clip to [percentile_low, percentile_high] of
       the actual data, then linearly stretch to [0, 255]. Robust to a
@@ -410,13 +432,20 @@ def _to_gray(
     - BIT_SHIFT: legacy /256 behaviour. Use only when the camera is
       known to span the full 16-bit range.
     """
-    if image.ndim == 3:
-        if image.shape[2] == 4:
-            gray = cv2.cvtColor(image, cv2.COLOR_BGRA2GRAY)
-        elif image.shape[2] == 3:
-            gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
-        else:
-            gray = image[:, :, 0]
+    if image.ndim == 3 and image.shape[2] >= 3:
+        conv = (rgb_conversion or "GREEN").upper()
+        if conv == "GREEN":
+            # OpenCV loads colour as BGR; index 1 is the green channel. Green
+            # maximises H&E tissue structure and keeps intensity polarity
+            # (tissue dark) commensurate with a brightfield mono camera.
+            gray = image[:, :, 1]
+            logger.info("_to_gray: RGB->green-channel conversion")
+        else:  # LUMINANCE (legacy)
+            code = cv2.COLOR_BGRA2GRAY if image.shape[2] == 4 else cv2.COLOR_BGR2GRAY
+            gray = cv2.cvtColor(image, code)
+            logger.info("_to_gray: RGB->luminance (BGR2GRAY) conversion")
+    elif image.ndim == 3:
+        gray = image[:, :, 0]
     else:
         gray = image
 

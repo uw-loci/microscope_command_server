@@ -488,6 +488,9 @@ def handle_siftal(conn, client, hardware, settings, **kwargs):
         elif parts[i] == "--coarse-to-fine" and i + 1 < len(parts):
             params["coarse_to_fine_enabled"] = parts[i + 1].lower() in ("1", "true", "yes")
             i += 2
+        elif parts[i] == "--rgb-conv" and i + 1 < len(parts):
+            params["rgb_conversion"] = parts[i + 1]
+            i += 2
         elif parts[i] == "--flip-x":
             params["flip_x"] = True
             i += 1
@@ -540,12 +543,13 @@ def handle_siftal(conn, client, hardware, settings, **kwargs):
         clahe_clip_limit = params.get("clahe_clip_limit", 2.0)
         coarse_pixel_size_um = params.get("coarse_pixel_size_um", 0.0)
         coarse_to_fine_enabled = params.get("coarse_to_fine_enabled", False)
+        rgb_conversion = params.get("rgb_conversion", "GREEN")
 
         logger.info(
             "SIFT: micro_px=%s, wsi_px=%s, min_px=%s, flip=(%s,%s), "
             "ratio=%s, min_matches=%s, contrast=%s, nfeatures=%s, "
             "mono_norm=%s, pct=(%s,%s), clahe=%s clip=%s, "
-            "coarse_to_fine=%s coarse_px=%s",
+            "coarse_to_fine=%s coarse_px=%s, rgb_conv=%s",
             micro_px,
             wsi_px,
             min_px,
@@ -562,6 +566,7 @@ def handle_siftal(conn, client, hardware, settings, **kwargs):
             clahe_clip_limit,
             coarse_to_fine_enabled,
             coarse_pixel_size_um,
+            rgb_conversion,
         )
 
         result = match_sift(
@@ -583,6 +588,7 @@ def handle_siftal(conn, client, hardware, settings, **kwargs):
             clahe_clip_limit=clahe_clip_limit,
             coarse_pixel_size_um=coarse_pixel_size_um,
             coarse_to_fine_enabled=coarse_to_fine_enabled,
+            rgb_conversion=rgb_conversion,
         )
 
         if result is None:
