@@ -142,8 +142,13 @@ def handle_getfov(conn, client, hardware, settings, **kwargs):
         conn.sendall(struct.pack("!ff", fov_x, fov_y))
         logger.debug("Sent FOV: (%.1f, %.1f)", fov_x, fov_y)
     except Exception as e:
+        # Return -1,-1 (the same sentinel as the not-configured branch above),
+        # NOT 0,0. A genuine 0 FOV (Micro-Manager reports pixel size 0 for the
+        # active objective) is a real, distinct state the client falls back on;
+        # keeping the error sentinel out of that value range lets the client tell
+        # "server errored" from "MM says zero".
         logger.error("Failed to get FOV: %s", e)
-        conn.sendall(struct.pack("!ff", 0.0, 0.0))
+        conn.sendall(struct.pack("!ff", -1.0, -1.0))
 
 
 def handle_getpxsz(conn, client, hardware, settings, **kwargs):

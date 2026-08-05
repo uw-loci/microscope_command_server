@@ -107,6 +107,24 @@ def match_sift(
         Offset is the correction to apply to the stage position:
         stage should move by (offset_x, offset_y) to center on the matching region.
     """
+    # Reject a non-positive / non-finite microscope pixel size before it can
+    # drive the resolution scaling. Micro-Manager returns 0.0 um/px when no
+    # pixel-size calibration is bound to the active objective; with a 0 (or NaN)
+    # here the scale ratio below collapses the microscope image toward 1x1 px,
+    # producing zero keypoints and a misleading "insufficient features" result.
+    # Fail loudly instead so the caller reports the real cause. (The Java client
+    # also guards this, but the server must not silently degrade.)
+    if not np.isfinite(microscope_pixel_size_um) or microscope_pixel_size_um <= 0:
+        logger.error(
+            "SIFT: invalid microscope_pixel_size_um=%r (Micro-Manager pixel-size "
+            "calibration missing for the active objective); cannot scale images",
+            microscope_pixel_size_um,
+        )
+        return None
+    if not np.isfinite(wsi_pixel_size_um) or wsi_pixel_size_um <= 0:
+        logger.error("SIFT: invalid wsi_pixel_size_um=%r; cannot scale images", wsi_pixel_size_um)
+        return None
+
     # Convert to 8-bit grayscale, normalising as configured.
     gray_micro = _to_gray(
         microscope_image,
@@ -196,8 +214,12 @@ def _match_at_resolution(
     wsi_scale = wsi_pixel_size_um / target_pixel_size
 
     if micro_scale < 0.99:
-        new_w = max(1, int(gray_micro.shape[1] * micro_scale))
-        new_h = max(1, int(gray_micro.shape[0] * micro_scale))
+        # Floor each dimension at a SIFT-meaningful minimum (16 px) so a
+        # degenerate scale can never collapse the image to a keypoint-free
+        # sliver. A no-op for normal downscales; the invalid-pixel-size guard in
+        # match_sift already rejects the 0 um/px case that produced 1x1 before.
+        new_w = max(16, int(gray_micro.shape[1] * micro_scale))
+        new_h = max(16, int(gray_micro.shape[0] * micro_scale))
         gray_micro = cv2.resize(gray_micro, (new_w, new_h), interpolation=cv2.INTER_AREA)
         logger.info(
             f"Downscaled microscope image to {new_w}x{new_h} "
@@ -205,8 +227,8 @@ def _match_at_resolution(
         )
 
     if wsi_scale < 0.99:
-        new_w = max(1, int(gray_wsi.shape[1] * wsi_scale))
-        new_h = max(1, int(gray_wsi.shape[0] * wsi_scale))
+        new_w = max(16, int(gray_wsi.shape[1] * wsi_scale))
+        new_h = max(16, int(gray_wsi.shape[0] * wsi_scale))
         gray_wsi = cv2.resize(gray_wsi, (new_w, new_h), interpolation=cv2.INTER_AREA)
         logger.info(
             f"Downscaled WSI region to {new_w}x{new_h} "
@@ -458,10 +480,7 @@ def _to_gray(
     mode = (mono_normalization or "PERCENTILE").upper()
 
     if mode == "BIT_SHIFT":
-        if gray.dtype == np.uint16:
-            out = (gray / 256).astype(np.uint8)
-        else:
-            out = gray.astype(np.uint8)
+        out = (gray / 256).astype(np.uint8) if gray.dtype == np.uint16 else gray.astype(np.uint8)
         logger.info(
             f"_to_gray: BIT_SHIFT applied (input dtype={gray.dtype}, "
             f"min={int(gray.min())}, max={int(gray.max())})"
