@@ -12,7 +12,7 @@ authors = [
 ]
 dependencies = [
     "microscope-control>=1.0.0",
-    "microscope-imageprocessing>=0.1.0",
+    "microscope-imageprocessing>=0.2.0",
 ]
 
 [project.optional-dependencies]
