@@ -255,9 +255,45 @@ The server computes the number of planes as `ceil(|z_end - z_start| / z_step)`.
 - `max` -- Maximum intensity projection (default). Each tile output is a single
   2D image (the brightest pixel at each xy position across the Z-stack).
 - `mean` -- Mean intensity projection. Single 2D output per tile.
+- `edf` -- Extended Depth of Field (EDF) projection. Computes a single 2D image
+  by selecting pixels from the Z-stack according to a sharpness metric (see
+  "EDF tuning parameters" below). Each tile output is a single 2D image.
 - `none` -- Preserve individual Z-planes without projection. Output structure
   changes to a per-plane layout, enabling 5D stitching (x, y, z, channel/angle,
   time). See "File layout on disk" below.
+
+### EDF tuning parameters
+
+When using `--z-projection edf`, three optional parameters control the sharpness
+metric and filtering behavior:
+
+- `--edf-metric <name>` -- Per-pixel sharpness map (default: `tenengrad`).
+  Valid values are exactly `tenengrad`, `modified_laplacian` and `variance` --
+  the names in `microscope_imageprocessing.focus.sharpness_maps`. Anything else
+  raises rather than silently substituting, so a typo fails before the
+  acquisition starts. `tenengrad` matches the autofocus metric of the same
+  name; `modified_laplacian` peaks more sharply in Z but is noisier;
+  `variance` is the most forgiving of noise. Only meaningful with `edf`.
+- `--edf-window <pixels>` -- Averaging window for the sharpness map, in pixels
+  (integer, >= 1; default 9). Raw per-pixel sharpness is too noisy to choose a
+  plane from, so it is averaged over this window first -- the setting that
+  matters most. Raise it if the fused output looks blocky or speckled; lower it
+  if boundaries between in-focus regions look smeared. Scales with pixel size.
+  Only meaningful with `edf`.
+- `--edf-index-smooth <pixels>` -- Median-filter size applied to the map of
+  which plane each pixel selected, in pixels (integer, >= 0; default 5; 0
+  disables). Real focal surfaces are smooth, so this removes pixels that chose
+  an odd plane for no physical reason. Raise it for a tilted but flat sample;
+  lower it where focus genuinely steps (a fold, a torn section), because a
+  large median bridges the step and picks a plane sharp on neither side.
+  Only meaningful with `edf`.
+
+The defaults are reasoned starting points, not measured optima.
+
+**Example:**
+```
+--z-projection edf --edf-metric tenengrad --edf-window 9 --edf-index-smooth 5
+```
 
 ### File layout on disk
 

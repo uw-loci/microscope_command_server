@@ -2146,6 +2146,17 @@ def parse_acquisition_message(message: str) -> dict:
             elif parts[i] == "--z-projection" and i + 1 < len(parts):
                 params["z_projection"] = parts[i + 1]
                 i += 2
+            # EDF tuning. Only meaningful with --z-projection edf; ignored
+            # otherwise, since the other projections have nothing to tune.
+            elif parts[i] == "--edf-metric" and i + 1 < len(parts):
+                params["edf_metric"] = parts[i + 1]
+                i += 2
+            elif parts[i] == "--edf-window" and i + 1 < len(parts):
+                params["edf_window"] = int(parts[i + 1])
+                i += 2
+            elif parts[i] == "--edf-index-smooth" and i + 1 < len(parts):
+                params["edf_index_smooth"] = int(parts[i + 1])
+                i += 2
             elif parts[i] == "--inner-axis" and i + 1 < len(parts):
                 # Loop nesting axis for the per-tile snap loop. Allowed values:
                 #   'z'       -- z is the inner loop (current widefield default,
@@ -3089,6 +3100,7 @@ def _prepare_acquisition(
             from microscope_command_server.acquisition.projections import (
                 generate_z_offsets,
                 get_projection,
+                resolve_projection,
             )
 
             z_offsets = generate_z_offsets(z_total_range, z_step)
@@ -3107,8 +3119,11 @@ def _prepare_acquisition(
                 )
             else:
                 try:
-                    projection_fn = get_projection(projection_name)
-                except KeyError as e:
+                    # resolve_projection, not get_projection: EDF carries user
+                    # tuning (metric / window / index smoothing) that the plain
+                    # registry signature cannot express.
+                    projection_fn = resolve_projection(projection_name, params)
+                except (KeyError, ValueError) as e:
                     logger.error("Invalid z_projection: %s. Falling back to 'max'.", e)
                     projection_fn = get_projection("max")
                     projection_name = "max"

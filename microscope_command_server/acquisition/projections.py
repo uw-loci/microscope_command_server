@@ -14,6 +14,7 @@ import logging
 from abc import ABC, abstractmethod
 from typing import Dict, Any
 
+from microscope_imageprocessing.zstack.edf import make_edf_projection
 from microscope_imageprocessing.zstack.projections import (
     max_intensity_projection,
     min_intensity_projection,
@@ -37,8 +38,46 @@ __all__ = [
     "PROJECTIONS",
     "get_projection",
     "generate_z_offsets",
+    "make_edf_projection",
+    "resolve_projection",
     "PositionHook",
 ]
+
+
+def resolve_projection(name: str, params: Dict[str, Any]):
+    """Look up a projection, honouring EDF's tuning parameters.
+
+    ``get_projection`` returns a fixed ``List[ndarray] -> ndarray`` callable
+    with no room for settings, which is right for max/min/sum/mean/std -- they
+    have none. EDF has three (sharpness metric, averaging window, index
+    smoothing), and their best values depend on pixel size, camera noise and
+    whether the focal surface is smooth, so they are exposed to the user rather
+    than fixed. This is the one place that difference is handled.
+
+    Unknown or malformed EDF settings raise HERE, before the acquisition
+    starts, rather than after the tiles have been captured.
+
+    Args:
+        name: Projection name from ``--z-projection``.
+        params: Parsed command parameters; EDF reads ``edf_metric``,
+            ``edf_window`` and ``edf_index_smooth`` when present.
+
+    Returns:
+        A callable taking a Z-stack and returning the projected 2D image.
+    """
+    if name != "edf":
+        return get_projection(name)
+
+    metric = params.get("edf_metric") or "tenengrad"
+    window = params.get("edf_window")
+    index_smooth = params.get("edf_index_smooth")
+    kwargs = {"metric": metric}
+    if window is not None:
+        kwargs["window"] = int(window)
+    if index_smooth is not None:
+        kwargs["index_smooth"] = int(index_smooth)
+    logger.info("EDF projection: %s", kwargs)
+    return make_edf_projection(**kwargs)
 
 
 # ============================================================
