@@ -142,6 +142,16 @@ def acquire_rapid_scan(
     if binning > 1:
         try:
             original_binning = camera.get_binning()
+            if original_binning is None:
+                # We cannot read what the binning is now, so we cannot put it
+                # back afterwards. Say so loudly -- the restore below is
+                # already guarded on None, so it will be skipped rather than
+                # writing a guessed 1x over whatever the user had set.
+                logger.warning(
+                    "Camera did not report its current binning; binning will be set to "
+                    "%d for this scan but NOT restored afterwards",
+                    binning,
+                )
             camera.set_binning(binning)
             logger.info("Set camera binning=%d (was %s)", binning, original_binning)
         except Exception as e:

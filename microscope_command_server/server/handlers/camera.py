@@ -275,14 +275,21 @@ def handle_getgain(conn, client, hardware, settings, **kwargs):
     """Return gain values.
 
     Always returns 3 floats: [unified_gain, analog_red, analog_blue] = 12 bytes.
-    Non-per-channel cameras return (1.0, 1.0, 1.0) via Camera ABC defaults.
-    Error: returns (-1.0, -1.0, -1.0).
+    A camera that does not report a unified gain, or whose gain property
+    could not be read, yields the same (-1.0, -1.0, -1.0) sentinel as an
+    outright error -- the client must not be told "1.0" (unity gain, no
+    amplification) about hardware nobody queried.
+    Error / unknown: returns (-1.0, -1.0, -1.0).
     """
     logger.debug("Client %s requested gain values", client.addr)
     try:
         cam = hardware.camera
         unified = cam.get_unified_gain()
         rb_gains = cam.get_rb_analog_gains()
+        if unified is None:
+            logger.warning("GETGAIN: unified gain is not reportable; sending unknown sentinel")
+            conn.sendall(struct.pack("!fff", -1.0, -1.0, -1.0))
+            return
         response = struct.pack(
             "!fff",
             float(unified),
@@ -549,7 +556,14 @@ def handle_getbin(conn, client, hardware, settings, **kwargs):
         available = [int(v) & 0xFF for v in available if 1 <= int(v) <= 255]
         if not available:
             available = [1]
-        current = int(cam.get_binning()) & 0xFF
+        raw_current = cam.get_binning()
+        if raw_current is None:
+            # The camera could not report its binning. Do not substitute 1 --
+            # that is a claim the camera is not binning, and the client would
+            # act on it (and a save/restore round-trip would then write 1x
+            # back to the hardware). The protocol has an error path; use it.
+            raise RuntimeError("camera could not report its current binning")
+        current = int(raw_current) & 0xFF
         if current < 1:
             current = 1
         payload = bytes([len(available)]) + bytes(available) + bytes([current])
@@ -650,15 +664,30 @@ def _build_illumination_descriptors(hardware, modalities):
         try:
             power_range = list(source.get_power_range())
         except Exception:
-            power_range = [0.0, 0.0]
+            power_range = None
+        # current_power / is_on are measurements. get_power() and is_on()
+        # return None when the device could not be read, and JSON null is how
+        # we say that on the wire. Substituting 0.0 / False here would tell
+        # the client the source is dark on no evidence at all.
         try:
-            current_power = float(source.get_power())
-        except Exception:
-            current_power = 0.0
+            raw_power = source.get_power()
+            current_power = None if raw_power is None else float(raw_power)
+        except Exception as e:
+            logger.debug("GETCAP: power unreadable for %s: %s", device, e)
+            current_power = None
         try:
-            is_on = bool(source.is_on())
-        except Exception:
-            is_on = False
+            raw_on = source.is_on()
+            is_on = None if raw_on is None else bool(raw_on)
+        except Exception as e:
+            logger.debug("GETCAP: on/off state unreadable for %s: %s", device, e)
+            is_on = None
+        if current_power is None or is_on is None:
+            logger.warning(
+                "GETCAP: reporting unknown illumination state for %s (power=%s, is_on=%s)",
+                device,
+                current_power,
+                is_on,
+            )
 
         # value_type tells the UI which widget to render. "binary" means
         # the source has only the State property (state_prop == intensity_prop)
@@ -803,17 +832,29 @@ def handle_getcap(conn, client, hardware, settings, **kwargs):
         cam = hardware.camera
         try:
             available_binnings = list(cam.get_available_binnings())
-        except Exception:
-            available_binnings = [1]
+        except Exception as e:
+            logger.warning("GETCAP: could not enumerate binnings: %s", e)
+            available_binnings = None
+        # None (JSON null) means "the camera did not tell us", which is a
+        # different thing from 1x. Reporting 1 here was a claim about the
+        # hardware's current state that nothing had verified.
         try:
-            current_binning = int(cam.get_binning())
-        except Exception:
-            current_binning = 1
+            raw_binning = cam.get_binning()
+            current_binning = None if raw_binning is None else int(raw_binning)
+        except Exception as e:
+            logger.warning("GETCAP: could not read current binning: %s", e)
+            current_binning = None
+        if current_binning is None:
+            logger.warning("GETCAP: reporting current_binning as unknown")
+        # Exposure bounds are the camera's own limits, not our policy. The
+        # 0.01-10000 ms pair was invented and would silently widen or narrow
+        # what the client offers the user.
         try:
             exp_min = float(cam.get_min_exposure_ms())
             exp_max = float(cam.get_max_exposure_ms())
-        except Exception:
-            exp_min, exp_max = 0.01, 10000.0
+        except Exception as e:
+            logger.warning("GETCAP: could not read exposure limits: %s", e)
+            exp_min, exp_max = None, None
         try:
             gain_range = cam.get_gain_range()
             gain_range = list(gain_range) if gain_range is not None else None
@@ -829,7 +870,9 @@ def handle_getcap(conn, client, hardware, settings, **kwargs):
             "supports_hardware_white_balance": bool(cam.supports_hardware_white_balance()),
             "available_binnings": available_binnings,
             "current_binning": current_binning,
-            "exposure_range_ms": [exp_min, exp_max],
+            "exposure_range_ms": (
+                None if exp_min is None or exp_max is None else [exp_min, exp_max]
+            ),
             "gain_range": gain_range,
         }
 

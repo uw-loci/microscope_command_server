@@ -38,6 +38,21 @@ def handle_getillm(conn, client, hardware, settings, **kwargs):
         power_range = illum.get_power_range()
         is_on = illum.is_on()
 
+        # get_power()/is_on() return None when the device could not be read.
+        # Reporting 0.0 / off would be a fabricated hardware state -- the
+        # client would draw the source as dark when we have no idea what it
+        # is doing. The protocol already has a word for "no answer": the
+        # 0x00 unavailable byte, which the Java client handles. Use it.
+        if power is None or is_on is None:
+            logger.warning(
+                "Illumination state unreadable (power=%s, is_on=%s); reporting "
+                "unavailable rather than inventing an off state",
+                power,
+                is_on,
+            )
+            conn.sendall(struct.pack(">BfffB", 0x00, 0.0, 0.0, 0.0, 0))
+            return
+
         response = struct.pack(
             ">BfffB",
             0x01,

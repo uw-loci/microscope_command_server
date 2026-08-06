@@ -3992,7 +3992,12 @@ def _guard_af_saturation(ctx: "AcquisitionContext", hardware, logger) -> None:
 
         base_exposure = float(ctx.exposure_90) if use_exposure else 0.0
         try:
-            base_power = float(illum.get_power()) if not use_exposure else 0.0
+            raw_power = illum.get_power() if not use_exposure else 0.0
+            # get_power() returns None when the source could not be read. The
+            # <= 0 branch below already refuses to scale in that case; make
+            # the None path explicit rather than relying on float(None)
+            # raising into the except.
+            base_power = 0.0 if raw_power is None else float(raw_power)
         except Exception:
             base_power = 0.0
         if not use_exposure and base_power <= 0:

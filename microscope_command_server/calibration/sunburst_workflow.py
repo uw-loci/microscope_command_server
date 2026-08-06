@@ -281,7 +281,11 @@ def _read_current_camera_settings(hardware, logger) -> Dict[str, str]:
             extra_info["Exposure B"] = f"{exposures['blue']:.1f} ms"
 
             gain = cam.get_unified_gain()
-            if gain > 1.0:
+            if gain is None:
+                # Record the gain as unknown on the calibration figure rather
+                # than omitting it -- a missing row reads as "gain was 1.0".
+                extra_info["Unified Gain"] = "unknown (not readable)"
+            elif gain > 1.0:
                 extra_info["Unified Gain"] = f"{gain:.2f}x"
 
             logger.info(
@@ -289,7 +293,7 @@ def _read_current_camera_settings(hardware, logger) -> Dict[str, str]:
                 f"R={exposures['red']:.1f}ms, "
                 f"G={exposures['green']:.1f}ms, "
                 f"B={exposures['blue']:.1f}ms, "
-                f"gain={gain:.2f}x"
+                f"gain={'unknown' if gain is None else f'{gain:.2f}x'}"
             )
         else:
             exposure_ms = hardware.get_exposure()
