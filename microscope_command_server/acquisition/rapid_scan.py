@@ -143,17 +143,21 @@ def acquire_rapid_scan(
         try:
             original_binning = camera.get_binning()
             if original_binning is None:
-                # We cannot read what the binning is now, so we cannot put it
-                # back afterwards. Say so loudly -- the restore below is
-                # already guarded on None, so it will be skipped rather than
-                # writing a guessed 1x over whatever the user had set.
+                # We cannot read the current binning, so we could not put it
+                # back afterwards -- the restore below is guarded on None and
+                # would silently skip, leaving the camera binned for whatever
+                # the user does next. Do not change hardware state you cannot
+                # undo. Take the same path as a failed set_binning: run
+                # unbinned.
                 logger.warning(
-                    "Camera did not report its current binning; binning will be set to "
-                    "%d for this scan but NOT restored afterwards",
+                    "Camera did not report its current binning, so binning cannot be "
+                    "restored after the scan; running unbinned instead of setting %d",
                     binning,
                 )
-            camera.set_binning(binning)
-            logger.info("Set camera binning=%d (was %s)", binning, original_binning)
+                binning = 1
+            else:
+                camera.set_binning(binning)
+                logger.info("Set camera binning=%d (was %s)", binning, original_binning)
         except Exception as e:
             logger.warning("Could not set binning=%d: %s", binning, e)
             binning = 1  # fall back to no binning
