@@ -527,8 +527,20 @@ def handle_siftal(conn, client, hardware, settings, **kwargs):
         else:
             micro_bgr = image
 
-        micro_px = params.get("micro_px", 0.173)
-        wsi_px = params.get("wsi_px", 0.25)
+        # Pixel sizes are measured properties of the two images. Their RATIO
+        # is the scale prior for the match, so a wrong pair yields a
+        # confident wrong affine and therefore wrong stage coordinates --
+        # silently, with a plausible inlier count. There is no default that
+        # is right for an arbitrary pair of images, so refuse instead.
+        micro_px = params.get("micro_px")
+        wsi_px = params.get("wsi_px")
+        if micro_px is None or wsi_px is None:
+            missing = ", ".join(
+                n for n, v in (("--micro-px", micro_px), ("--wsi-px", wsi_px)) if v is None
+            )
+            logger.error("SIFTAL missing required pixel size(s): %s", missing)
+            conn.sendall(f"FAILED:Missing required pixel size argument(s): {missing}".encode())
+            return
         min_px = params.get("min_px", 1.0)
         flip_x = params.get("flip_x", False)
         flip_y = params.get("flip_y", False)
@@ -719,8 +731,19 @@ def handle_siftim(conn, client, hardware, settings, **kwargs):
             conn.sendall(f"FAILED:Could not read image-b: {params['image_b_path']}".encode())
             return
 
-        pixel_size_a = params.get("pixel_size_a", 0.25)
-        pixel_size_b = params.get("pixel_size_b", 0.173)
+        # As in SIFTAL: the ratio of these two is the scale prior, and a
+        # wrong pair produces a confident wrong affine rather than an error.
+        pixel_size_a = params.get("pixel_size_a")
+        pixel_size_b = params.get("pixel_size_b")
+        if pixel_size_a is None or pixel_size_b is None:
+            missing = ", ".join(
+                n
+                for n, v in (("--pixel-size-a", pixel_size_a), ("--pixel-size-b", pixel_size_b))
+                if v is None
+            )
+            logger.error("SIFTIM missing required pixel size(s): %s", missing)
+            conn.sendall(f"FAILED:Missing required pixel size argument(s): {missing}".encode())
+            return
         min_px = params.get("min_px", 1.0)
         flip_x = params.get("flip_x", False)
         flip_y = params.get("flip_y", False)
