@@ -202,6 +202,15 @@ class AcquisitionState(enum.Enum):
     FAILED = "FAILED"
 
 
+# Admission control for acquisitions. The per-addr locks below serialize each
+# CLIENT's own state transitions; this one guards the MICROSCOPE, which every
+# client shares. Without it the mutual exclusion is per-connection, and a single
+# QuPath -- which opens a main and an auxiliary connection, each with its own
+# source port and therefore its own addr -- can start two acquisitions that both
+# drive one stage. Each loop's snap then catches the other loop's move, and the
+# mosaic comes out scrambled with no error anywhere. Observed 2026-08-06 on OWS3.
+acquisition_admission_lock = threading.Lock()
+
 # Global acquisition tracking
 acquisition_states = {}  # addr -> AcquisitionState
 acquisition_progress = {}  # addr -> (current, total)
@@ -529,6 +538,8 @@ def handle_client(conn, addr):
         "acquisitionWorkflow": acquisitionWorkflow,
         # Session logging control (for CONFIG handler)
         "start_session_logging": _start_session_logging,
+        # Guards the hardware rather than a single client; see its definition.
+        "acquisition_admission_lock": acquisition_admission_lock,
         # Per-client state dicts (legacy -- handlers access by addr)
         "acquisition_states": acquisition_states,
         "acquisition_progress": acquisition_progress,

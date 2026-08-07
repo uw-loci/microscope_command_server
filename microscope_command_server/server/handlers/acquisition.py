@@ -56,14 +56,62 @@ def handle_acquire(conn, client, hardware, settings, **kwargs):
 
     logger.info("Client %s requested acquisition workflow", addr)
 
-    # Check if already running
-    with acquisition_locks[addr]:
-        if acquisition_states[addr] == AcquisitionState.RUNNING:
-            logger.warning("Acquisition already running for %s", addr)
-            return None
-        # Set state to RUNNING immediately
-        acquisition_states[addr] = AcquisitionState.RUNNING
-        acquisition_progress[addr] = (0, 0)
+    # Admission control. The check MUST span every client, not just this one:
+    # there is one stage, and two acquisitions driving it interleave their moves,
+    # so each loop's snap lands wherever the other loop just went. That produces a
+    # scrambled mosaic and no error at all -- the acquisition "succeeds", the
+    # stitch "succeeds", and only the pixels are wrong.
+    #
+    # Keying the guard by addr made it per-CONNECTION, which is not the same
+    # thing: one QuPath opens a main and an auxiliary socket, each with its own
+    # source port and therefore its own addr, so each could admit an acquisition
+    # while the other was mid-run.
+    admission_lock = kwargs.get("acquisition_admission_lock")
+    busy_addr = None
+    if admission_lock is not None:
+        with admission_lock:
+            for other_addr, other_state in acquisition_states.items():
+                if other_addr != addr and other_state in (
+                    AcquisitionState.RUNNING,
+                    AcquisitionState.CANCELLING,
+                ):
+                    busy_addr = other_addr
+                    break
+            if busy_addr is None and acquisition_states[addr] == AcquisitionState.RUNNING:
+                busy_addr = addr
+            if busy_addr is None:
+                acquisition_states[addr] = AcquisitionState.RUNNING
+                acquisition_progress[addr] = (0, 0)
+    else:
+        # No admission lock supplied (older caller). Fall back to the per-client
+        # check rather than failing outright, but say so -- this is the state in
+        # which two acquisitions can overlap.
+        logger.warning(
+            "No acquisition_admission_lock supplied; falling back to a per-connection "
+            "guard, which cannot prevent two clients from acquiring at once"
+        )
+        with acquisition_locks[addr]:
+            if acquisition_states[addr] == AcquisitionState.RUNNING:
+                busy_addr = addr
+            else:
+                acquisition_states[addr] = AcquisitionState.RUNNING
+                acquisition_progress[addr] = (0, 0)
+
+    if busy_addr is not None:
+        logger.error(
+            "REJECTED acquisition from %s: an acquisition is already running for %s. "
+            "The microscope serves one acquisition at a time.",
+            addr,
+            busy_addr,
+        )
+        # Answer explicitly. The client requires an ack beginning with "STARTED",
+        # so this makes it fail loudly and immediately; returning silently would
+        # leave it waiting on a socket read for an acquisition that will never run.
+        try:
+            conn.sendall("BUSY:ACQUIRING".ljust(16)[:16].encode())
+        except OSError as e:
+            logger.warning("Could not send BUSY response to %s: %s", addr, e)
+        return None
 
     # Read the full message immediately
     message_parts = []
