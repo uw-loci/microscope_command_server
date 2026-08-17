@@ -4386,25 +4386,43 @@ def _handle_tile_autofocus(
                 ctx.af_gap_spatial_multiplier,
             )
 
-    # For non-AF tiles, move Z to the spatially nearest AF's Z
-    if not needs_af and ctx.completed_af_positions:
+    # Seed Z from the spatially NEAREST already-focused tile -- for EVERY tile
+    # that has one, including tiles that will themselves run AF. A per-tile
+    # drift sweep is a narrow (+/-15 um) search that only corrects drift from
+    # its starting Z. Seeding an AF tile from the last raster tile's Z instead
+    # (the old behaviour) breaks after a row wrap or a jump to a new region:
+    # the last tile can sit at a very different tissue height, the true focus
+    # falls outside the sweep window, and the tile is silently acquired out of
+    # focus. Seeding from the nearest focused tile keeps the sweep's start near
+    # the local tissue height so the narrow window suffices. nearest_af_dist
+    # also drives the full-AF fallback below (a jump with no nearby focused
+    # tile to trust as a seed).
+    nearest_af_dist = float("inf")
+    if ctx.completed_af_positions:
         tile_xy = np.array([[pos.x, pos.y]])
         af_xy = np.array([(ax, ay) for ax, ay, _ in ctx.completed_af_positions])
-        nearest_idx = int(np.argmin(_cdist_scipy(tile_xy, af_xy)[0]))
+        dists = _cdist_scipy(tile_xy, af_xy)[0]
+        nearest_idx = int(np.argmin(dists))
+        nearest_af_dist = float(dists[nearest_idx])
         nearest_z = ctx.completed_af_positions[nearest_idx][2]
-        current_z = hardware.get_current_position().z
-        if abs(nearest_z - current_z) > 0.1:
-            hardware.move_to_position(Position(z=nearest_z))
-            logger.debug(
-                "  Nearest-AF Z correction: %.2f -> %.2f um "
-                "(nearest AF at X=%.0f, Y=%.0f, dist=%.0f um)",
-                current_z,
-                nearest_z,
-                ctx.completed_af_positions[nearest_idx][0],
-                ctx.completed_af_positions[nearest_idx][1],
-                float(_cdist_scipy(tile_xy, [af_xy[nearest_idx]])[0][0]),
-            )
         pos.z = nearest_z
+        if not needs_af:
+            # Non-AF tile: the nearest-AF Z is the final focus for this tile, so
+            # move Z now; the XY move below is issued no-wait.
+            current_z = hardware.get_current_position().z
+            if abs(nearest_z - current_z) > 0.1:
+                hardware.move_to_position(Position(z=nearest_z))
+                logger.debug(
+                    "  Nearest-AF Z correction: %.2f -> %.2f um "
+                    "(nearest AF at X=%.0f, Y=%.0f, dist=%.0f um)",
+                    current_z,
+                    nearest_z,
+                    ctx.completed_af_positions[nearest_idx][0],
+                    ctx.completed_af_positions[nearest_idx][1],
+                    nearest_af_dist,
+                )
+        # AF tiles: the seed Z rides along in the move_to_position(pos) below,
+        # then the drift sweep refines from this nearest-AF starting point.
     else:
         pos.z = hardware.get_current_position().z
 
@@ -4569,8 +4587,27 @@ def _handle_tile_autofocus(
             f"valid={signal_valid}, stats={strategy_stats})"
         )
 
-        if not ctx.first_tissue_autofocus_done:
-            logger.info("  First tissue position - using STANDARD autofocus for accuracy")
+        # Use a full (wide-range) autofocus rather than a narrow drift sweep
+        # when there is no nearby already-focused tile to seed the sweep from:
+        # the first tissue tile, or any tile whose nearest completed AF is more
+        # than ~1.5 AF-grid spacings away (a jump to new/uncovered tissue, e.g.
+        # the first tiles of a fresh annotation). A +/-15 um sweep seeded from a
+        # distant tile's Z can miss focus entirely; a full search does not
+        # depend on the seed. The extra time is worth it -- an out-of-focus tile
+        # is unrecoverable, a slower AF is not. Guarded off on small grids
+        # (af_min_distance == 0), which already AF every tile and skip the sweep.
+        full_af_gap_um = 1.5 * ctx.af_min_distance
+        seed_too_far = full_af_gap_um > 0 and nearest_af_dist > full_af_gap_um
+        if not ctx.first_tissue_autofocus_done or seed_too_far:
+            if not ctx.first_tissue_autofocus_done:
+                logger.info("  First tissue position - using STANDARD autofocus for accuracy")
+            else:
+                logger.info(
+                    "  No nearby focused tile (nearest AF %.0f um > %.0f um) -- "
+                    "using STANDARD autofocus instead of drift sweep",
+                    nearest_af_dist,
+                    full_af_gap_um,
+                )
             t_af = time.perf_counter()
             new_z = autofocus_with_manual_fallback(
                 hardware=hardware,
