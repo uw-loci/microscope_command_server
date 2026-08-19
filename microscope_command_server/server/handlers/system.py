@@ -12,6 +12,7 @@ import logging
 import yaml
 
 from microscope_command_server.server.handlers.utils import read_message_string
+from microscope_command_server.server.log_scrubber import scrub_paths
 
 logger = logging.getLogger(__name__)
 
@@ -841,6 +842,7 @@ def _read_log_head_tail(path, max_chars=_LOG_MAX_CHARS):
 
     The head keeps everything through the startup version banner so provenance
     is always present; the tail keeps the most recent lines (where errors are).
+    The result is scrubbed of the server's home directory before it is returned.
     Returns "" if the file cannot be read.
     """
     try:
@@ -850,7 +852,7 @@ def _read_log_head_tail(path, max_chars=_LOG_MAX_CHARS):
         return ""
 
     if len(text) <= max_chars:
-        return text
+        return scrub_paths(text)
 
     head = ""
     start = text.find(_LOG_BANNER_START)
@@ -871,7 +873,7 @@ def _read_log_head_tail(path, max_chars=_LOG_MAX_CHARS):
     tail_start = max(len(head), len(text) - tail_chars)
     tail = text[tail_start:]
     omitted = len(text) - len(head) - len(tail)
-    return f"{head}\n... [{omitted} chars omitted] ...\n{tail}"
+    return scrub_paths(f"{head}\n... [{omitted} chars omitted] ...\n{tail}")
 
 
 def handle_get_log(conn, client, hardware, settings, **kwargs):
