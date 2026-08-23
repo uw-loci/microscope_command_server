@@ -117,6 +117,27 @@ def check_reconstruction_inputs(channel_ids, background_correction_enabled):
         )
 
 
+def _copy_tile_configuration(source_dir, out_dir):
+    """Give a derived tile directory the tile layout the stitcher needs.
+
+    Without a TileConfiguration.txt the stitcher cannot place these tiles, so
+    the retardance and orientation mosaics silently come out empty or
+    scrambled while the per-tile files look perfectly fine on disk.
+
+    Copied per tile rather than once, because the source file is written
+    during acquisition and does not necessarily exist yet when the first tiles
+    are reconstructed. Skipped once the destination has it.
+    """
+    import shutil
+
+    dest = out_dir / "TileConfiguration.txt"
+    if dest.exists() or source_dir is None:
+        return
+    source = source_dir / "TileConfiguration.txt"
+    if source.exists():
+        shutil.copy2(source, dest)
+
+
 def _reconstruct_and_write(
     state_images,
     reconstruction_cfg,
@@ -126,6 +147,7 @@ def _reconstruct_and_write(
     pixel_size_um,
     ome_writer,
     log,
+    tile_config_source=None,
 ):
     """Reconstruct one tile and write retardance + orientation. Runs in the write pool."""
     from polscope_library import reconstruct
@@ -149,6 +171,7 @@ def _reconstruct_and_write(
     ):
         out_dir = output_path / subdir
         out_dir.mkdir(parents=True, exist_ok=True)
+        _copy_tile_configuration(tile_config_source, out_dir)
         ome_writer(
             filename=str(out_dir / filename),
             pixel_size_um=pixel_size_um,
@@ -213,8 +236,12 @@ def submit_tile_reconstruction(
             return False
 
     ordered = [channel_images[cid] for cid in channel_order]
+    # The first state's directory is the tile-layout reference; every channel
+    # is imaged at the same positions, so any of them would do.
+    tile_config_source = output_path / str(channel_order[0]) if output_path is not None else None
     write_pool.submit(
         _reconstruct_and_write,
+        tile_config_source=tile_config_source,
         state_images=ordered,
         reconstruction_cfg=reconstruction_cfg,
         background_images=background_images,

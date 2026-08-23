@@ -204,3 +204,50 @@ def test_reconstruction_runs_end_to_end(tmp_path):
     assert len(written) == 2
     for data in written.values():
         assert data.shape == (8, 8)
+
+
+def test_derived_dirs_get_a_tile_configuration(tmp_path):
+    """Without TileConfiguration.txt the stitcher cannot place derived tiles,
+    and the mosaic comes out empty while the per-tile files look fine."""
+    pytest.importorskip("polscope_library")
+    import numpy as np
+
+    from microscope_command_server.modality.lcpolscope import (
+        ORIENTATION_DIR,
+        RETARDANCE_DIR,
+    )
+
+    # The acquisition writes the layout into the first state's directory.
+    state0 = tmp_path / "State0"
+    state0.mkdir()
+    (state0 / "TileConfiguration.txt").write_text("dim = 2\ntile_0_0.tif; ; (0.0, 0.0)\n")
+
+    states = [np.full((4, 4), v, dtype=float) for v in (10.0, 60.0, 55.0, 50.0, 45.0)]
+    _, pool = _submit(
+        channel_images=dict(zip([f"State{i}" for i in range(5)], states)),
+        output_path=tmp_path,
+        ome_writer=lambda filename, pixel_size_um, data: None,
+    )
+    fn, kwargs = pool.submissions[0]
+    fn(**kwargs)
+
+    for subdir in (RETARDANCE_DIR, ORIENTATION_DIR):
+        copied = tmp_path / subdir / "TileConfiguration.txt"
+        assert copied.exists(), f"{subdir} has no tile layout"
+        assert copied.read_text() == (state0 / "TileConfiguration.txt").read_text()
+
+
+def test_missing_tile_configuration_does_not_break_reconstruction(tmp_path):
+    """It is written during acquisition, so early tiles may reconstruct before
+    it exists. That must not fail the tile."""
+    pytest.importorskip("polscope_library")
+    import numpy as np
+
+    states = [np.full((4, 4), v, dtype=float) for v in (10.0, 60.0, 55.0, 50.0, 45.0)]
+    _, pool = _submit(
+        channel_images=dict(zip([f"State{i}" for i in range(5)], states)),
+        output_path=tmp_path,
+        ome_writer=lambda filename, pixel_size_um, data: None,
+    )
+    fn, kwargs = pool.submissions[0]
+    fn(**kwargs)  # must not raise

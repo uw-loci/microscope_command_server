@@ -349,6 +349,133 @@ Omitting `--z-stack` or setting it to `false` disables Z-stack acquisition
 entirely. Omitting `--z-projection` defaults to `max` (maximum intensity
 projection), preserving the original single-image-per-tile output.
 
+## LC-PolScope Acquisition (Automatic Birefringence Reconstruction)
+
+LC-PolScope acquisitions automatically reconstruct birefringence (retardance and
+orientation) maps from polarization states when properly configured. The server
+queues reconstruction for each tile after all state images are acquired.
+
+### Configuration Requirements
+
+Reconstruction requires three settings in the microscope YAML under
+`modalities.lcpolscope.reconstruction`:
+
+```yaml
+modalities:
+  lcpolscope:
+    reconstruction:
+      swing_waves: 0.03          # Calibration swing amplitude (required)
+      wavelength_nm: 549         # Light wavelength in nanometers (required)
+      scheme: "5-State"          # Polarization scheme; default "5-State"
+```
+
+- **`swing_waves`**: The calibration swing amplitude used during system
+  calibration. A fixed value per microscope.
+- **`wavelength_nm`**: Illumination wavelength in nanometers. Must match the
+  wavelength used during acquisition and calibration.
+- **`scheme`**: Reconstruction scheme (default `"5-State"`). The only accepted
+  values are `"5-State"` and `"4-State"`; the scheme is fixed by how the system
+  was calibrated and is not a free choice at acquisition time.
+
+**If this block is missing or incomplete**, the server logs a warning and skips
+reconstruction; raw state images are still saved and can be reconstructed
+offline.
+
+### State Image Acquisition
+
+Acquire 4 or 5 polarization states (depending on your scheme) as separate
+channels using the standard multi-channel acquisition flags:
+
+```
+--channels "(State0,State1,State2,State3,State4)"
+--channel-exposures "(100,100,100,100,100)"
+```
+
+The state ids must match exactly (case-sensitive); Micro-Manager presets should
+map to these state names in your configuration.
+
+**Two invariants that fail silently.** Neither raises, and neither is visible
+in the output -- a violated run still produces a plausible-looking retardance
+and orientation map that is simply wrong.
+
+1. **All states must share one exposure and gain.** The Stokes inversion
+   treats the state intensities as samples of a single radiometric scale, so a
+   per-state difference biases the result. Three layers cooperate to hold
+   this: the QuPath extension equalises the exposures before sending them,
+   every channel in `config_LCPolScope.yml` carries the same `exposure_ms`,
+   and the LC-PolScope acquisition profiles deliberately carry no
+   `channel_overrides`. Do not add per-channel exposure tuning to any of them.
+
+2. **State order is positional.** States are consumed in calibration order,
+   taken from the acquisition profile's channel list. A permutation rotates or
+   mirrors the orientation map without any error. If you did not run the
+   calibration yourself, identify it from the data with
+   `polscope-scheme-check` (shipped with `polscope-library`) before trusting
+   any orientation output.
+
+### Automatic Reconstruction Behavior
+
+After all state images for a tile are acquired and saved:
+1. The server validates the state set (4 or 5 images, in calibration order)
+2. If valid, reconstruction is queued in the background write pool
+3. Retardance and orientation maps are computed and written as OME-TIFF files
+4. A refusal to reconstruct does not abort the acquisition — raw states remain
+   saved and can be reconstructed offline
+
+### Constraints and Validation
+
+**Background Correction Incompatible**: QLIPP applies background correction in
+Stokes space, using background *intensities* passed to the reconstruction
+library. Flat-field division of the raw state tiles is a different operation
+and biases retardance and orientation with no visible symptom -- the images
+still look right. The server therefore refuses to reconstruct when raw-tile
+background correction is on.
+
+Note where that flag comes from: it is the `--bg-correction true`
+**acquisition parameter sent over the socket**, not the
+`background_correction:` block in the microscope YAML. Setting `enabled: false`
+in the YAML does *not* prevent a client from requesting correction, which is
+precisely why this check exists at reconstruction time.
+
+A refusal does not abort the acquisition. Raw state images are still saved, so
+the run can be reconstructed offline afterwards. It is logged once per
+acquisition rather than once per tile.
+
+### Output File Layout
+
+Derived retardance and orientation maps are written to sibling directories
+alongside the state images:
+
+```
+{projectsFolder}/{sample}/{scan_type}/{annotation}/
+    State0/tile_0_0.tif
+    State1/tile_0_0.tif
+    State2/tile_0_0.tif
+    State3/tile_0_0.tif
+    State4/tile_0_0.tif
+    retardance/tile_0_0.tif          # Retardance in nm
+    orientation/tile_0_0.tif         # Orientation in radians, [0, π)
+    TileConfiguration.txt
+```
+
+Each is a tile directory in its own right, with a `TileConfiguration.txt`
+copied from the state directories, so the stitcher
+(`qupath-extension-tiles-to-pyramid`) stitches each into its own mosaic.
+
+**Orientation is axial data and must not be resampled as an ordinary scalar.**
+0 and pi are the same physical orientation, so the mean of 179 degrees and 1
+degree is 90 degrees -- perpendicular to the truth, and entirely
+plausible-looking. Anything that averages these pixels (blending in a stitch
+seam, pyramid downsampling) has to go through sin(2*theta)/cos(2*theta), or
+encode the angle as hue, rather than averaging the angle directly. Retardance
+is an ordinary scalar and has no such constraint.
+
+### Backward Compatibility
+
+Omitting the `modalities.lcpolscope.reconstruction` block disables
+reconstruction. Raw state images are still acquired and saved normally, and
+reconstruction can be performed offline using the `polscope-library` directly.
+
 ## PPM Acquisition Options (--ppm-high-bit-depth)
 
 The BGACQUIRE (and ACQUIRE) acquisition message parser accepts optional flags
@@ -401,7 +528,10 @@ Omitting `--ppm-high-bit-depth` or setting it to `false` preserves the standard
 - Git (for `pip install git+https://...` commands)
 
 **Important**: This package depends on `microscope-imageprocessing` (required) and `microscope-control` (required).
-`ppm-library` is an **optional** dependency, only needed for PPM (polarized light) modality support.
+Optional dependencies:
+- `ppm-library` -- only needed for PPM (polarized light) modality support
+- `polscope-library` -- only needed for LC-PolScope birefringence reconstruction
+
 See the [QPSC Installation Guide](https://github.com/uw-loci/QPSC#automated-installation-windows) for complete setup instructions.
 
 ### Quick Install (from GitHub)
@@ -417,7 +547,10 @@ pip install git+https://github.com/uw-loci/microscope_control.git
 # 3. (Optional) Install ppm-library for PPM modality support
 pip install git+https://github.com/uw-loci/ppm_library.git
 
-# 4. Then install microscope_command_server
+# 4. (Optional) Install polscope-library for LC-PolScope birefringence reconstruction
+pip install git+https://github.com/uw-loci/polscope_library.git
+
+# 5. Then install microscope_command_server
 pip install git+https://github.com/uw-loci/microscope_command_server.git
 ```
 
@@ -534,16 +667,16 @@ The server coordinates between QuPath (Java) and the microscope hardware (Python
 ```
 QuPath Extension -> Socket Client -> Microscope Server
                                           |
-                          +---------------+---------------+
-                          |               |               |
-                  Microscope       Microscope        PPM Library
-                   Control       ImageProcessing     (optional)
-                      |               |                  |
-                      v               v                  v
-              Micro-Manager     Debayering,        PPM-specific
-                Hardware        Background,        analysis and
-                               OME-TIFF I/O,       calibration
-                              Z-stack projections
+                  +-------+---------------+-------+-------+
+                  |       |               |       |       |
+          Microscope Microscope      PPM Lib  PolScope   ...
+           Control ImageProcessing (opt)     Lib(opt)
+              |        |                      |
+              v        v                      v
+        Micro-Manager Debayering,      Birefringence
+          Hardware    Background,     reconstruction
+                    OME-TIFF I/O,     per-tile
+                    Z-stack projections
 ```
 
 ## Server Configuration
