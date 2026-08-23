@@ -17,6 +17,9 @@ dependencies = [
 
 [project.optional-dependencies]
 ppm = ["ppm-library>=1.0.0"]
+# LC-PolScope birefringence reconstruction. Optional for the same reason
+# ppm is: only scopes running that modality need it.
+polscope = ["polscope-library>=0.1.0"]
 dev = [
     "pytest>=7.4.0",
     "pytest-cov>=4.1.0",

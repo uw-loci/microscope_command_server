@@ -30,7 +30,8 @@ jobs:
           pip install \
             "microscope-imageprocessing @ git+https://github.com/uw-loci/microscope_imageprocessing@main" \
             "microscope-control @ git+https://github.com/uw-loci/microscope_control@main" \
-            "ppm-library @ git+https://github.com/uw-loci/ppm_library@main"
+            "ppm-library @ git+https://github.com/uw-loci/ppm_library@main" \
+            "polscope-library @ git+https://github.com/uw-loci/polscope_library@main"
           pip install -e ".[dev]"
 
       - name: Run tests

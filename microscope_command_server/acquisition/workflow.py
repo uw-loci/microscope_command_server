@@ -5722,6 +5722,9 @@ def _acquire_tile_channels_z_outer(
     """
     logger = ctx.logger
     hardware = ctx.hardware
+    # See _acquire_tile_channels: final 2D image per channel, retained only
+    # for modalities that combine channels into a derived product.
+    channel_images: dict = {}
     tile_worst_sat = {}
     tile_role_sat = {
         SATURATION_ROLE_LOW: 0.0,
@@ -5817,6 +5820,7 @@ def _acquire_tile_channels_z_outer(
             if not ctx.z_stack_enabled:
                 # 2D mode: save directly. (Z-outer collapses to the same
                 # write path as the default mode here -- no projection.)
+                channel_images[ch_id] = image
                 image_path = ctx.output_path / str(ch_id) / filename
                 if image_path.parent.exists():
                     bf_pixel_size = hardware.get_pixel_size_um()
@@ -5870,6 +5874,7 @@ def _acquire_tile_channels_z_outer(
             if not planes:
                 continue
             projected = ctx.projection_fn(planes)
+            channel_images[ch_id] = projected
             image_path = ctx.output_path / str(ch_id) / filename
             if image_path.parent.exists():
                 ctx.write_pool.submit(
@@ -5926,8 +5931,59 @@ def _acquire_tile_channels_z_outer(
         else:
             ctx.channel_consecutive_saturated[ch_id] = 0
 
+    _maybe_reconstruct_lcpolscope_tile(ctx, channel_plan, channel_images, filename)
+
     tile_stats.pop("__counts__", None)
     return tile_worst_sat, tile_role_sat, tile_stats
+
+
+def _maybe_reconstruct_lcpolscope_tile(ctx, channel_plan, channel_images, filename) -> None:
+    """Queue LC-PolScope birefringence reconstruction once a tile's states are in hand.
+
+    No-op for every other modality. The channel order comes from the resolved
+    acquisition plan rather than dict iteration, because the states are
+    consumed positionally and a permutation silently rotates or mirrors the
+    orientation map.
+
+    A refusal does not abort the run: the raw state images are already saved,
+    so the acquisition is still usable and reconstruction can be re-run
+    offline. It is logged once per acquisition rather than once per tile,
+    since the conditions that cause it are set at acquisition start and would
+    otherwise repeat for every position.
+    """
+    from microscope_command_server.modality.lcpolscope import (
+        LCPOLSCOPE_CONFIG,
+        ReconstructionRefused,
+        submit_tile_reconstruction,
+    )
+
+    if get_modality_config(ctx.modality) is not LCPOLSCOPE_CONFIG:
+        return
+
+    modalities = (ctx.ppm_settings or {}).get("modalities", {}) or {}
+    recon_cfg = (modalities.get("lcpolscope") or {}).get("reconstruction") or {}
+
+    try:
+        submit_tile_reconstruction(
+            channel_images=channel_images,
+            channel_order=[entry["id"] for entry in channel_plan],
+            reconstruction_cfg=recon_cfg,
+            output_path=ctx.output_path,
+            filename=filename,
+            pixel_size_um=ctx.hardware.get_pixel_size_um(),
+            write_pool=ctx.write_pool,
+            ome_writer=ome_tiff_writer,
+            background_correction_enabled=bool(ctx.background_correction_enabled),
+            logger_=ctx.logger,
+        )
+    except ReconstructionRefused as e:
+        if not getattr(ctx, "_lcps_refusal_logged", False):
+            ctx.logger.error(
+                "LC-PolScope reconstruction refused (raw state images are still "
+                "being saved, so this run can be reconstructed offline): %s",
+                e,
+            )
+            ctx._lcps_refusal_logged = True
 
 
 def _acquire_tile_channels(
@@ -5979,6 +6035,10 @@ def _acquire_tile_channels(
     )
 
     center_z = current_stage_pos.z
+
+    # Final 2D image per channel, retained only for modalities that combine the
+    # channels into a derived product (LC-PolScope). Empty and unused otherwise.
+    channel_images: dict = {}
 
     for ch_entry in channel_plan:
         apply_channel_hardware_state(
@@ -6043,6 +6103,7 @@ def _acquire_tile_channels(
 
             if not ctx.z_stack_enabled:
                 # 2D mode: save directly
+                channel_images[ch_id] = image
                 image_path = ctx.output_path / str(ch_id) / filename
                 if image_path.parent.exists():
                     bf_pixel_size = hardware.get_pixel_size_um()
@@ -6083,6 +6144,7 @@ def _acquire_tile_channels(
         # Z-stack projection per channel: reduce planes to single 2D image
         if ctx.z_stack_enabled and ctx.projection_fn is not None and z_stack_planes:
             projected = ctx.projection_fn(z_stack_planes)
+            channel_images[ch_id] = projected
             image_path = ctx.output_path / str(ch_id) / filename
             if image_path.parent.exists():
                 ctx.write_pool.submit(
@@ -6138,6 +6200,8 @@ def _acquire_tile_channels(
                 ctx.channel_consecutive_saturated[ch_id] = 0
         else:
             ctx.channel_consecutive_saturated[ch_id] = 0
+
+    _maybe_reconstruct_lcpolscope_tile(ctx, channel_plan, channel_images, filename)
 
     tile_stats.pop("__counts__", None)
     return tile_worst_sat, tile_role_sat, tile_stats

@@ -65,10 +65,142 @@ def test_derived_outputs_are_separate_directories():
     """Retardance and orientation stitch independently, so they need their own
     tile directories -- and orientation must stay separable because it is
     axial data that cannot be resampled like an ordinary scalar."""
-    assert LCPOLSCOPE_CONFIG.post_processing_suffixes == [".retardance", ".orientation"]
+    assert LCPOLSCOPE_CONFIG.post_processing_suffixes == ["retardance", "orientation"]
 
 
 def test_extinction_channel_id_matches_the_java_handler():
     """LCPolScopeModalityHandler.EXTINCTION_CHANNEL_ID must agree; autofocus
     skips this state on both sides."""
     assert EXTINCTION_CHANNEL_ID == "State0"
+
+
+# ---------------------------------------------------------------------------
+# Per-tile reconstruction guards
+#
+# These run without polscope_library: check_reconstruction_inputs deliberately
+# validates before anything is imported or computed, so a misconfigured run is
+# refused on the first tile rather than after an hour of imaging.
+# ---------------------------------------------------------------------------
+
+
+class _FakePool:
+    """Stand-in for ctx.write_pool that records submissions instead of running them."""
+
+    def __init__(self):
+        self.submissions = []
+
+    def submit(self, fn, **kwargs):
+        self.submissions.append((fn, kwargs))
+
+
+def _submit(**overrides):
+    from microscope_command_server.modality import lcpolscope
+
+    pool = _FakePool()
+    kwargs = dict(
+        channel_images={f"State{i}": object() for i in range(5)},
+        channel_order=[f"State{i}" for i in range(5)],
+        reconstruction_cfg={"swing_waves": 0.03, "wavelength_nm": 549, "scheme": "5-State"},
+        output_path=None,
+        filename="tile_0_0.tif",
+        pixel_size_um=0.1715,
+        write_pool=pool,
+        ome_writer=None,
+    )
+    kwargs.update(overrides)
+    queued = lcpolscope.submit_tile_reconstruction(**kwargs)
+    return queued, pool
+
+
+def test_raw_tile_background_correction_is_refused():
+    """QLIPP corrects in Stokes space, not by dividing each state tile.
+
+    background_correction_enabled arrives as a socket parameter, so the
+    'enabled: false' in config_LCPolScope.yml does not gate it -- this check
+    is the only thing standing between a flat-field divide and a silently
+    biased orientation map.
+    """
+    from microscope_command_server.modality.lcpolscope import ReconstructionRefused
+
+    with pytest.raises(ReconstructionRefused, match="Stokes space"):
+        _submit(background_correction_enabled=True)
+
+
+def test_partial_state_set_is_refused():
+    from microscope_command_server.modality.lcpolscope import ReconstructionRefused
+
+    with pytest.raises(ReconstructionRefused, match="4 or 5 polarization states"):
+        _submit(
+            channel_images={f"State{i}": object() for i in range(3)},
+            channel_order=[f"State{i}" for i in range(3)],
+        )
+
+
+def test_missing_state_image_is_refused_not_silently_dropped():
+    """A dropped state must not reconstruct from whatever else is present."""
+    from microscope_command_server.modality.lcpolscope import ReconstructionRefused
+
+    with pytest.raises(ReconstructionRefused, match="missing state image"):
+        _submit(channel_images={f"State{i}": object() for i in range(4)})
+
+
+def test_states_are_passed_in_calibration_order_not_dict_order():
+    """Order is positional; a permutation rotates or mirrors orientation."""
+    order = ["State0", "State3", "State1", "State4", "State2"]
+    images = {cid: f"img-{cid}" for cid in order}
+    # Build the dict in a different order than the plan.
+    shuffled = {cid: images[cid] for cid in sorted(order)}
+
+    queued, pool = _submit(channel_images=shuffled, channel_order=order)
+
+    assert queued is True
+    assert len(pool.submissions) == 1
+    _, kwargs = pool.submissions[0]
+    assert kwargs["state_images"] == [images[cid] for cid in order]
+
+
+@pytest.mark.parametrize("missing_key", ["swing_waves", "wavelength_nm"])
+def test_incomplete_reconstruction_config_skips_rather_than_guesses(missing_key):
+    """No default swing or wavelength: both are calibration facts, and a wrong
+    value produces a wrong retardance scale with no visible symptom. Raw state
+    images are still saved, so the run stays reconstructable offline."""
+    cfg = {"swing_waves": 0.03, "wavelength_nm": 549}
+    cfg.pop(missing_key)
+
+    queued, pool = _submit(reconstruction_cfg=cfg)
+
+    assert queued is False
+    assert pool.submissions == []
+
+
+def test_reconstruction_runs_end_to_end(tmp_path):
+    """The queued callable actually reconstructs and writes both outputs."""
+    pytest.importorskip("polscope_library")
+    import numpy as np
+
+    from microscope_command_server.modality.lcpolscope import (
+        ORIENTATION_DIR,
+        RETARDANCE_DIR,
+    )
+
+    written = {}
+
+    def fake_writer(filename, pixel_size_um, data):
+        written[filename] = data
+
+    states = [np.full((8, 8), v, dtype=float) for v in (10.0, 60.0, 55.0, 50.0, 45.0)]
+    queued, pool = _submit(
+        channel_images=dict(zip([f"State{i}" for i in range(5)], states)),
+        output_path=tmp_path,
+        ome_writer=fake_writer,
+    )
+    assert queued is True
+
+    fn, kwargs = pool.submissions[0]
+    fn(**kwargs)
+
+    assert (tmp_path / RETARDANCE_DIR).is_dir()
+    assert (tmp_path / ORIENTATION_DIR).is_dir()
+    assert len(written) == 2
+    for data in written.values():
+        assert data.shape == (8, 8)

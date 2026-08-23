@@ -54,9 +54,11 @@ LCPOLSCOPE_CONFIG = ModalityConfig(
     # Deliberately no angle_intensity_targets: the per-state brightness spread
     # (extinction is dark by design) is signal, not something to normalize away.
     default_target_intensity=200.0,
-    # Derived outputs written per tile by the reconstruction hook. Retardance
-    # and orientation are separate directories so each stitches independently.
-    post_processing_suffixes=[".retardance", ".orientation"],
+    # Derived outputs written per tile by the reconstruction hook. Plain
+    # directory names (not ".suffix" like PPM) because they sit alongside
+    # State0..State4 rather than qualifying one of them, and the stitcher
+    # treats every tile directory the same way.
+    post_processing_suffixes=["retardance", "orientation"],
 )
 
 
@@ -65,3 +67,161 @@ def register_lcpolscope():
     register("lcpolscope", LCPOLSCOPE_CONFIG)
     register("lcps", LCPOLSCOPE_CONFIG)
     logger.debug("Registered LC-PolScope modality config")
+
+
+# ---------------------------------------------------------------------------
+# Per-tile reconstruction
+# ---------------------------------------------------------------------------
+
+RETARDANCE_DIR = "retardance"
+ORIENTATION_DIR = "orientation"
+
+
+class ReconstructionRefused(Exception):
+    """Raised when the acquisition state makes a valid inversion impossible.
+
+    Deliberately an error rather than a warning. Every failure mode this
+    guards against produces a plausible-looking retardance and orientation
+    map that is simply wrong, and nothing downstream can detect it.
+    """
+
+
+def check_reconstruction_inputs(channel_ids, background_correction_enabled):
+    """Validate acquisition state before any state images are reconstructed.
+
+    Args:
+        channel_ids: Channel ids acquired for this tile, in acquisition order.
+        background_correction_enabled: Whether the acquisition applied
+            flat-field correction to the raw tiles.
+
+    Raises:
+        ReconstructionRefused: if the inversion could not be trusted.
+    """
+    if background_correction_enabled:
+        raise ReconstructionRefused(
+            "Raw-tile background correction is enabled, which is incompatible "
+            "with QLIPP reconstruction. QLIPP corrects in Stokes space using "
+            "background *intensities* passed to reconstruct(); dividing each "
+            "state tile by a flat field first is a different operation and "
+            "biases retardance and orientation with no visible symptom. "
+            "Re-run with background correction off and supply background "
+            "state images instead."
+        )
+
+    n = len(channel_ids)
+    if n not in (4, 5):
+        raise ReconstructionRefused(
+            f"Expected 4 or 5 polarization states, got {n} ({list(channel_ids)}). "
+            "The scheme is fixed by the calibration; a partial state set cannot "
+            "be inverted."
+        )
+
+
+def _reconstruct_and_write(
+    state_images,
+    reconstruction_cfg,
+    background_images,
+    output_path,
+    filename,
+    pixel_size_um,
+    ome_writer,
+    log,
+):
+    """Reconstruct one tile and write retardance + orientation. Runs in the write pool."""
+    from polscope_library import reconstruct
+
+    result = reconstruct(
+        intensities=state_images,
+        swing=float(reconstruction_cfg["swing_waves"]),
+        wavelength_nm=float(reconstruction_cfg["wavelength_nm"]),
+        scheme=str(reconstruction_cfg.get("scheme", "5-State")),
+        background_intensities=background_images,
+    )
+
+    for subdir, data in (
+        (RETARDANCE_DIR, result.retardance_nm),
+        # Orientation is axial data in [0, pi). Written raw here on purpose --
+        # any downsampling or blending of these pixels must go through
+        # sin(2*theta)/cos(2*theta), never an arithmetic mean, or 179 deg and
+        # 1 deg average to 90 deg: perpendicular to the truth and entirely
+        # plausible-looking.
+        (ORIENTATION_DIR, result.orientation_rad),
+    ):
+        out_dir = output_path / subdir
+        out_dir.mkdir(parents=True, exist_ok=True)
+        ome_writer(
+            filename=str(out_dir / filename),
+            pixel_size_um=pixel_size_um,
+            data=data,
+        )
+    if log is not None:
+        log.debug("Reconstructed LC-PolScope tile %s", filename)
+
+
+def submit_tile_reconstruction(
+    *,
+    channel_images,
+    channel_order,
+    reconstruction_cfg,
+    output_path,
+    filename,
+    pixel_size_um,
+    write_pool,
+    ome_writer,
+    background_correction_enabled=False,
+    background_images=None,
+    logger_=None,
+):
+    """Queue birefringence reconstruction for one acquired tile.
+
+    ``channel_order`` is authoritative: the states are consumed positionally
+    in calibration order, and a permutation silently rotates or mirrors the
+    orientation map rather than raising. It must come from the acquisition
+    profile, never from dict iteration order.
+
+    Returns True if work was queued, False if it was skipped.
+
+    Raises:
+        ReconstructionRefused: if the inputs cannot yield a trustworthy result.
+    """
+    log = logger_ or logger
+
+    missing = [cid for cid in channel_order if cid not in channel_images]
+    if missing:
+        raise ReconstructionRefused(
+            f"Tile {filename} is missing state image(s) {missing}; "
+            f"have {sorted(channel_images)}."
+        )
+
+    check_reconstruction_inputs(channel_order, background_correction_enabled)
+
+    if not reconstruction_cfg:
+        log.warning(
+            "No modalities.lcpolscope.reconstruction block; skipping "
+            "reconstruction for %s. Raw state images are still saved.",
+            filename,
+        )
+        return False
+    for required in ("swing_waves", "wavelength_nm"):
+        if reconstruction_cfg.get(required) is None:
+            log.warning(
+                "reconstruction.%s is not set; skipping reconstruction for %s. "
+                "Raw state images are still saved.",
+                required,
+                filename,
+            )
+            return False
+
+    ordered = [channel_images[cid] for cid in channel_order]
+    write_pool.submit(
+        _reconstruct_and_write,
+        state_images=ordered,
+        reconstruction_cfg=reconstruction_cfg,
+        background_images=background_images,
+        output_path=output_path,
+        filename=filename,
+        pixel_size_um=pixel_size_um,
+        ome_writer=ome_writer,
+        log=log,
+    )
+    return True
