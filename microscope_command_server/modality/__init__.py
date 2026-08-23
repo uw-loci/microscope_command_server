@@ -19,12 +19,14 @@ from .ppm import register_ppm
 from .shg import register_shg
 from .brightfield import register_brightfield
 from .widefield import register_widefield
+from .lcpolscope import register_lcpolscope
 
 # Register built-in modalities on import
 register_ppm()
 register_shg()
 register_brightfield()
 register_widefield()
+register_lcpolscope()
 
 __all__ = [
     "ModalityConfig",
