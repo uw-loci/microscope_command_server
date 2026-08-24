@@ -424,21 +424,27 @@ After all state images for a tile are acquired and saved:
 
 ### Constraints and Validation
 
-**Background Correction Incompatible**: QLIPP applies background correction in
-Stokes space, using background *intensities* passed to the reconstruction
-library. Flat-field division of the raw state tiles is a different operation
-and biases retardance and orientation with no visible symptom -- the images
-still look right. The server therefore refuses to reconstruct when raw-tile
-background correction is on.
+**Background Correction**: QLIPP applies the background in Stokes space, using
+background *intensities* passed to the reconstruction library. Flat-field
+division of the raw state tiles is a different operation and biases retardance
+and orientation with no visible symptom -- the images still look right.
 
-Note where that flag comes from: it is the `--bg-correction true`
-**acquisition parameter sent over the socket**, not the
-`background_correction:` block in the microscope YAML. Setting `enabled: false`
-in the YAML does *not* prevent a client from requesting correction, which is
-precisely why this check exists at reconstruction time.
+The server routes this correctly on its own: for LC-PolScope the acquisition
+loop skips the flat-field divide, so raw states reach the reconstruction, which
+applies the background itself. No special flag selects this behaviour; it
+follows from the modality.
 
-A refusal does not abort the acquisition. Raw state images are still saved, so
-the run can be reconstructed offline afterwards. It is logged once per
+You do still have to ask for backgrounds. Per-channel background images are
+only loaded when the acquisition is sent with `--bg-correction true` -- placing
+files in the background folder without that flag has no effect.
+
+**A partial background set is refused.** The correction is per-state, so
+filling the gaps with uncorrected states biases the result rather than merely
+weakening it. Supply a background for every state, or none. Reconstructing with
+no background at all is valid, just lower quality.
+
+Refusals do not abort the acquisition. Raw state images are still saved, so the
+run can be reconstructed offline afterwards, and a refusal is logged once per
 acquisition rather than once per tile.
 
 ### Output File Layout
