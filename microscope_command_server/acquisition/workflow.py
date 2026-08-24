@@ -5787,7 +5787,13 @@ def _acquire_tile_channels_z_outer(
             image, metadata = hardware.snap_image()
 
             # Per-channel flat-field correction (same as the default path).
-            if ctx.channel_background_images and ch_id in ctx.channel_background_images:
+            # Skipped for LC-PolScope, whose backgrounds are applied in Stokes
+            # space by the reconstruction rather than by dividing raw tiles.
+            if (
+                ctx.channel_background_images
+                and ch_id in ctx.channel_background_images
+                and not _uses_stokes_background(ctx)
+            ):
                 try:
                     image = BackgroundCorrectionUtils.apply_flat_field_correction(
                         image,
@@ -5937,6 +5943,21 @@ def _acquire_tile_channels_z_outer(
     return tile_worst_sat, tile_role_sat, tile_stats
 
 
+def _uses_stokes_background(ctx) -> bool:
+    """True when this acquisition corrects background in Stokes space.
+
+    LC-PolScope must NOT have its raw state tiles flat-field divided: QLIPP
+    applies the background inside the inversion, using the background state
+    intensities. Dividing first is a different operation that biases
+    retardance and orientation with no visible symptom, so the channel
+    acquisition paths skip the divide and hand the loaded per-channel
+    backgrounds to the reconstruction instead.
+    """
+    from microscope_command_server.modality.lcpolscope import LCPOLSCOPE_CONFIG
+
+    return get_modality_config(ctx.modality) is LCPOLSCOPE_CONFIG
+
+
 def _maybe_reconstruct_lcpolscope_tile(ctx, channel_plan, channel_images, filename) -> None:
     """Queue LC-PolScope birefringence reconstruction once a tile's states are in hand.
 
@@ -5973,7 +5994,9 @@ def _maybe_reconstruct_lcpolscope_tile(ctx, channel_plan, channel_images, filena
             pixel_size_um=ctx.hardware.get_pixel_size_um(),
             write_pool=ctx.write_pool,
             ome_writer=ome_tiff_writer,
-            background_correction_enabled=bool(ctx.background_correction_enabled),
+            # The divide was skipped for this modality, so the tiles are raw.
+            raw_tiles_flat_fielded=False,
+            background_images=ctx.channel_background_images or None,
             logger_=ctx.logger,
         )
     except ReconstructionRefused as e:
@@ -6070,7 +6093,13 @@ def _acquire_tile_channels(
             image, metadata = hardware.snap_image()
 
             # Per-channel flat-field correction
-            if ctx.channel_background_images and ch_id in ctx.channel_background_images:
+            # Skipped for LC-PolScope, whose backgrounds are applied in Stokes
+            # space by the reconstruction rather than by dividing raw tiles.
+            if (
+                ctx.channel_background_images
+                and ch_id in ctx.channel_background_images
+                and not _uses_stokes_background(ctx)
+            ):
                 try:
                     image = BackgroundCorrectionUtils.apply_flat_field_correction(
                         image,

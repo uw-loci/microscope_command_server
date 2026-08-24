@@ -86,26 +86,28 @@ class ReconstructionRefused(Exception):
     """
 
 
-def check_reconstruction_inputs(channel_ids, background_correction_enabled):
+def check_reconstruction_inputs(channel_ids, raw_tiles_flat_fielded, background_images=None):
     """Validate acquisition state before any state images are reconstructed.
 
     Args:
         channel_ids: Channel ids acquired for this tile, in acquisition order.
-        background_correction_enabled: Whether the acquisition applied
-            flat-field correction to the raw tiles.
+        raw_tiles_flat_fielded: Whether a flat-field correction was already
+            applied to the state images being handed in.
+        background_images: Background state images keyed by channel id, or
+            None. Must cover every state or none of them.
 
     Raises:
         ReconstructionRefused: if the inversion could not be trusted.
     """
-    if background_correction_enabled:
+    if raw_tiles_flat_fielded:
         raise ReconstructionRefused(
-            "Raw-tile background correction is enabled, which is incompatible "
-            "with QLIPP reconstruction. QLIPP corrects in Stokes space using "
-            "background *intensities* passed to reconstruct(); dividing each "
-            "state tile by a flat field first is a different operation and "
-            "biases retardance and orientation with no visible symptom. "
-            "Re-run with background correction off and supply background "
-            "state images instead."
+            "The state tiles were flat-field corrected before reconstruction, "
+            "which is incompatible with QLIPP. QLIPP corrects in Stokes space "
+            "using background *intensities* passed to reconstruct(); dividing "
+            "each state tile by a flat field first is a different operation "
+            "and biases retardance and orientation with no visible symptom. "
+            "The acquisition path is supposed to skip the divide for this "
+            "modality and route the backgrounds here instead."
         )
 
     n = len(channel_ids)
@@ -115,6 +117,18 @@ def check_reconstruction_inputs(channel_ids, background_correction_enabled):
             "The scheme is fixed by the calibration; a partial state set cannot "
             "be inverted."
         )
+
+    if background_images:
+        missing = [cid for cid in channel_ids if cid not in background_images]
+        if missing:
+            raise ReconstructionRefused(
+                f"Background images cover only {sorted(background_images)} but the "
+                f"acquisition uses {list(channel_ids)}; missing {missing}. A partial "
+                "background set cannot be used: the correction is a per-state "
+                "subtraction in Stokes space, so filling the gaps with uncorrected "
+                "states would bias the result rather than merely weaken it. Supply a "
+                "background for every state, or none."
+            )
 
 
 def _copy_tile_configuration(source_dir, out_dir):
@@ -191,7 +205,7 @@ def submit_tile_reconstruction(
     pixel_size_um,
     write_pool,
     ome_writer,
-    background_correction_enabled=False,
+    raw_tiles_flat_fielded=False,
     background_images=None,
     logger_=None,
 ):
@@ -201,6 +215,10 @@ def submit_tile_reconstruction(
     in calibration order, and a permutation silently rotates or mirrors the
     orientation map rather than raising. It must come from the acquisition
     profile, never from dict iteration order.
+
+    ``background_images`` is a per-state mapping (channel id -> array) of a
+    specimen-free, slightly defocused field. It is applied by the inversion in
+    Stokes space, NOT by dividing the raw tiles -- see check_reconstruction_inputs.
 
     Returns True if work was queued, False if it was skipped.
 
@@ -216,7 +234,9 @@ def submit_tile_reconstruction(
             f"have {sorted(channel_images)}."
         )
 
-    check_reconstruction_inputs(channel_order, background_correction_enabled)
+    check_reconstruction_inputs(
+        channel_order, raw_tiles_flat_fielded, background_images=background_images
+    )
 
     if not reconstruction_cfg:
         log.warning(
@@ -236,6 +256,12 @@ def submit_tile_reconstruction(
             return False
 
     ordered = [channel_images[cid] for cid in channel_order]
+    # Backgrounds must be ordered exactly like the states: reconstruct() pairs
+    # them positionally, so a mismatched order corrects each state with another
+    # state's background -- which does not raise and does not look wrong.
+    ordered_background = (
+        [background_images[cid] for cid in channel_order] if background_images else None
+    )
     # The first state's directory is the tile-layout reference; every channel
     # is imaged at the same positions, so any of them would do.
     tile_config_source = output_path / str(channel_order[0]) if output_path is not None else None
@@ -244,7 +270,7 @@ def submit_tile_reconstruction(
         tile_config_source=tile_config_source,
         state_images=ordered,
         reconstruction_cfg=reconstruction_cfg,
-        background_images=background_images,
+        background_images=ordered_background,
         output_path=output_path,
         filename=filename,
         pixel_size_um=pixel_size_um,

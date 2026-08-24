@@ -97,16 +97,20 @@ def _submit(**overrides):
     from microscope_command_server.modality import lcpolscope
 
     pool = _FakePool()
-    kwargs = dict(
-        channel_images={f"State{i}": object() for i in range(5)},
-        channel_order=[f"State{i}" for i in range(5)],
-        reconstruction_cfg={"swing_waves": 0.03, "wavelength_nm": 549, "scheme": "5-State"},
-        output_path=None,
-        filename="tile_0_0.tif",
-        pixel_size_um=0.1715,
-        write_pool=pool,
-        ome_writer=None,
-    )
+    kwargs = {
+        "channel_images": {f"State{i}": object() for i in range(5)},
+        "channel_order": [f"State{i}" for i in range(5)],
+        "reconstruction_cfg": {
+            "swing_waves": 0.03,
+            "wavelength_nm": 549,
+            "scheme": "5-State",
+        },
+        "output_path": None,
+        "filename": "tile_0_0.tif",
+        "pixel_size_um": 0.1715,
+        "write_pool": pool,
+        "ome_writer": None,
+    }
     kwargs.update(overrides)
     queued = lcpolscope.submit_tile_reconstruction(**kwargs)
     return queued, pool
@@ -122,8 +126,8 @@ def test_raw_tile_background_correction_is_refused():
     """
     from microscope_command_server.modality.lcpolscope import ReconstructionRefused
 
-    with pytest.raises(ReconstructionRefused, match="Stokes space"):
-        _submit(background_correction_enabled=True)
+    with pytest.raises(ReconstructionRefused, match="flat-field corrected"):
+        _submit(raw_tiles_flat_fielded=True)
 
 
 def test_partial_state_set_is_refused():
@@ -251,3 +255,70 @@ def test_missing_tile_configuration_does_not_break_reconstruction(tmp_path):
     )
     fn, kwargs = pool.submissions[0]
     fn(**kwargs)  # must not raise
+
+
+def test_partial_background_set_is_refused():
+    """The correction is per-state in Stokes space, so filling the gaps with
+    uncorrected states biases the result rather than merely weakening it."""
+    from microscope_command_server.modality.lcpolscope import ReconstructionRefused
+
+    with pytest.raises(ReconstructionRefused, match="partial background set"):
+        _submit(background_images={f"State{i}": object() for i in range(3)})
+
+
+def test_no_backgrounds_at_all_is_allowed():
+    """Background-free reconstruction is valid, just lower quality."""
+    queued, pool = _submit(background_images=None)
+    assert queued is True
+    assert pool.submissions[0][1]["background_images"] is None
+
+
+def test_backgrounds_are_ordered_like_the_states():
+    """reconstruct() pairs states and backgrounds positionally. A mismatched
+    order corrects each state with another state's background, which neither
+    raises nor looks wrong."""
+    order = ["State0", "State3", "State1", "State4", "State2"]
+    bgs = {cid: f"bg-{cid}" for cid in order}
+    shuffled = {cid: bgs[cid] for cid in sorted(order)}
+
+    _, pool = _submit(
+        channel_images={cid: f"img-{cid}" for cid in order},
+        channel_order=order,
+        background_images=shuffled,
+    )
+
+    assert pool.submissions[0][1]["background_images"] == [bgs[cid] for cid in order]
+
+
+def test_background_reaches_the_reconstruction(tmp_path):
+    """A background must actually change the result, or it is not being used."""
+    pytest.importorskip("polscope_library")
+    import numpy as np
+
+    def run(background_images):
+        captured = {}
+        _, pool = _submit(
+            channel_images={
+                f"State{i}": np.full((4, 4), v, dtype=float)
+                for i, v in enumerate((10.0, 60.0, 55.0, 50.0, 45.0))
+            },
+            background_images=background_images,
+            output_path=tmp_path,
+            ome_writer=lambda filename, pixel_size_um, data: captured.setdefault(
+                filename.rsplit("/", 2)[-2], data
+            ),
+        )
+        fn, kwargs = pool.submissions[0]
+        fn(**kwargs)
+        return captured
+
+    plain = run(None)
+    corrected = run(
+        {
+            f"State{i}": np.full((4, 4), v, dtype=float)
+            for i, v in enumerate((9.0, 58.0, 54.0, 49.0, 44.0))
+        }
+    )
+
+    assert set(plain) == set(corrected)
+    assert not np.allclose(plain["retardance"], corrected["retardance"])
