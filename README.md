@@ -524,6 +524,110 @@ instead of quantized 8-bit data.
 Omitting `--ppm-high-bit-depth` or setting it to `false` preserves the standard
 8-bit capture behavior, ensuring acquisitions are unchanged from prior releases.
 
+## Autofocus / Streaming Focus (--safe-z, --approach-max, --tissue-gate)
+
+The `STRMAFZ` command supports multiple autofocus strategies. The default
+edge-retry walk is always available; an alternative approach-from-safe-Z strategy
+can be enabled via parameters measured during a separate validation run.
+
+### Two autofocus strategies
+
+**Edge-Retry Walk (default):**
+Starts from wherever the stage currently is and scans a window; if the peak
+appears to lie past an edge of that window, it shifts the window in that
+direction and scans again, up to `--max-attempts` times. Needs no operator
+measurement and works from any starting position, but each continuation is an
+inference that moving further -- possibly toward the sample -- is correct.
+
+**Approach-from-Safe-Z (new):**
+A bounded single-pass scan that retracts to a known-safe position first, then
+approaches the sample once. The operator measures the safe Z (clear of sample)
+and the maximum distance to travel during a separate validation run. This
+strategy:
+- Guarantees a clear retraction on failure
+- Bounds travel distance (no open-ended walk)
+- Optionally validates tissue before committing to a focus peak
+
+### Flag syntax
+
+```
+--safe-z <micrometers>         # Retraction Z (where the sample is definitely not)
+--approach-max <micrometers>   # Distance to scan from safe Z toward the sample
+--tissue-gate 1                # Require tissue validation before committing (omit to disable)
+```
+
+### Approach-from-safe-Z parameters
+
+- **`--safe-z <um>`** -- the RETRACTED Z, where the objective is clearly clear of
+  the sample for the insert and objective in use. Not the coverslip and not the
+  sample plane -- those are what it must stay away from. The stage retracts here
+  before scanning, and returns here if the scan fails. **Required to activate
+  approach mode; no safe default, because a guessed retraction could be on the
+  wrong side of the sample.**
+  
+- **`--approach-max <um>`** -- Maximum distance to travel from safe Z toward
+  the sample (positive or negative, depending on Z direction). The actual scan
+  span is clamped by stage limits. **Required to activate approach mode; no
+  safe default.** Typically measured from a validation run as the distance from
+  safe Z to the auto-detected focus peak, with a safety margin.
+  
+- **`--tissue-gate 1`** -- If set, each focus peak candidate is
+  tested for tissue presence before committing. Peaks that fail the tissue
+  check (e.g., coverslip reflections producing metric peaks but no tissue
+  texture) are rejected and the scan continues to the next peak. Omitted means
+  no tissue check: commit to the first prominent peak. QPSC sets this when its
+  validation run found surfaces BEFORE focus, which is exactly when committing
+  to the first peak would land on glass.
+
+**Activation rule:** Approach-from-safe-Z is enabled ONLY when BOTH
+`--safe-z` AND `--approach-max` are provided. If only one is given, the server
+logs a warning and falls back to the edge-retry walk.
+
+### Tissue gate validation
+
+When `--tissue-gate true`, each focus peak undergoes a texture-based tissue
+presence check before commitment. The check uses the same validity criteria
+applied during acquisition (via `resolve_validity_check("texture_and_area")`),
+configured by the microscope YAML:
+
+```yaml
+autofocus:
+  texture_threshold: 0.010        # Texture variance threshold (default 0.010)
+  tissue_area_threshold: 0.200    # Tissue coverage % (default 20%)
+  rgb_brightness_threshold: 240.0 # Max RGB value for coverslip rejection (default 240)
+```
+
+A peak passes the gate if the image at that Z shows sufficient texture (cell
+structure, not uniform glass) and has tissue in the required fraction of pixels.
+Coverslip reflections are typically rejected because they produce uniform,
+bright pixels rather than textured features.
+
+### Example: Validating and using approach-from-safe-Z
+
+**Step 1: Validation run (operator measurement)**
+```
+STREAMING_FOCUS --yaml config.yml --metric tenengrad --range 100
+# Server scans across the sample, prints the detected focus peak Z.
+# Operator measures the safe Z (e.g., at the coverslip) = 2.00 mm.
+# Difference: peak_Z - safe_Z = 0.042 mm -> measure approach_max as 0.050 mm (with margin).
+```
+
+**Step 2: Subsequent acquisitions**
+```
+STREAMING_FOCUS --yaml config.yml --metric tenengrad \
+  --safe-z 2.00 --approach-max 0.050 --tissue-gate true
+# Server retracts to 2.00 mm, scans 0.050 mm toward the sample,
+# finds the first prominent peak, validates tissue, and commits.
+# On failure, stage returns to 2.00 mm (safe).
+```
+
+### Backward compatibility
+
+Omitting `--safe-z` and `--approach-max` (or providing only one) preserves the
+default edge-retry walk, ensuring autofocus behavior is unchanged when these
+parameters are not supplied. The `--tissue-gate` parameter has no effect when
+approach mode is not active.
+
 ## Installation
 
 **Part of [QPSC (QuPath Scope Control)](https://github.com/uw-loci/QPSC)**

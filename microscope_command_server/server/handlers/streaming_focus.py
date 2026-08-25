@@ -568,6 +568,7 @@ from microscope_imageprocessing.focus import (
     UnknownMetricError,
     modality_default_metric,
     resolve_metric,
+    resolve_validity_check,
 )
 
 DEFAULT_METRIC_NAME = "tenengrad"
@@ -3331,6 +3332,249 @@ def _attempt_one_scan(
         )
 
 
+def _first_prominent_peaks_in_scan_order(
+    samples_zm: List[Tuple[float, float]],
+    prominence_fraction: float = 0.15,
+) -> List[Tuple[float, float]]:
+    """Prominent local maxima, in the order the scan met them.
+
+    Order is what matters here: an approach commits to the FIRST peak it can
+    justify, so the caller needs candidates in travel order, not by strength.
+    Prominence is measured against the deeper adjacent valley so a shoulder on
+    the way up is not mistaken for a separate focal plane.
+
+    Returns a list of (z, metric).
+    """
+    if len(samples_zm) < 5:
+        return []
+    values = [m for _, m in samples_zm]
+    lo = min(values)
+    hi = max(values)
+    rng = hi - lo
+    if rng <= 0:
+        return []
+
+    peaks: List[Tuple[float, float]] = []
+    for i in range(1, len(values) - 1):
+        if values[i] <= values[i - 1] or values[i] < values[i + 1]:
+            continue
+        left_valley = values[i]
+        for j in range(i, -1, -1):
+            left_valley = min(left_valley, values[j])
+            if values[j] > values[i]:
+                break
+        right_valley = values[i]
+        for j in range(i, len(values)):
+            right_valley = min(right_valley, values[j])
+            if values[j] > values[i]:
+                break
+        prominence = values[i] - max(left_valley, right_valley)
+        if prominence >= prominence_fraction * rng:
+            peaks.append((samples_zm[i][0], values[i]))
+    return peaks
+
+
+def _tissue_present_at(
+    core,
+    focus_device: str,
+    z: float,
+    validity_name: str,
+    validity_kwargs: Dict[str, Any],
+) -> Tuple[bool, str]:
+    """Move to z, snap, and ask the strategy's validity check whether this is tissue.
+
+    This is what separates a coverslip peak from the sample plane at commit
+    time. A glass surface produces contrast but not tissue, so the same gate the
+    acquisition path already uses for its tissue/background decision rejects it
+    without any threshold tuning specific to focus.
+
+    Returns (is_tissue, reason).
+    """
+    try:
+        core.set_position(focus_device, float(z))
+        _wait_via_busy(core, focus_device)
+    except Exception as e:
+        return (False, f"could not move to {z:.2f}: {e}")
+    img = _snap_image_as_numpy(core)
+    if img is None:
+        return (False, "no frame")
+    try:
+        check = resolve_validity_check(validity_name)
+    except Exception as e:
+        # An unknown validity name is a config error. Refusing to commit is the
+        # safe reading: the alternative is committing to an unverified peak.
+        return (False, f"validity check unavailable ({e})")
+    try:
+        ok, stats = check(img, **validity_kwargs)
+        return (bool(ok), "tissue" if ok else f"no tissue ({stats})")
+    except Exception as e:
+        return (False, f"validity check failed: {e}")
+
+
+def _approach_from_safe_z(
+    core,
+    focus_device: str,
+    speed_prop: Optional[str],
+    safe_z: float,
+    approach_max_um: float,
+    require_tissue_gate: bool,
+    validity_name: str,
+    validity_kwargs: Dict[str, Any],
+    sequence_was_running: bool,
+    velocity_um_s: float,
+    metric_name: str,
+    slow_value: str,
+    normal_value: str,
+    z_low: Optional[float],
+    z_high: Optional[float],
+    initial_z: float,
+    dump_dir: Optional[Path] = None,
+    abort_event: Optional[threading.Event] = None,
+    head_discard_ms: float = DEFAULT_HEAD_DISCARD_MS,
+) -> _ScanAttemptResult:
+    """Retract to safe_z, then approach the sample once and commit to the first
+    justified peak.
+
+    Contrast with the edge-retry walk this replaces: that walk starts wherever
+    the stage was left and decides after each 30 um scan whether to keep going,
+    so every ``edge_high`` is a GUESS that moving further -- possibly toward the
+    sample -- is correct. Here the direction is not guessed: it is implied by
+    the declared safe Z, which the operator measured as clear of the sample.
+    Travel is bounded by ``approach_max_um`` (from the validation run's measured
+    safe-Z-to-focus distance) and by the stage limits, and the scan is a single
+    pass rather than an open-ended walk.
+
+    On failure the stage is returned to ``safe_z`` rather than left wherever the
+    scan ended -- a failed autofocus should finish clear of the sample.
+    """
+    direction = 1.0 if approach_max_um >= 0 else -1.0
+    span = abs(approach_max_um)
+    far_end = safe_z + direction * span
+    if z_low is not None:
+        far_end = max(far_end, z_low)
+        safe_z = max(safe_z, z_low)
+    if z_high is not None:
+        far_end = min(far_end, z_high)
+        safe_z = min(safe_z, z_high)
+    span = abs(far_end - safe_z)
+    if span < 1.0:
+        return _ScanAttemptResult(
+            "error",
+            None,
+            0,
+            0.0,
+            f"approach range collapsed to {span:.2f} um after clamping to stage limits",
+        )
+
+    logger.info(
+        "STREAM_AF:approach-from-safe-Z: retracting to %.2f, scanning %.1f um toward the sample "
+        "(tissue gate %s)",
+        safe_z,
+        span,
+        "ON" if require_tissue_gate else "off",
+    )
+    try:
+        core.set_position(focus_device, float(safe_z))
+        _wait_via_busy(core, focus_device)
+    except Exception as e:
+        return _ScanAttemptResult("error", None, 0, 0.0, f"could not retract to safe Z: {e}")
+
+    center = (safe_z + far_end) / 2.0
+    scan = _attempt_one_scan(
+        core,
+        focus_device,
+        speed_prop,
+        z_center=center,
+        range_um=span,
+        sequence_was_running_on_entry=sequence_was_running,
+        attempt_label="approach",
+        velocity_um_s=velocity_um_s,
+        metric_name=metric_name,
+        slow_value=slow_value,
+        normal_value=normal_value,
+        dump_dir=dump_dir,
+        abort_event=abort_event,
+        head_discard_ms=head_discard_ms,
+    )
+    if scan.status == "aborted":
+        _retract(core, focus_device, safe_z, "aborted")
+        return scan
+    if not scan.samples_trace:
+        _retract(core, focus_device, safe_z, "no samples")
+        return _ScanAttemptResult(
+            "insufficient_samples",
+            None,
+            scan.n_samples,
+            scan.z_span,
+            "approach scan produced no samples",
+        )
+
+    # Samples come back in travel order, which is the order the approach met
+    # them -- exactly the order candidates must be considered in.
+    # _attempt_one_scan returns samples in travel order, which is the order the
+    # approach met them -- so no re-sorting by Z, which would destroy that.
+    samples = [(z, m) for z, m in scan.samples_trace]
+    peaks = _first_prominent_peaks_in_scan_order(samples)
+    if not peaks:
+        _retract(core, focus_device, safe_z, "no prominent peak")
+        return _ScanAttemptResult(
+            "metric_flat",
+            None,
+            scan.n_samples,
+            scan.z_span,
+            "no prominent focus peak between the safe Z and the approach limit",
+        )
+
+    for idx, (z, metric_value) in enumerate(peaks):
+        if not require_tissue_gate:
+            logger.info("STREAM_AF:approach committing to first peak Z=%.3f (no tissue gate)", z)
+            return _ScanAttemptResult(
+                "success", z, scan.n_samples, scan.z_span, f"approach peak {idx + 1}"
+            )
+        ok, why = _tissue_present_at(core, focus_device, z, validity_name, validity_kwargs)
+        if ok:
+            logger.info(
+                "STREAM_AF:approach committing to peak %d at Z=%.3f (tissue confirmed)", idx + 1, z
+            )
+            return _ScanAttemptResult(
+                "success",
+                z,
+                scan.n_samples,
+                scan.z_span,
+                f"approach peak {idx + 1}, tissue confirmed",
+            )
+        logger.info(
+            "STREAM_AF:approach rejected peak %d at Z=%.3f -- %s; continuing to the next peak",
+            idx + 1,
+            z,
+            why,
+        )
+
+    _retract(core, focus_device, safe_z, "no peak passed the tissue gate")
+    return _ScanAttemptResult(
+        "metric_flat",
+        None,
+        scan.n_samples,
+        scan.z_span,
+        f"{len(peaks)} peak(s) found but none had tissue; stage returned to the safe Z",
+    )
+
+
+def _retract(core, focus_device: str, safe_z: float, why: str) -> None:
+    """Return the stage to the safe Z after a failed approach.
+
+    A failed autofocus must finish clear of the sample rather than parked
+    wherever the scan stopped, which may be closer to it than where the run
+    started.
+    """
+    try:
+        core.set_position(focus_device, float(safe_z))
+        _wait_via_busy(core, focus_device)
+        logger.info("STREAM_AF:approach retracted to safe Z %.2f (%s)", safe_z, why)
+    except Exception as e:
+        logger.error("STREAM_AF:approach could NOT retract to safe Z %.2f (%s): %s", safe_z, why, e)
+
+
 def _brent_fallback_scan(
     core,
     focus_device: str,
@@ -3535,6 +3779,9 @@ def handle_streaming_focus(conn, client, hardware, settings, **kwargs):
             "--crop-factor",
             "--dump",
             "--max-attempts",
+            "--safe-z",
+            "--approach-max",
+            "--tissue-gate",
         ],
     )
     yaml_path = params.get("yaml")
@@ -3544,6 +3791,37 @@ def handle_streaming_focus(conn, client, hardware, settings, **kwargs):
     crop_factor_str = params.get("crop_factor")
     dump_flag = params.get("dump")
     max_attempts_str = params.get("max_attempts")
+    # Approach-from-safe-Z. Off unless the caller supplies BOTH a retraction
+    # position and a bound on how far to travel from it -- neither has a safe
+    # default, and a partial specification must not be guessed at. The caller
+    # (QPSC) resolves the safe Z per insert and modality and takes the approach
+    # bound from the Focus Approach Validation run's measured distance, so both
+    # are measurements rather than settings.
+    safe_z_str = params.get("safe_z")
+    approach_max_str = params.get("approach_max")
+    tissue_gate_str = params.get("tissue_gate")
+    approach_safe_z: Optional[float] = None
+    approach_max_um: Optional[float] = None
+    try:
+        if safe_z_str:
+            approach_safe_z = float(safe_z_str)
+        if approach_max_str:
+            approach_max_um = float(approach_max_str)
+    except ValueError:
+        logger.warning(
+            "STREAM_AF:ignoring non-numeric --safe-z/--approach-max: %r / %r",
+            safe_z_str,
+            approach_max_str,
+        )
+        approach_safe_z = None
+        approach_max_um = None
+    approach_mode = approach_safe_z is not None and approach_max_um is not None
+    require_tissue_gate = str(tissue_gate_str).strip() in ("1", "true", "True")
+    if (safe_z_str or approach_max_str) and not approach_mode:
+        logger.warning(
+            "STREAM_AF:approach-from-safe-Z needs BOTH --safe-z and --approach-max; "
+            "falling back to the standard edge-retry scan"
+        )
     range_override_um: Optional[float] = None
     if range_override_str:
         try:
@@ -4069,6 +4347,46 @@ def handle_streaming_focus(conn, client, hardware, settings, **kwargs):
     last_clamped_center: Optional[float] = None
 
     try:
+        if approach_mode:
+            # A different strategy entirely, so it replaces the walk rather than
+            # seeding it: setting max_attempts to 0 skips the retry loop below,
+            # and the shared commit/response block runs on this result. The walk
+            # must NOT run afterwards -- falling back to it would reintroduce the
+            # open-ended travel the approach exists to avoid.
+            final_result = _approach_from_safe_z(
+                core,
+                focus_device,
+                speed_prop,
+                safe_z=approach_safe_z,
+                approach_max_um=approach_max_um,
+                require_tissue_gate=require_tissue_gate,
+                validity_name="texture_and_area",
+                validity_kwargs={
+                    "texture_threshold": float(af_entry.get("texture_threshold", 0.010)),
+                    "tissue_area_threshold": float(af_entry.get("tissue_area_threshold", 0.200)),
+                    "rgb_brightness_threshold": float(
+                        af_entry.get("rgb_brightness_threshold", 240.0)
+                    ),
+                },
+                sequence_was_running=sequence_was_running,
+                velocity_um_s=min_velocity_um_s,
+                metric_name=metric_name,
+                slow_value=eff_slow_value,
+                normal_value=eff_normal_value,
+                z_low=z_low,
+                z_high=z_high,
+                initial_z=initial_z,
+                dump_dir=dump_root,
+                abort_event=abort_event,
+                head_discard_ms=eff_head_discard_ms,
+            )
+            attempts_log.append(
+                f"approach-from-safe-Z: safe_z={approach_safe_z:.3f} "
+                f"max={approach_max_um:.1f} tissue_gate={require_tissue_gate} "
+                f"status={final_result.status} reason='{final_result.reason}'"
+            )
+            max_attempts = 0
+
         for attempt_idx in range(max_attempts):
             attempt_num = attempt_idx + 1
             label = f"attempt {attempt_num}/{max_attempts}"
