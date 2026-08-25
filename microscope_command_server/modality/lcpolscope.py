@@ -124,9 +124,10 @@ def check_reconstruction_inputs(channel_ids, raw_tiles_flat_fielded, background_
             raise ReconstructionRefused(
                 f"Background images cover only {sorted(background_images)} but the "
                 f"acquisition uses {list(channel_ids)}; missing {missing}. A partial "
-                "background set cannot be used: the correction is a per-state "
-                "subtraction in Stokes space, so filling the gaps with uncorrected "
-                "states would bias the result rather than merely weaken it. Supply a "
+                "background set cannot be used: the background states are inverted to "
+                "Stokes parameters and collapsed into ONE Mueller matrix, whose "
+                "inverse is applied to the sample. A missing state corrupts that "
+                "whole matrix rather than degrading one channel. Supply a "
                 "background for every state, or none."
             )
 

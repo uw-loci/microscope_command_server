@@ -438,9 +438,12 @@ You do still have to ask for backgrounds. Per-channel background images are
 only loaded when the acquisition is sent with `--bg-correction true` -- placing
 files in the background folder without that flag has no effect.
 
-**A partial background set is refused.** The correction is per-state, so
-filling the gaps with uncorrected states biases the result rather than merely
-weakening it. Supply a background for every state, or none. Reconstructing with
+**A partial background set is refused.** The correction is not a per-state
+subtraction. The background states are inverted to Stokes parameters, an
+attenuating-depolarizing-retarder Mueller matrix is estimated from them, and its
+inverse is applied to the sample's Stokes vector. All states feed that one
+matrix, so a missing state corrupts the entire correction rather than degrading
+a single channel. Supply a background for every state, or none. Reconstructing with
 no background at all is valid, just lower quality.
 
 Refusals do not abort the acquisition. Raw state images are still saved, so the
