@@ -5943,6 +5943,40 @@ def _acquire_tile_channels_z_outer(
     return tile_worst_sat, tile_role_sat, tile_stats
 
 
+def _write_derived_polscope_tile(*, filename, pixel_size_um, data, channel_name, map_annotations):
+    """Write one derived LC-PolScope tile with its provenance in the OME-XML.
+
+    Not ome_tiff_writer: that adapter replaces the OME description with a
+    version string, so there is nowhere for the metadata to live. Retardance
+    and especially orientation carry constraints a reader cannot infer from
+    the pixels -- orientation is axial, and is measured in the image frame --
+    and losing them is how an orientation channel gets averaged or mirrored
+    into a plausible-looking wrong answer.
+    """
+    from microscope_imageprocessing.io.ome_writer import StackWriter
+
+    arr = np.asarray(data)
+    writer = StackWriter(
+        filename,
+        size_t=1,
+        size_z=1,
+        size_c=1,
+        size_y=int(arr.shape[0]),
+        size_x=int(arr.shape[1]),
+        dtype=arr.dtype,
+        pixel_size_um=pixel_size_um,
+        channel_names=[channel_name],
+        map_annotations=map_annotations,
+        granularity="single",
+        bigtiff=False,
+        photometric="minisblack",
+    )
+    try:
+        writer.write_frame(arr, t=0, z=0, c=0)
+    finally:
+        writer.close()
+
+
 def _uses_stokes_background(ctx) -> bool:
     """True when this acquisition corrects background in Stokes space.
 
@@ -5993,7 +6027,7 @@ def _maybe_reconstruct_lcpolscope_tile(ctx, channel_plan, channel_images, filena
             filename=filename,
             pixel_size_um=ctx.hardware.get_pixel_size_um(),
             write_pool=ctx.write_pool,
-            ome_writer=ome_tiff_writer,
+            ome_writer=_write_derived_polscope_tile,
             # The divide was skipped for this modality, so the tiles are raw.
             raw_tiles_flat_fielded=False,
             background_images=ctx.channel_background_images or None,

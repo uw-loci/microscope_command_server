@@ -189,8 +189,8 @@ def test_reconstruction_runs_end_to_end(tmp_path):
 
     written = {}
 
-    def fake_writer(filename, pixel_size_um, data):
-        written[filename] = data
+    def fake_writer(filename, pixel_size_um, data, **kw):
+        written[filename] = (data, kw)
 
     states = [np.full((8, 8), v, dtype=float) for v in (10.0, 60.0, 55.0, 50.0, 45.0)]
     queued, pool = _submit(
@@ -206,7 +206,7 @@ def test_reconstruction_runs_end_to_end(tmp_path):
     assert (tmp_path / RETARDANCE_DIR).is_dir()
     assert (tmp_path / ORIENTATION_DIR).is_dir()
     assert len(written) == 2
-    for data in written.values():
+    for data, _ in written.values():
         assert data.shape == (8, 8)
 
 
@@ -230,7 +230,7 @@ def test_derived_dirs_get_a_tile_configuration(tmp_path):
     _, pool = _submit(
         channel_images=dict(zip([f"State{i}" for i in range(5)], states)),
         output_path=tmp_path,
-        ome_writer=lambda filename, pixel_size_um, data: None,
+        ome_writer=lambda **kw: None,
     )
     fn, kwargs = pool.submissions[0]
     fn(**kwargs)
@@ -251,7 +251,7 @@ def test_missing_tile_configuration_does_not_break_reconstruction(tmp_path):
     _, pool = _submit(
         channel_images=dict(zip([f"State{i}" for i in range(5)], states)),
         output_path=tmp_path,
-        ome_writer=lambda filename, pixel_size_um, data: None,
+        ome_writer=lambda **kw: None,
     )
     fn, kwargs = pool.submissions[0]
     fn(**kwargs)  # must not raise
@@ -304,7 +304,7 @@ def test_background_reaches_the_reconstruction(tmp_path):
             },
             background_images=background_images,
             output_path=tmp_path,
-            ome_writer=lambda filename, pixel_size_um, data: captured.setdefault(
+            ome_writer=lambda filename, data, **kw: captured.setdefault(
                 filename.rsplit("/", 2)[-2], data
             ),
         )
@@ -322,3 +322,140 @@ def test_background_reaches_the_reconstruction(tmp_path):
 
     assert set(plain) == set(corrected)
     assert not np.allclose(plain["retardance"], corrected["retardance"])
+
+
+# ---------------------------------------------------------------------------
+# State ordering
+# ---------------------------------------------------------------------------
+
+
+def test_state_order_reorders_before_inversion():
+    """OpenPolScope acquires in Oldenbourg order -- pairs (1,4) and (2,3) --
+    so State3 and State4 swap before reconstruct() sees them. Verified against
+    real reference-slide data: this permutation matches OpenPolScope's own
+    orientation channel to 0.07 deg, every other permutation to 17-90 deg."""
+    ids = [f"State{i}" for i in range(5)]
+    queued, pool = _submit(
+        channel_images={cid: f"img-{cid}" for cid in ids},
+        channel_order=ids,
+        reconstruction_cfg={
+            "swing_waves": 0.03,
+            "wavelength_nm": 549,
+            "scheme": "5-State",
+            "state_order": ["State0", "State1", "State2", "State4", "State3"],
+        },
+    )
+    assert queued is True
+    assert pool.submissions[0][1]["state_images"] == [
+        "img-State0",
+        "img-State1",
+        "img-State2",
+        "img-State4",
+        "img-State3",
+    ]
+
+
+def test_backgrounds_follow_the_same_reordering():
+    """Background states are paired positionally with sample states, so a
+    reorder that moves one must move the other."""
+    ids = [f"State{i}" for i in range(5)]
+    _, pool = _submit(
+        channel_images={cid: f"img-{cid}" for cid in ids},
+        channel_order=ids,
+        background_images={cid: f"bg-{cid}" for cid in ids},
+        reconstruction_cfg={
+            "swing_waves": 0.03,
+            "wavelength_nm": 549,
+            "state_order": ["State0", "State1", "State2", "State4", "State3"],
+        },
+    )
+    assert pool.submissions[0][1]["background_images"] == [
+        "bg-State0",
+        "bg-State1",
+        "bg-State2",
+        "bg-State4",
+        "bg-State3",
+    ]
+
+
+def test_omitted_state_order_keeps_acquisition_order():
+    """recOrder's own naming is already (ext, +S1, +S2, -S1, -S2)."""
+    ids = [f"State{i}" for i in range(5)]
+    _, pool = _submit(channel_images={cid: f"img-{cid}" for cid in ids}, channel_order=ids)
+    assert pool.submissions[0][1]["state_images"] == [f"img-{c}" for c in ids]
+
+
+@pytest.mark.parametrize(
+    "bad",
+    [
+        ["State0", "State1", "State2", "State3"],  # too few
+        ["State0", "State1", "State2", "State3", "State3"],  # duplicate
+        ["State0", "State1", "State2", "State3", "State9"],  # unknown id
+    ],
+)
+def test_state_order_must_be_a_permutation(bad):
+    """It reorders states; it does not select or invent them."""
+    from microscope_command_server.modality.lcpolscope import ReconstructionRefused
+
+    with pytest.raises(ReconstructionRefused, match="permutation"):
+        _submit(
+            reconstruction_cfg={
+                "swing_waves": 0.03,
+                "wavelength_nm": 549,
+                "state_order": bad,
+            }
+        )
+
+
+def test_derived_tiles_carry_their_provenance_and_handling_rules(tmp_path):
+    """A reader cannot infer from the pixels that orientation is axial, nor
+    which frame it is measured in. Both must travel with the file."""
+    pytest.importorskip("polscope_library")
+    import numpy as np
+
+    from microscope_command_server.modality.lcpolscope import (
+        ORIENTATION_DIR,
+        RETARDANCE_DIR,
+    )
+
+    seen = {}
+
+    def writer(*, filename, pixel_size_um, data, channel_name, map_annotations):
+        seen[filename.rsplit("/", 2)[-2]] = (channel_name, map_annotations)
+
+    _, pool = _submit(
+        channel_images={
+            f"State{i}": np.full((4, 4), v, dtype=float)
+            for i, v in enumerate((10.0, 60.0, 55.0, 50.0, 45.0))
+        },
+        reconstruction_cfg={
+            "swing_waves": 0.03,
+            "wavelength_nm": 549,
+            "scheme": "5-State",
+            "state_order": ["State0", "State1", "State2", "State4", "State3"],
+        },
+        output_path=tmp_path,
+        ome_writer=writer,
+    )
+    fn, kwargs = pool.submissions[0]
+    fn(**kwargs)
+
+    ret_name, ret_meta = seen[RETARDANCE_DIR]
+    ori_name, ori_meta = seen[ORIENTATION_DIR]
+
+    assert "nm" in ret_name and "Orientation" in ori_name
+    assert ret_meta["polscope.units"] == "nanometres"
+    assert ret_meta["polscope.axial"] == "false"
+    assert ori_meta["polscope.units"] == "radians"
+    assert ori_meta["polscope.axial"] == "true"
+    assert "sin(2t)" in ori_meta["polscope.resample"]
+    assert "mirror" in ori_meta["polscope.frame"]
+
+    # The reconstruction parameters travel with BOTH channels, so a file found
+    # on its own can still be traced back to the calibration that made it.
+    for meta in (ret_meta, ori_meta):
+        assert meta["polscope.wavelength_nm"] == 549
+        assert meta["polscope.swing_waves"] == 0.03
+        assert meta["polscope.scheme"] == "5-State"
+        assert meta["polscope.state_order"] == "State0,State1,State2,State4,State3"
+        assert meta["polscope.background_corrected"] == "false"

@@ -163,6 +163,7 @@ def _reconstruct_and_write(
     ome_writer,
     log,
     tile_config_source=None,
+    state_order=None,
 ):
     """Reconstruct one tile and write retardance + orientation. Runs in the write pool."""
     from polscope_library import reconstruct
@@ -174,6 +175,38 @@ def _reconstruct_and_write(
         scheme=str(reconstruction_cfg.get("scheme", "5-State")),
         background_intensities=background_images,
     )
+
+    shared = {
+        "polscope.wavelength_nm": reconstruction_cfg.get("wavelength_nm"),
+        "polscope.swing_waves": reconstruction_cfg.get("swing_waves"),
+        "polscope.scheme": reconstruction_cfg.get("scheme", "5-State"),
+        "polscope.state_order": ",".join(str(c) for c in (state_order or [])),
+        "polscope.background_corrected": "true" if background_images else "false",
+        "polscope.reconstruction": "QLIPP Stokes inversion (polscope_library)",
+    }
+    per_channel = {
+        RETARDANCE_DIR: {
+            "polscope.quantity": "retardance",
+            "polscope.units": "nanometres",
+            "polscope.axial": "false",
+            # Ordinary non-negative scalar: safe to average, blend and downsample.
+            "polscope.resample": "linear",
+        },
+        ORIENTATION_DIR: {
+            "polscope.quantity": "slow_axis_orientation",
+            "polscope.units": "radians",
+            "polscope.range": "[0,pi)",
+            "polscope.axial": "true",
+            # The two rules that make this channel different from every other
+            # image QPSC writes. Both fail silently if ignored.
+            "polscope.resample": "doubled-angle: sin(2t)/cos(2t); NEVER average the angle",
+            "polscope.frame": "image (y-down); a single mirror negates the angle",
+        },
+    }
+    channel_label = {
+        RETARDANCE_DIR: "Retardance (nm)",
+        ORIENTATION_DIR: "Slow Axis Orientation (rad, axial)",
+    }
 
     for subdir, data in (
         (RETARDANCE_DIR, result.retardance_nm),
@@ -191,9 +224,43 @@ def _reconstruct_and_write(
             filename=str(out_dir / filename),
             pixel_size_um=pixel_size_um,
             data=data,
+            channel_name=channel_label[subdir],
+            map_annotations={**shared, **per_channel[subdir]},
         )
     if log is not None:
         log.debug("Reconstructed LC-PolScope tile %s", filename)
+
+
+def resolve_state_order(channel_order, state_order):
+    """Map acquisition order to the order ``reconstruct()`` expects.
+
+    The five states are consumed positionally as (extinction, +S1, +S2, -S1,
+    -S2). Which acquired state plays which role is a property of the software
+    that ran the calibration, NOT of the microscope:
+
+      * recOrder names them ext, I0, I45, I90, I135, which is already
+        (ext, +S1, +S2, -S1, -S2) -- pairs (1,3) and (2,4).
+      * OpenPolScope 3.20 acquires in the Oldenbourg order -- pairs (1,4) and
+        (2,3) -- so State3 and State4 must be swapped before inversion.
+
+    Getting this wrong rotates or mirrors the orientation map and raises
+    nothing, so the order is configuration rather than an assumption baked
+    into code. ``state_order`` is a list of channel ids in reconstruction
+    order; omitting it means the acquisition order is already correct.
+
+    Raises:
+        ReconstructionRefused: if state_order is not a permutation of the
+            acquired channels.
+    """
+    if not state_order:
+        return list(channel_order)
+    if sorted(state_order) != sorted(channel_order):
+        raise ReconstructionRefused(
+            f"reconstruction.state_order {list(state_order)} is not a permutation of "
+            f"the acquired channels {list(channel_order)}. It must name every acquired "
+            "state exactly once -- it reorders them, it does not select them."
+        )
+    return list(state_order)
 
 
 def submit_tile_reconstruction(
@@ -256,12 +323,13 @@ def submit_tile_reconstruction(
             )
             return False
 
-    ordered = [channel_images[cid] for cid in channel_order]
+    recon_order = resolve_state_order(channel_order, reconstruction_cfg.get("state_order"))
+    ordered = [channel_images[cid] for cid in recon_order]
     # Backgrounds must be ordered exactly like the states: reconstruct() pairs
     # them positionally, so a mismatched order corrects each state with another
     # state's background -- which does not raise and does not look wrong.
     ordered_background = (
-        [background_images[cid] for cid in channel_order] if background_images else None
+        [background_images[cid] for cid in recon_order] if background_images else None
     )
     # The first state's directory is the tile-layout reference; every channel
     # is imaged at the same positions, so any of them would do.
@@ -269,6 +337,7 @@ def submit_tile_reconstruction(
     write_pool.submit(
         _reconstruct_and_write,
         tile_config_source=tile_config_source,
+        state_order=recon_order,
         state_images=ordered,
         reconstruction_cfg=reconstruction_cfg,
         background_images=ordered_background,

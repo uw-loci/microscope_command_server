@@ -367,6 +367,12 @@ modalities:
       swing_waves: 0.03          # Calibration swing amplitude (required)
       wavelength_nm: 549         # Light wavelength in nanometers (required)
       scheme: "5-State"          # Polarization scheme; default "5-State"
+      state_order:               # Optional: state reordering before reconstruction
+        - State0
+        - State1
+        - State2
+        - State4
+        - State3
 ```
 
 - **`swing_waves`**: The calibration swing amplitude used during system
@@ -376,6 +382,14 @@ modalities:
 - **`scheme`**: Reconstruction scheme (default `"5-State"`). The only accepted
   values are `"5-State"` and `"4-State"`; the scheme is fixed by how the system
   was calibrated and is not a free choice at acquisition time.
+- **`state_order`** (optional): A permutation of the acquired state ids that
+  reorders them before inversion. Used when the acquisition order differs from
+  the calibration order (e.g., when using OpenPolScope, which acquires in the
+  Oldenbourg order with pairs (1,4) and (2,3), requiring State3 and State4 to
+  swap). Omitting this field means states are consumed in acquisition order,
+  which is correct for recOrder and similar tools. Must list every acquired
+  state exactly once; specifying a partial list or unknown state ids will
+  raise an error and skip reconstruction.
 
 **If this block is missing or incomplete**, the server logs a warning and skips
 reconstruction; raw state images are still saved and can be reconstructed
@@ -394,24 +408,25 @@ channels using the standard multi-channel acquisition flags:
 The state ids must match exactly (case-sensitive); Micro-Manager presets should
 map to these state names in your configuration.
 
-**Two invariants that fail silently.** Neither raises, and neither is visible
-in the output -- a violated run still produces a plausible-looking retardance
-and orientation map that is simply wrong.
+**One critical invariant that fails silently:** The Stokes inversion treats
+the state intensities as samples of a single radiometric scale, so a per-state
+difference biases the result.
 
-1. **All states must share one exposure and gain.** The Stokes inversion
-   treats the state intensities as samples of a single radiometric scale, so a
-   per-state difference biases the result. Three layers cooperate to hold
-   this: the QuPath extension equalises the exposures before sending them,
-   every channel in `config_LCPolScope.yml` carries the same `exposure_ms`,
-   and the LC-PolScope acquisition profiles deliberately carry no
-   `channel_overrides`. Do not add per-channel exposure tuning to any of them.
+- **All states must share one exposure and gain.** Three layers cooperate to
+  hold this: the QuPath extension equalises the exposures before sending them,
+  every channel in `config_LCPolScope.yml` carries the same `exposure_ms`,
+  and the LC-PolScope acquisition profiles deliberately carry no
+  `channel_overrides`. Do not add per-channel exposure tuning to any of them.
 
-2. **State order is positional.** States are consumed in calibration order,
-   taken from the acquisition profile's channel list. A permutation rotates or
-   mirrors the orientation map without any error. If you did not run the
-   calibration yourself, identify it from the data with
-   `polscope-scheme-check` (shipped with `polscope-library`) before trusting
-   any orientation output.
+**State order is configurable.** The `state_order` parameter in the YAML
+reorders states before inversion to match the calibration scheme. When omitted,
+states are consumed in acquisition order (correct for recOrder). A wrong
+permutation rotates or mirrors the orientation map without raising an error.
+If you did not run the calibration yourself, identify it from the data with
+`polscope-scheme-check` (shipped with `polscope-library`) before trusting
+any orientation output. The correct order is a property of the software that
+ran the calibration -- not of the microscope -- so it can change without any
+hardware changing, and must be re-checked after a software switch.
 
 ### Automatic Reconstruction Behavior
 
@@ -471,13 +486,21 @@ Each is a tile directory in its own right, with a `TileConfiguration.txt`
 copied from the state directories, so the stitcher
 (`qupath-extension-tiles-to-pyramid`) stitches each into its own mosaic.
 
+Each derived tile file carries OME-XML metadata recording the reconstruction
+parameters (wavelength, swing waves, scheme, state order), whether background
+correction was applied, and critical handling rules for downstream processing.
+This metadata travels with the file, so a reader can identify both the
+calibration used to produce it and the processing constraints that must be
+respected.
+
 **Orientation is axial data and must not be resampled as an ordinary scalar.**
 0 and pi are the same physical orientation, so the mean of 179 degrees and 1
 degree is 90 degrees -- perpendicular to the truth, and entirely
 plausible-looking. Anything that averages these pixels (blending in a stitch
 seam, pyramid downsampling) has to go through sin(2*theta)/cos(2*theta), or
 encode the angle as hue, rather than averaging the angle directly. Retardance
-is an ordinary scalar and has no such constraint.
+is an ordinary scalar and has no such constraint. The metadata in the OME-XML
+flags which channel is axial and how it may be resampled.
 
 ### Backward Compatibility
 
