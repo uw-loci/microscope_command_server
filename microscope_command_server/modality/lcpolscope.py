@@ -29,6 +29,8 @@ Two invariants this modality does NOT enforce alone
 
 import logging
 
+import numpy as np
+
 from .config import ModalityConfig
 from .registry import register
 
@@ -75,6 +77,27 @@ def register_lcpolscope():
 
 RETARDANCE_DIR = "retardance"
 ORIENTATION_DIR = "orientation"
+
+# Derived tiles are written as uint16, not float, because the stitcher cannot
+# consume anything else: ChunkCompositor builds TYPE_USHORT_GRAY / TYPE_BYTE_GRAY
+# and PyramidLevelGenerator branches only on is16Bit. Float tiles would
+# reconstruct correctly and then be unstitchable.
+#
+# ORIENTATION uses OpenPolScope's own convention -- 0..18000 spanning 0..180
+# degrees, i.e. hundredths of a degree -- so our files are directly comparable
+# with theirs. Confirmed from their 2026-08-25 output, whose orientation channel
+# maxes at exactly 18000.
+ORIENTATION_COUNTS_PER_DEGREE = 100.0
+ORIENTATION_MAX_COUNTS = 18000
+
+# RETARDANCE uses an explicit scale of our own rather than OpenPolScope's.
+# Theirs is a single linear factor measured at ~1097.5 counts/nm, suspiciously
+# close to 2*wavelength, but the formula is undocumented and may be wavelength
+# dependent -- so reproducing it would mean guessing. Hundredths of a nanometre
+# is far finer than the noise and spans 0..655 nm, while the algorithm caps
+# retardance at a quarter wave (137 nm at 549 nm), so there is ample headroom.
+RETARDANCE_COUNTS_PER_NM = 100.0
+_UINT16_MAX = 65535
 
 
 class ReconstructionRefused(Exception):
@@ -130,6 +153,17 @@ def check_reconstruction_inputs(channel_ids, raw_tiles_flat_fielded, background_
                 "whole matrix rather than degrading one channel. Supply a "
                 "background for every state, or none."
             )
+
+
+def _to_uint16(values, counts_per_unit, max_counts=_UINT16_MAX):
+    """Scale a physical map to uint16 counts, reporting whether it clipped.
+
+    Returns (array, clipped). Clipping is reported rather than silently
+    absorbed: a saturated retardance map still looks like data.
+    """
+    scaled = np.rint(np.nan_to_num(np.asarray(values, dtype=np.float64), nan=0.0) * counts_per_unit)
+    clipped = bool(np.any(scaled > max_counts) or np.any(scaled < 0))
+    return np.clip(scaled, 0, max_counts).astype(np.uint16), clipped
 
 
 def _copy_tile_configuration(source_dir, out_dir):
@@ -188,18 +222,22 @@ def _reconstruct_and_write(
         RETARDANCE_DIR: {
             "polscope.quantity": "retardance",
             "polscope.units": "nanometres",
+            "polscope.counts_per_unit": RETARDANCE_COUNTS_PER_NM,
+            "polscope.to_physical": "nanometres = counts / 100",
             "polscope.axial": "false",
             # Ordinary non-negative scalar: safe to average, blend and downsample.
             "polscope.resample": "linear",
         },
         ORIENTATION_DIR: {
             "polscope.quantity": "slow_axis_orientation",
-            "polscope.units": "radians",
-            "polscope.range": "[0,pi)",
+            "polscope.units": "degrees",
+            "polscope.range": "[0,180)",
+            "polscope.counts_per_unit": ORIENTATION_COUNTS_PER_DEGREE,
+            "polscope.to_physical": "degrees = counts / 100 (OpenPolScope convention)",
             "polscope.axial": "true",
             # The two rules that make this channel different from every other
             # image QPSC writes. Both fail silently if ignored.
-            "polscope.resample": "doubled-angle: sin(2t)/cos(2t); NEVER average the angle",
+            "polscope.resample": "doubled-angle: sin(2t)/cos(2t); NEVER average the counts",
             "polscope.frame": "image (y-down); a single mirror negates the angle",
         },
     }
@@ -208,14 +246,26 @@ def _reconstruct_and_write(
         ORIENTATION_DIR: "Slow Axis Orientation (rad, axial)",
     }
 
+    retardance_counts, ret_clipped = _to_uint16(result.retardance_nm, RETARDANCE_COUNTS_PER_NM)
+    orientation_counts, _ = _to_uint16(
+        np.rad2deg(result.orientation_rad), ORIENTATION_COUNTS_PER_DEGREE, ORIENTATION_MAX_COUNTS
+    )
+    if ret_clipped and log is not None:
+        log.warning(
+            "Retardance clipped at %.1f nm while writing %s; the stored map is "
+            "saturated there and must not be read quantitatively.",
+            _UINT16_MAX / RETARDANCE_COUNTS_PER_NM,
+            filename,
+        )
+
     for subdir, data in (
-        (RETARDANCE_DIR, result.retardance_nm),
+        (RETARDANCE_DIR, retardance_counts),
         # Orientation is axial data in [0, pi). Written raw here on purpose --
         # any downsampling or blending of these pixels must go through
         # sin(2*theta)/cos(2*theta), never an arithmetic mean, or 179 deg and
         # 1 deg average to 90 deg: perpendicular to the truth and entirely
         # plausible-looking.
-        (ORIENTATION_DIR, result.orientation_rad),
+        (ORIENTATION_DIR, orientation_counts),
     ):
         out_dir = output_path / subdir
         out_dir.mkdir(parents=True, exist_ok=True)

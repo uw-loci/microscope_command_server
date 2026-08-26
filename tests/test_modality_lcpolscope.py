@@ -446,7 +446,9 @@ def test_derived_tiles_carry_their_provenance_and_handling_rules(tmp_path):
     assert "nm" in ret_name and "Orientation" in ori_name
     assert ret_meta["polscope.units"] == "nanometres"
     assert ret_meta["polscope.axial"] == "false"
-    assert ori_meta["polscope.units"] == "radians"
+    # Stored as hundredths of a degree, matching OpenPolScope, because the
+    # stitcher is 16-bit only -- see the uint16 tests below.
+    assert ori_meta["polscope.units"] == "degrees"
     assert ori_meta["polscope.axial"] == "true"
     assert "sin(2t)" in ori_meta["polscope.resample"]
     assert "mirror" in ori_meta["polscope.frame"]
@@ -459,3 +461,122 @@ def test_derived_tiles_carry_their_provenance_and_handling_rules(tmp_path):
         assert meta["polscope.scheme"] == "5-State"
         assert meta["polscope.state_order"] == "State0,State1,State2,State4,State3"
         assert meta["polscope.background_corrected"] == "false"
+
+
+# ---------------------------------------------------------------------------
+# uint16 encoding
+#
+# The stitcher's ChunkCompositor builds TYPE_USHORT_GRAY / TYPE_BYTE_GRAY and
+# PyramidLevelGenerator branches only on is16Bit, so float tiles reconstruct
+# correctly and are then unstitchable. These pin the encoding and its scales.
+# ---------------------------------------------------------------------------
+
+
+def _reconstructed(tmp_path, states):
+    import numpy as np
+
+    seen = {}
+
+    def writer(*, filename, pixel_size_um, data, channel_name, map_annotations):
+        seen[filename.rsplit("/", 2)[-2]] = (data, map_annotations)
+
+    _, pool = _submit(
+        channel_images=dict(zip([f"State{i}" for i in range(5)], states)),
+        output_path=tmp_path,
+        ome_writer=writer,
+    )
+    fn, kwargs = pool.submissions[0]
+    fn(**kwargs)
+    return seen
+
+
+def test_derived_tiles_are_uint16_so_they_can_be_stitched(tmp_path):
+    pytest.importorskip("polscope_library")
+    import numpy as np
+
+    from microscope_command_server.modality.lcpolscope import (
+        ORIENTATION_DIR,
+        RETARDANCE_DIR,
+    )
+
+    states = [np.full((4, 4), v, dtype=float) for v in (10.0, 60.0, 55.0, 50.0, 45.0)]
+    seen = _reconstructed(tmp_path, states)
+    for key in (RETARDANCE_DIR, ORIENTATION_DIR):
+        assert seen[key][0].dtype == np.uint16, f"{key} must be uint16 to stitch"
+
+
+def test_orientation_uses_the_openpolscope_scale(tmp_path):
+    """0..18000 spanning 0..180 degrees, so our files compare directly with
+    theirs. Their 2026-08-25 orientation channel maxes at exactly 18000."""
+    pytest.importorskip("polscope_library")
+    import numpy as np
+
+    from microscope_command_server.modality.lcpolscope import (
+        ORIENTATION_COUNTS_PER_DEGREE,
+        ORIENTATION_DIR,
+        ORIENTATION_MAX_COUNTS,
+    )
+
+    states = [np.full((4, 4), v, dtype=float) for v in (10.0, 60.0, 55.0, 50.0, 45.0)]
+    data, meta = _reconstructed(tmp_path, states)[ORIENTATION_DIR]
+
+    assert ORIENTATION_COUNTS_PER_DEGREE == 100.0
+    assert ORIENTATION_MAX_COUNTS == 18000
+    assert data.max() <= ORIENTATION_MAX_COUNTS
+    assert meta["polscope.units"] == "degrees"
+    assert meta["polscope.counts_per_unit"] == 100.0
+    assert "counts / 100" in meta["polscope.to_physical"]
+
+
+def test_scales_are_recorded_so_physical_units_are_recoverable(tmp_path):
+    """A count is meaningless without its scale; both must travel together."""
+    pytest.importorskip("polscope_library")
+    import numpy as np
+
+    from microscope_command_server.modality.lcpolscope import RETARDANCE_DIR
+
+    states = [np.full((4, 4), v, dtype=float) for v in (10.0, 60.0, 55.0, 50.0, 45.0)]
+    _, meta = _reconstructed(tmp_path, states)[RETARDANCE_DIR]
+    assert meta["polscope.counts_per_unit"] == 100.0
+    assert meta["polscope.units"] == "nanometres"
+
+
+def test_round_trip_through_counts_preserves_the_physics(tmp_path):
+    """0.01 nm and 0.01 degree steps are far below the noise floor, so the
+    encoding must not be where accuracy is lost."""
+    pytest.importorskip("polscope_library")
+    import numpy as np
+
+    from polscope_library import reconstruct
+
+    from microscope_command_server.modality.lcpolscope import (
+        ORIENTATION_DIR,
+        RETARDANCE_DIR,
+    )
+
+    rng = np.random.default_rng(0)
+    states = [rng.uniform(500, 4000, (16, 16)) for _ in range(5)]
+    seen = _reconstructed(tmp_path, states)
+
+    exact = reconstruct(intensities=states, swing=0.03, wavelength_nm=549, scheme="5-State")
+    ret_nm = seen[RETARDANCE_DIR][0].astype(float) / 100.0
+    ori_deg = seen[ORIENTATION_DIR][0].astype(float) / 100.0
+
+    assert np.max(np.abs(ret_nm - exact.retardance_nm)) <= 0.01
+    d = np.abs(ori_deg - np.rad2deg(exact.orientation_rad)) % 180.0
+    assert np.max(np.minimum(d, 180.0 - d)) <= 0.01
+
+
+def test_clipping_is_reported_not_absorbed(tmp_path, caplog):
+    """A saturated retardance map still looks like data."""
+    import logging
+
+    from microscope_command_server.modality.lcpolscope import _to_uint16
+
+    arr, clipped = _to_uint16([0.0, 700.0], 100.0)
+    assert clipped is True
+    assert arr.max() == 65535
+
+    arr, clipped = _to_uint16([0.0, 12.0], 100.0)
+    assert clipped is False
+    assert arr.tolist() == [0, 1200]

@@ -3435,11 +3435,13 @@ def _approach_from_safe_z(
     """Retract to safe_z, then approach the sample once and commit to the first
     justified peak.
 
-    Contrast with the edge-retry walk this replaces: that walk starts wherever
-    the stage was left and decides after each 30 um scan whether to keep going,
-    so every ``edge_high`` is a GUESS that moving further -- possibly toward the
-    sample -- is correct. Here the direction is not guessed: it is implied by
-    the declared safe Z, which the operator measured as clear of the sample.
+    NOT a safer default. This traverses the WHOLE distance to the sample on a
+    bound extrapolated from one slide, starting from a position a human typed in;
+    the edge-retry walk it replaces creeps in 30 um steps near the last focus. It
+    trades "the algorithm guesses wrong by 30 um" for "the operator entered the
+    wrong number and the objective drives into the slide". What it buys is
+    control and auditability, and only once the caller has validated the rig:
+    the direction is not guessed but implied by the declared safe Z.
     Travel is bounded by ``approach_max_um`` (from the validation run's measured
     safe-Z-to-focus distance) and by the stage limits, and the scan is a single
     pass rather than an open-ended walk.

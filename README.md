@@ -477,8 +477,8 @@ alongside the state images:
     State2/tile_0_0.tif
     State3/tile_0_0.tif
     State4/tile_0_0.tif
-    retardance/tile_0_0.tif          # Retardance in nm
-    orientation/tile_0_0.tif         # Orientation in radians, [0, π)
+    retardance/tile_0_0.tif          # Retardance (uint16, hundredths of nm)
+    orientation/tile_0_0.tif         # Orientation (uint16, hundredths of degrees, [0, 18000) = [0, 180) degrees)
     TileConfiguration.txt
 ```
 
