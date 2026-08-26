@@ -31,6 +31,12 @@ import logging
 
 import numpy as np
 
+from microscope_imageprocessing.io import (
+    RESAMPLE_ANGULAR_180,
+    RESAMPLE_LINEAR,
+    channel_handling,
+)
+
 from .config import ModalityConfig
 from .registry import register
 
@@ -218,15 +224,17 @@ def _reconstruct_and_write(
         "polscope.background_corrected": "true" if background_images else "false",
         "polscope.reconstruction": "QLIPP Stokes inversion (polscope_library)",
     }
+    # Resampling policy uses the shared vocabulary rather than a polscope-specific
+    # key: a mask, a label map or an object-id channel needs the same protection,
+    # and a reader should only have to understand one convention.
     per_channel = {
         RETARDANCE_DIR: {
             "polscope.quantity": "retardance",
             "polscope.units": "nanometres",
             "polscope.counts_per_unit": RETARDANCE_COUNTS_PER_NM,
             "polscope.to_physical": "nanometres = counts / 100",
-            "polscope.axial": "false",
-            # Ordinary non-negative scalar: safe to average, blend and downsample.
-            "polscope.resample": "linear",
+            # Ordinary non-negative scalar. Nothing special.
+            **channel_handling(RESAMPLE_LINEAR),
         },
         ORIENTATION_DIR: {
             "polscope.quantity": "slow_axis_orientation",
@@ -234,16 +242,21 @@ def _reconstruct_and_write(
             "polscope.range": "[0,180)",
             "polscope.counts_per_unit": ORIENTATION_COUNTS_PER_DEGREE,
             "polscope.to_physical": "degrees = counts / 100 (OpenPolScope convention)",
-            "polscope.axial": "true",
-            # The two rules that make this channel different from every other
-            # image QPSC writes. Both fail silently if ignored.
-            "polscope.resample": "doubled-angle: sin(2t)/cos(2t); NEVER average the counts",
+            # The frame note stays polscope-local: it is about how the values
+            # relate to image geometry, not about how they may be combined.
             "polscope.frame": "image (y-down); a single mirror negates the angle",
+            **channel_handling(
+                RESAMPLE_ANGULAR_180,
+                reason=(
+                    "axial slow-axis angle: 0 and 180 degrees are the same physical "
+                    "axis, so the mean of 179 and 1 is 90 -- perpendicular to the truth"
+                ),
+            ),
         },
     }
     channel_label = {
         RETARDANCE_DIR: "Retardance (nm)",
-        ORIENTATION_DIR: "Slow Axis Orientation (rad, axial)",
+        ORIENTATION_DIR: "Slow Axis Orientation (deg x100, axial)",
     }
 
     retardance_counts, ret_clipped = _to_uint16(result.retardance_nm, RETARDANCE_COUNTS_PER_NM)

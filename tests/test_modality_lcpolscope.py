@@ -444,14 +444,28 @@ def test_derived_tiles_carry_their_provenance_and_handling_rules(tmp_path):
     ori_name, ori_meta = seen[ORIENTATION_DIR]
 
     assert "nm" in ret_name and "Orientation" in ori_name
+    # The label must not claim radians -- the stored values are counts.
+    assert "rad" not in ori_name and "deg" in ori_name
     assert ret_meta["polscope.units"] == "nanometres"
-    assert ret_meta["polscope.axial"] == "false"
     # Stored as hundredths of a degree, matching OpenPolScope, because the
     # stitcher is 16-bit only -- see the uint16 tests below.
     assert ori_meta["polscope.units"] == "degrees"
-    assert ori_meta["polscope.axial"] == "true"
-    assert "sin(2t)" in ori_meta["polscope.resample"]
     assert "mirror" in ori_meta["polscope.frame"]
+
+    # Resampling is declared in the SHARED vocabulary, not a polscope-private
+    # key, so a stitcher only has to understand one convention to protect a
+    # mask, a label map and an orientation channel alike.
+    from microscope_imageprocessing.io import (
+        RESAMPLE_ANGULAR_180,
+        RESAMPLE_LINEAR,
+        may_combine,
+    )
+
+    assert ret_meta["qpsc.resample"] == RESAMPLE_LINEAR
+    assert may_combine(ret_meta) is True
+    assert ori_meta["qpsc.resample"] == RESAMPLE_ANGULAR_180
+    assert may_combine(ori_meta) is False
+    assert "179" in ori_meta["qpsc.resample_reason"]
 
     # The reconstruction parameters travel with BOTH channels, so a file found
     # on its own can still be traced back to the calibration that made it.
