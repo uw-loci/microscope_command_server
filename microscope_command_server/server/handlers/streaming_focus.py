@@ -110,6 +110,7 @@ from typing import Dict, Any, List, Optional, Tuple
 
 import numpy as np
 
+from microscope_command_server.server.focus_geometry import build_z_from_poll
 from microscope_command_server.server.handlers.utils import (
     read_message_string,
     parse_flags,
@@ -138,6 +139,14 @@ NORMAL_SPEED_VALUE = "100"
 # Overridden per-rig by stage.streaming_af.slow_speed_um_per_s in the
 # main config YAML.
 MIN_VELOCITY_UM_S = 11.5
+
+# How far the velocity model may drift from the measured stage position before
+# the drift is reported as a warning rather than an observation. Sample Z comes
+# from the measurement either way, so this does not gate anything -- it flags a
+# `slow_speed_um_per_s` that no longer matches the stage, which costs sampling
+# density and scan duration. 2 um is roughly one 20x depth of field: below that
+# the mis-calibration cannot move a sample by a meaningful fraction of a peak.
+MODEL_DIVERGENCE_WARN_UM = 2.0
 
 # Motion blur budget (um). If expected blur per frame exceeds this,
 # Streaming autofocus is not feasible. Derived from 25% of a representative 20X
@@ -356,6 +365,7 @@ HARD_DEADLINE_SEC_PER_UM = 0.15
 # handles the case where velocity_um_s is so wrong that we exit
 # before useful samples arrive (it widens the range and re-runs).
 SCAN_TAIL_MS = 100.0
+
 
 # Default fallback range if yaml lookup completely fails.
 FALLBACK_RANGE_UM = 6.0
@@ -2129,7 +2139,42 @@ def _run_streaming_scan(
         )
 
     # --- Post-scan: reshape + metric computation ---
+    #
+    # Where each frame was taken comes from the Z-POLL TRACE, not from
+    # wall_ms * velocity_um_s. The model is an extrapolation from a
+    # hand-calibrated constant (`slow_speed_um_per_s`); the poll is a direct
+    # measurement of the quantity we actually want. When they disagree the
+    # measurement is right, and they do disagree.
+    #
+    # Observed (PPM 20x, 2026-08-26, 267 um approach traverse): configured
+    # 11.5 um/s, real 11.96 um/s -- only 4% fast, but the error INTEGRATES over
+    # the traverse, so by the sample plane the modelled Z lagged the true Z by
+    # 8.6 um. The operator's own focus was -237.0; the metric peak sat at
+    # z_polled = -236.65 (0.35 um away, i.e. correct) and at z_model = -228.08
+    # (8.9 um away, i.e. badly out of focus at 20x). Committing on the model
+    # would have driven to -228 and called it success.
+    #
+    # This is specifically an APPROACH-mode hazard. A 20-40 um sweep with the
+    # same 4% error is off by under a micron and nobody notices; the approach
+    # traverses ten times further from a retracted start, so it turns a
+    # negligible calibration error into a focus miss. The existing
+    # endpoint-average velocity guard cannot catch it: the stage reaches z_end
+    # and sits there, so displacement-over-total-time lands right back on the
+    # configured value (11.48 vs 11.50 um/s here) while the mid-scan labelling
+    # is wrong throughout.
+    #
+    # The model stays as the fallback for when polling produced too little to
+    # interpolate over -- it is the only thing available then.
+    z_from_poll = build_z_from_poll(z_poll_samples)
+    if z_from_poll is None:
+        logger.warning(
+            "STREAM_AF:only %d Z-poll samples; falling back to the modelled "
+            "wall_ms * velocity Z. Sample positions are extrapolated, not measured.",
+            len(z_poll_samples),
+        )
+
     samples: List[Tuple[float, float, float]] = []
+    max_model_divergence_um = 0.0
     # Parallel list: per-accepted-sample (wall_ms, image_2D_or_3D, metric)
     # only populated when dump_dir is set, since each entry holds a full
     # frame and we don't want to keep them in the hot path.
@@ -2165,27 +2210,66 @@ def _run_streaming_scan(
             except Exception:
                 secondary = None
 
-        # Z from wall time * velocity. This is now directly
-        # accurate -- no camera_period back-fill, no inference.
+        # Modelled Z, kept so the two can be compared below and so there is
+        # still an answer when the poll trace is too thin to interpolate.
         if wall_ms <= 0:
-            z_interp = z_start
+            z_model = z_start
         elif wall_ms >= motion_duration_ms:
-            z_interp = z_end
+            z_model = z_end
         else:
             progress_um = (wall_ms / 1000.0) * velocity_um_s * direction
-            z_interp = z_start + progress_um
+            z_model = z_start + progress_um
+
+        z_interp = z_model if z_from_poll is None else z_from_poll(wall_ms)
+        if z_from_poll is not None:
+            _d = abs(z_interp - z_model)
+            if _d > max_model_divergence_um:
+                max_model_divergence_um = _d
+
         samples.append((wall_ms, float(z_interp), metric, secondary))
         if dump_records is not None:
-            dump_records.append((wall_ms, img, float(z_interp), metric))
+            dump_records.append((wall_ms, img, float(z_model), metric))
 
+    # How far the velocity model drifted from the measured stage position over
+    # this scan. Sample Z now comes from the poll, so this is a calibration
+    # report rather than an error -- but a large value means
+    # `slow_speed_um_per_s` is wrong for this stage, which still costs sampling
+    # density and scan duration even though it no longer costs focus accuracy.
+    if z_from_poll is not None and max_model_divergence_um > 0:
+        span_um = abs(z_end - z_start)
+        pct = (max_model_divergence_um / span_um * 100.0) if span_um > 0 else 0.0
+        log_at = (
+            logger.warning if max_model_divergence_um > MODEL_DIVERGENCE_WARN_UM else logger.info
+        )
+        log_at(
+            "STREAM_AF:velocity model drifted %.2f um (%.1f%% of the %.1f um scan) from the "
+            "measured stage position; configured slow_speed_um_per_s=%.3f. Sample Z is taken "
+            "from the measurement, so focus is unaffected, but re-calibrating the configured "
+            "speed would restore the intended sampling density.",
+            max_model_divergence_um,
+            pct,
+            span_um,
+            velocity_um_s,
+        )
+
+    # Sampling density (um per sample) is the number that decides whether a scan
+    # can resolve the focus peak at all, and it is not directly configurable: it
+    # falls out of scan speed divided by the camera's frame rate. Reporting it
+    # means "was the scan too coarse?" can be answered from the log instead of
+    # inferred from a bad result. Compare it against the peak width for this
+    # objective -- a peak wants roughly ten samples across its full width at half
+    # maximum, so a 20x peak ~20 um wide is comfortable at 0.7 um/sample while a
+    # 40x peak a few um wide is not.
+    _density_um = (abs(z_end - z_start) / len(samples)) if samples else float("nan")
     logger.info(
         "STREAM_AF:scan exit at t=%.0fms (motion_end=%.0fms + tail=%.0fms) "
-        "captures=%d samples=%d",
+        "captures=%d samples=%d density=%.3f um/sample",
         total_scan_ms,
         motion_duration_ms,
         SCAN_TAIL_MS,
         len(raw_captures),
         len(samples),
+        _density_um,
     )
 
     if dump_dir is not None and dump_records is not None:
@@ -4096,6 +4180,42 @@ def handle_streaming_focus(conn, client, hardware, settings, **kwargs):
         str(yaml_normal_value) if yaml_normal_value is not None else NORMAL_SPEED_VALUE
     )
     eff_slow_um_s = float(yaml_slow_um_s) if yaml_slow_um_s is not None else MIN_VELOCITY_UM_S
+
+    # Per-objective scan-speed override. Scan speed is what sets SAMPLING DENSITY:
+    # frames arrive at whatever rate the camera runs, so um-per-sample is
+    # speed / frame_rate. The right density depends on how wide the focus peak is,
+    # and peak width is a property of the OBJECTIVE -- a 40x peak is a few um across
+    # where a 10x peak is tens. Every other parameter that varies with the objective
+    # (sweep_range_um, score_metric, the widening cap) already lives in the
+    # per-objective autofocus profile; the speed was the one that did not, so a
+    # density tuned for one objective silently applied to all of them. Scope-wide
+    # `stage.streaming_af.slow_speed_um_per_s` remains the default when the profile
+    # does not set one.
+    if af_entry:
+        obj_slow_um_s = af_entry.get("slow_speed_um_per_s")
+        if obj_slow_um_s is not None:
+            try:
+                obj_slow_um_s = float(obj_slow_um_s)
+                if obj_slow_um_s <= 0:
+                    raise ValueError("must be positive")
+                logger.info(
+                    "STREAM_AF:per-objective slow_speed_um_per_s=%.3f for '%s' "
+                    "(overrides scope-wide %.3f)",
+                    obj_slow_um_s,
+                    objective,
+                    eff_slow_um_s,
+                )
+                eff_slow_um_s = obj_slow_um_s
+            except (TypeError, ValueError) as e:
+                logger.warning(
+                    "STREAM_AF:per-objective slow_speed_um_per_s=%r for '%s' is not a "
+                    "positive number (%s); using scope-wide %.3f",
+                    af_entry.get("slow_speed_um_per_s"),
+                    objective,
+                    e,
+                    eff_slow_um_s,
+                )
+
     eff_head_discard_ms = (
         float(yaml_head_discard_ms) if yaml_head_discard_ms is not None else DEFAULT_HEAD_DISCARD_MS
     )
