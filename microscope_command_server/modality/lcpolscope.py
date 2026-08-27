@@ -247,6 +247,13 @@ def _reconstruct_and_write(
             "polscope.frame": "image (y-down); a single mirror negates the angle",
             **channel_handling(
                 RESAMPLE_ANGULAR_180,
+                # 0..18000 counts span the full 0..180 degree cycle. A reader
+                # holding counts cannot convert them to angles without this, so
+                # microscope_imageprocessing requires it for angular policies --
+                # without it the declared circular averaging would silently
+                # degrade to nearest-neighbour, which is the exact failure the
+                # policy exists to prevent.
+                period=ORIENTATION_MAX_COUNTS,
                 reason=(
                     "axial slow-axis angle: 0 and 180 degrees are the same physical "
                     "axis, so the mean of 179 and 1 is 90 -- perpendicular to the truth"
