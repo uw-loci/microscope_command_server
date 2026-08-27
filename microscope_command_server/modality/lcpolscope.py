@@ -163,6 +163,25 @@ def check_reconstruction_inputs(channel_ids, raw_tiles_flat_fielded, background_
                 "background for every state, or none."
             )
 
+    # Checked here rather than left to the import inside the write pool.
+    # polscope_library is an optional extra, so a rig set up without it is a
+    # realistic configuration -- and if that surfaces as an ImportError raised
+    # on a worker thread at the first tile write, the operator learns about it
+    # somewhere in a log, per tile, partway into a slide. As a refusal it is
+    # reported once, up front, in the same place as every other reason a
+    # reconstruction cannot be trusted, and the run still saves its raw states.
+    try:
+        import polscope_library  # noqa: F401
+    except ImportError as exc:
+        raise ReconstructionRefused(
+            f"polscope_library is not installed in the server environment ({exc}). "
+            "The raw state images are still saved, so this run can be "
+            "reconstructed offline once it is. Install it from the checkout "
+            "next to this repo -- 'pip install -e ../polscope_library', or run "
+            "update_env.bat with the environment active. It is not on PyPI, so "
+            "the [polscope] extra cannot fetch it on its own."
+        ) from exc
+
 
 def _to_uint16(values, counts_per_unit, max_counts=_UINT16_MAX):
     """Scale a physical map to uint16 counts, reporting whether it clipped.

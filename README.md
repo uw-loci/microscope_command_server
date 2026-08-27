@@ -1117,14 +1117,25 @@ pip install -e .
 
 **Solution:**
 
-1. **Ensure virtual environment is activated:**
+1. **Ensure the environment is activated.** Not every rig uses a venv --
+   the LC-PolScope machine has no system Python and runs from conda -- so
+   check which kind this one is before assuming:
    ```bash
-   # Windows
+   # Windows, venv
    path\to\venv_qpsc\Scripts\Activate.ps1
+
+   # Windows, conda
+   conda activate <env name>        # conda env list, if you do not know it
 
    # Linux/macOS
    source path/to/venv_qpsc/bin/activate
    ```
+
+   `start_server.bat` handles both without being told, and prints the
+   interpreter it settled on. If it cannot find the right one, copy
+   `server_env.bat.example` to `server_env.bat` and set the environment up
+   there explicitly -- that file is git-ignored, so per-rig settings survive
+   a pull.
 
 2. **Reinstall the package:**
    ```bash

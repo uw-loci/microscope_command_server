@@ -1,0 +1,3 @@
+# Batch files must keep CRLF: cmd.exe mishandles LF-only files around
+# labels and goto, which is exactly what the launcher relies on.
+*.bat text eol=crlf

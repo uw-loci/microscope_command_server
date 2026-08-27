@@ -7,6 +7,8 @@ the reconstruction still produces a plausible-looking retardance and
 orientation map that is simply wrong. Nothing downstream will notice.
 """
 
+import sys
+
 import pytest
 
 from microscope_command_server.modality import get_config, registered_prefixes
@@ -487,8 +489,6 @@ def test_derived_tiles_carry_their_provenance_and_handling_rules(tmp_path):
 
 
 def _reconstructed(tmp_path, states):
-    import numpy as np
-
     seen = {}
 
     def writer(*, filename, pixel_size_um, data, channel_name, map_annotations):
@@ -583,8 +583,6 @@ def test_round_trip_through_counts_preserves_the_physics(tmp_path):
 
 def test_clipping_is_reported_not_absorbed(tmp_path, caplog):
     """A saturated retardance map still looks like data."""
-    import logging
-
     from microscope_command_server.modality.lcpolscope import _to_uint16
 
     arr, clipped = _to_uint16([0.0, 700.0], 100.0)
@@ -594,3 +592,40 @@ def test_clipping_is_reported_not_absorbed(tmp_path, caplog):
     arr, clipped = _to_uint16([0.0, 12.0], 100.0)
     assert clipped is False
     assert arr.tolist() == [0, 1200]
+
+
+def test_missing_polscope_library_refuses_early_not_in_the_write_pool(monkeypatch):
+    """A rig without the optional extra must be told before the first tile.
+
+    The reconstruction imports polscope_library inside the write-pool task, so
+    without this check a missing install surfaces as an ImportError on a worker
+    thread, once per tile, partway into a slide. As a refusal it is caught and
+    logged once by the acquisition path.
+    """
+    import builtins
+
+    from microscope_command_server.modality.lcpolscope import (
+        ReconstructionRefused,
+        check_reconstruction_inputs,
+    )
+
+    real_import = builtins.__import__
+
+    def deny_polscope(name, *args, **kwargs):
+        if name == "polscope_library":
+            raise ImportError("No module named 'polscope_library'")
+        return real_import(name, *args, **kwargs)
+
+    monkeypatch.delitem(sys.modules, "polscope_library", raising=False)
+    monkeypatch.setattr(builtins, "__import__", deny_polscope)
+
+    with pytest.raises(ReconstructionRefused) as excinfo:
+        check_reconstruction_inputs(
+            ["State0", "State1", "State2", "State3", "State4"],
+            raw_tiles_flat_fielded=False,
+        )
+
+    message = str(excinfo.value)
+    assert "polscope_library is not installed" in message
+    # The operator needs to know the run is not lost.
+    assert "raw state images are still saved" in message.lower()

@@ -1,0 +1,30 @@
+@echo off
+REM ============================================================
+REM  Per-rig environment override for start_server.bat
+REM
+REM  Copy this to  server_env.bat  (same folder) and edit.
+REM  That name is git-ignored, so your rig's settings survive a
+REM  pull and never conflict with another microscope's.
+REM
+REM  start_server.bat calls this INSTEAD of autodetecting, so
+REM  everything the server needs must be set up here.
+REM ============================================================
+
+REM -- Conda, activated by full path. Use this when conda is not
+REM    on PATH -- which is the normal case when the launcher is
+REM    started from a desktop shortcut rather than a prompt.
+REM
+REM    Activate rather than calling the env's python.exe directly:
+REM    conda packages load DLLs from the env's Library\bin, and
+REM    only activation puts that on PATH. Calling python.exe
+REM    directly appears to work until a package with native code
+REM    fails to import.
+
+call "C:\ProgramData\miniconda3\condabin\conda.bat" activate qpsc
+
+REM -- A venv in a non-standard location would instead be:
+REM call "D:\envs\qpsc\Scripts\activate.bat"
+
+REM -- Anything else this rig needs can go here, for example an
+REM    extra directory on PATH for a vendor SDK.
+REM set "PATH=C:\Program Files\SomeVendor\bin;%PATH%"

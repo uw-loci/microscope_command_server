@@ -47,3 +47,7 @@ codemap/
 
 # Claude Code session scope
 CLAUDE.md
+
+# Per-rig server environment override (see start_server.bat header).
+# Deliberately untracked: each microscope resolves its Python differently.
+server_env.bat
