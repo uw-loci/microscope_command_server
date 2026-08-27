@@ -2484,8 +2484,19 @@ def _attempt_one_scan(
     secondary_metric_name: Optional[str] = None,
     abort_event: Optional[threading.Event] = None,
     head_discard_ms: float = DEFAULT_HEAD_DISCARD_MS,
+    z_endpoints: Optional[Tuple[float, float]] = None,
 ) -> _ScanAttemptResult:
     """Run one streaming AF scan centered on z_center with the given range.
+
+    ``z_endpoints`` overrides the centre/range geometry with an explicit
+    ``(z_start, z_end)``, and z_start MAY be greater than z_end. The edge-retry
+    walk always scans in the direction of increasing Z, which is fine because it
+    starts near the last focus and creeps outward. Approach-from-safe-Z cannot
+    use that: it must travel from greater objective-sample SEPARATION to lesser
+    -- retracted position toward the sample -- and which Z direction that is
+    depends on the rig (``stage.focus.retract_sign``), not on a convention. On a
+    scope that retracts in +Z, forcing an increasing scan would either miss the
+    sample entirely or reach the far end by moving THROUGH it first.
 
     Returns an _ScanAttemptResult describing the outcome. Does NOT
     commit the peak (caller decides whether to retry or commit) and
@@ -2511,8 +2522,12 @@ def _attempt_one_scan(
             override comes from stage.streaming_af.normal_speed_value.
     """
     tag_prefix = f"{attempt_label}: " if attempt_label else ""
-    z_start = z_center - range_um / 2.0
-    z_end = z_center + range_um / 2.0
+    if z_endpoints is not None:
+        z_start, z_end = z_endpoints
+        range_um = abs(z_end - z_start)
+    else:
+        z_start = z_center - range_um / 2.0
+        z_end = z_center + range_um / 2.0
     logger.info(
         "STREAM_AF:%sscan window [%.3f -> %.3f] (center %.3f, range %.2f)",
         tag_prefix,
@@ -3481,13 +3496,13 @@ def _approach_from_safe_z(
     except Exception as e:
         return _ScanAttemptResult("error", None, 0, 0.0, f"could not retract to safe Z: {e}")
 
-    center = (safe_z + far_end) / 2.0
     scan = _attempt_one_scan(
         core,
         focus_device,
         speed_prop,
-        z_center=center,
+        z_center=(safe_z + far_end) / 2.0,
         range_um=span,
+        z_endpoints=(safe_z, far_end),
         sequence_was_running_on_entry=sequence_was_running,
         attempt_label="approach",
         velocity_um_s=velocity_um_s,
@@ -3784,6 +3799,8 @@ def handle_streaming_focus(conn, client, hardware, settings, **kwargs):
             "--safe-z",
             "--approach-max",
             "--tissue-gate",
+            "--z-start",
+            "--z-end",
         ],
     )
     yaml_path = params.get("yaml")
@@ -3817,7 +3834,35 @@ def handle_streaming_focus(conn, client, hardware, settings, **kwargs):
         )
         approach_safe_z = None
         approach_max_um = None
+    # Profiling scan: traverse EXACTLY this interval once and dump it, committing to
+    # nothing. Used by Focus Approach Validation, which needs the raw metric profile over a
+    # named interval -- not a focus decision. Without it the scan centres on the current Z,
+    # which on 2026-08-26 put a 265 um window at [-133, +133] while the sample sat at -235.
+    z_start_str = params.get("z_start")
+    z_end_str = params.get("z_end")
+    profile_z_start: Optional[float] = None
+    profile_z_end: Optional[float] = None
+    try:
+        if z_start_str and z_end_str:
+            profile_z_start = float(z_start_str)
+            profile_z_end = float(z_end_str)
+    except ValueError:
+        logger.warning(
+            "STREAM_AF:ignoring non-numeric --z-start/--z-end: %r / %r", z_start_str, z_end_str
+        )
+    profile_mode = profile_z_start is not None and profile_z_end is not None
+    if (z_start_str or z_end_str) and not profile_mode:
+        logger.warning("STREAM_AF:profiling needs BOTH --z-start and --z-end; ignoring")
+
     approach_mode = approach_safe_z is not None and approach_max_um is not None
+    if profile_mode and approach_mode:
+        # Both would otherwise run in sequence -- two traverses toward the sample for one
+        # request. Profiling wins: it commits to nothing, so it is the safe one to honour.
+        logger.warning(
+            "STREAM_AF:both profiling (--z-start/--z-end) and approach (--safe-z/--approach-max) "
+            "were requested; running the profiling traverse only"
+        )
+        approach_mode = False
     require_tissue_gate = str(tissue_gate_str).strip() in ("1", "true", "True")
     if (safe_z_str or approach_max_str) and not approach_mode:
         logger.warning(
@@ -4349,6 +4394,54 @@ def handle_streaming_focus(conn, client, hardware, settings, **kwargs):
     last_clamped_center: Optional[float] = None
 
     try:
+        if profile_mode:
+            # No retry loop and no commitment: the caller wants the profile, and deciding
+            # anything from it is their job. The stage returns to z_start afterwards so a
+            # profiling run does not leave it parked wherever the traverse ended.
+            logger.info(
+                "STREAM_AF:profiling scan over [%.3f -> %.3f] (single pass, no peak commitment)",
+                profile_z_start,
+                profile_z_end,
+            )
+            final_result = _attempt_one_scan(
+                core,
+                focus_device,
+                speed_prop,
+                z_center=(profile_z_start + profile_z_end) / 2.0,
+                range_um=abs(profile_z_end - profile_z_start),
+                sequence_was_running_on_entry=sequence_was_running,
+                attempt_label="profile",
+                velocity_um_s=min_velocity_um_s,
+                metric_name=metric_name,
+                slow_value=eff_slow_value,
+                normal_value=eff_normal_value,
+                dump_dir=dump_root,
+                abort_event=abort_event,
+                head_discard_ms=eff_head_discard_ms,
+                z_endpoints=(profile_z_start, profile_z_end),
+            )
+            attempts_log.append(
+                f"profile: [{profile_z_start:.3f} -> {profile_z_end:.3f}] "
+                f"status={final_result.status} n={final_result.n_samples}"
+            )
+            try:
+                core.set_position(focus_device, float(profile_z_start))
+                _wait_via_busy(core, focus_device)
+            except Exception as e:
+                logger.warning("STREAM_AF:profiling could not return to z_start: %s", e)
+            # A profiling traverse always "succeeds" as a measurement; the client decides
+            # what the profile means. Reporting edge_* here would make the shared response
+            # block treat a perfectly good profile as a failed focus.
+            final_result = _ScanAttemptResult(
+                "success",
+                profile_z_start,
+                final_result.n_samples,
+                final_result.z_span,
+                "profiling traverse complete",
+                final_result.samples_trace,
+            )
+            max_attempts = 0
+
         if approach_mode:
             # A different strategy entirely, so it replaces the walk rather than
             # seeding it: setting max_attempts to 0 skips the retry loop below,

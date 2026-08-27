@@ -654,6 +654,64 @@ default edge-retry walk, ensuring autofocus behavior is unchanged when these
 parameters are not supplied. The `--tissue-gate` parameter has no effect when
 approach mode is not active.
 
+## Autofocus Profiling (--z-start, --z-end)
+
+The `STRMAFZ` command supports an explicit profiling mode to acquire the focus
+metric over a named interval without committing to any focus result. This is
+used for validation workflows that need the raw metric profile over a specific
+region to analyze focus behavior and measure safe-Z distances.
+
+### Profiling mode parameters
+
+```
+--z-start <micrometers>   # Start Z position for the profiling scan
+--z-end <micrometers>     # End Z position for the profiling scan
+```
+
+**Activation rule:** Profiling mode is enabled ONLY when BOTH `--z-start` AND
+`--z-end` are provided. If only one is given, the server logs a warning and
+ignores both. Profiling mode is **mutually exclusive** with approach-from-safe-Z
+mode (`--safe-z` / `--approach-max`).
+
+### Profiling behavior
+
+- **Single pass:** The stage scans exactly once from `z_start` to `z_end`, in
+  whichever Z direction that requires.
+- **No focus decision:** The metric profile is recorded and returned, but no peak
+  is committed. The focus is not updated.
+- **Return to start:** After the scan, the stage returns to `z_start`, so the
+  acquisition leaves the Z position unchanged from before the profiling run.
+- **Direction-agnostic:** Unlike the edge-retry walk (which always increments Z),
+  profiling supports scans in either direction: `z_end` can be greater than or
+  less than `z_start`.
+
+### Use case: Focus approach validation
+
+Profiling is used during Focus Approach Validation to measure safe-Z distances
+and validate that the sample is reachable:
+
+1. **Step 1: Profiling run** - Scan across the expected sample region and capture
+   the metric profile.
+2. **Step 2: Analyze profile** - Identify the focus peak, the safe-Z (clear of
+   sample), and the approach distance.
+3. **Step 3: Subsequent acquisitions** - Use the measured values with
+   `--safe-z` and `--approach-max` for bounded, repeatable focusing.
+
+### Example: Profiling scan
+
+```
+STREAMING_FOCUS --yaml config.yml --metric tenengrad \
+  --z-start -0.500 --z-end 0.500
+# Server scans from -0.500 mm to +0.500 mm, records the metric profile,
+# and returns the stage to -0.500 mm without committing to any focus.
+```
+
+### Backward compatibility
+
+Omitting `--z-start` and `--z-end` (or providing only one) disables profiling
+mode, ensuring autofocus behavior is unchanged when these parameters are not
+supplied.
+
 ## Installation
 
 **Part of [QPSC (QuPath Scope Control)](https://github.com/uw-loci/QPSC)**
