@@ -56,7 +56,7 @@ LCPOLSCOPE_CONFIG = ModalityConfig(
     # Channel modality: one "angle" per tile, five channels within it.
     default_angle_count=1,
     # Polarized transmitted light through a monochrome camera at a single
-    # wavelength (549 nm). White balance is meaningless here, and applying one
+    # wavelength (546 nm). White balance is meaningless here, and applying one
     # would rescale the states unequally -- see invariant 1 above.
     wb_settings_key=None,
     # Deliberately no angle_intensity_targets: the per-state brightness spread
@@ -97,11 +97,14 @@ ORIENTATION_COUNTS_PER_DEGREE = 100.0
 ORIENTATION_MAX_COUNTS = 18000
 
 # RETARDANCE uses an explicit scale of our own rather than OpenPolScope's.
-# Theirs is a single linear factor measured at ~1097.5 counts/nm, suspiciously
-# close to 2*wavelength, but the formula is undocumented and may be wavelength
-# dependent -- so reproducing it would mean guessing. Hundredths of a nanometre
+# Theirs is a single linear factor measured at ~1097.5 counts/nm. That is close
+# to 2*wavelength, but which wavelength is unclear and the agreement is not
+# clean enough to settle it: 2*549 = 1098 (0.05% away) fits better than
+# 2*546 = 1092 (0.5% away), yet the formula is undocumented, so the whole
+# resemblance may be a coincidence. Treat it as a loose end, not as evidence
+# for a wavelength. Either way, reproducing their scale would mean guessing. Hundredths of a nanometre
 # is far finer than the noise and spans 0..655 nm, while the algorithm caps
-# retardance at a quarter wave (137 nm at 549 nm), so there is ample headroom.
+# retardance at a quarter wave (137 nm at 546 nm), so there is ample headroom.
 RETARDANCE_COUNTS_PER_NM = 100.0
 _UINT16_MAX = 65535
 
