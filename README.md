@@ -550,6 +550,76 @@ instead of quantized 8-bit data.
 Omitting `--ppm-high-bit-depth` or setting it to `false` preserves the standard
 8-bit capture behavior, ensuring acquisitions are unchanged from prior releases.
 
+## Finding tissue before autofocus (FINDTISS)
+
+`FINDTISS` moves the stage in **XY** until the camera is looking at tissue. It never
+changes Z, exposure, or any camera setting -- the caller orders the pair itself:
+
+```
+MOVE -> FINDTISS -> STRMAFZ
+```
+
+### Why it exists
+
+A multi-slide batch predicts each slide's first alignment landmark from the base
+transform. Measured over 8 slides (2026-08-24) that prediction lands a median **613 um**
+from its target, worst case **1507 um**, which frequently puts the camera over blank
+glass. A focus scan there commits to coverslip contrast or walks its whole attempt budget
+and gives up.
+
+The second landmark, corrected by the first's translation, lands within **26 um**. So the
+base transform's error is very nearly a constant per-slide offset, and **only the first
+landmark of a slide needs this** -- which is the only place QPSC sends it.
+
+Alignment reach is *not* what is being fixed: SIFT matched at 1507 um with 796 inliers and
+0.999 confidence. The search only has to put tissue -- any tissue -- in view so the focus
+scan has something real to find.
+
+### Parameters
+
+```
+FINDTISS --yaml config_PPM.yml [--objective <id>] [--dir <dx>,<dy>] \
+         [--step <um>] [--max-attempts <n>] ENDOFSTR
+```
+
+- `--dir` is a stage-space hint toward where tissue is believed to be; only its bearing is
+  used. QPSC computes it as the vector from the predicted position toward the centre of the
+  tile grid. Malformed input is ignored with a warning rather than failing the command --
+  the search still works unhinted.
+- `--step` defaults to one camera FOV diagonal, the coarsest step that cannot skip ground.
+- `--max-attempts` counts the starting position. Default 7, capped at 25.
+
+### Search pattern
+
+`server/tissue_search.py` is pure geometry and unit-tested (`tests/test_tissue_search.py`).
+The first position is always where the caller already is. After that, positions lie on
+rings at whole multiples of `--step`: with a hint, three bearings per ring (down the hint,
+then +/-45 deg); without one, the four compass points then the diagonals. Reach is
+therefore `step * ((max_attempts - 1) // bearings_per_ring)`, so an attempt budget converts
+directly into a distance -- which is how the default was sized against the measurement
+above.
+
+Tissue is decided by the **same strategy validity check the acquisition path uses**
+(`texture_and_area` and friends, thresholds from `autofocus_<scope>.yml`), so there is no
+new metric to calibrate and no second definition of "has content" to drift.
+
+### Exposure is deliberately not adjusted
+
+The caller has just put the modality into its alignment reference state -- for PPM, the
+calibrated uncrossed angle and exposure -- and SIFT is about to match against that state.
+A brightness-chasing loop here would silently change what the next step depends on. This
+differs from the acquisition path's first-tile tissue search, which *does* double exposure:
+that one owns the camera state, this one borrows it.
+
+### Responses
+
+- `FOUND:<x>:<y>:<attempt>:<of>` -- the stage is standing at `(x, y)`.
+- `NOTFOUND:<x>:<y>:<of>` -- everything searched was background, and **the stage has been
+  put back where the search started**. A search that found nothing has no reason to prefer
+  its last guess over its first, and leaving the stage elsewhere would silently invalidate
+  the caller's own prediction.
+- `FAILED:<reason>` -- could not run at all. Nothing moved.
+
 ## Autofocus / Streaming Focus (--safe-z, --approach-max, --tissue-gate)
 
 The `STRMAFZ` command supports multiple autofocus strategies. The default

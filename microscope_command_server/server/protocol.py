@@ -158,6 +158,12 @@ class ExtendedCommand:
     # Cancel an in-progress STRMAFZ scan. Sent on the client's AUXILIARY
     # socket (the primary is blocked running STRMAFZ). Response: 'ACK'.
     ABORTAF = b"abortaf_"  # Abort streaming autofocus scan
+    # Move the stage until the camera is looking at tissue, so a focus scan has
+    # something to find. Pure XY -- it never touches Z or the exposure, and the
+    # caller orders it itself: MOVE -> FINDTISS -> STRMAFZ. Exists because a
+    # multi-slide batch's first predicted landmark lands a median 613 um off
+    # (worst 1507), often on blank glass. See handlers/find_tissue.py.
+    FINDTISS = b"findtiss"  # Search XY for tissue before autofocus
     RPDSCAN = b"rpdscan_"  # Rapid scan -- fast tiled brightfield, no AF, no Z
 
     # Illumination & Profile Commands

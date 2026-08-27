@@ -104,6 +104,7 @@ from microscope_command_server.server.handlers.system import (
 )
 from microscope_command_server.server.handlers.probez import handle_probez
 from microscope_command_server.server.handlers.probe_stage_af import handle_probe_stage_af
+from microscope_command_server.server.handlers.find_tissue import handle_findtissue
 from microscope_command_server.server.handlers.streaming_focus import (
     handle_streaming_focus,
     handle_abort_af,
@@ -200,6 +201,7 @@ COMMAND_HANDLERS = {
     # Streaming autofocus
     ExtendedCommand.STRMAFZ: handle_streaming_focus,
     ExtendedCommand.ABORTAF: handle_abort_af,
+    ExtendedCommand.FINDTISS: handle_findtissue,
     # Rapid scan
     ExtendedCommand.RPDSCAN: handle_rapid_scan,
 }
