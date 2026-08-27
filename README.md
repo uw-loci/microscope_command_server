@@ -712,6 +712,65 @@ Omitting `--z-start` and `--z-end` (or providing only one) disables profiling
 mode, ensuring autofocus behavior is unchanged when these parameters are not
 supplied.
 
+## Autofocus diagnostics (`--dump`, `--dump-label`, `--dump-frames`)
+
+`STRMAFZ` can write the scan out to disk for offline analysis.
+
+```
+--dump 1              enable the dump (CSV traces + manifest)
+--dump-label <text>   append a label to the folder name
+--dump-frames 1       ALSO write one TIF per sample
+```
+
+`--dump 1` writes the traces and the manifest. Frames are **not** written unless
+`--dump-frames` is also set: they are several hundred TIFs, often ~750 MB per scan,
+whereas the traces are a few kB and are what the analysis actually reads.
+
+`--dump-label` exists because a focus-approach validation performs two scans -- one
+over tissue and one over blank slide -- and both would otherwise land as
+`streaming_af_<timestamp>`, indistinguishable without opening them. Anything outside
+`[A-Za-z0-9_-]` is replaced with `-`, and the result is truncated to 40 characters.
+
+### Layout
+
+```
+<yaml_dir>/autofocus_tests/streaming_af_<TIMESTAMP>[_<LABEL>]/
+    samples.csv       idx, wall_ms, z_assumed_um, z_actual_um, metric
+    z_poll.csv        wall_ms, z_actual_um   -- the raw stage-position poll
+    manifest.json     scan parameters and summary
+    frames/           ONLY when --dump-frames is set
+        frame_0000_t000093ms_zass-001.072.tif
+        ...
+```
+
+`samples.csv` carries both Z columns on purpose. `z_actual_um` is interpolated from
+the poll trace and is what the focus fit uses; `z_assumed_um` is the old
+`wall_ms * velocity` model, kept so the two can be compared. They diverge whenever
+`slow_speed_um_per_s` is mis-calibrated, and the divergence grows with distance
+travelled -- see *Where a sample's Z comes from* in the QPSC autofocus documentation.
+
+`manifest.json` records `z_start`, `z_end`, `velocity_um_s_configured`,
+`motion_duration_ms`, `metric_name`, `n_kept_samples`, `n_z_poll_samples`,
+`frames_written`, and the observed average velocity from the poll trace.
+
+The retry walk gives each attempt its own `attempt_<N>/` subfolder; a single-pass
+profiling or approach scan writes straight into the dump root. Readers should handle
+both.
+
+### Example
+
+A profiling traverse from a retracted safe Z of 0 um in to -267 um, over tissue,
+keeping only the traces:
+
+```
+STRMAFZ --yaml config_PPM.yml --modality ppm --range 267.0 \
+        --z-start 0.0 --z-end -267.0 \
+        --max-attempts 1 --dump 1 --dump-label tissue
+```
+
+Repeat it over a bare part of the same slide with `--dump-label blank`. Any peak
+present in both is a surface rather than the sample.
+
 ## Installation
 
 **Part of [QPSC (QuPath Scope Control)](https://github.com/uw-loci/QPSC)**
