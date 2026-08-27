@@ -36,7 +36,14 @@ Protocol (reuses the existing "--flag value" text payload pattern):
              --range <um>            (optional override of sweep_range_um)
              --modality <name>       (optional; selects metric/threshold profile)
              --crop-factor <0..1]    (optional override of DEFAULT_CROP_FACTOR)
-             --dump 1                (optional; per-sample TIF + CSV diagnostic)
+             --dump 1                (optional; CSV + manifest diagnostic. Frames
+                                      are NOT written unless --dump-frames is set)
+             --dump-label <text>     (optional; appended to the dump folder name so
+                                      runs are identifiable afterwards, e.g. the
+                                      "tissue" and "background" halves of a focus
+                                      approach validation)
+             --dump-frames 1         (optional; also write one TIF per sample.
+                                      Hundreds of files, often ~750 MB per scan)
              --max-attempts <N>      (optional; caps the edge-retry walk to N
                                       scans. Default MAX_EDGE_RETRIES+1=3. Pass
                                       1 from acquisition tile-AF so a tight
@@ -102,6 +109,7 @@ cross-check the implementation can find the upstream source.
 
 import logging
 import math
+import re
 import threading
 import time
 from concurrent.futures import Future, ThreadPoolExecutor
@@ -1630,6 +1638,7 @@ def _run_streaming_scan(
     dump_dir: Optional[Path] = None,
     secondary_metric_name: Optional[str] = None,
     abort_event: Optional[threading.Event] = None,
+    dump_frames: bool = True,
 ) -> List[Tuple[float, float, float, Optional[float]]]:
     """Execute the streaming-sample scan and return a list of
     (t_capture_ms, z_interp, metric) triples. Leaves the camera in
@@ -2291,6 +2300,7 @@ def _run_streaming_scan(
             velocity_um_s,
             motion_duration_ms,
             metric_name,
+            dump_frames,
         )
         _pending_dump_futures.append(fut)
 
@@ -2323,6 +2333,7 @@ def _dump_streaming_scan_safe(
     velocity_um_s,
     motion_duration_ms,
     metric_name,
+    write_frames=True,
 ) -> None:
     """Background wrapper around _dump_streaming_scan that swallows
     errors so a failed dump can never bubble back into the request
@@ -2337,6 +2348,7 @@ def _dump_streaming_scan_safe(
             velocity_um_s=velocity_um_s,
             motion_duration_ms=motion_duration_ms,
             metric_name=metric_name,
+            write_frames=write_frames,
         )
     except Exception as e:
         logger.warning("STREAM_AF:background dump failed (non-fatal): %s", e)
@@ -2371,6 +2383,7 @@ def _dump_streaming_scan(
     velocity_um_s: float,
     motion_duration_ms: float,
     metric_name: str,
+    write_frames: bool = True,
 ) -> None:
     """Write per-sample TIFs + a CSV trace + a manifest into dump_dir.
 
@@ -2397,7 +2410,8 @@ def _dump_streaming_scan(
 
     dump_dir.mkdir(parents=True, exist_ok=True)
     frames_dir = dump_dir / "frames"
-    frames_dir.mkdir(parents=True, exist_ok=True)
+    if write_frames:
+        frames_dir.mkdir(parents=True, exist_ok=True)
 
     # Pre-build the sorted z_poll arrays for O(log n) interpolation.
     poll_t = np.asarray([t for (t, _) in z_poll_samples], dtype=np.float64)
@@ -2427,6 +2441,8 @@ def _dump_streaming_scan(
                     f"{metric:.6f}",
                 ]
             )
+            if not write_frames:
+                continue
             tif_name = (
                 f"frame_{idx:04d}_t{int(round(wall_ms)):06d}ms_" f"zass{z_assumed:+09.3f}.tif"
             ).replace(" ", "0")
@@ -2457,6 +2473,7 @@ def _dump_streaming_scan(
         "motion_duration_ms": motion_duration_ms,
         "metric_name": metric_name,
         "n_kept_samples": len(dump_records),
+        "frames_written": bool(write_frames),
         "n_z_poll_samples": len(z_poll_samples),
     }
     if z_poll_samples:
@@ -2565,6 +2582,7 @@ def _attempt_one_scan(
     slow_value: str = SLOW_SPEED_VALUE,
     normal_value: str = NORMAL_SPEED_VALUE,
     dump_dir: Optional[Path] = None,
+    dump_frames: bool = True,
     secondary_metric_name: Optional[str] = None,
     abort_event: Optional[threading.Event] = None,
     head_discard_ms: float = DEFAULT_HEAD_DISCARD_MS,
@@ -2699,6 +2717,7 @@ def _attempt_one_scan(
                     velocity_um_s=velocity_um_s,
                     metric_name=metric_name,
                     dump_dir=dump_dir,
+                    dump_frames=dump_frames,
                     secondary_metric_name=secondary_metric_name,
                     abort_event=abort_event,
                 )
@@ -3530,6 +3549,7 @@ def _approach_from_safe_z(
     dump_dir: Optional[Path] = None,
     abort_event: Optional[threading.Event] = None,
     head_discard_ms: float = DEFAULT_HEAD_DISCARD_MS,
+    dump_frames: bool = True,
 ) -> _ScanAttemptResult:
     """Retract to safe_z, then approach the sample once and commit to the first
     justified peak.
@@ -3594,6 +3614,7 @@ def _approach_from_safe_z(
         slow_value=slow_value,
         normal_value=normal_value,
         dump_dir=dump_dir,
+        dump_frames=dump_frames,
         abort_event=abort_event,
         head_discard_ms=head_discard_ms,
     )
@@ -3879,6 +3900,8 @@ def handle_streaming_focus(conn, client, hardware, settings, **kwargs):
             "--modality",
             "--crop-factor",
             "--dump",
+            "--dump-label",
+            "--dump-frames",
             "--max-attempts",
             "--safe-z",
             "--approach-max",
@@ -3888,6 +3911,8 @@ def handle_streaming_focus(conn, client, hardware, settings, **kwargs):
         ],
     )
     yaml_path = params.get("yaml")
+    dump_label = params.get("dump-label")
+    dump_frames_flag = params.get("dump-frames")
     client_objective = params.get("objective")
     range_override_str = params.get("range")
     client_modality = params.get("modality")
@@ -4011,12 +4036,35 @@ def handle_streaming_focus(conn, client, hardware, settings, **kwargs):
         "false",
         "no",
     )
+    # Frames are the bulk of a dump -- several hundred TIFs, often ~750 MB. The CSVs and
+    # manifest are a few kB and are what the analysis actually reads, so they are always
+    # written and the frames are opt-in.
+    dump_frames = bool(dump_frames_flag) and str(dump_frames_flag).strip().lower() not in (
+        "0",
+        "false",
+        "no",
+    )
     if dump_enabled:
         try:
             timestamp = time.strftime("%Y%m%d_%H%M%S")
-            dump_root = Path(yaml_path).parent / "autofocus_tests" / f"streaming_af_{timestamp}"
+            # A caller-supplied label goes in the folder name. Without it the directory is
+            # just streaming_af_<timestamp>, and a validation run produces two of those --
+            # one over tissue and one over blank slide -- which are indistinguishable
+            # afterwards without opening them and guessing from the curve.
+            suffix = ""
+            if dump_label:
+                safe = re.sub(r"[^A-Za-z0-9_-]+", "-", str(dump_label)).strip("-")[:40]
+                if safe:
+                    suffix = "_" + safe
+            dump_root = (
+                Path(yaml_path).parent / "autofocus_tests" / f"streaming_af_{timestamp}{suffix}"
+            )
             dump_root.mkdir(parents=True, exist_ok=True)
-            logger.info("STREAM_AF:dump enabled, writing to %s", dump_root)
+            logger.info(
+                "STREAM_AF:dump enabled, writing to %s (frames %s)",
+                dump_root,
+                "ON" if dump_frames else "off -- CSVs and manifest only",
+            )
         except Exception as e:
             logger.warning(
                 "STREAM_AF:could not create dump dir (%s); " "continuing without dump",
@@ -4536,6 +4584,7 @@ def handle_streaming_focus(conn, client, hardware, settings, **kwargs):
                 slow_value=eff_slow_value,
                 normal_value=eff_normal_value,
                 dump_dir=dump_root,
+                dump_frames=dump_frames,
                 abort_event=abort_event,
                 head_discard_ms=eff_head_discard_ms,
                 z_endpoints=(profile_z_start, profile_z_end),
@@ -4592,6 +4641,7 @@ def handle_streaming_focus(conn, client, hardware, settings, **kwargs):
                 z_high=z_high,
                 initial_z=initial_z,
                 dump_dir=dump_root,
+                dump_frames=dump_frames,
                 abort_event=abort_event,
                 head_discard_ms=eff_head_discard_ms,
             )
@@ -4709,6 +4759,7 @@ def handle_streaming_focus(conn, client, hardware, settings, **kwargs):
                 slow_value=eff_slow_value,
                 normal_value=eff_normal_value,
                 dump_dir=attempt_dump_dir,
+                dump_frames=dump_frames,
                 secondary_metric_name=secondary_metric_name,
                 abort_event=abort_event,
                 head_discard_ms=eff_head_discard_ms,
