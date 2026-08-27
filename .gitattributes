@@ -1,3 +1,5 @@
 # Batch files must keep CRLF: cmd.exe mishandles LF-only files around
 # labels and goto, which is exactly what the launcher relies on.
 *.bat text eol=crlf
+# The template is copied to server_env.bat on the rig, so it needs the same.
+*.bat.example text eol=crlf
