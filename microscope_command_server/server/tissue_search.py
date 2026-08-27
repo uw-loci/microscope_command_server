@@ -14,11 +14,15 @@ second landmark, corrected by the first's translation, lands within **26 um** --
 error is very nearly a CONSTANT PER-SLIDE OFFSET, and only the FIRST landmark of each
 slide needs help.
 
-What that help has to achieve is narrower than it first appears. SIFT already matched
-at 1507 um (796 inliers, confidence 0.999), so alignment reach is not the problem. What
-breaks is AUTOFOCUS: at 613 um from target the camera is often over blank glass, where a
-focus scan has no tissue to find. **So the search only has to land on tissue -- any
-tissue -- not on the intended tile.** Once focus is real, SIFT does the rest.
+What that help has to achieve is narrower than it first appears. What breaks at 613 um
+from target is AUTOFOCUS: the camera is often over blank glass, where a focus scan has no
+tissue to find. **So the search only has to land on tissue -- any tissue -- not on the
+intended tile**, because what the caller keeps from it is a Z value, not a position.
+
+That distinction is load-bearing. The caller drives back to its predicted position once
+focus is measured, and it has to: the alignment step that follows matches against a WSI
+region anchored on the TILE, so a camera left where the search stopped would be outside it
+entirely. Finding tissue is a means to a focus, not a new place to align from.
 
 That is why the pattern below is coarse rings rather than a fine raster: it is looking
 for the tissue mass, not for a specific field of view. A direction hint, when the caller

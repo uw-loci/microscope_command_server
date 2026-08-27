@@ -9,10 +9,11 @@ focus scan there has nothing to find -- it reports a peak from coverslip contras
 walks its whole attempt budget and gives up. The alignment that follows is then done
 against an out-of-focus view.
 
-SIFT is NOT the problem: it matched at 1507 um with 796 inliers. So the fix is purely
-"put the camera on tissue before focusing", which is an XY operation with no opinion
-about Z. Keeping it as its own verb means the (already subtle, already tuned) streaming
-autofocus path is untouched, and the caller can order the two itself:
+The fix is purely "put the camera on tissue before focusing", which is an XY operation with
+no opinion about Z. What the caller keeps is the Z: it drives back to its predicted position
+afterwards, because the alignment step that follows matches against a region anchored on the
+intended tile. Keeping this as its own verb means the (already subtle, already tuned)
+streaming autofocus path is untouched, and the caller can order the two itself:
 
     MOVE -> FINDTISS -> STRMAFZ -> SIFT
 

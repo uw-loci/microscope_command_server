@@ -723,9 +723,15 @@ The second landmark, corrected by the first's translation, lands within **26 um*
 base transform's error is very nearly a constant per-slide offset, and **only the first
 landmark of a slide needs this** -- which is the only place QPSC sends it.
 
-Alignment reach is *not* what is being fixed: SIFT matched at 1507 um with 796 inliers and
-0.999 confidence. The search only has to put tissue -- any tissue -- in view so the focus
-scan has something real to find.
+Alignment reach is *not* what is being fixed. The search only has to put tissue -- any
+tissue -- in view so the focus scan has something real to find.
+
+**`FOUND` leaves the stage at the tissue, and the caller is expected to leave again.** What
+it keeps is the Z. QPSC focuses at the found position and then drives back to the position it
+predicted, because the alignment step that follows matches against a WSI region anchored on
+the intended TILE: a camera several hundred micrometres away has no overlap with it. Treating
+the found position as a new place to align from would trade a focus scan over glass for an
+alignment that cannot match.
 
 ### Parameters
 
