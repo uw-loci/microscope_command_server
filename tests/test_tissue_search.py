@@ -12,6 +12,7 @@ import pytest
 from microscope_command_server.server.tissue_search import (
     DEFAULT_RINGS,
     FAN_DEGREES,
+    MAX_ATTEMPTS_CEILING,
     default_max_attempts,
     parse_direction,
     search_offsets,
@@ -59,40 +60,61 @@ class TestSearchOffsets:
         long = search_offsets((9999.0, 0.0), 400.0, 4)
         assert short == long
 
-    def test_search_fans_either_side_of_the_hint(self):
+    def test_search_tries_the_hint_then_either_side_of_it(self):
         offsets = search_offsets((1.0, 0.0), 400.0, 4)
-        bearings = sorted(_bearing(o) for o in offsets[1:])
-        assert bearings == pytest.approx(sorted([0.0, FAN_DEGREES, 360.0 - FAN_DEGREES]))
+        assert [_bearing(o) for o in offsets[1:]] == pytest.approx(
+            [0.0, FAN_DEGREES, 360.0 - FAN_DEGREES]
+        )
+
+    def test_a_hinted_ring_is_still_a_complete_ring(self):
+        # The regression this guards is the one that made a wrong hint fatal. The hint is
+        # measured in the transform's own frame, and the transform is off by the very offset
+        # the search exists to defeat -- so its angular error is unbounded when the predicted
+        # point sits near the tile-grid centre, which is exactly where the reference-tile
+        # picker tends to aim. A pattern that only swept +/-45 deg of the hint would then
+        # march two rings the wrong way and report NOTFOUND with tissue behind it.
+        hinted = search_offsets((1.0, 0.0), 400.0, 9)
+        unhinted = search_offsets(None, 400.0, 9)
+        assert sorted(_bearing(o) for o in hinted[1:]) == pytest.approx(
+            sorted(_bearing(o) for o in unhinted[1:])
+        )
+        # ... and the hint still decides the ORDER, which is the whole value of having one.
+        assert _bearing(hinted[1]) == pytest.approx(0.0)
+
+    def test_a_reversed_hint_still_reaches_the_tissue_behind_it(self):
+        # A hint pointing 180 deg away from the truth must cost attempts, not the slide.
+        offsets = search_offsets((1.0, 0.0), 400.0, default_max_attempts((1.0, 0.0)))
+        opposite = [o for o in offsets[1:] if _bearing(o) == pytest.approx(180.0)]
+        assert opposite, "the bearing opposite the hint is never visited"
+        assert _radius(opposite[0]) == pytest.approx(400.0), "and it is reached on ring 1"
 
     def test_radius_grows_one_step_per_ring(self):
         # An attempt budget must translate directly into a reach, so a caller can size it
         # against a measured landing error.
-        offsets = search_offsets((1.0, 0.0), 400.0, 7)
-        assert [_radius(o) for o in offsets] == pytest.approx(
-            [0.0, 400.0, 400.0, 400.0, 800.0, 800.0, 800.0]
-        )
+        offsets = search_offsets((1.0, 0.0), 400.0, 11)
+        assert [_radius(o) for o in offsets] == pytest.approx([0.0] + [400.0] * 8 + [800.0] * 2)
 
     def test_reach_is_the_sizing_number_against_the_measured_landing_error(self):
         # The budget has to be chosen against a measurement, so pin down what each one
-        # buys. At a 446 um FOV diagonal and 3 bearings per ring, reach is
-        # 446 * ((n - 1) // 3): the hinted default covers the measured MEDIAN landing error
-        # of 613 um outright, and the 1507 um worst case needs four rings.
+        # buys. At a 446 um FOV diagonal and 8 bearings per ring, the radius swept in EVERY
+        # direction is 446 * ((n - 1) // 8): the default covers the measured MEDIAN landing
+        # error of 613 um outright, and the 1507 um worst case needs four rings.
         def reach(n):
             return max(_radius(o) for o in search_offsets((1.0, 0.0), 446.0, n))
 
-        assert reach(4) == pytest.approx(446.0)
-        assert reach(4) < 613.0, "one ring does not reach the median error on its own"
+        assert reach(9) == pytest.approx(446.0)
+        assert reach(9) < 613.0, "one ring does not reach the median error on its own"
         assert reach(default_max_attempts((1.0, 0.0))) >= 613.0
         assert reach(default_max_attempts((1.0, 0.0))) < 1507.0
-        assert reach(13) >= 1507.0
+        assert reach(MAX_ATTEMPTS_CEILING) >= 1507.0, "the ceiling can still cover the worst case"
 
     @pytest.mark.parametrize("direction", [(1.0, 0.0), None])
     def test_default_budget_is_always_a_whole_number_of_rings(self, direction):
-        # The regression this guards: one fixed attempt count cannot mean "whole rings" for
-        # both patterns, because they have different bearing counts (3 around a hint, 8
-        # around the compass). A budget that stops mid-ring biases the search toward
-        # whichever bearings are enumerated first -- the exact thing the ring structure
-        # exists to prevent. A fixed 7 did this to the unhinted sweep, leaving it 6/8 done.
+        # A budget that stops mid-ring biases the search toward whichever bearings are
+        # enumerated first -- the exact thing the ring structure exists to prevent. With a
+        # hint, "enumerated first" means "wherever the hint pointed", so a partial ring puts
+        # the bias precisely where the hint is least trustworthy. Deriving the budget from
+        # the bearing count is what keeps that from happening.
         n = default_max_attempts(direction)
         offsets = search_offsets(direction, 446.0, n)
         assert len(offsets) == n
@@ -102,8 +124,11 @@ class TestSearchOffsets:
             at_this_radius = sum(1 for o in offsets if _radius(o) == pytest.approx(ring * 446.0))
             assert at_this_radius == per_ring, f"ring {ring} is not fully swept"
 
-    def test_unhinted_search_costs_more_because_it_knows_less(self):
-        assert default_max_attempts(None) > default_max_attempts((1.0, 0.0))
+    def test_hinting_does_not_change_the_budget_only_the_order(self):
+        # Both sweep complete rings, so both cost the same in the worst case. What a hint
+        # buys is an EARLY exit, which does not show up in the offset list -- it shows up in
+        # the search returning at attempt 2 instead of attempt 7.
+        assert default_max_attempts(None) == default_max_attempts((1.0, 0.0))
 
     def test_no_hint_sweeps_the_compass(self):
         offsets = search_offsets(None, 400.0, 5)

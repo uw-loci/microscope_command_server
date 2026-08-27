@@ -750,21 +750,31 @@ FINDTISS --yaml config_PPM.yml [--modality <name>] [--objective <id>] [--dir <dx
   (267 um), which would need far more positions for the same reach. Gaps are acceptable
   here because the target is a tissue mass many fields across, not a specific field --
   the same trade the acquisition path's own first-tile search makes.
-- `--max-attempts` counts the starting position. Default is two complete rings, which is
-  **7 with a direction hint and 17 without** (three bearings per ring versus eight); capped
-  at 25. It is not one fixed number because that cannot mean "whole rings" for both
-  patterns, and a budget stopping mid-ring biases the search toward whichever bearings are
-  enumerated first.
+- `--max-attempts` counts the starting position. Default is two complete rings, **17
+  either way** -- a hint reorders a ring, it does not shrink one. Capped at 33 (four rings,
+  what the measured 1507 um worst case needs at a 446 um step). Derived from the bearing
+  count rather than written as a literal, because a budget stopping mid-ring biases the
+  search toward whichever bearings are enumerated first -- and with a hint, that is exactly
+  where the hint is least trustworthy.
 
 ### Search pattern
 
 `server/tissue_search.py` is pure geometry and unit-tested (`tests/test_tissue_search.py`).
 The first position is always where the caller already is. After that, positions lie on
-rings at whole multiples of `--step`: with a hint, three bearings per ring (down the hint,
-then +/-45 deg); without one, the four compass points then the four diagonals. Reach is
-therefore `step * ((max_attempts - 1) // bearings_per_ring)`, so an attempt budget converts
-directly into a distance -- which is how the default was sized against the measurement
-above.
+rings at whole multiples of `--step`, eight bearings to a ring. The radius swept in every
+direction is `step * ((max_attempts - 1) // 8)`, so an attempt budget converts directly
+into a distance -- which is how the default was sized against the measurement above.
+
+**A hint orders a ring; it never trims one.** `--dir` sorts the ring's bearings
+nearest-first (down the hint, then +/-45, out to 180), so a good hint returns on the first
+or second position. It deliberately does NOT restrict the search to a fan. The hint is the
+vector from the predicted position to the tile-grid centre, measured in the transform's own
+frame -- and that transform is off by the very offset the search exists to defeat, which
+displaces both ends of the vector. Its angular error is about `asin(offset / separation)`:
+negligible when the predicted point is far from the grid centre, **unbounded when it is
+close**. Close is the common case, because the caller's tile picker favours interior,
+high-texture tiles, which on a compact section sit near the middle. A +/-45 deg fan would
+then march two rings the wrong way and report NOTFOUND with tissue directly behind it.
 
 ### How tissue is decided
 
@@ -792,6 +802,17 @@ straight at some.
 A modality bound to a manual-only strategy resolves to `always_false`, which no search can
 satisfy. That returns `FAILED:no-automatic-tissue-check-for-this-modality` immediately,
 **without moving the stage**, instead of walking the pattern to a foregone `NOTFOUND`.
+
+### Frames come from the live stream when there is one
+
+With the Live Viewer streaming -- which is the state the caller has just put the rig in so
+SIFT can work -- the camera holds a buffer of frames from before and during the move just
+made. Reading one of those judges the PREVIOUS position, which is how a search reports
+tissue at a place that has none. So after each move the buffer is drained and the next
+frame to arrive is used. It is also ~400 ms per position cheaper than a blocking JAI snap
+(17 positions: seven seconds a slide), and it carries the LIVE exposure, which is the state
+SIFT will match against. Falls back to `snap_image()` whenever no sequence is running or no
+stream frame arrives within 250 ms.
 
 ### Exposure is deliberately not adjusted
 

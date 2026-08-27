@@ -20,8 +20,10 @@ breaks is AUTOFOCUS: at 613 um from target the camera is often over blank glass,
 focus scan has no tissue to find. **So the search only has to land on tissue -- any
 tissue -- not on the intended tile.** Once focus is real, SIFT does the rest.
 
-That is why the pattern below is a coarse fan rather than a fine raster: it is looking
-for the tissue mass, not for a specific field of view.
+That is why the pattern below is coarse rings rather than a fine raster: it is looking
+for the tissue mass, not for a specific field of view. A direction hint, when the caller
+has one, decides the ORDER bearings are tried in and never which ones are tried at all --
+see ``_HINT_OFFSETS_DEGREES`` for why trimming the ring to a fan was wrong.
 """
 
 import math
@@ -33,14 +35,20 @@ from typing import List, Optional, Sequence, Tuple
 #: knows whether anyone is waiting.
 DEFAULT_RINGS = 2
 
-#: Hard cap on the attempt budget. Each attempt is a stage move plus a snap, so a
-#: mistyped budget should degrade the search, not park the socket for ten minutes.
-MAX_ATTEMPTS_CEILING = 25
+#: Hard cap on the attempt budget. Each attempt is a stage move plus a snap, so a mistyped
+#: budget should degrade the search, not park the socket for ten minutes.
+#:
+#: Sized so the ceiling can still cover the measured WORST landing error, 1507 um: at a
+#: 446 um FOV diagonal that needs four complete rings, and at eight bearings a ring that is
+#: 1 + 4 * 8 = 33. The old 25 predates rings being complete -- with three bearings it bought
+#: eight rings, and with eight it silently bought only three, putting the worst case out of
+#: reach even for a caller who explicitly asked for it. Roughly 100 s of stage time at the
+#: cap, which is why MicroscopeSocketClient allows 180 s for the round trip.
+MAX_ATTEMPTS_CEILING = 33
 
-# Lateral spread either side of the direction hint, in degrees. The hint says which way
-# the tissue lies, but it is derived from a transform that has just been shown to be off
-# by more than a field of view -- so the pattern hedges around it instead of marching
-# down a single ray that a wrong hint would waste every attempt on.
+# Angular granularity of a ring: eight bearings, 45 degrees apart. Fine enough that a
+# ring cannot slip past a tissue mass many fields across, coarse enough that a ring is
+# eight snaps rather than thirty.
 FAN_DEGREES = 45.0
 
 # Bearings tried at each radius when there is no usable direction hint: the four
@@ -48,16 +56,39 @@ FAN_DEGREES = 45.0
 # nothing says which way to go.
 _COMPASS_DEGREES = (0.0, 90.0, 180.0, 270.0, 45.0, 135.0, 225.0, 315.0)
 
+# Offsets from the hint's heading, in visit order. Every ring is a COMPLETE ring either
+# way -- the hint only decides what order the bearings are tried in.
+#
+# It used to restrict the ring to a +/-45 deg fan, which is wrong for a reason specific to
+# how the hint is built. The hint is the vector from the predicted position to the tile
+# grid's centre, computed in the transform's own frame -- but the transform is off by the
+# very offset the search exists to defeat (median 613 um, worst 1507 um), and that offset
+# displaces both ends. So the hint's angular error is roughly asin(offset / separation):
+# tiny when the predicted point is far from the grid centre, and UNBOUNDED when it is
+# close. Close is the common case, because the reference tile picker deliberately favours
+# interior, high-texture tiles -- which on a compact section sit near the middle. A fan
+# would then march two rings down a bearing that can be 180 deg wrong and report NOTFOUND
+# with the tissue directly behind it.
+#
+# Ordering costs nothing when the hint is good (the search returns on its first or second
+# position) and cannot fail when the hint is bad, so there is no separation threshold to
+# calibrate and no case where hinting is worse than not hinting.
+_HINT_OFFSETS_DEGREES = (0.0, 45.0, -45.0, 90.0, -90.0, 135.0, -135.0, 180.0)
+
 
 def default_max_attempts(direction: Optional[Sequence[float]]) -> int:
-    """Attempt budget for {DEFAULT_RINGS} complete rings, given whether there is a hint.
+    """Attempt budget for {DEFAULT_RINGS} complete rings.
 
-    Deliberately NOT a single constant. The two patterns have different bearing counts (3
-    around a hint, 8 around the compass), so one number cannot mean "whole rings" for both:
-    a fixed 7 sweeps two full rings when hinted, but leaves the unhinted ring 6/8 done --
-    biasing the search toward whichever bearings happen to be enumerated first, which is the
-    one property the ring structure exists to avoid. Searching unhinted costs more because
-    knowing nothing about where the tissue lies genuinely is more work.
+    Derived from the bearing count rather than written as a literal, so a budget always
+    means WHOLE rings. A budget that stops mid-ring biases the search toward whichever
+    bearings are enumerated first, which is the one property the ring structure exists to
+    avoid -- and with a hint, "enumerated first" means "wherever the hint pointed", so the
+    bias would land exactly where the hint is least trustworthy.
+
+    Hinted and unhinted currently agree (both rings are complete rings), and that is the
+    point: the hint reorders a ring, it does not shrink one. The parameter stays so a
+    future pattern with a different bearing count cannot silently reintroduce a partial
+    ring.
     """
     return 1 + DEFAULT_RINGS * len(_bearings_for(direction))
 
@@ -71,8 +102,10 @@ def search_offsets(
 
     The first offset is always ``(0.0, 0.0)``: check where the transform actually put us
     before moving anywhere. Every later offset lies on a ring at a whole multiple of
-    ``step_um``, so an attempt budget translates directly into a reach --
-    ``step_um * ceil((max_attempts - 1) / bearings)``.
+    ``step_um``, so an attempt budget translates directly into a reach. The FARTHEST
+    position visited is at ``step_um * ceil((max_attempts - 1) / bearings)``; the farthest
+    radius swept in EVERY direction -- the number to size a budget against -- is
+    ``step_um * ((max_attempts - 1) // bearings)``.
 
     :param direction: stage-space vector pointing at where tissue is believed to be. Its
         length is ignored (only the bearing is used). ``None``, too short to have a
@@ -102,13 +135,16 @@ def search_offsets(
 
 
 def _bearings_for(direction: Optional[Sequence[float]]) -> Tuple[float, ...]:
-    """Bearings to sweep at each radius: hint-first fan, or the compass when unhinted."""
+    """Bearings to sweep at each radius, nearest the hint first, or the plain compass.
+
+    A complete ring either way; see _HINT_OFFSETS_DEGREES for why the hint orders the ring
+    rather than trimming it. A hint that is right costs one attempt; a hint that is 180 deg
+    wrong costs a full ring instead of costing the slide.
+    """
     heading = _heading_degrees(direction)
     if heading is None:
         return _COMPASS_DEGREES
-    # Straight down the hint first, then either side of it. A hint that is right costs
-    # one attempt; a hint that is 45 deg out costs two.
-    return (heading, heading + FAN_DEGREES, heading - FAN_DEGREES)
+    return tuple(heading + offset for offset in _HINT_OFFSETS_DEGREES)
 
 
 def _heading_degrees(direction: Optional[Sequence[float]]) -> Optional[float]:

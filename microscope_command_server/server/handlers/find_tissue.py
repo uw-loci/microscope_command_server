@@ -29,6 +29,7 @@ validity check are reported as such rather than corrected.
 """
 
 import logging
+import time
 from typing import Any, Dict, Optional, Tuple
 
 import numpy as np
@@ -43,6 +44,11 @@ from microscope_command_server.server.tissue_search import (
 )
 
 logger = logging.getLogger(__name__)
+
+#: How long to wait for a frame from a running stream before falling back to a blocking
+#: snap. Generous at any realistic frame rate (30 fps is 33 ms), and the fallback is
+#: correct anyway -- this only decides how long we hope to save 400 ms.
+FRESH_FRAME_WAIT_S = 0.25
 
 
 def _return_to_start(hardware, x: float, y: float, z: float) -> None:
@@ -71,6 +77,64 @@ def _reply(conn, text: str) -> None:
         conn.sendall(text.encode())
     except Exception as e:
         logger.error("FINDTISS:reply send failed (%s): %s", text.split(":", 1)[0], e)
+
+
+def _fresh_frame(hardware):
+    """One frame that is definitely from AFTER the stage move, as cheaply as possible.
+
+    Two reasons this is not just ``hardware.snap_image()``.
+
+    STALENESS, which would be a wrong answer rather than a slow one. FINDTISS runs with the
+    Live Viewer streaming -- ``AlignmentLivePrep`` puts the rig there so SIFT can work -- so
+    the camera has a circular buffer of frames captured before and during the move we just
+    made. Reading one of those evaluates the PREVIOUS position, which is how a search
+    reports tissue at a place that does not have any. Draining the buffer first and taking
+    the next frame to arrive is what makes the frame belong to where the stage now is.
+
+    COST. A blocking snap on the JAI is ~400 ms -- the streaming-AF handler calls it "the
+    single biggest fixed cost" and pops a stream frame instead for exactly this reason.
+    Over a 17-position sweep that is seven seconds of pure snap overhead per slide.
+
+    Falls back to a plain snap whenever no sequence is running or the buffer path does not
+    produce a frame in time; a snap is always correct, just slower.
+
+    A side benefit worth keeping: a stream frame carries the LIVE exposure, which is the
+    state SIFT is about to match against. Snap and live exposures are separately held on the
+    JAI and have drifted apart before, so judging tissue from the same frames the alignment
+    will use is the more honest test as well as the cheaper one.
+    """
+    core = getattr(hardware, "core", None)
+    sequence_running = False
+    if core is not None:
+        try:
+            sequence_running = bool(core.is_sequence_running())
+        except Exception as e:
+            logger.debug("FINDTISS:could not query the sequence state (%s); snapping", e)
+
+    if sequence_running:
+        try:
+            from microscope_command_server.server.handlers.streaming_focus import (
+                _pop_image_as_numpy,
+            )
+
+            # Everything already buffered predates this position. Drop it.
+            core.clear_circular_buffer()
+            deadline = time.perf_counter() + FRESH_FRAME_WAIT_S
+            while time.perf_counter() < deadline:
+                if int(core.get_remaining_image_count()) > 0:
+                    img = _pop_image_as_numpy(core)
+                    if img is not None:
+                        return img
+                    break
+                time.sleep(0.003)
+            logger.info(
+                "FINDTISS:no stream frame within %.2fs; snapping instead", FRESH_FRAME_WAIT_S
+            )
+        except Exception as e:
+            logger.info("FINDTISS:stream frame unavailable (%s); snapping instead", e)
+
+    snapped = hardware.snap_image()
+    return snapped[0] if isinstance(snapped, tuple) else snapped
 
 
 def _as_uint8(img):
@@ -307,10 +371,11 @@ def handle_findtissue(conn, client, hardware, settings, **kwargs):
 
         img = None
         try:
-            snapped = hardware.snap_image()
-            img = snapped[0] if isinstance(snapped, tuple) else snapped
+            img = _fresh_frame(hardware)
         except Exception as e:
-            logger.warning("FINDTISS:attempt %d/%d snap failed: %s", attempt, len(offsets), e)
+            logger.warning(
+                "FINDTISS:attempt %d/%d frame capture failed: %s", attempt, len(offsets), e
+            )
         img = _as_uint8(img)
         if img is None:
             continue
