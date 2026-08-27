@@ -365,7 +365,7 @@ modalities:
   lcpolscope:
     reconstruction:
       swing_waves: 0.03          # Calibration swing amplitude (required)
-      wavelength_nm: 549         # Light wavelength in nanometers (required)
+      wavelength_nm: 546         # Light wavelength in nanometers (required)
       scheme: "5-State"          # Polarization scheme; default "5-State"
       state_order:               # Optional: state reordering before reconstruction
         - State0
@@ -507,6 +507,158 @@ flags which channel is axial and how it may be resampled.
 Omitting the `modalities.lcpolscope.reconstruction` block disables
 reconstruction. Raw state images are still acquired and saved normally, and
 reconstruction can be performed offline using the `polscope-library` directly.
+
+## LC-PolScope Calibration (LCCALIB)
+
+The `LCCALIB` command calibrates the liquid crystals on an LC-PolScope system,
+finding the extinction point and swing states. It produces a calibration palette
+and metadata file that guides all subsequent LC-PolScope acquisitions.
+
+### When to calibrate
+
+- **First setup**: After installing or aligning new liquid crystals
+- **Configuration change**: When wavelength or scheme changes
+- **Whenever the extinction ratio drops**: it is the health metric, so a
+  falling value is the signal to recalibrate. How often that happens on this
+  rig is not yet known.
+
+### Command syntax
+
+```
+LCCALIB --yaml config.yml --output /path/to/output [--modality lcpolscope] \
+        [--swing 0.03] [--scheme "5-State"] [--wavelength 546.0] \
+        [--black-level 100.0] [--strategy single_pass] ENDOFSTR
+```
+
+### Parameters
+
+- **`--yaml config.yml`** (required) -- Microscope configuration file. The server
+  reads `modalities.<modality>.reconstruction` for default swing, wavelength, scheme,
+  and settle time if not overridden on the command line.
+- **`--output /path/to/output`** (required) -- Folder where the calibration palette
+  and metadata file are written. The server creates this folder if it doesn't exist.
+- **`--modality lcpolscope`** (optional) -- Which modality to calibrate. Default:
+  `lcpolscope`. Only relevant if the YAML defines multiple LC-PolScope configurations.
+- **`--swing 0.03`** (optional) -- Calibration swing amplitude in waves. If omitted,
+  taken from `modalities.<modality>.reconstruction.swing_waves` in the YAML.
+- **`--scheme "5-State"`** (optional) -- Polarization scheme to calibrate. Accepted
+  values: `"5-State"` or `"4-State"`. If omitted, taken from the YAML; defaults to
+  `"5-State"`. **The scheme is fixed by your hardware and calibration procedure**;
+  it is not a free choice at runtime.
+- **`--wavelength 546.0`** (optional) -- Illumination wavelength in nanometers.
+  If omitted, taken from the YAML; defaults to 546.0 nm.
+- **`--black-level 100.0`** (optional) -- Dark-frame intensity used to correct the
+  raw measurements. If omitted, the calibration falls through its black-level chain, in this order:
+  (1) an explicit value here or in the YAML, (2) an averaged dark frame if lamp
+  control is configured, (3) zero, with a warning. The value matters: a 50-count
+  error moves the extinction ratio by roughly 10%.
+- **`--strategy single_pass`** (optional) -- Search strategy. `single_pass`
+  (default) makes one pass per state; `iterative` repeats, re-centring on the
+  crystals, until the residual is small enough. The second costs roughly three
+  times the exposures, so it is a trade rather than an upgrade.
+
+### Response sequence
+
+The command sends multiple responses as it progresses:
+
+1. **`STARTED:<output_folder>`** -- Calibration has begun; acknowledges the output
+   path the operator requested.
+
+2. **`PROGRESS:<current>:<total>:<message>`** -- Updates during the search, in
+   the same four-field shape PPMBIREF uses.
+
+3. **`SUCCESS:<json>`** -- Calibration succeeded. The JSON payload always contains:
+   ```json
+   {
+     "success": true,
+     "scheme": "5-State",
+     "swing_waves": 0.03,
+     "wavelength_nm": 546.0,
+     "lc_control_mode": "MM-Retardance",
+     "strategy": "single_pass",
+     "black_level": 100.0,
+     "black_level_source": "configured|measured|assumed",
+     "extinction_ratio": 150.5,
+     "assessment": "good|acceptable|poor|unmeasurable",
+     "palette": {
+       "State0": [0.2500, 0.5000],
+       "State1": [0.2200, 0.5000],
+       "...": "[LC-A, LC-B] in waves, one entry per state"
+     },
+     "state_intensities": {...},
+     "exposures": 42,
+     "elapsed_s": 15.3,
+     "warnings": [],
+     "output_folder": "/path/to/output",
+     "metadata_path": "/path/to/output/lc_calibration_YYYYMMDD_HHMMSS.json"
+   }
+   ```
+
+   **Key fields:**
+   - `success: true` always indicates a palette was produced
+   - `extinction_ratio` is the quality metric; higher is better (>100 is good)
+   - `assessment` is a human-readable quality summary
+   - `palette` contains the retardance values (in waves) for each state and LC axis
+   - `warnings` lists any issues that don't prevent use (e.g., marginal extinction)
+   - `metadata_path` points to a JSON file with the full trace (per-exposure details)
+
+4. **`FAILED:<reason>`** -- Calibration could not complete. The reason string
+   describes the error (e.g., "could not reach the liquid crystals", "polscope_library
+   is not installed").
+
+### Extinction ratio interpretation
+
+The extinction ratio is the primary quality metric, computed from the measured
+intensities at the calibration swing. Higher is better.
+
+- **100 or above**: Good. These are recOrder's bands; this rig reached 267.
+- **80-100**: Acceptable. Usable, but check alignment and optical cleanliness.
+- **Below 80**: Poor. Recorded with a warning rather than rejected.
+- **Unmeasurable**: The search failed to find a valid extinction point. The hardware
+  or configuration may need attention.
+
+A poor result is still returned (not rejected), so the operator can inspect the data
+and decide whether to retry or investigate the hardware.
+
+### Using the calibration result
+
+The generated palette should be stored and then referenced in your microscope YAML
+under `modalities.lcpolscope.reconstruction`:
+
+```yaml
+modalities:
+  lcpolscope:
+    reconstruction:
+      swing_waves: 0.03
+      wavelength_nm: 546.0
+      scheme: "5-State"
+      palette:
+        State0: [0.0, 0.0]
+        State1: [0.25, 0.0]
+        ...
+```
+
+Or the palette can be burned into the microscope's persistent configuration so
+acquisitions always use the correct calibration.
+
+### Black-level options
+
+The `--black-level` parameter controls the dark-frame correction, which improves
+extinction ratio by accounting for detector noise and dark current:
+
+- **Omitted or 0**: Falls through the library's chain: measure if a lamp is
+  configured, use the YAML value if present, otherwise assume zero.
+- **Positive value**: Use the supplied dark level directly.
+
+A measured dark frame (via a lamp) is preferred when available, as it captures
+the actual hardware behavior on the day.
+
+### LC control mode
+
+The server currently supports **`MM-Retardance`** mode: commands the liquid
+crystals in retardance (wave) units, and the Micro-Manager device adapter
+converts to voltage. Voltage mode (`MM-Voltage`) is not yet wired up and is
+refused with an error message directing the operator to use retardance mode.
 
 ## PPM Acquisition Options (--ppm-high-bit-depth)
 
