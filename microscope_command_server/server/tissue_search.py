@@ -27,13 +27,11 @@ for the tissue mass, not for a specific field of view.
 import math
 from typing import List, Optional, Sequence, Tuple
 
-#: Positions to visit, including the starting one, when the caller does not say.
-#: Two full rings: at a 446 um FOV diagonal that reaches 892 um, which covers the
-#: measured MEDIAN landing error of 613 um outright. The 1507 um worst case would need
-#: 13 (four rings); the caller sizes that trade-off, since it knows whether anyone is
-#: waiting. Kept a whole number of rings so no bearing in the fan is left half-swept --
-#: a budget stopping mid-ring biases the search toward whichever side is enumerated first.
-DEFAULT_MAX_ATTEMPTS = 7
+#: Rings to sweep when the caller does not specify a budget. Two, because at a 446 um FOV
+#: diagonal that reaches 892 um, which covers the measured MEDIAN landing error of 613 um
+#: outright. The 1507 um worst case needs four; the caller sizes that trade-off, since it
+#: knows whether anyone is waiting.
+DEFAULT_RINGS = 2
 
 #: Hard cap on the attempt budget. Each attempt is a stage move plus a snap, so a
 #: mistyped budget should degrade the search, not park the socket for ten minutes.
@@ -49,6 +47,19 @@ FAN_DEGREES = 45.0
 # compass points, then the diagonals. Even coverage is the best available strategy when
 # nothing says which way to go.
 _COMPASS_DEGREES = (0.0, 90.0, 180.0, 270.0, 45.0, 135.0, 225.0, 315.0)
+
+
+def default_max_attempts(direction: Optional[Sequence[float]]) -> int:
+    """Attempt budget for {DEFAULT_RINGS} complete rings, given whether there is a hint.
+
+    Deliberately NOT a single constant. The two patterns have different bearing counts (3
+    around a hint, 8 around the compass), so one number cannot mean "whole rings" for both:
+    a fixed 7 sweeps two full rings when hinted, but leaves the unhinted ring 6/8 done --
+    biasing the search toward whichever bearings happen to be enumerated first, which is the
+    one property the ring structure exists to avoid. Searching unhinted costs more because
+    knowing nothing about where the tissue lies genuinely is more work.
+    """
+    return 1 + DEFAULT_RINGS * len(_bearings_for(direction))
 
 
 def search_offsets(

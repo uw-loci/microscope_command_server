@@ -35,8 +35,8 @@ import numpy as np
 
 from microscope_command_server.server.handlers.utils import parse_flags, read_message_string
 from microscope_command_server.server.tissue_search import (
-    DEFAULT_MAX_ATTEMPTS,
     MAX_ATTEMPTS_CEILING,
+    default_max_attempts,
     parse_direction,
     search_offsets,
 )
@@ -121,7 +121,14 @@ def _resolve_validity(
 
 
 def _fov_diagonal_um(hardware) -> Optional[float]:
-    """One camera FOV diagonal, the natural step for a search that must not skip ground."""
+    """One camera FOV diagonal -- the default search step.
+
+    Deliberately coarse, and it does leave gaps: stepping 446 um along X with a 357 x 267 um
+    field skips 89 um. The largest step that could not skip anything on an arbitrary bearing
+    is the field's SHORT side, which would need far more positions for the same reach. Gaps
+    are the right trade here because the target is a tissue mass many fields across, not a
+    particular field -- the same choice the acquisition path's own first-tile search makes.
+    """
     try:
         fov = hardware.get_fov()
     except Exception as e:
@@ -198,7 +205,9 @@ def handle_findtissue(conn, client, hardware, settings, **kwargs):
             params.get("dir"),
         )
 
-    max_attempts = DEFAULT_MAX_ATTEMPTS
+    # Depends on the hint: an unhinted sweep has more bearings per ring, so "two rings"
+    # is a different number of positions. See default_max_attempts.
+    max_attempts = default_max_attempts(direction)
     if params.get("max_attempts"):
         try:
             requested = int(params["max_attempts"])

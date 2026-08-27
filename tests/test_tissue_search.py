@@ -10,8 +10,9 @@ import math
 import pytest
 
 from microscope_command_server.server.tissue_search import (
-    DEFAULT_MAX_ATTEMPTS,
+    DEFAULT_RINGS,
     FAN_DEGREES,
+    default_max_attempts,
     parse_direction,
     search_offsets,
 )
@@ -74,24 +75,35 @@ class TestSearchOffsets:
     def test_reach_is_the_sizing_number_against_the_measured_landing_error(self):
         # The budget has to be chosen against a measurement, so pin down what each one
         # buys. At a 446 um FOV diagonal and 3 bearings per ring, reach is
-        # 446 * ((n - 1) // 3): the default 7 covers the measured MEDIAN landing error
-        # of 613 um outright, and the 1507 um worst case needs 13.
+        # 446 * ((n - 1) // 3): the hinted default covers the measured MEDIAN landing error
+        # of 613 um outright, and the 1507 um worst case needs four rings.
         def reach(n):
             return max(_radius(o) for o in search_offsets((1.0, 0.0), 446.0, n))
 
         assert reach(4) == pytest.approx(446.0)
         assert reach(4) < 613.0, "one ring does not reach the median error on its own"
-        assert reach(DEFAULT_MAX_ATTEMPTS) >= 613.0
-        assert reach(DEFAULT_MAX_ATTEMPTS) < 1507.0
+        assert reach(default_max_attempts((1.0, 0.0))) >= 613.0
+        assert reach(default_max_attempts((1.0, 0.0))) < 1507.0
         assert reach(13) >= 1507.0
 
-    def test_default_budget_is_two_full_rings(self):
-        # Sized so no bearing in the fan is left half-swept: a budget that stops mid-ring
-        # would bias the search toward whichever side happens to be enumerated first.
-        offsets = search_offsets((1.0, 0.0), 446.0, DEFAULT_MAX_ATTEMPTS)
-        assert len(offsets) == DEFAULT_MAX_ATTEMPTS
-        assert sum(1 for o in offsets if _radius(o) == pytest.approx(446.0)) == 3
-        assert sum(1 for o in offsets if _radius(o) == pytest.approx(892.0)) == 3
+    @pytest.mark.parametrize("direction", [(1.0, 0.0), None])
+    def test_default_budget_is_always_a_whole_number_of_rings(self, direction):
+        # The regression this guards: one fixed attempt count cannot mean "whole rings" for
+        # both patterns, because they have different bearing counts (3 around a hint, 8
+        # around the compass). A budget that stops mid-ring biases the search toward
+        # whichever bearings are enumerated first -- the exact thing the ring structure
+        # exists to prevent. A fixed 7 did this to the unhinted sweep, leaving it 6/8 done.
+        n = default_max_attempts(direction)
+        offsets = search_offsets(direction, 446.0, n)
+        assert len(offsets) == n
+
+        per_ring = (n - 1) // DEFAULT_RINGS
+        for ring in range(1, DEFAULT_RINGS + 1):
+            at_this_radius = sum(1 for o in offsets if _radius(o) == pytest.approx(ring * 446.0))
+            assert at_this_radius == per_ring, f"ring {ring} is not fully swept"
+
+    def test_unhinted_search_costs_more_because_it_knows_less(self):
+        assert default_max_attempts(None) > default_max_attempts((1.0, 0.0))
 
     def test_no_hint_sweeps_the_compass(self):
         offsets = search_offsets(None, 400.0, 5)

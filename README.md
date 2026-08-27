@@ -738,15 +738,24 @@ FINDTISS --yaml config_PPM.yml [--objective <id>] [--dir <dx>,<dy>] \
   used. QPSC computes it as the vector from the predicted position toward the centre of the
   tile grid. Malformed input is ignored with a warning rather than failing the command --
   the search still works unhinted.
-- `--step` defaults to one camera FOV diagonal, the coarsest step that cannot skip ground.
-- `--max-attempts` counts the starting position. Default 7, capped at 25.
+- `--step` defaults to one camera FOV diagonal. Note this is deliberately COARSE and does
+  leave gaps: stepping 446 um along X with a 357 x 267 um field skips 89 um. The largest
+  step that could not skip anything on an arbitrary bearing is the field's SHORT side
+  (267 um), which would need far more positions for the same reach. Gaps are acceptable
+  here because the target is a tissue mass many fields across, not a specific field --
+  the same trade the acquisition path's own first-tile search makes.
+- `--max-attempts` counts the starting position. Default is two complete rings, which is
+  **7 with a direction hint and 17 without** (three bearings per ring versus eight); capped
+  at 25. It is not one fixed number because that cannot mean "whole rings" for both
+  patterns, and a budget stopping mid-ring biases the search toward whichever bearings are
+  enumerated first.
 
 ### Search pattern
 
 `server/tissue_search.py` is pure geometry and unit-tested (`tests/test_tissue_search.py`).
 The first position is always where the caller already is. After that, positions lie on
 rings at whole multiples of `--step`: with a hint, three bearings per ring (down the hint,
-then +/-45 deg); without one, the four compass points then the diagonals. Reach is
+then +/-45 deg); without one, the four compass points then the four diagonals. Reach is
 therefore `step * ((max_attempts - 1) // bearings_per_ring)`, so an attempt budget converts
 directly into a distance -- which is how the default was sized against the measurement
 above.
