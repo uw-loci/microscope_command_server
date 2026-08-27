@@ -33,6 +33,7 @@ from typing import Any, Dict, Optional, Tuple
 
 import numpy as np
 
+from microscope_command_server.server.focus_validity import load_autofocus_doc, resolve_validity
 from microscope_command_server.server.handlers.utils import parse_flags, read_message_string
 from microscope_command_server.server.tissue_search import (
     MAX_ATTEMPTS_CEILING,
@@ -93,31 +94,18 @@ def _as_uint8(img):
 
 
 def _resolve_validity(
-    yaml_path: Optional[str], objective: Optional[str]
+    yaml_path: Optional[str], modality: Optional[str], objective: Optional[str]
 ) -> Tuple[str, Dict[str, Any]]:
-    """The strategy validity check name + thresholds for this scope and objective.
+    """The validity check name + parameters this modality and objective actually use.
 
-    Falls back to the shipped ``texture_and_area`` defaults when the autofocus YAML has
-    nothing to say, which is the same thing the acquisition path does.
+    Delegates to the shared resolver so this uses the SAME chain the acquisition path
+    does -- modality binding, strategy, then the binding's ``validity_params`` overrides.
+    Reading only the flat per-objective keys would discard exactly the tuning PPM and
+    LC-PolScope depend on (a widened ``tissue_mask_range``, and on LC-PolScope a
+    ``tissue_area_threshold`` its config says the default value rejects valid fields at),
+    so the search would report "no tissue" while looking straight at some.
     """
-    af_entry: Dict[str, Any] = {}
-    if yaml_path:
-        try:
-            from microscope_command_server.server.handlers.streaming_focus import (
-                _load_autofocus_yaml_for_objective,
-            )
-
-            af_entry = _load_autofocus_yaml_for_objective(yaml_path, objective) or {}
-        except Exception as e:
-            logger.warning("FINDTISS:could not read autofocus yaml (%s); using defaults", e)
-    return (
-        "texture_and_area",
-        {
-            "texture_threshold": float(af_entry.get("texture_threshold", 0.010)),
-            "tissue_area_threshold": float(af_entry.get("tissue_area_threshold", 0.200)),
-            "rgb_brightness_threshold": float(af_entry.get("rgb_brightness_threshold", 240.0)),
-        },
-    )
+    return resolve_validity(load_autofocus_doc(yaml_path), modality, objective)
 
 
 def _fov_diagonal_um(hardware) -> Optional[float]:
@@ -149,7 +137,9 @@ def handle_findtissue(conn, client, hardware, settings, **kwargs):
 
     Payload flags (all optional except that a usable step must be derivable):
       ``--yaml``          main config path, used to find ``autofocus_<scope>.yml``
-      ``--objective``     objective id, for the per-objective validity thresholds
+      ``--modality``      active modality, which selects the strategy binding whose
+                          ``validity_params`` define tissue for this light path
+      ``--objective``     objective id, for the per-objective fallback thresholds
       ``--dir``           ``"dx,dy"`` stage-space hint toward believed tissue
       ``--step``          radius increment in um (default: one FOV diagonal)
       ``--max-attempts``  positions to visit including the start
@@ -197,7 +187,9 @@ def handle_findtissue(conn, client, hardware, settings, **kwargs):
         _reply(conn, f"FAILED:payload-read-error: {e}")
         return
 
-    params = parse_flags(message, ["--yaml", "--objective", "--dir", "--step", "--max-attempts"])
+    params = parse_flags(
+        message, ["--yaml", "--modality", "--objective", "--dir", "--step", "--max-attempts"]
+    )
     direction = parse_direction(params.get("dir"))
     if params.get("dir") and direction is None:
         logger.warning(
@@ -246,7 +238,20 @@ def handle_findtissue(conn, client, hardware, settings, **kwargs):
         _reply(conn, f"FAILED:get-position: {e}")
         return
 
-    validity_name, validity_kwargs = _resolve_validity(params.get("yaml"), params.get("objective"))
+    validity_name, validity_kwargs = _resolve_validity(
+        params.get("yaml"), params.get("modality"), params.get("objective")
+    )
+    if validity_name == "always_false":
+        # A modality bound to a manual-only strategy has no automatic tissue test at all.
+        # Walking the search pattern would move the stage several times and then report
+        # NOTFOUND by construction, so say why instead and leave the stage alone.
+        logger.info(
+            "FINDTISS:modality %r uses the always_false validity check; no automatic "
+            "tissue test exists for it",
+            params.get("modality"),
+        )
+        _reply(conn, "FAILED:no-automatic-tissue-check-for-this-modality")
+        return
     try:
         from microscope_imageprocessing.focus import resolve_validity_check
 

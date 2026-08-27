@@ -730,10 +730,16 @@ scan has something real to find.
 ### Parameters
 
 ```
-FINDTISS --yaml config_PPM.yml [--objective <id>] [--dir <dx>,<dy>] \
+FINDTISS --yaml config_PPM.yml [--modality <name>] [--objective <id>] [--dir <dx>,<dy>] \
          [--step <um>] [--max-attempts <n>] ENDOFSTR
 ```
 
+- `--modality` selects the `modalities.<name>` binding in `autofocus_<scope>.yml`, and with
+  it the strategy whose `validity_params` decide what counts as tissue. Optional in the
+  parser but not in practice -- see *How tissue is decided* below.
+- `--objective` is the fallback when no modality binding matches: the flat
+  `texture_threshold` / `tissue_area_threshold` on that objective's `autofocus_settings`
+  entry.
 - `--dir` is a stage-space hint toward where tissue is believed to be; only its bearing is
   used. QPSC computes it as the vector from the predicted position toward the centre of the
   tile grid. Malformed input is ignored with a warning rather than failing the command --
@@ -760,9 +766,32 @@ therefore `step * ((max_attempts - 1) // bearings_per_ring)`, so an attempt budg
 directly into a distance -- which is how the default was sized against the measurement
 above.
 
-Tissue is decided by the **same strategy validity check the acquisition path uses**
-(`texture_and_area` and friends, thresholds from `autofocus_<scope>.yml`), so there is no
-new metric to calibrate and no second definition of "has content" to drift.
+### How tissue is decided
+
+By the **same strategy validity check the acquisition path uses**, resolved through the
+same chain: `modalities.<modality>` binding -> `strategies.<name>.validity_check` +
+`validity_params`, with the binding's `overrides.validity_params` merged on top. The
+resolver is `server/focus_validity.py` -- pure, unit-tested
+(`tests/test_focus_validity.py`), and deliberately outside `server.handlers` so a test
+needs no pycromanager.
+
+Going through the modality is not a nicety. `autofocus_<scope>.yml` states thresholds in
+two places, and they disagree:
+
+| Where | Scope |
+|---|---|
+| `autofocus_settings[].texture_threshold` etc. | Per OBJECTIVE, flat keys |
+| `strategies.<n>.validity_params` + `modalities.<m>.overrides.validity_params` | Per MODALITY -- where the real tuning lives |
+
+LC-PolScope's binding sets `tissue_area_threshold: 0.1` where the objective entry still
+says `0.2`, with the comment that the 20% floor "rejects valid fields"; PPM and LC-PolScope
+both widen `tissue_mask_range` to `[0.05, 0.95]`, which the flat keys cannot express at
+all. A search reading only the flat keys on those scopes reports "no tissue" while looking
+straight at some.
+
+A modality bound to a manual-only strategy resolves to `always_false`, which no search can
+satisfy. That returns `FAILED:no-automatic-tissue-check-for-this-modality` immediately,
+**without moving the stage**, instead of walking the pattern to a foregone `NOTFOUND`.
 
 ### Exposure is deliberately not adjusted
 
