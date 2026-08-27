@@ -4880,7 +4880,15 @@ def handle_streaming_focus(conn, client, hardware, settings, **kwargs):
         else:
             # Ran out of retries without a success or early exit. The
             # last result is stored in `result` (still in scope).
-            final_result = result  # noqa: F821  -- result is bound by the for-loop
+            #
+            # Guard on the loop having actually run. Profiling and approach modes set
+            # final_result themselves and force max_attempts to 0, so the body never executes
+            # -- but a for/else still takes the else branch when the loop completes without a
+            # break, and `result` is then unbound. That surfaced as
+            # "FAILED:local variable 'result' referenced before assignment" AFTER a full 44 s
+            # traverse had already been performed and dumped.
+            if max_attempts > 0:
+                final_result = result  # noqa: F821  -- bound by the for-loop when it runs
 
         # --- Dispatch based on final result ---
         if final_result is None:
