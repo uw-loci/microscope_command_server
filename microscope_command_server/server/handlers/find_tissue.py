@@ -44,6 +44,21 @@ from microscope_command_server.server.tissue_search import (
 logger = logging.getLogger(__name__)
 
 
+def _return_to_start(hardware, x: float, y: float, z: float) -> None:
+    """Put the stage back where the search began.
+
+    Both the cancelled and the found-nothing paths owe the caller this: neither has any
+    reason to prefer the last position tried, and leaving the stage somewhere the caller did
+    not ask for would silently invalidate the prediction it is about to align against.
+    """
+    try:
+        from microscope_control.hardware import Position
+
+        hardware.move_to_position(Position(x, y, z))
+    except Exception as e:
+        logger.error("FINDTISS:could not return to the starting position (%.1f, %.1f): %s", x, y, e)
+
+
 def _reply(conn, text: str) -> None:
     """Send one response line, tolerating a socket the client has already dropped.
 
@@ -144,6 +159,30 @@ def handle_findtissue(conn, client, hardware, settings, **kwargs):
     prediction it is about to use.
     """
     addr = getattr(client, "addr", client)
+    # Reuse the streaming-AF abort signal rather than inventing a second one. From the
+    # operator's side this search and the focus scan that follows it are ONE action -- the
+    # Live Viewer has already turned its Autofocus button into a Cancel toggle before the
+    # search starts -- so the Cancel they press must stop whichever half is running. Without
+    # this the button is live but inert for the whole search, and the stage keeps stepping.
+    abort_event = None
+    try:
+        from microscope_command_server.server.handlers.streaming_focus import (
+            _client_ip,
+            _get_af_abort_event,
+        )
+
+        abort_ip = _client_ip(addr)
+        if abort_ip is not None:
+            abort_event = _get_af_abort_event(abort_ip)
+            # Clear anything left set by an earlier scan, exactly as handle_streaming_focus
+            # does on entry -- a stale signal would abort this search before it began.
+            abort_event.clear()
+    except Exception as e:
+        logger.warning(
+            "FINDTISS:could not resolve the abort signal (%s); the search will not be cancellable",
+            e,
+        )
+
     try:
         message = read_message_string(conn)
     except Exception as e:
@@ -222,6 +261,19 @@ def handle_findtissue(conn, client, hardware, settings, **kwargs):
 
     for index, (dx, dy) in enumerate(offsets):
         attempt = index + 1
+        # Between positions, not mid-move: a stage move is a blocking hardware call, and
+        # tearing one down part-way is how you lose track of where the stage is.
+        if abort_event is not None and abort_event.is_set():
+            logger.warning(
+                "FINDTISS:cancelled by the operator at attempt %d/%d; returning to (%.1f, %.1f)",
+                attempt,
+                len(offsets),
+                start_x,
+                start_y,
+            )
+            _return_to_start(hardware, start_x, start_y, start_z)
+            _reply(conn, f"ABORTED:{start_x:.3f}:{start_y:.3f}:{attempt - 1}")
+            return
         x = start_x + dx
         y = start_y + dy
         try:
@@ -285,8 +337,5 @@ def handle_findtissue(conn, client, hardware, settings, **kwargs):
         start_x,
         start_y,
     )
-    try:
-        hardware.move_to_position(Position(start_x, start_y, start_z))
-    except Exception as e:
-        logger.error("FINDTISS:could not return to the starting position: %s", e)
+    _return_to_start(hardware, start_x, start_y, start_z)
     _reply(conn, f"NOTFOUND:{start_x:.3f}:{start_y:.3f}:{len(offsets)}")

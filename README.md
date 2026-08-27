@@ -770,6 +770,11 @@ that one owns the camera state, this one borrows it.
   put back where the search started**. A search that found nothing has no reason to prefer
   its last guess over its first, and leaving the stage elsewhere would silently invalidate
   the caller's own prediction.
+- `ABORTED:<x>:<y>:<completed>` -- the operator cancelled via `ABORTAF`, which `FINDTISS`
+  honours deliberately: the Live Viewer turns its Autofocus button into a Cancel toggle
+  before the search starts, so one Cancel has to stop whichever half of "search then focus"
+  is running. The stage is returned to the starting point. Polled BETWEEN positions, never
+  mid-move.
 - `FAILED:<reason>` -- could not run at all. Nothing moved.
 
 ## Autofocus / Streaming Focus (--safe-z, --approach-max, --tissue-gate)
