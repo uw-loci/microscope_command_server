@@ -75,6 +75,7 @@ from microscope_command_server.server.handlers.calibration import (
     handle_polcal,
     handle_ppmsens,
     handle_ppmbiref,
+    handle_lccalib,
     handle_sbcalib,
     handle_getnoise,
     handle_noischar,
@@ -171,6 +172,7 @@ COMMAND_HANDLERS = {
     ExtendedCommand.PPMSENS: handle_ppmsens,
     ExtendedCommand.PPMBIREF: handle_ppmbiref,
     ExtendedCommand.SBCALIB: handle_sbcalib,
+    ExtendedCommand.LCCALIB: handle_lccalib,
     ExtendedCommand.GETNOISE: handle_getnoise,
     ExtendedCommand.NOISCHAR: handle_noischar,
     # Acquisition

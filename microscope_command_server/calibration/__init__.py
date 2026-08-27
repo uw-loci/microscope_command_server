@@ -8,3 +8,5 @@ with hardware and call calibration functions from ppm_library.
 from .sunburst_workflow import run_sunburst_calibration
 
 __all__ = ["run_sunburst_calibration"]
+
+from .lc_calibration_workflow import run_lc_calibration  # noqa: E402,F401

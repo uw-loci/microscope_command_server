@@ -72,6 +72,7 @@ class ExtendedCommand:
     PPMSENS = b"ppmsens_"  # PPM Rotation Sensitivity Test
     PPMBIREF = b"ppmbiref"  # PPM Birefringence Maximization Test
     SBCALIB = b"sbcalib_"  # Sunburst Calibration for hue-to-angle mapping
+    LCCALIB = b"lccalib_"  # LC-PolScope liquid-crystal voltage/retardance calibration
 
     # ---- JAI-Specific: White Balance Calibration Commands ----
     # These commands require a JAI trilinear color camera with per-channel
