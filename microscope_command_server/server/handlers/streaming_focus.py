@@ -3666,7 +3666,33 @@ def _approach_from_safe_z(
 
     for idx, (z, metric_value) in enumerate(peaks):
         if not require_tissue_gate:
-            logger.info("STREAM_AF:approach committing to first peak Z=%.3f (no tissue gate)", z)
+            # Committing blind, because this scope/modality/objective was validated as having
+            # no surface peak before focus. Check anyway and SAY SO when the peak has no
+            # tissue.
+            #
+            # Whatever the first peak is, it is not always the sample. Observed 2026-08-28 at
+            # 20x: the approach committed Z=-119.4 on a slide whose real focus was near -320,
+            # and the peak it took was nothing like a focus peak -- 16.7% amplitude, R^2=0.78,
+            # gaussian sigma 53 um, against the 6-8 um sigma and R^2>0.97 of the genuine peaks
+            # on the neighbouring slide. Committing it looked exactly like success in the log.
+            # One snap to turn a silent wrong answer into a loud one is worth it; the commit
+            # still honours the configuration.
+            ok, why = _tissue_present_at(core, focus_device, z, validity_name, validity_kwargs)
+            if not ok:
+                logger.warning(
+                    "STREAM_AF:approach committing to first peak Z=%.3f WITHOUT a tissue gate, "
+                    "and that peak has NO TISSUE (%s). It is not the sample -- %d peak(s) were "
+                    "found in this scan and the sample is probably a deeper one. Re-run the "
+                    "focus-approach validation for this objective; it recorded that no tissue "
+                    "gate was needed, which does not hold on this slide.",
+                    z,
+                    why,
+                    len(peaks),
+                )
+            else:
+                logger.info(
+                    "STREAM_AF:approach committing to first peak Z=%.3f (no tissue gate)", z
+                )
             return _ScanAttemptResult(
                 "success", z, scan.n_samples, scan.z_span, f"approach peak {idx + 1}"
             )
