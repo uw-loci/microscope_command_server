@@ -550,6 +550,12 @@ def _pop_tagged_frame(core) -> Tuple[Optional[np.ndarray], Optional[float]]:
         return arr, elapsed_ms
 
 
+#: How long to wait for the running stream to deliver a frame before stopping the sequence and
+#: snapping instead. At 38 fps a frame is ~26 ms, so this is generous; the cases it covers are a
+#: stream that has stalled, not one that is merely slow.
+FRESH_FRAME_WAIT_S = 0.30
+
+
 def _fresh_frame_as_numpy(core) -> Optional[np.ndarray]:
     """A frame from AFTER the caller's last stage move, whether or not a sequence is running.
 
@@ -573,7 +579,7 @@ def _fresh_frame_as_numpy(core) -> Optional[np.ndarray]:
     if sequence_running:
         try:
             core.clear_circular_buffer()
-            deadline = time.perf_counter() + 0.25
+            deadline = time.perf_counter() + FRESH_FRAME_WAIT_S
             while time.perf_counter() < deadline:
                 if int(core.get_remaining_image_count()) > 0:
                     img = _pop_image_as_numpy(core)
@@ -581,11 +587,45 @@ def _fresh_frame_as_numpy(core) -> Optional[np.ndarray]:
                         return img
                     break
                 time.sleep(0.003)
-            logger.debug("fresh frame: no stream frame within 250ms; falling back to snap")
+            logger.info(
+                "fresh frame: no stream frame within %.2fs; stopping the sequence to snap",
+                FRESH_FRAME_WAIT_S,
+            )
         except Exception as e:
-            logger.debug("fresh frame: stream pop unavailable (%s); falling back to snap", e)
+            logger.info(
+                "fresh frame: stream pop unavailable (%s); stopping the sequence to snap", e
+            )
 
-    return _snap_image_as_numpy(core)
+        # Falling straight through to snap_image here was a dead end: snap FAILS while a
+        # sequence is running, which is the very condition that sent us down this branch. So
+        # both paths failed and the caller got None -- reported as "no frame", which is how the
+        # tissue gate rejected a textbook focus peak at Z=-227.9 on a field of sharp H&E.
+        # Stop the sequence, snap, restart it. Same stop/resume pattern the Brent fallback uses.
+        stopped = False
+        try:
+            core.stop_sequence_acquisition()
+            stopped = True
+        except Exception as e:
+            logger.warning("fresh frame: could not stop the sequence to snap (%s)", e)
+        img = _snap_image_as_numpy(core)
+        if stopped:
+            try:
+                core.clear_circular_buffer()
+                core.start_continuous_sequence_acquisition(0)
+            except Exception as e:
+                logger.warning("fresh frame: could not restart the sequence after snapping (%s)", e)
+        if img is None:
+            logger.warning(
+                "fresh frame: no frame from the stream OR from a snap with the sequence stopped. "
+                "Anything asking 'is there tissue here' will be told there is none, whatever is "
+                "actually under the objective."
+            )
+        return img
+
+    img = _snap_image_as_numpy(core)
+    if img is None:
+        logger.warning("fresh frame: snap returned nothing and no sequence was running")
+    return img
 
 
 def _snap_image_as_numpy(core) -> Optional[np.ndarray]:
