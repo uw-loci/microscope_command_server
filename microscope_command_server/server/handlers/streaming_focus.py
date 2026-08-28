@@ -3635,7 +3635,24 @@ def _approach_from_safe_z(
     # them -- exactly the order candidates must be considered in.
     # _attempt_one_scan returns samples in travel order, which is the order the
     # approach met them -- so no re-sorting by Z, which would destroy that.
-    samples = [(z, m) for z, m in scan.samples_trace]
+    # samples_trace elements are (t, z, m), with an optional 4th (secondary metric) added in
+    # Phase C -- so take z and m BY INDEX. Unpacking them as `for z, m in ...` raised
+    # ValueError: too many values to unpack on every run that produced any samples, which
+    # means this approach path could never once have committed a peak: the exception escaped
+    # to the retry loop's handler, no commit ran, and the stage was left wherever the scan
+    # ended -- the far end of a 358 um travel, i.e. as far from focus as the scan could put
+    # it. Observed 2026-08-28 as "autofocus scanned, found a peak, then stopped at the
+    # bottom", with SIFT matching against the resulting blur.
+    samples = [(float(s[1]), float(s[2])) for s in scan.samples_trace if len(s) >= 3]
+    if not samples:
+        _retract(core, focus_device, safe_z, "no usable samples")
+        return _ScanAttemptResult(
+            "metric_flat",
+            None,
+            scan.n_samples,
+            scan.z_span,
+            "scan returned samples in an unexpected shape",
+        )
     peaks = _first_prominent_peaks_in_scan_order(samples)
     if not peaks:
         _retract(core, focus_device, safe_z, "no prominent peak")
