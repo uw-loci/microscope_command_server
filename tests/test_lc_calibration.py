@@ -22,7 +22,7 @@ from microscope_command_server.calibration.lc_instrument import MicroManagerLC  
 class FakeCore:
     """Records property traffic and answers reads consistently."""
 
-    def __init__(self, failing_device=None):
+    def __init__(self, failing_device=None, limits=None):
         self.properties = {
             ("MeadowlarkLC", "Retardance LC-A [in waves]"): "0.25",
             ("MeadowlarkLC", "Retardance LC-B [in waves]"): "0.50",
@@ -31,6 +31,18 @@ class FakeCore:
         self.writes = []
         self.waits = []
         self.failing_device = failing_device
+        #: (device, property) -> (lower, upper). Empty by default, which is
+        #: how an adapter that declares no limits behaves.
+        self.limits = dict(limits or {})
+
+    def has_property_limits(self, device, prop):
+        return (device, prop) in self.limits
+
+    def get_property_lower_limit(self, device, prop):
+        return self.limits[(device, prop)][0]
+
+    def get_property_upper_limit(self, device, prop):
+        return self.limits[(device, prop)][1]
 
     def set_property(self, device, prop, value):
         if device == self.failing_device:
@@ -218,3 +230,63 @@ class TestWorkflow:
             progress_callback=bad,
         )
         assert result["success"] is True
+
+
+def _waves_limits(lca, lcb):
+    return {
+        ("MeadowlarkLC", "Retardance LC-A [in waves]"): lca,
+        ("MeadowlarkLC", "Retardance LC-B [in waves]"): lcb,
+    }
+
+
+class TestRetardanceLimitsComeFromTheDevice:
+    """The 1.600-wave ceiling is recOrder's number, not this rig's.
+
+    The D5020 on the LC-PolScope reports roughly 0 to 1 wave on the writable
+    "[in waves]" properties. Keeping the inherited constant would let the
+    clamp hand the adapter a value it refuses -- the clamp exists precisely
+    so a search near a rail loses one measurement instead of the run.
+    """
+
+    def test_device_limits_replace_the_inherited_default(self):
+        core = FakeCore(limits=_waves_limits((0.0, 1.0), (0.0, 1.0)))
+        lc = MicroManagerLC(FakeHardware(core), settle_ms=0)
+
+        assert lc.limits.max_waves == pytest.approx(1.0)
+        # Not the library default, which is what this test exists to catch.
+        assert lc.limits.max_waves != pytest.approx(1.600)
+        # An exact zero is still avoided even though the device permits it.
+        assert lc.limits.min_waves == pytest.approx(0.001)
+
+    def test_the_narrower_axis_wins(self):
+        """One RetardanceLimits clamps both crystals, so it must fit both."""
+        core = FakeCore(limits=_waves_limits((0.0, 1.0), (0.05, 0.80)))
+        lc = MicroManagerLC(FakeHardware(core), settle_ms=0)
+
+        assert lc.limits.min_waves == pytest.approx(0.05)
+        assert lc.limits.max_waves == pytest.approx(0.80)
+
+    def test_a_commanded_value_is_clamped_to_what_the_device_accepts(self):
+        core = FakeCore(limits=_waves_limits((0.0, 1.0), (0.0, 1.0)))
+        lc = MicroManagerLC(FakeHardware(core), settle_ms=0)
+
+        # 1.69 waves is where the config's leftover voltages land.
+        lc.set_retardance("LCA", 1.69)
+
+        written = float(core.properties[("MeadowlarkLC", "Retardance LC-A [in waves]")])
+        assert written == pytest.approx(1.0)
+
+    def test_an_adapter_declaring_no_limits_falls_back(self):
+        """Not a reason to refuse: calibration works near a quarter wave."""
+        lc = MicroManagerLC(FakeHardware(FakeCore()), settle_ms=0)
+
+        assert lc.limits.max_waves == pytest.approx(1.600)
+
+    def test_a_core_that_cannot_answer_falls_back(self):
+        class Unhelpful(FakeCore):
+            def has_property_limits(self, device, prop):
+                raise RuntimeError("adapter does not implement this")
+
+        lc = MicroManagerLC(FakeHardware(Unhelpful()), settle_ms=0)
+
+        assert lc.limits.max_waves == pytest.approx(1.600)

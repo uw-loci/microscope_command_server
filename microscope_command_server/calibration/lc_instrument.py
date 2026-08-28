@@ -25,6 +25,10 @@ LC_DEVICE = "MeadowlarkLC"
 #: Property names per control mode. Retardance mode asks the Micro-Manager
 #: adapter for a retardance and lets it work out the voltage; voltage mode
 #: computes the voltage itself and needs a curve.
+#:
+#: The waves properties are the writable ones. The adapter also exposes
+#: "Retardance LC-A [in nm]", which is READ-ONLY -- confirmed on the rig
+#: 2026-08-28 -- so it can be reported but never commanded.
 RETARDANCE_PROPERTY = {"LCA": "Retardance LC-A [in waves]", "LCB": "Retardance LC-B [in waves]"}
 VOLTAGE_PROPERTY = {"LCA": "Voltage (V) LC-A", "LCB": "Voltage (V) LC-B"}
 
@@ -64,8 +68,9 @@ class MicroManagerLC:
         lamp: Optional[tuple] = None,
         dark_exposure_ms: Optional[float] = None,
     ):
-        from polscope_library.calibration import RetardanceLimits
-
+        # RetardanceLimits is imported inside _device_limits, which __init__
+        # calls, so a missing polscope_library still fails here rather than
+        # later on a crystal move.
         if mode not in ("MM-Retardance", "MM-Voltage"):
             raise ValueError(f"unknown LC control mode {mode!r}")
         if mode == "MM-Voltage" and curve is None:
@@ -75,10 +80,76 @@ class MicroManagerLC:
         self.mode = mode
         self.curve = curve
         self.settle_ms = float(settle_ms)
-        self.limits = limits or RetardanceLimits()
         self.lamp = lamp
         self.dark_exposure_ms = dark_exposure_ms
         self.exposures = 0
+        self.limits = limits if limits is not None else self._device_limits()
+
+    def _device_limits(self):
+        """Ask the adapter what the crystals will actually accept.
+
+        The library default (0.001 to 1.600 waves) is recOrder's number, and
+        it does not match this rig: the D5020 adapter here reports a range of
+        about 0 to 1 wave on the writable "[in waves]" properties. Asking the
+        device is the only way to be right on a rig we have not seen, and it
+        removes one more constant transcribed from another program's source.
+
+        Both axes are queried and the INTERSECTION is used, because one
+        RetardanceLimits governs the clamp for either crystal; a range wider
+        than a crystal's own would let the clamp hand it a value it rejects.
+
+        Falls back to the library default if the device cannot be asked --
+        the calibration itself works around a quarter wave, far from either
+        rail, so an unqueryable device is not a reason to refuse to run.
+        """
+        from polscope_library.calibration import RetardanceLimits
+
+        default = RetardanceLimits()
+        if self.mode != "MM-Retardance":
+            return default
+        try:
+            core = self._core()
+        except RuntimeError:
+            return default
+
+        lower, upper = None, None
+        for prop in RETARDANCE_PROPERTY.values():
+            try:
+                if not core.has_property_limits(LC_DEVICE, prop):
+                    continue
+                low = float(core.get_property_lower_limit(LC_DEVICE, prop))
+                high = float(core.get_property_upper_limit(LC_DEVICE, prop))
+            except Exception as exc:
+                logger.debug("Could not read limits for %s.%s: %s", LC_DEVICE, prop, exc)
+                continue
+            lower = low if lower is None else max(lower, low)
+            upper = high if upper is None else min(upper, high)
+
+        if lower is None or upper is None or not upper > lower:
+            logger.warning(
+                "Could not read retardance limits from %s; using the library default "
+                "%.3f to %.3f waves. If this rig's crystals travel less than that, a "
+                "commanded value near the top will be clamped to something the adapter "
+                "then refuses.",
+                LC_DEVICE,
+                default.min_waves,
+                default.max_waves,
+            )
+            return default
+
+        # Never command an exact zero: it is a degenerate point for the
+        # compensator model and some adapters treat it as "off".
+        lower = max(lower, default.min_waves)
+        logger.info(
+            "Retardance limits read from %s: %.4f to %.4f waves (library default was "
+            "%.3f to %.3f).",
+            LC_DEVICE,
+            lower,
+            upper,
+            default.min_waves,
+            default.max_waves,
+        )
+        return RetardanceLimits(min_waves=lower, max_waves=upper)
 
     # -- LiquidCrystalInstrument ------------------------------------------
 
