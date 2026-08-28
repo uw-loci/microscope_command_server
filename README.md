@@ -545,8 +545,8 @@ LCCALIB --yaml config.yml --output /path/to/output [--modality lcpolscope] \
   values: `"5-State"` or `"4-State"`. If omitted, taken from the YAML; defaults to
   `"5-State"`. **The scheme is fixed by your hardware and calibration procedure**;
   it is not a free choice at runtime.
-- **`--wavelength 549.0`** (optional) -- Illumination wavelength in nanometers.
-  If omitted, taken from the YAML; defaults to 549.0 nm with a warning. The
+- **`--wavelength 546.0`** (optional) -- Illumination wavelength in nanometers.
+  If omitted, taken from the YAML; defaults to 546.0 nm with a warning. The
   default is used only as a placeholder when no wavelength is configured; it does
   not apply silently, so calibration and acquisition can be compared for agreement.
 - **`--black-level 100.0`** (optional) -- Dark-frame intensity used to correct the
@@ -575,7 +575,7 @@ The command sends multiple responses as it progresses:
      "success": true,
      "scheme": "5-State",
      "swing_waves": 0.03,
-     "wavelength_nm": 549.0,
+     "wavelength_nm": 546.0,
      "wavelength_source": "request|config|fallback",
      "lc_control_mode": "MM-Retardance",
      "strategy": "single_pass",
@@ -600,7 +600,7 @@ The command sends multiple responses as it progresses:
    **Key fields:**
    - `success: true` always indicates a palette was produced
    - `wavelength_nm` is the wavelength used for reconstruction (in nanometers)
-   - `wavelength_source` indicates where the wavelength came from: `"request"` (command-line parameter), `"config"` (microscope YAML), or `"fallback"` (default 549.0 nm when neither is set; a warning is logged in this case)
+   - `wavelength_source` indicates where the wavelength came from: `"request"` (command-line parameter), `"config"` (microscope YAML), or `"fallback"` (default 546.0 nm when neither is set; a warning is logged in this case)
    - `extinction_ratio` is the quality metric; higher is better (>100 is good)
    - `assessment` is a human-readable quality summary
    - `palette` contains the retardance values (in waves) for each state and LC axis

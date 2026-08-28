@@ -17,10 +17,13 @@ from typing import Any, Callable, Dict, Optional
 logger = logging.getLogger(__name__)
 
 #: Used only when the microscope YAML declares no wavelength, and always with
-#: a warning. 549 nm is what the OpenPolScope acquisition summary records for
-#: this instrument -- the same role this value plays -- but the interference
-#: filter has never been identified, so treat it as a placeholder.
-DEFAULT_WAVELENGTH_NM = 549.0
+#: a warning. 546 nm is what OpenPolScope persists in its own registry entry
+#: (ps.acq.MeadowlarkLC.wavelength) for this instrument. Its 2026-08-25
+#: acquisition summary says 549 instead, so the two disagree; the registry is
+#: machine-written and is what the plugin reloads, so it is the one copied
+#: here. The interference filter has never been identified -- a placeholder,
+#: not a measurement.
+DEFAULT_WAVELENGTH_NM = 546.0
 
 DEFAULT_SETTLE_MS = 50.0
 
