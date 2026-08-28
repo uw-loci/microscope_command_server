@@ -550,6 +550,44 @@ def _pop_tagged_frame(core) -> Tuple[Optional[np.ndarray], Optional[float]]:
         return arr, elapsed_ms
 
 
+def _fresh_frame_as_numpy(core) -> Optional[np.ndarray]:
+    """A frame from AFTER the caller's last stage move, whether or not a sequence is running.
+
+    ``snap_image`` FAILS while a sequence acquisition is active, and streaming autofocus runs
+    with one active by design ("reusing already-running sequence"). That is why the tissue gate
+    rejected 32 consecutive peaks with "no frame" on 2026-08-28: it never saw an image, so it
+    never tested one, and then reported "none had tissue" -- a statement about tissue it had no
+    evidence for.
+
+    When a sequence is running, drain the circular buffer and take the next frame to arrive.
+    Draining is the point: buffered frames predate the move to this Z, so popping the oldest
+    would judge the PREVIOUS position. Falls back to a blocking snap when no sequence is running
+    or no frame arrives in time.
+    """
+    sequence_running = False
+    try:
+        sequence_running = bool(core.is_sequence_running())
+    except Exception:
+        pass
+
+    if sequence_running:
+        try:
+            core.clear_circular_buffer()
+            deadline = time.perf_counter() + 0.25
+            while time.perf_counter() < deadline:
+                if int(core.get_remaining_image_count()) > 0:
+                    img = _pop_image_as_numpy(core)
+                    if img is not None:
+                        return img
+                    break
+                time.sleep(0.003)
+            logger.debug("fresh frame: no stream frame within 250ms; falling back to snap")
+        except Exception as e:
+            logger.debug("fresh frame: stream pop unavailable (%s); falling back to snap", e)
+
+    return _snap_image_as_numpy(core)
+
+
 def _snap_image_as_numpy(core) -> Optional[np.ndarray]:
     """Snap one image (blocking) and return as numpy array."""
     try:
@@ -3513,7 +3551,7 @@ def _tissue_present_at(
         _wait_via_busy(core, focus_device)
     except Exception as e:
         return (False, f"could not move to {z:.2f}: {e}")
-    img = _snap_image_as_numpy(core)
+    img = _fresh_frame_as_numpy(core)
     if img is None:
         return (False, "no frame")
     try:
