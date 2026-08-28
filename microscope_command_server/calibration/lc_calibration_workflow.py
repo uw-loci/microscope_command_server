@@ -16,6 +16,12 @@ from typing import Any, Callable, Dict, Optional
 
 logger = logging.getLogger(__name__)
 
+#: Used only when the microscope YAML declares no wavelength, and always with
+#: a warning. 549 nm is what the OpenPolScope acquisition summary records for
+#: this instrument -- the same role this value plays -- but the interference
+#: filter has never been identified, so treat it as a placeholder.
+DEFAULT_WAVELENGTH_NM = 549.0
+
 DEFAULT_SETTLE_MS = 50.0
 
 
@@ -68,9 +74,28 @@ def run_lc_calibration(
     ) or {}
     swing = float(swing if swing is not None else recon.get("swing_waves", 0.03))
     scheme = scheme or recon.get("scheme", "5-State")
-    wavelength_nm = float(
-        wavelength_nm if wavelength_nm is not None else recon.get("wavelength_nm", 546.0)
-    )
+
+    # Wavelength is a pure scale on reported retardance, so a wrong one is
+    # invisible -- the maps look right and are uniformly off. It is also the
+    # value we are least sure of on this instrument. So a fallback is used
+    # loudly and recorded, never applied in silence: if the calibration is
+    # later compared against an acquisition, the two must have agreed, and a
+    # silent default is exactly how they would not.
+    if wavelength_nm is not None:
+        wavelength_nm = float(wavelength_nm)
+        wavelength_source = "request"
+    elif recon.get("wavelength_nm") is not None:
+        wavelength_nm = float(recon["wavelength_nm"])
+        wavelength_source = "config"
+    else:
+        wavelength_nm = float(DEFAULT_WAVELENGTH_NM)
+        wavelength_source = "fallback"
+        warnings.append(
+            f"modalities.{modality}.reconstruction.wavelength_nm is not set; falling back to "
+            f"{DEFAULT_WAVELENGTH_NM} nm. Retardance is reported in nanometres by scaling with "
+            "this value, so if the acquisition uses a different one the two will disagree by "
+            "that ratio with nothing to show for it. Set it in the microscope YAML."
+        )
     mode = lc_control_mode or recon.get("lc_control_mode", "MM-Retardance")
 
     if mode == "MM-Voltage":
@@ -135,6 +160,7 @@ def run_lc_calibration(
         "scheme": result.scheme,
         "swing_waves": result.swing,
         "wavelength_nm": result.wavelength_nm,
+        "wavelength_source": wavelength_source,
         "lc_control_mode": mode,
         "strategy": strategy,
         "black_level": result.black_level,
