@@ -137,8 +137,14 @@ for %%P in (microscope_command_server microscope_control microscope_imageprocess
 for %%P in (ppm_library polscope_library) do call :optional %%P
 if defined QPSC_MISSING (
     echo.
-    echo ERROR: required packages are missing from this environment.
-    echo        Run update_env.bat with the environment active.
+    echo ERROR: required packages are not installed in this environment.
+    echo        Having the repositories cloned is not the same thing -- they
+    echo        have to be installed into the env that runs the server.
+    echo.
+    echo        Fix it once, from an Anaconda Prompt:
+    echo            conda activate ^<env^>
+    echo            cd /d "%SCRIPT_DIR%"
+    echo            update_env.bat
     echo.
     pause
     exit /b 1
@@ -171,7 +177,7 @@ REM  is how a preflight check ends up silently passing.
 REM ============================================================
 
 :require
-python -c "import %~1" 2>nul
+call :probe %~1
 if errorlevel 1 (
     echo   MISSING ^(required^): %~1
     set "QPSC_MISSING=1"
@@ -179,6 +185,19 @@ if errorlevel 1 (
 exit /b 0
 
 :optional
-python -c "import %~1" 2>nul
+call :probe %~1
 if errorlevel 1 echo   absent ^(optional^): %~1 -- that modality will not process
 exit /b 0
+
+:probe
+REM  Drop sys.path[0] before importing. For 'python -c' that entry is the
+REM  working directory, which is this repo -- and this repo contains a folder
+REM  named microscope_command_server. Without the pop, the server package
+REM  imports straight off the source tree and reports itself installed no
+REM  matter what the environment actually holds, while its siblings (which
+REM  are NOT subfolders here) correctly report missing. That combination is
+REM  worse than no check: it points the blame at the wrong packages.
+REM  An editable install is importable from anywhere, so this stays true for
+REM  a correctly set up environment.
+python -c "import sys; sys.path.pop(0); import %~1" 2>nul
+exit /b %errorlevel%
