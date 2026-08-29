@@ -558,12 +558,15 @@ FRESH_FRAME_WAIT_S = 0.30
 
 #: Chroma at or above which a pixel counts as stained, for the survey columns in samples.csv.
 #: Matches chroma_deviation's default so the numbers in the CSV mean the same thing the check
-#: would mean by them.
-CHROMA_SURVEY_MIN = 12.0
+#: would mean by them -- so chroma_frac reads as a direct simulation of the gate's verdict.
+#: Raised 12.0 -> 28.0 on 2026-08-28 from the first measured tissue/blank pair: bare glass on
+#: PPM sits at median chroma 11-13, so a bar of 12 landed inside the blank's own distribution
+#: and passed roughly half of its pixels as "stained".
+CHROMA_SURVEY_MIN = 28.0
 
 
-def _chroma_stats(img) -> Tuple[Optional[float], Optional[float]]:
-    """Median chroma and the fraction of pixels at or above CHROMA_SURVEY_MIN, or (None, None).
+def _chroma_stats(img) -> Tuple[Optional[float], Optional[float], Optional[float]]:
+    """Median chroma, 95th-percentile chroma, and the fraction at or above CHROMA_SURVEY_MIN.
 
     Recorded per sample so a focus-approach validation answers "does colour separate tissue
     from glass on THIS stain?" from data it already has. The frame is in hand at this point --
@@ -573,25 +576,31 @@ def _chroma_stats(img) -> Tuple[Optional[float], Optional[float]]:
     off a microscope PC to answer a calibration question.
 
     The point of surveying it across the WHOLE traverse rather than at focus alone is that
-    chroma is supposed to be defocus-INVARIANT. If that holds, these columns are close to flat
-    over the tissue scan and near zero over the blank one, and the gap between the two files is
-    the separation a chroma-based tissue gate would have to work with.
+    chroma is supposed to be defocus-INVARIANT. The first measured pair bore that out: median
+    chroma held at 36 across a 256 um tissue traverse over which the focus metric swung 2.4x.
+
+    p95 is here because a median plus a fraction at one threshold does not pin the tail, and
+    the tail is what sets the threshold. On the first pair the blank's median (11-13) sat on
+    top of the survey bar itself, so its fraction reported where the bar was rather than how
+    far the blank's colour actually reaches. p95 answers that outright: put CHROMA_SURVEY_MIN
+    and chroma_deviation's min_chroma above the blank's p95 and below the tissue's median.
 
     Chroma is max(RGB) - min(RGB), the same quantity chroma_deviation uses. Monochrome frames
-    have none and return (None, None) rather than a number that would look like an answer.
+    have none and return all-None rather than numbers that would look like an answer.
     """
     try:
         if img is None or img.ndim != 3 or img.shape[2] < 3:
-            return (None, None)
+            return (None, None, None)
         rgb = img[:, :, :3].astype(np.float32)
         chroma = rgb.max(axis=2) - rgb.min(axis=2)
         return (
             float(np.median(chroma)),
+            float(np.percentile(chroma, 95.0)),
             float(np.count_nonzero(chroma >= CHROMA_SURVEY_MIN) / chroma.size),
         )
     except Exception as e:
         logger.debug("chroma stats unavailable for this sample: %s", e)
-        return (None, None)
+        return (None, None, None)
 
 
 def _fresh_frame_as_numpy(core) -> Optional[np.ndarray]:
@@ -2507,7 +2516,7 @@ def _dump_streaming_scan(
         dump_dir/
           frames/frame_NNNN_t<ms>_zassumed<um>.tif    -- one per kept sample
           samples.csv                                  -- (idx, wall_ms, z_assumed_um, z_actual_um, metric,
-                                                          chroma_median, chroma_frac)
+                                                          chroma_median, chroma_p95, chroma_frac)
           z_poll.csv                                   -- (wall_ms, z_actual_um) raw poll
           manifest.json                                -- scan params
 
@@ -2554,12 +2563,13 @@ def _dump_streaming_scan(
                 "z_actual_um",
                 "metric",
                 "chroma_median",
+                "chroma_p95",
                 "chroma_frac",
             ]
         )
         for idx, (wall_ms, img, z_assumed, metric) in enumerate(dump_records):
             z_actual = _z_actual_at(wall_ms)
-            chroma_median, chroma_frac = _chroma_stats(img)
+            chroma_median, chroma_p95, chroma_frac = _chroma_stats(img)
             w.writerow(
                 [
                     idx,
@@ -2568,6 +2578,7 @@ def _dump_streaming_scan(
                     "" if z_actual is None else f"{z_actual:.4f}",
                     f"{metric:.6f}",
                     "" if chroma_median is None else f"{chroma_median:.2f}",
+                    "" if chroma_p95 is None else f"{chroma_p95:.2f}",
                     "" if chroma_frac is None else f"{chroma_frac:.4f}",
                 ]
             )
