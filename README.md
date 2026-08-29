@@ -1032,7 +1032,8 @@ over tissue and one over blank slide -- and both would otherwise land as
 
 ```
 <yaml_dir>/autofocus_tests/streaming_af_<TIMESTAMP>[_<LABEL>]/
-    samples.csv       idx, wall_ms, z_assumed_um, z_actual_um, metric
+    samples.csv       idx, wall_ms, z_assumed_um, z_actual_um, metric,
+                      chroma_median, chroma_frac
     z_poll.csv        wall_ms, z_actual_um   -- the raw stage-position poll
     manifest.json     scan parameters and summary
     frames/           ONLY when --dump-frames is set
@@ -1045,6 +1046,24 @@ the poll trace and is what the focus fit uses; `z_assumed_um` is the old
 `wall_ms * velocity` model, kept so the two can be compared. They diverge whenever
 `slow_speed_um_per_s` is mis-calibrated, and the divergence grows with distance
 travelled -- see *Where a sample's Z comes from* in the QPSC autofocus documentation.
+
+Two chroma columns exist to measure tissue-vs-glass separation from a focus-approach
+validation pair, without dumping frames (a 300-sample traverse is ~0.7 GB of frames per
+scan; these columns are ~21 KB):
+
+- **`chroma_median`** -- median chroma, `max(RGB) - min(RGB)`, over the frame.
+- **`chroma_frac`** -- fraction of pixels at or above the stain threshold (12.0, the same
+  default `chroma_deviation` uses, so the numbers mean what that check would mean by them).
+
+Both are blank when the frame is monochrome, rather than reporting a number that would look
+like an answer.
+
+They are surveyed across the WHOLE traverse on purpose. Chroma is *expected* to be
+defocus-invariant -- that is the property that would make it useful in a tissue gate -- so
+if the expectation holds these columns stay roughly flat over a tissue scan and near zero
+over a blank one, and the gap between the two files is the separation such a gate would have
+to work with. If they overlap instead, chroma does not discriminate on that stain. Both
+outcomes are worth knowing before wiring it into anything; neither is assumed here.
 
 `manifest.json` records `z_start`, `z_end`, `velocity_um_s_configured`,
 `motion_duration_ms`, `metric_name`, `n_kept_samples`, `n_z_poll_samples`,
