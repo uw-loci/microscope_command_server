@@ -91,6 +91,45 @@ def first_prominent_peaks_in_scan_order(
 SHARP_PEAK_MIN_AMPLITUDE_RATIO = 1.6
 SHARP_PEAK_MAX_FWHM_UM = 25.0
 
+#: How many samples must land across a peak's FWHM before its SHAPE is worth
+#: believing. Below this the traverse is stepping over the peak rather than
+#: resolving it, so the measured height and width are both accidents of where the
+#: samples happened to fall.
+#:
+#: This is not hypothetical. In the measured 10x scan the local stride near the
+#: peak was 0.93 um against a 4.7 um FWHM -- 5.0 samples, comfortable. The stride
+#: does not change with magnification but the peak does: the same traverse gives
+#: about 2.7 samples across a 2.5 um peak and 1.3 across a 1.2 um one, at which
+#: point the apex can be stepped over completely and the recorded "peak" is a
+#: shoulder. A blunter object in the same field -- a fibre lying across the slide,
+#: which is tilted and so stays in focus over a much wider Z range -- is immune to
+#: that and wins on score despite being the wrong thing to focus on.
+#:
+#: Note the existing pre-flight blur budget does NOT cover this. It bounds
+#: exposure x velocity, i.e. smear within one frame; this bounds frame INTERVAL x
+#: velocity, i.e. the gap between frames. The interval is dominated by readout, so
+#: blur can be well inside budget while the stride is several times coarser.
+MIN_SAMPLES_ACROSS_FWHM = 3.0
+
+
+def local_sampling_gap_um(
+    samples_zm: List[Tuple[float, float]], index: int, half_window: int = 10
+) -> float:
+    """Median Z stride between neighbouring samples around ``index``.
+
+    Local rather than whole-scan because the stride is not uniform: streaming frames
+    arrive irregularly, and in the measured trace the gap ranged from 0.74 um at the
+    median to 4.23 um at the worst. What matters for a peak is the stride where that
+    peak is, not the average over a traverse that is mostly empty.
+    """
+    lo = max(0, index - half_window)
+    hi = min(len(samples_zm) - 1, index + half_window)
+    gaps = [abs(samples_zm[i + 1][0] - samples_zm[i][0]) for i in range(lo, hi)]
+    gaps = [g for g in gaps if g > 0]
+    if not gaps:
+        return float("inf")
+    return float(median(gaps))
+
 
 def peak_shape(
     samples_zm: List[Tuple[float, float]], index: int, baseline: float
@@ -169,7 +208,38 @@ def standout_peak(
             return None
 
     amplitude, fwhm = peak_shape(samples_zm, index, baseline)
+
+    # Resolution guard: a peak the traverse stepped over has no trustworthy shape, so
+    # "sharp" cannot be asserted about it either way. Refusing here is the conservative
+    # branch -- it sends the caller to the ordered walk rather than committing to a
+    # height and width that are artefacts of the sampling.
+    stride = local_sampling_gap_um(samples_zm, index)
+    samples_across = fwhm / stride if stride > 0 else 0.0
+    if samples_across < MIN_SAMPLES_ACROSS_FWHM:
+        logger.warning(
+            "STREAM_AF:approach strongest peak at Z=%.3f is UNRESOLVED -- only %.1f samples "
+            "across its %.1f um width at a %.2f um stride (need %.1f). The traverse is "
+            "stepping over peaks this narrow, so both its height and its width are "
+            "accidents of sampling, and a broader object in the field (a fibre, say) will "
+            "out-score the sample. Slow the approach or raise the frame rate.",
+            best_z,
+            samples_across,
+            fwhm,
+            stride,
+            MIN_SAMPLES_ACROSS_FWHM,
+        )
+        return None
+
     if amplitude >= SHARP_PEAK_MIN_AMPLITUDE_RATIO and fwhm <= SHARP_PEAK_MAX_FWHM_UM:
+        logger.info(
+            "STREAM_AF:approach standout peak at Z=%.3f -- %.2fx baseline, FWHM %.1f um, "
+            "%.1f samples across it at a %.2f um stride",
+            best_z,
+            amplitude,
+            fwhm,
+            samples_across,
+            stride,
+        )
         return (best_z, best_m, amplitude, fwhm)
     logger.info(
         "STREAM_AF:approach strongest peak at Z=%.3f is not sharp enough to short-circuit "

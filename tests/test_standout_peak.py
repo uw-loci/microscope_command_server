@@ -125,3 +125,55 @@ def test_bars_sit_in_the_gap_rather_than_on_a_boundary():
     """Guards against a later 'tidy-up' tightening these onto the measured values."""
     assert 1.2 < SHARP_PEAK_MIN_AMPLITUDE_RATIO < 2.4, "must reject 1.17x and accept 2.44x"
     assert 6.0 < SHARP_PEAK_MAX_FWHM_UM < 125.0, "must accept 4.7 um and reject ~125 um"
+
+
+# ---------------------------------------------- sampling resolution
+
+
+def _undersampled_tissue_scan(stride_um):
+    """The measured tissue peak, resampled at a coarser stride.
+
+    The peak is real and strong; the only thing that changes is how often the traverse
+    looked at it. This is the "moved past it too quickly" case.
+    """
+    import bisect
+
+    zs = [z for z, _ in TISSUE_PEAK_REGION]
+    ms = [m for _, m in TISSUE_PEAK_REGION]
+
+    def interp(z):
+        i = bisect.bisect_left([-x for x in zs], -z)
+        if i <= 0:
+            return ms[0]
+        if i >= len(zs):
+            return ms[-1]
+        f = (z - zs[i - 1]) / (zs[i] - zs[i - 1])
+        return ms[i - 1] + f * (ms[i] - ms[i - 1])
+
+    flat = [
+        (-1.0 - stride_um * i, 12.59e6 + (i % 5) * 12000.0) for i in range(int(200 / stride_um))
+    ]
+    peak = []
+    z = zs[0]
+    while z > zs[-1]:
+        peak.append((z, interp(z)))
+        z -= stride_um
+    return flat + peak
+
+
+def test_a_well_sampled_peak_is_still_a_standout():
+    scan = _undersampled_tissue_scan(0.93)  # the stride actually measured at 10x
+    assert standout_peak(scan, first_prominent_peaks_in_scan_order(scan)) is not None
+
+
+def test_an_unresolved_peak_is_refused_however_tall_it_looks():
+    """Guards the failure the user hit: a narrow peak stepped over by the traverse.
+
+    Its recorded height and width are accidents of where samples fell, so no claim about
+    sharpness can be made -- and a blunter object in the same field will out-score it.
+    Refusing sends the caller to the ordered walk instead of committing to an artefact.
+    """
+    scan = _undersampled_tissue_scan(3.0)
+    peaks = first_prominent_peaks_in_scan_order(scan)
+    assert peaks, "the peak is still found -- it is the SHAPE that cannot be trusted"
+    assert standout_peak(scan, peaks) is None
