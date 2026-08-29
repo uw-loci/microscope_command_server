@@ -119,6 +119,10 @@ from typing import Dict, Any, List, Optional, Tuple
 import numpy as np
 
 from microscope_command_server.server.focus_geometry import build_z_from_poll
+from microscope_command_server.server.focus_peaks import (
+    first_prominent_peaks_in_scan_order,
+    standout_peak,
+)
 from microscope_command_server.server.focus_validity import (
     load_autofocus_doc,
     resolve_validity,
@@ -3595,48 +3599,6 @@ def _attempt_one_scan(
         )
 
 
-def _first_prominent_peaks_in_scan_order(
-    samples_zm: List[Tuple[float, float]],
-    prominence_fraction: float = 0.15,
-) -> List[Tuple[float, float]]:
-    """Prominent local maxima, in the order the scan met them.
-
-    Order is what matters here: an approach commits to the FIRST peak it can
-    justify, so the caller needs candidates in travel order, not by strength.
-    Prominence is measured against the deeper adjacent valley so a shoulder on
-    the way up is not mistaken for a separate focal plane.
-
-    Returns a list of (z, metric).
-    """
-    if len(samples_zm) < 5:
-        return []
-    values = [m for _, m in samples_zm]
-    lo = min(values)
-    hi = max(values)
-    rng = hi - lo
-    if rng <= 0:
-        return []
-
-    peaks: List[Tuple[float, float]] = []
-    for i in range(1, len(values) - 1):
-        if values[i] <= values[i - 1] or values[i] < values[i + 1]:
-            continue
-        left_valley = values[i]
-        for j in range(i, -1, -1):
-            left_valley = min(left_valley, values[j])
-            if values[j] > values[i]:
-                break
-        right_valley = values[i]
-        for j in range(i, len(values)):
-            right_valley = min(right_valley, values[j])
-            if values[j] > values[i]:
-                break
-        prominence = values[i] - max(left_valley, right_valley)
-        if prominence >= prominence_fraction * rng:
-            peaks.append((samples_zm[i][0], values[i]))
-    return peaks
-
-
 def _tissue_present_at(
     core,
     focus_device: str,
@@ -3798,7 +3760,7 @@ def _approach_from_safe_z(
             scan.z_span,
             "scan returned samples in an unexpected shape",
         )
-    peaks = _first_prominent_peaks_in_scan_order(samples)
+    peaks = first_prominent_peaks_in_scan_order(samples)
     if not peaks:
         _retract(core, focus_device, safe_z, "no prominent peak")
         return _ScanAttemptResult(
@@ -3807,6 +3769,54 @@ def _approach_from_safe_z(
             scan.n_samples,
             scan.z_span,
             "no prominent focus peak between the safe Z and the approach limit",
+        )
+
+    # An unmistakable peak -- far above baseline AND narrow -- is the sample, so go
+    # straight to it rather than snapping at every earlier candidate on the way. This is
+    # the "if we get an extreme peak, stop" case: on the measured PPM scans the real peak
+    # is 2.44x baseline at 4.7 um FWHM, while the spurious 20x peak that cost a slide was
+    # 1.17x at ~125 um.
+    #
+    # Always tissue-gated, INCLUDING when require_tissue_gate is off, and that is the one
+    # place this changes an outcome rather than just saving work: with the gate off the
+    # walk below commits peak 1 whatever it is, so a tissue-confirmed standout further in
+    # gets committed instead. That is the intended fix, not a side effect -- committing a
+    # peak that was not the sample is exactly what happened on 2026-08-28. A standout that
+    # fails the gate falls through to the walk, which then behaves exactly as configured.
+    standout = standout_peak(samples, peaks)
+    if standout is not None:
+        sz, _sm, samplitude, sfwhm = standout
+        logger.info(
+            "STREAM_AF:approach found a standout peak at Z=%.3f (%.2fx baseline, FWHM %.1f um) "
+            "among %d candidate(s) -- checking it first",
+            sz,
+            samplitude,
+            sfwhm,
+            len(peaks),
+        )
+        ok, why = _tissue_present_at(core, focus_device, sz, validity_name, validity_kwargs)
+        if ok:
+            if peaks and abs(peaks[0][0] - sz) > 1e-9:
+                logger.info(
+                    "STREAM_AF:approach preferring the standout peak at Z=%.3f over the first "
+                    "peak in travel order at Z=%.3f (tissue gate %s)",
+                    sz,
+                    peaks[0][0],
+                    "ON" if require_tissue_gate else "off",
+                )
+            logger.info("STREAM_AF:approach committing to the standout peak at Z=%.3f", sz)
+            return _ScanAttemptResult(
+                "success",
+                sz,
+                scan.n_samples,
+                scan.z_span,
+                f"standout peak ({samplitude:.2f}x baseline, FWHM {sfwhm:.1f} um), tissue confirmed",
+            )
+        logger.info(
+            "STREAM_AF:approach standout peak at Z=%.3f has no tissue (%s); falling back to "
+            "the ordered walk",
+            sz,
+            why,
         )
 
     for idx, (z, metric_value) in enumerate(peaks):
