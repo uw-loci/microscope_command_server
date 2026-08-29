@@ -4032,8 +4032,15 @@ def handle_streaming_focus(conn, client, hardware, settings, **kwargs):
         ],
     )
     yaml_path = params.get("yaml")
-    dump_label = params.get("dump-label")
-    dump_frames_flag = params.get("dump-frames")
+    # parse_flags keys are the flag name with internal dashes turned into UNDERSCORES
+    # (see its docstring), so "--dump-label" arrives as "dump_label". Reading "dump-label"
+    # returned None every time: every validation run's dump landed in a bare
+    # streaming_af_<timestamp> directory, and the two scans of a pair -- one over tissue,
+    # one over blank glass -- became indistinguishable afterwards without opening them and
+    # guessing from the curve. Which is exactly what the suffix was added to prevent, and
+    # what its own comment three lines below says it prevents.
+    dump_label = params.get("dump_label")
+    dump_frames_flag = params.get("dump_frames")
     client_objective = params.get("objective")
     range_override_str = params.get("range")
     client_modality = params.get("modality")
