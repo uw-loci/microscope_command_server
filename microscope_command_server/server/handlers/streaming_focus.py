@@ -556,6 +556,44 @@ def _pop_tagged_frame(core) -> Tuple[Optional[np.ndarray], Optional[float]]:
 FRESH_FRAME_WAIT_S = 0.30
 
 
+#: Chroma at or above which a pixel counts as stained, for the survey columns in samples.csv.
+#: Matches chroma_deviation's default so the numbers in the CSV mean the same thing the check
+#: would mean by them.
+CHROMA_SURVEY_MIN = 12.0
+
+
+def _chroma_stats(img) -> Tuple[Optional[float], Optional[float]]:
+    """Median chroma and the fraction of pixels at or above CHROMA_SURVEY_MIN, or (None, None).
+
+    Recorded per sample so a focus-approach validation answers "does colour separate tissue
+    from glass on THIS stain?" from data it already has. The frame is in hand at this point --
+    it was just used to compute the focus metric -- so this costs one pass over an array that
+    is already in memory, and needs no frames written to disk. That matters: dumping frames
+    for a 300-sample traverse is most of a gigabyte per scan, which is not something to move
+    off a microscope PC to answer a calibration question.
+
+    The point of surveying it across the WHOLE traverse rather than at focus alone is that
+    chroma is supposed to be defocus-INVARIANT. If that holds, these columns are close to flat
+    over the tissue scan and near zero over the blank one, and the gap between the two files is
+    the separation a chroma-based tissue gate would have to work with.
+
+    Chroma is max(RGB) - min(RGB), the same quantity chroma_deviation uses. Monochrome frames
+    have none and return (None, None) rather than a number that would look like an answer.
+    """
+    try:
+        if img is None or img.ndim != 3 or img.shape[2] < 3:
+            return (None, None)
+        rgb = img[:, :, :3].astype(np.float32)
+        chroma = rgb.max(axis=2) - rgb.min(axis=2)
+        return (
+            float(np.median(chroma)),
+            float(np.count_nonzero(chroma >= CHROMA_SURVEY_MIN) / chroma.size),
+        )
+    except Exception as e:
+        logger.debug("chroma stats unavailable for this sample: %s", e)
+        return (None, None)
+
+
 def _fresh_frame_as_numpy(core) -> Optional[np.ndarray]:
     """A frame from AFTER the caller's last stage move, whether or not a sequence is running.
 
@@ -2468,7 +2506,8 @@ def _dump_streaming_scan(
     Layout:
         dump_dir/
           frames/frame_NNNN_t<ms>_zassumed<um>.tif    -- one per kept sample
-          samples.csv                                  -- (idx, wall_ms, z_assumed_um, z_actual_um, metric)
+          samples.csv                                  -- (idx, wall_ms, z_assumed_um, z_actual_um, metric,
+                                                          chroma_median, chroma_frac)
           z_poll.csv                                   -- (wall_ms, z_actual_um) raw poll
           manifest.json                                -- scan params
 
@@ -2507,9 +2546,20 @@ def _dump_streaming_scan(
     samples_csv_path = dump_dir / "samples.csv"
     with open(samples_csv_path, "w", newline="") as fh:
         w = csv.writer(fh)
-        w.writerow(["idx", "wall_ms", "z_assumed_um", "z_actual_um", "metric"])
+        w.writerow(
+            [
+                "idx",
+                "wall_ms",
+                "z_assumed_um",
+                "z_actual_um",
+                "metric",
+                "chroma_median",
+                "chroma_frac",
+            ]
+        )
         for idx, (wall_ms, img, z_assumed, metric) in enumerate(dump_records):
             z_actual = _z_actual_at(wall_ms)
+            chroma_median, chroma_frac = _chroma_stats(img)
             w.writerow(
                 [
                     idx,
@@ -2517,6 +2567,8 @@ def _dump_streaming_scan(
                     f"{z_assumed:.4f}",
                     "" if z_actual is None else f"{z_actual:.4f}",
                     f"{metric:.6f}",
+                    "" if chroma_median is None else f"{chroma_median:.2f}",
+                    "" if chroma_frac is None else f"{chroma_frac:.4f}",
                 ]
             )
             if not write_frames:
