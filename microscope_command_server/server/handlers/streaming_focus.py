@@ -119,6 +119,10 @@ from typing import Dict, Any, List, Optional, Tuple
 import numpy as np
 
 from microscope_command_server.server.focus_geometry import build_z_from_poll
+from microscope_command_server.server.focus_validity import (
+    load_autofocus_doc,
+    resolve_validity,
+)
 from microscope_command_server.server.handlers.utils import (
     read_message_string,
     parse_flags,
@@ -4803,38 +4807,78 @@ def handle_streaming_focus(conn, client, hardware, settings, **kwargs):
             max_attempts = 0
 
         if approach_mode:
+            # Resolve the tissue gate the same way the acquisition path and FINDTISS do:
+            # modality binding -> strategy -> validity_params, merged with the binding's
+            # overrides. This used to hardcode texture_and_area and read the FLAT
+            # per-objective keys, which is exactly the mistake server.focus_validity was
+            # written to prevent. Two consequences, both silent: the modality's tuned
+            # thresholds never applied (on PPM that is tissue_mask_range [0.05, 0.95] and
+            # texture_threshold 0.005), and the params it did not pass -- tissue_mask_range,
+            # median_floor, saturation_threshold -- fell back to the check's own defaults.
+            # So the gate deciding whether to commit a Z was running a DIFFERENT test from
+            # the one the operator configured and the one the rest of the server uses.
+            gate_validity_name, gate_validity_kwargs = resolve_validity(
+                load_autofocus_doc(yaml_path), client_modality, objective
+            )
+            if gate_validity_name == "always_false":
+                # No automatic tissue test exists for this modality, so a gated approach
+                # can only traverse the full bound and reject every peak it meets. Say so
+                # rather than spending the travel to arrive at a foregone conclusion --
+                # and do NOT quietly drop the gate, which would commit an unverified peak.
+                logger.error(
+                    "STREAM_AF:approach requested with a tissue gate, but modality %r uses "
+                    "the always_false validity check -- no automatic tissue test exists for "
+                    "it. Refusing rather than committing an unverified peak.",
+                    client_modality,
+                )
+            gate_unavailable = gate_validity_name == "always_false" and require_tissue_gate
+            logger.info(
+                "STREAM_AF:approach tissue gate %s (validity=%s %s)",
+                "ON" if require_tissue_gate else "off",
+                gate_validity_name,
+                gate_validity_kwargs,
+            )
             # A different strategy entirely, so it replaces the walk rather than
             # seeding it: setting max_attempts to 0 skips the retry loop below,
             # and the shared commit/response block runs on this result. The walk
             # must NOT run afterwards -- falling back to it would reintroduce the
             # open-ended travel the approach exists to avoid.
-            final_result = _approach_from_safe_z(
-                core,
-                focus_device,
-                speed_prop,
-                safe_z=approach_safe_z,
-                approach_max_um=approach_max_um,
-                require_tissue_gate=require_tissue_gate,
-                validity_name="texture_and_area",
-                validity_kwargs={
-                    "texture_threshold": float(af_entry.get("texture_threshold", 0.010)),
-                    "tissue_area_threshold": float(af_entry.get("tissue_area_threshold", 0.200)),
-                    "rgb_brightness_threshold": float(
-                        af_entry.get("rgb_brightness_threshold", 240.0)
-                    ),
-                },
-                sequence_was_running=sequence_was_running,
-                velocity_um_s=min_velocity_um_s,
-                metric_name=metric_name,
-                slow_value=eff_slow_value,
-                normal_value=eff_normal_value,
-                z_low=z_low,
-                z_high=z_high,
-                initial_z=initial_z,
-                dump_dir=dump_root,
-                dump_frames=dump_frames,
-                abort_event=abort_event,
-                head_discard_ms=eff_head_discard_ms,
+            #
+            # A gate that can never pass is reported through the same result object
+            # rather than an early return, so the shared block still restores the stage
+            # speed and Z on the way out.
+            final_result = (
+                _ScanAttemptResult(
+                    "error",
+                    None,
+                    0,
+                    0.0,
+                    "no automatic tissue check exists for this modality; "
+                    "refusing a gated approach rather than committing an unverified peak",
+                )
+                if gate_unavailable
+                else _approach_from_safe_z(
+                    core,
+                    focus_device,
+                    speed_prop,
+                    safe_z=approach_safe_z,
+                    approach_max_um=approach_max_um,
+                    require_tissue_gate=require_tissue_gate,
+                    validity_name=gate_validity_name,
+                    validity_kwargs=gate_validity_kwargs,
+                    sequence_was_running=sequence_was_running,
+                    velocity_um_s=min_velocity_um_s,
+                    metric_name=metric_name,
+                    slow_value=eff_slow_value,
+                    normal_value=eff_normal_value,
+                    z_low=z_low,
+                    z_high=z_high,
+                    initial_z=initial_z,
+                    dump_dir=dump_root,
+                    dump_frames=dump_frames,
+                    abort_event=abort_event,
+                    head_discard_ms=eff_head_discard_ms,
+                )
             )
             attempts_log.append(
                 f"approach-from-safe-Z: safe_z={approach_safe_z:.3f} "
