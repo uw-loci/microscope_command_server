@@ -1035,7 +1035,8 @@ over tissue and one over blank slide -- and both would otherwise land as
     samples.csv       idx, wall_ms, z_assumed_um, z_actual_um, metric,
                       chroma_median, chroma_p95, chroma_frac
     z_poll.csv        wall_ms, z_actual_um   -- the raw stage-position poll
-    manifest.json     scan parameters and summary
+    blocks.csv        per-block focus energy profile (spatial distribution of sharpness)
+    manifest.json     scan parameters, summary, and focus-plane analysis result
     frames/           ONLY when --dump-frames is set
         frame_0000_t000093ms_zass-001.072.tif
         ...
@@ -1047,7 +1048,45 @@ the poll trace and is what the focus fit uses; `z_assumed_um` is the old
 `slow_speed_um_per_s` is mis-calibrated, and the divergence grows with distance
 travelled -- see *Where a sample's Z comes from* in the QPSC autofocus documentation.
 
-Three chroma columns exist to measure tissue-vs-glass separation from a focus-approach
+### Block-wise focus analysis
+
+`blocks.csv` contains per-block focus energy for each sample, revealing **where** in the
+field the sharpness is concentrated. This spatial distribution separates the actual sample
+plane from false peaks caused by dust specks or fibres on the coverslip:
+
+- A sample plane shows sharpness distributed across many blocks, scattered over the frame.
+- A dust speck or fibre lights up only the few blocks covering it, and those blocks are
+  contiguous -- which is what the `dispersion` figure measures.
+
+This matters because a whole-frame metric cannot make that distinction, and neither can
+chroma: chroma is defocus-invariant, so two candidate planes inside ONE field report
+essentially the same chroma by construction.
+
+The file has one row per sample frame with columns: `idx, z_actual_um, b00, b01, ... b77`.
+The grid is a fixed 8x8 (64 blocks), not detector-dependent -- on a 772x1024 frame that is
+~96x128 px per block, large enough that a block of blank glass still has a meaningful
+gradient statistic and small enough that a fibre spanning a corner lights up only a few.
+
+The manifest includes a `focus_plane` field with the block-wise analysis result:
+- `z`: The Z identified as the sample plane, or `null` if no plane was accepted.
+- `n_blocks`: How many blocks agree on this plane. Must reach 10 of 64.
+- `dispersion`: How SPREAD OUT those agreeing blocks are -- mean pairwise block distance
+  over the grid diagonal. **Higher is better**: a scatter across the frame scores ~0.42 and
+  is what tissue looks like, while a blob on one object scores ~0.2. Must reach 0.30.
+- `n_live_blocks`: How many blocks have any focus peak at all (>= 1.3x their own baseline).
+- `reason`: Why, in words -- `"accepted"`, or e.g. "only 4 of 64 blocks have any focus peak".
+- `rejected`: Candidate planes that were ruled out, each with its block count, dispersion,
+  and which bar it missed.
+
+Measured values behind those bars, from the four positions that failed a 4-slide run
+(PPM 20x, 2026-09-04): a fibre scored 8 blocks / 0.247, dust specks 4 / 0.199, and real
+tissue 14 / 0.366 and 63 / 0.424. The bars sit in those gaps, which are narrow -- four
+planes is not a distribution, so re-measure before trusting them on a different stain or
+objective.
+
+### Chroma columns for tissue detection
+
+Three chroma columns in `samples.csv` measure tissue-vs-glass separation from a focus-approach
 validation pair, without dumping frames (a 300-sample traverse is ~0.7 GB of frames per
 scan; these columns are ~21 KB):
 
