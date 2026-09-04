@@ -611,6 +611,87 @@ def _chroma_stats(img) -> Tuple[Optional[float], Optional[float], Optional[float
         return (None, None, None)
 
 
+def _block_profile(img):
+    """Per-block focus energy for one frame, or None when it cannot be computed.
+
+    Same gradient quantity the whole-frame metric uses, kept per-block instead of summed.
+    The sum is precisely what lets one small bright object outvote the rest of the field:
+    a fibre carries ~200 counts of edge contrast against pale H&E's 20-40, so a few hundred
+    fibre pixels outweigh a whole field of tissue (measured 2026-09-04 at 6281,-38413,
+    where the fibre peaked 108 um away from the tissue and won).
+    """
+    try:
+        from microscope_imageprocessing.focus.planes import block_focus_profile
+
+        return block_focus_profile(img)
+    except Exception as e:
+        logger.debug("block profile unavailable for this sample: %s", e)
+        return None
+
+
+def _write_block_profiles(dump_dir: Path, rows, zs, profiles) -> Optional[Dict[str, Any]]:
+    """Write blocks.csv and report which plane the SAMPLE is on.
+
+    Reported rather than acted on: this runs on a dump, so a focus-approach validation at a
+    problem position shows what the block analysis would have chosen without changing what
+    the scan actually did. Compare it against the raw peak in the same manifest.
+    """
+    if not rows:
+        return None
+    import csv
+
+    try:
+        with open(dump_dir / "blocks.csv", "w", newline="") as fh:
+            w = csv.writer(fh)
+            grid = profiles[0].shape[0]
+            w.writerow(
+                ["idx", "z_actual_um"] + [f"b{r}{c}" for r in range(grid) for c in range(grid)]
+            )
+            for idx, z_actual, prof in rows:
+                w.writerow(
+                    [idx, "" if z_actual is None else f"{z_actual:.4f}"]
+                    + [f"{v:.4f}" for v in prof.ravel()]
+                )
+    except Exception as e:
+        logger.warning("could not write blocks.csv: %s", e)
+
+    try:
+        from microscope_imageprocessing.focus.planes import detect_focus_plane
+
+        r = detect_focus_plane(zs, profiles)
+    except Exception as e:
+        logger.warning("focus-plane analysis failed: %s", e)
+        return None
+
+    for rj in r.rejected:
+        logger.info(
+            "STREAM_AF:plane analysis REJECTED Z=%.2f -- %d blocks, dispersion %.3f: %s",
+            rj["z"],
+            rj["blocks"],
+            rj["dispersion"],
+            rj["why"],
+        )
+    if r.found:
+        logger.info(
+            "STREAM_AF:plane analysis says the SAMPLE is at Z=%.2f "
+            "(%d blocks agree, dispersion %.3f, %d of the field live)",
+            r.z,
+            r.n_blocks,
+            r.dispersion,
+            r.n_live,
+        )
+    else:
+        logger.info("STREAM_AF:plane analysis found no sample plane -- %s", r.reason)
+    return {
+        "z": r.z,
+        "n_blocks": r.n_blocks,
+        "dispersion": r.dispersion,
+        "n_live_blocks": r.n_live,
+        "reason": r.reason,
+        "rejected": r.rejected,
+    }
+
+
 def _fresh_frame_as_numpy(core) -> Optional[np.ndarray]:
     """A frame from AFTER the caller's last stage move, whether or not a sequence is running.
 
@@ -2560,6 +2641,14 @@ def _dump_streaming_scan(
             return float(poll_z[-1])
         return float(np.interp(wall_ms, poll_t, poll_z))
 
+    # Per-block focus profiles, collected in the same pass as the chroma columns. These
+    # answer a question the whole-frame metric cannot: WHERE in the field the sharpness is,
+    # which is what separates the sample plane from a fibre or a dust speck lying on the
+    # slide. See microscope_imageprocessing.focus.planes.
+    block_zs: List[float] = []
+    block_profiles: List[Any] = []
+    block_rows: List[Tuple[int, Optional[float], Any]] = []
+
     samples_csv_path = dump_dir / "samples.csv"
     with open(samples_csv_path, "w", newline="") as fh:
         w = csv.writer(fh)
@@ -2578,6 +2667,11 @@ def _dump_streaming_scan(
         for idx, (wall_ms, img, z_assumed, metric) in enumerate(dump_records):
             z_actual = _z_actual_at(wall_ms)
             chroma_median, chroma_p95, chroma_frac = _chroma_stats(img)
+            prof = _block_profile(img)
+            if prof is not None:
+                block_zs.append(z_actual if z_actual is not None else z_assumed)
+                block_profiles.append(prof)
+                block_rows.append((idx, z_actual, prof))
             w.writerow(
                 [
                     idx,
@@ -2615,6 +2709,8 @@ def _dump_streaming_scan(
         for t_ms, z in z_poll_samples:
             w.writerow([f"{t_ms:.2f}", f"{z:.4f}"])
 
+    plane_summary = _write_block_profiles(dump_dir, block_rows, block_zs, block_profiles)
+
     manifest = {
         "z_start": z_start,
         "z_end": z_end,
@@ -2634,6 +2730,8 @@ def _dump_streaming_scan(
         manifest["z_poll_last_t_ms"] = last_t
         manifest["z_poll_last_z"] = last_z
         manifest["observed_avg_velocity_um_s"] = abs(last_z - first_z) / observed_dur_s
+    if plane_summary:
+        manifest["focus_plane"] = plane_summary
     with open(dump_dir / "manifest.json", "w") as fh:
         json.dump(manifest, fh, indent=2)
 
