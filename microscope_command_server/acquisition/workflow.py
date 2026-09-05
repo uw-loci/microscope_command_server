@@ -1027,6 +1027,73 @@ def get_interpolated_calibration_for_angle(
     return None
 
 
+def set_af_exposure(hardware, ctx, exposure_ms: float, logger=None, why: str = "autofocus") -> None:
+    """Set the autofocus exposure WITHOUT destroying the camera's colour balance.
+
+    On the JAI the balance comes from per-channel exposures as much as from the analog
+    gains -- the uncrossed calibration is R=0.1ms, G=0.2ms, B=0.6ms. Three sites used to
+    call ``disable_individual_exposure()`` and then apply one unified exposure, keeping the
+    gains but discarding the exposures. That puts red at 2x its calibrated exposure and
+    blue at a third of it.
+
+    Measured on the 2026-08-29 run, slide ppm_20x_22: AF frames came back with a channel
+    mean of [254.7, 119.6, 57.7] -- red pinned against the ceiling with no contrast left,
+    blue starved. Normalised to green that is R/G = 2.13 and B/G = 0.48, against the 2.00
+    and 0.33 the exposure ratios predict. With a third of the luminance carrying no signal,
+    the texture metric came in just under threshold: 469 of 1250 autofocus attempts were
+    rejected at a median texture of 0.00836 against a bar of 0.01, with NONE below 0.005.
+    Every one of those deferred autofocus and acquired its tile at a stale Z, which is
+    what put a band of that slide out of focus.
+
+    So scale the calibrated per-channel exposures together instead. Green lands on
+    ``exposure_ms`` exactly as before -- the intent of the old call -- while red and blue
+    keep their ratio to it. Falls back to a unified exposure only when there is no
+    per-channel calibration to preserve, which is the correct behaviour for a camera that
+    does not have one.
+    """
+    scale = None
+    if getattr(ctx, "is_jai_camera", False) and ctx.jai_calibration is not None:
+        try:
+            cal = ctx.jai_calibration.get("angles", {}).get("uncrossed", {}) or {}
+            exps = cal.get("exposures_ms", {}) or {}
+            g = float(exps.get("g", 0.0))
+            if g > 0 and exposure_ms > 0:
+                scale = float(exposure_ms) / g
+        except Exception as e:
+            if logger:
+                logger.debug("Could not read the uncrossed per-channel exposures: %s", e)
+
+    if scale is not None:
+        applied, _ = apply_jai_calibration_for_angle(
+            hardware,
+            ctx.jai_calibration,
+            90.0,
+            per_angle=True,
+            logger=logger,
+            exposure_scale=scale,
+        )
+        if applied:
+            if logger:
+                logger.info(
+                    "Set %s exposure to %.3fms on green, per-channel ratio preserved "
+                    "(scale=%.3fx of the uncrossed calibration)",
+                    why,
+                    exposure_ms,
+                    scale,
+                )
+            return
+        if logger:
+            logger.warning(
+                "Could not apply per-channel %s exposure; falling back to a unified one, "
+                "which will unbalance the JAI's channels.",
+                why,
+            )
+
+    hardware.set_exposure(exposure_ms)
+    if logger:
+        logger.info("Set exposure to %sms for %s", exposure_ms, why)
+
+
 def apply_jai_calibration_for_angle(
     hardware: "PycromanagerHardware",
     jai_calibration: Dict[str, Any],
@@ -3967,7 +4034,13 @@ def _guard_af_saturation(ctx: "AcquisitionContext", hardware, logger) -> None:
             return
         try:
             if use_exposure:
-                hardware.set_exposure(ctx.exposure_90 * ctx.af_saturation_scale)
+                set_af_exposure(
+                    hardware,
+                    ctx,
+                    ctx.exposure_90 * ctx.af_saturation_scale,
+                    logger=logger,
+                    why="AF saturation reduction",
+                )
             elif ctx.af_illumination_power is not None:
                 illum.set_power(ctx.af_illumination_power)
         except Exception as e:
@@ -4173,8 +4246,7 @@ def _run_pre_acquisition_autofocus(ctx: AcquisitionContext) -> None:
             except Exception as e:
                 logger.warning(f"Could not configure camera for AF: {e}")
 
-        hardware.set_exposure(ctx.exposure_90)
-        logger.info(f"Set exposure to {ctx.exposure_90}ms for initial autofocus")
+        set_af_exposure(hardware, ctx, ctx.exposure_90, logger=logger, why="initial autofocus")
 
     # Calculate direction toward center for tissue search loop
     start_pos = np.array([first_af_pos.x, first_af_pos.y])
@@ -4213,7 +4285,9 @@ def _run_pre_acquisition_autofocus(ctx: AcquisitionContext) -> None:
             if bright_ok:
                 break
             ctx.exposure_90 *= 2.0
-            hardware.set_exposure(ctx.exposure_90)
+            set_af_exposure(
+                hardware, ctx, ctx.exposure_90, logger=logger, why="AF brightness doubling"
+            )
             logger.warning(
                 f"AF test image brightness_check failed ({bright_stats}), "
                 f"doubling exposure to {ctx.exposure_90:.2f}ms"
@@ -4512,28 +4586,14 @@ def _handle_tile_autofocus(
             if angle_idx < len(params["exposures"]):
                 ctx.exposure_90 = params["exposures"][angle_idx]
 
-        # Disable per-channel mode and apply analog gains
-        if ctx.is_jai_camera:
-            try:
-                hardware.camera.disable_individual_exposure()
-                hardware.camera.disable_individual_gain()
-                if ctx.jai_calibration is not None:
-                    uncrossed_gains = (
-                        ctx.jai_calibration.get("angles", {}).get("uncrossed", {}).get("gains", {})
-                    )
-                    af_unified_gain = uncrossed_gains.get("unified_gain", 1.0)
-                    hardware.camera.set_unified_gain(af_unified_gain)
-                    hardware.camera.set_rb_analog_gains(
-                        analog_red=uncrossed_gains.get("analog_red", 1.0),
-                        analog_blue=uncrossed_gains.get("analog_blue", 1.0),
-                    )
-            except Exception as e:
-                logger.warning(f"Could not configure camera for AF: {e}")
-
+        # Exposure + gains for tissue detection. set_af_exposure keeps the JAI's
+        # per-channel exposure ratio, which is half of what balances that camera; the
+        # gains alone are not enough. See set_af_exposure for what collapsing them cost.
         t_exp = time.perf_counter()
-        hardware.set_exposure(ctx.exposure_90)
+        set_af_exposure(
+            hardware, ctx, ctx.exposure_90, logger=logger, why="90 deg tissue detection"
+        )
         t_exp = log_timing(logger, "Set exposure for tissue detection", t_exp)
-        logger.info(f"Set exposure to {ctx.exposure_90}ms for 90 deg tissue detection")
 
     # Take a quick image to assess tissue content
     t_snap = time.perf_counter()
@@ -4553,7 +4613,7 @@ def _handle_tile_autofocus(
         if bright_ok:
             break
         ctx.exposure_90 *= 2.0
-        hardware.set_exposure(ctx.exposure_90)
+        set_af_exposure(hardware, ctx, ctx.exposure_90, logger=logger, why="AF brightness doubling")
         logger.warning(
             f"AF drift-check image brightness_check failed ({bright_stats}), "
             f"doubling exposure to {ctx.exposure_90:.2f}ms"
