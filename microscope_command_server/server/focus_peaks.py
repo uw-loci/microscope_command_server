@@ -22,7 +22,7 @@ confident peaks on a slide with nothing on it.
 
 import logging
 from statistics import median
-from typing import List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 logger = logging.getLogger(__name__)
 
@@ -252,3 +252,68 @@ def standout_peak(
         SHARP_PEAK_MAX_FWHM_UM,
     )
     return None
+
+
+def secondary_trend(
+    samples_trace: Optional[Sequence[Any]],
+    gaussian_fit: Optional[
+        Callable[[List[float], List[float]], Optional[Tuple[float, float, float]]]
+    ] = None,
+    min_frames: int = 5,
+) -> Optional[Dict[str, float]]:
+    """What the secondary metric is doing across one scan, peak or not.
+
+    The primary metric can be pinned to its noise floor while the secondary still
+    carries usable information, because they fail differently far from focus.
+    ``brenner_gradient`` is a mean of squared gradients, so tens of microns out it is
+    uniformly blurred to a constant; ``p98_p2`` is an intensity spread, and tissue
+    still darkens a defocused field, so it keeps rising all the way in. Over a window
+    that lies entirely to one side of focus that makes it a RAMP, not a peak -- which
+    is exactly the case the peak-shaped tests throw away.
+
+    Measured on PPM 20x, 2026-09-10, at stage (-39155, -35245), starting 118 um below
+    a focus that was later found at Z=-334.5: p98_p2 fitted sigma 12.32 um over a
+    22.97 um span, then 23.94 um over a 52.29 um span. The window grew 2.28x and the
+    fitted width grew 1.94x with it, at R^2 0.96 then 0.98 -- a real peak of fixed width
+    would have held sigma still as the window opened, so what was being fitted was a
+    ramp. Both readings therefore sat above the ``sigma < 0.45 * span`` shape test (the
+    second by 1.7%) and were discarded, taking with them the sign of the ramp -- the one
+    quantity that says WHICH WAY focus lies. This returns that sign alongside the shape
+    numbers so the caller can steer instead of only widening.
+
+    :returns: ``None`` when there is no usable secondary trace, else a dict with
+        ``amplitude`` (range as a fraction of peak), ``pearson_r``, ``span``, and --
+        when the gaussian converged -- ``mu``, ``r2``, ``sigma``.
+    """
+    if not samples_trace:
+        return None
+    zs = [float(s[1]) for s in samples_trace if len(s) >= 4 and s[3] is not None]
+    ms = [float(s[3]) for s in samples_trace if len(s) >= 4 and s[3] is not None]
+    if len(zs) < min_frames:
+        return None
+
+    peak, trough = max(ms), min(ms)
+    out: Dict[str, float] = {
+        "amplitude": (peak - trough) / max(abs(peak), 1e-6),
+        "span": max(zs) - min(zs),
+        "pearson_r": 0.0,
+    }
+    out["pearson_r"] = _pearson_r(zs, ms)
+
+    fit = gaussian_fit(zs, ms) if gaussian_fit is not None else None
+    if fit is not None:
+        out["mu"], out["r2"], out["sigma"] = fit
+    return out
+
+
+def _pearson_r(xs: List[float], ys: List[float]) -> float:
+    """Correlation of two equal-length sequences; 0.0 when either is constant."""
+    n = len(xs)
+    mx, my = sum(xs) / n, sum(ys) / n
+    dx = [x - mx for x in xs]
+    dy = [y - my for y in ys]
+    sxx = sum(v * v for v in dx)
+    syy = sum(v * v for v in dy)
+    if sxx <= 1e-12 or syy <= 1e-24:
+        return 0.0
+    return sum(a * b for a, b in zip(dx, dy)) / ((sxx**0.5) * (syy**0.5))

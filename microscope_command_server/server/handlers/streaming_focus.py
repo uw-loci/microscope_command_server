@@ -120,6 +120,7 @@ import numpy as np
 
 from microscope_command_server.server.focus_geometry import build_z_from_poll
 from microscope_command_server.server.focus_peaks import (
+    secondary_trend,
     first_prominent_peaks_in_scan_order,
     standout_peak,
 )
@@ -4856,6 +4857,7 @@ def handle_streaming_focus(conn, client, hardware, settings, **kwargs):
     # METRIC_FLAT_NO_IMPROVEMENT_R2, abort -- the peak is not hiding
     # outside the window, the sample lacks contrast.
     prev_flat_amplitude_ratio: Optional[float] = None
+    prev_flat_secondary_amplitude: Optional[float] = None
     # 2026-06-28: center of the most recent scan window that had to be
     # clamped to a stage z limit. An edge result shifts the walk a full
     # range past the limit each attempt; without this the clamp would
@@ -5218,6 +5220,52 @@ def handle_streaming_focus(conn, client, hardware, settings, **kwargs):
                 # fit to direct the next center, but for now we log so
                 # the field can confirm whether p98_p2 actually helps
                 # before we commit to auto-switching direction.
+                #
+                # 2026-09-11: the field confirmed it. Log the secondary's shape on
+                # EVERY flat attempt, including -- especially -- when it is not
+                # peak-shaped, because "not a peak" is itself the answer when the scan
+                # sits entirely on one side of focus, and the ramp's sign is then the
+                # only thing pointing at the sample. Previously this was logged solely
+                # on the `shape_ok_sec` path, so the two attempts that most needed it
+                # printed nothing.
+                flat_trend = secondary_trend(
+                    result.samples_trace,
+                    gaussian_fit=_gaussian_peak,
+                    min_frames=MIN_FRAMES_FOR_FIT,
+                )
+                flat_ramps = False
+                if flat_trend is not None:
+                    flat_ramps = (
+                        abs(flat_trend["pearson_r"]) >= SLOPE_PEARSON_R_THRESHOLD
+                        and flat_trend["amplitude"] >= SLOPE_MIN_AMPLITUDE
+                    )
+                    logger.info(
+                        "STREAM_AF:%s: '%s' trend -- amplitude %.2f%%, Pearson "
+                        "r=%+.3f over %.2f um%s. %s",
+                        label,
+                        secondary_metric_name,
+                        flat_trend["amplitude"] * 100.0,
+                        flat_trend["pearson_r"],
+                        flat_trend["span"],
+                        (
+                            ", gaussian mu=%.3f R^2=%.2f sigma=%.2f (%.2f of span)"
+                            % (
+                                flat_trend["mu"],
+                                flat_trend["r2"],
+                                flat_trend["sigma"],
+                                flat_trend["sigma"] / max(flat_trend["span"], 1e-6),
+                            )
+                            if "mu" in flat_trend
+                            else ", gaussian did not converge"
+                        ),
+                        (
+                            "Monotonic -- focus lies beyond the %s end."
+                            % ("high" if flat_trend["pearson_r"] > 0 else "low")
+                            if flat_ramps
+                            else "No usable direction."
+                        ),
+                    )
+
                 if secondary_metric_name is not None and result.samples_trace:
                     try:
                         zs_sec = [
@@ -5312,19 +5360,41 @@ def handle_streaming_focus(conn, client, hardware, settings, **kwargs):
                             if fit_pri_gate is not None:
                                 _, cur_r2, _ = fit_pri_gate
 
+                # 2026-09-11: this gate used to read the primary alone, and on
+                # 2026-09-10 that threw away a live search. brenner grew 0.71% ->
+                # 0.96% (1.36x, under the 1.5x bar) while p98_p2 -- scored on the very
+                # same frames, and logged three lines earlier -- grew 6.67% -> 16.84%
+                # (2.52x) with R^2 rising 0.96 -> 0.98. The run was told it had no
+                # signal at the moment its secondary metric was strongest. Defeat now
+                # has to be unanimous: the secondary gets a vote, by growth or by ramp.
+                sec_growing = (
+                    prev_flat_secondary_amplitude is not None
+                    and flat_trend is not None
+                    and flat_trend["amplitude"]
+                    > prev_flat_secondary_amplitude * METRIC_FLAT_AMPLITUDE_GROWTH_FACTOR
+                )
                 if prev_flat_amplitude_ratio is not None and cur_amplitude_ratio is not None:
                     grew = cur_amplitude_ratio > (
                         prev_flat_amplitude_ratio * METRIC_FLAT_AMPLITUDE_GROWTH_FACTOR
                     )
                     r2_poor = (cur_r2 is None) or (cur_r2 < METRIC_FLAT_NO_IMPROVEMENT_R2)
-                    if not grew and r2_poor:
+                    if not grew and r2_poor and not sec_growing and not flat_ramps:
+                        # State what was measured. The old wording asserted the sample
+                        # "lacks contrast", which on 2026-09-10 contradicted a
+                        # chroma_deviation pass (fraction 0.91, median 41.0 vs a bar of
+                        # 28) taken at the same XY sixty seconds earlier. A flat metric
+                        # means this WINDOW is featureless; it says nothing about the
+                        # slide.
                         logger.info(
                             "STREAM_AF:%s: metric_flat no-improvement abort -- "
-                            "amplitude %.2f%% vs prior %.2f%% "
-                            "(growth factor %.2fx < %.2fx), R^2=%.2f. "
-                            "Widening cannot reveal a peak; sample likely "
-                            "lacks contrast at this depth.",
+                            "'%s' amplitude %.2f%% vs prior %.2f%% "
+                            "(growth factor %.2fx < %.2fx), R^2=%.2f, and the "
+                            "secondary metric offers neither growth nor a "
+                            "direction. Nothing in THIS Z window has contrast -- "
+                            "if the slide does, the search is centred in the "
+                            "wrong place rather than too narrow.",
                             label,
+                            metric_name,
                             cur_amplitude_ratio * 100.0,
                             prev_flat_amplitude_ratio * 100.0,
                             cur_amplitude_ratio / max(prev_flat_amplitude_ratio, 1e-9),
@@ -5335,6 +5405,36 @@ def handle_streaming_focus(conn, client, hardware, settings, **kwargs):
                         break
 
                 prev_flat_amplitude_ratio = cur_amplitude_ratio
+                if flat_trend is not None:
+                    prev_flat_secondary_amplitude = flat_trend["amplitude"]
+
+                # Steer, do not just widen. Widening is symmetric about a centre, so it
+                # can only rescue a centre that is roughly right. On 2026-09-10 the
+                # centre was 118 um out: even the full 150 um cap around Z=-452.8
+                # reaches only -377.8, and focus was at -334.5, so every attempt in the
+                # budget would have missed. A monotonic secondary says which way to
+                # move, and the edge_low/edge_high paths above already shift by one
+                # range per attempt -- reuse exactly that. Same Z limits, same budget.
+                if flat_ramps and flat_trend is not None:
+                    if flat_trend["pearson_r"] > 0:
+                        current_center = current_center + range_um
+                        toward = "more positive Z"
+                    else:
+                        current_center = current_center - range_um
+                        toward = "more negative Z"
+                    logger.info(
+                        "STREAM_AF:%s: metric_flat but '%s' ramps (Pearson r=%+.3f, "
+                        "amplitude %.2f%%) -- shifting toward %s; next centre %.3f "
+                        "at range %.2f um.",
+                        label,
+                        secondary_metric_name,
+                        flat_trend["pearson_r"],
+                        flat_trend["amplitude"] * 100.0,
+                        toward,
+                        current_center,
+                        range_um,
+                    )
+                    continue
 
                 if range_um >= sweep_range_max_um:
                     logger.info(
