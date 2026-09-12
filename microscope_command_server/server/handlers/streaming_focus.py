@@ -5378,7 +5378,7 @@ def handle_streaming_focus(conn, client, hardware, settings, **kwargs):
                         prev_flat_amplitude_ratio * METRIC_FLAT_AMPLITUDE_GROWTH_FACTOR
                     )
                     r2_poor = (cur_r2 is None) or (cur_r2 < METRIC_FLAT_NO_IMPROVEMENT_R2)
-                    if not grew and r2_poor and not sec_growing and not flat_ramps:
+                    if not grew and r2_poor and not sec_growing:
                         # State what was measured. The old wording asserted the sample
                         # "lacks contrast", which on 2026-09-10 contradicted a
                         # chroma_deviation pass (fraction 0.91, median 41.0 vs a bar of
@@ -5408,34 +5408,23 @@ def handle_streaming_focus(conn, client, hardware, settings, **kwargs):
                 if flat_trend is not None:
                     prev_flat_secondary_amplitude = flat_trend["amplitude"]
 
-                # Steer, do not just widen. Widening is symmetric about a centre, so it
-                # can only rescue a centre that is roughly right. On 2026-09-10 the
-                # centre was 118 um out: even the full 150 um cap around Z=-452.8
-                # reaches only -377.8, and focus was at -334.5, so every attempt in the
-                # budget would have missed. A monotonic secondary says which way to
-                # move, and the edge_low/edge_high paths above already shift by one
-                # range per attempt -- reuse exactly that. Same Z limits, same budget.
-                if flat_ramps and flat_trend is not None:
-                    if flat_trend["pearson_r"] > 0:
-                        current_center = current_center + range_um
-                        toward = "more positive Z"
-                    else:
-                        current_center = current_center - range_um
-                        toward = "more negative Z"
-                    logger.info(
-                        "STREAM_AF:%s: metric_flat but '%s' ramps (Pearson r=%+.3f, "
-                        "amplitude %.2f%%) -- shifting toward %s; next centre %.3f "
-                        "at range %.2f um.",
-                        label,
-                        secondary_metric_name,
-                        flat_trend["pearson_r"],
-                        flat_trend["amplitude"] * 100.0,
-                        toward,
-                        current_center,
-                        range_um,
-                    )
-                    continue
-
+                # DO NOT steer on the secondary metric. Measured 2026-09-10 12:14, the
+                # landmark immediately before the failure this steering was written for:
+                # the search opened at Z=-332.0 -- the operator's own focus from slide
+                # setup -- and p98_p2 walked it away, mu=-340.9 (amplitude 8.4%) then
+                # -415.1 (29.5%) then -445.9 (56.6%), until it committed -452.8, a shift
+                # of 120.8 um after 7 attempts. The next landmark inherited that seed and
+                # is the run that failed outright; the acquisition focused on coverslip
+                # dust. Steering would have reached the wrong plane faster.
+                #
+                # The premise was that the secondary points at the sample. It does not
+                # when a brighter plane competes: brenner_gradient scored 68.58% amplitude
+                # at -452.4 and 0.91% at the true tissue, because it is a MEAN of squared
+                # gradients and sparse bright debris owns the tail. p98_p2 agreed with it.
+                # Both metrics prefer the dust, so no search strategy built on them can
+                # find the tissue. Fix the metric first; steering is only safe once the
+                # thing being steered toward is the sample. See the median-of-gradients
+                # measurement in claude-reports for the replacement.
                 if range_um >= sweep_range_max_um:
                     logger.info(
                         "STREAM_AF:metric_flat at max range %.2f um -- aborting retry loop",
