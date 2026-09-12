@@ -925,6 +925,43 @@ structure, not uniform glass) and has tissue in the required fraction of pixels.
 Coverslip reflections are typically rejected because they produce uniform,
 bright pixels rather than textured features.
 
+### Autofocus Configuration (YAML)
+
+Per-objective autofocus settings live in `autofocus_<scope>.yml` under
+`autofocus_settings`, keyed by objective id.
+
+**Colour frame reduction (`channel_reduction`)**
+
+How a colour frame is collapsed to one plane before the focus metric scores it.
+Valid values: `equal_mean` (default) or `green`.
+
+```yaml
+autofocus_settings:
+- objective: LOCI_OBJECTIVE_OLYMPUS_20X_POL_001
+  score_metric: brenner_gradient
+  channel_reduction: green        # score the green plane only
+```
+
+- `equal_mean` (default) -- an equal-weighted mean of the three colour planes.
+  This is the historical behaviour, and it is also what the standard (non-streaming)
+  autofocus path uses, so leaving it alone keeps the two paths agreeing.
+
+- `green` -- the green plane alone. Use it where achromatic debris competes with
+  stained tissue. Dust and fibres absorb across the spectrum, so they carry full
+  contrast into every channel; stained tissue carries most of its contrast where the
+  stain absorbs. Averaging the planes therefore preserves all of the debris signal
+  and dilutes the tissue's, and on a field holding both, the debris wins.
+
+  Measured on four PPM **20x** traverses, 2026-09-04: over a field holding a textile
+  fibre and tissue, `equal_mean` peaked at Z=-219.2 (the fibre) while `green` peaked
+  at -327.6 against a hand focus of -332. On a dust-only field green scored lower
+  amplitude (6.9% vs 9.8%, i.e. closer to being correctly rejected as flat), and on
+  clean tissue it scored higher (66.1% vs 58.6%) at the same Z.
+
+Unknown values fall back to `equal_mean` with a warning rather than failing, so a
+YAML typo does not take autofocus offline mid-run. The resolved value is logged on
+every run as `STREAM_AF:channel reduction = ...`.
+
 ### Example: Validating and using approach-from-safe-Z
 
 **Step 1: Validation run (operator measurement)**
