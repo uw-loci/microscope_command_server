@@ -849,18 +849,57 @@ def _resolve_metric_name(
     return modality_default_metric(modality, fallback=DEFAULT_METRIC_NAME)
 
 
-def _focus_metric(img, metric_name: str = DEFAULT_METRIC_NAME) -> float:
+VALID_CHANNEL_REDUCTIONS = ("equal_mean", "green")
+
+#: How a colour frame is collapsed to one plane before scoring. Set per objective
+#: in autofocus_<scope>.yml as ``channel_reduction``. Defaults to the historical
+#: equal-mean, which is also what standard AF uses -- see
+#: microscope_imageprocessing.focus.metrics.to_gray for why this is opt-in and for
+#: the 2026-09-04 measurements that motivated 'green'.
+_channel_reduction: str = "equal_mean"
+
+
+def _resolve_channel_reduction(af_entry: Optional[Dict[str, Any]] = None) -> str:
+    """Per-objective ``channel_reduction`` from autofocus_<scope>.yml.
+
+    Unknown values fall back to equal-mean with a warning rather than raising: a
+    typo in a YAML field should not take autofocus offline mid-run.
+    """
+    if af_entry:
+        raw = af_entry.get("channel_reduction")
+        if isinstance(raw, str):
+            v = raw.strip().lower()
+            if v in VALID_CHANNEL_REDUCTIONS:
+                return v
+            logger.warning(
+                "STREAM_AF: autofocus yaml channel_reduction=%r is not one of %s; "
+                "using 'equal_mean'.",
+                raw,
+                list(VALID_CHANNEL_REDUCTIONS),
+            )
+    return "equal_mean"
+
+
+def _focus_metric(
+    img, metric_name: str = DEFAULT_METRIC_NAME, reduction: Optional[str] = None
+) -> float:
     """Compute a focus metric on the given image.
 
-    Dispatches via ``resolve_metric``. The dispatcher accepts 2D and
-    3D input directly (multi-channel reduces to the green/index-1
-    channel) and returns 0.0 on empty/bad input. If ``metric_name``
-    is unknown the call is logged once and falls back to the default.
+    Dispatches via ``resolve_metric``. The dispatcher accepts 2D and 3D input
+    directly and returns 0.0 on empty/bad input. If ``metric_name`` is unknown
+    the call is logged once and falls back to the default.
+
+    ``reduction`` selects how a colour frame is collapsed to one plane; None means
+    "whatever this run resolved from YAML". The docstring here used to claim the
+    dispatcher reduced to the green channel. It did not -- it took an equal-weighted
+    mean of all three -- and that gap between the documented and actual behaviour is
+    exactly the one that let an achromatic fibre outscore stained tissue.
     """
     if img is None:
         return 0.0
+    red = _channel_reduction if reduction is None else reduction
     try:
-        fn = resolve_metric(metric_name)
+        fn = resolve_metric(metric_name, red)
     except UnknownMetricError as e:
         logger.debug(
             "focus metric '%s' not in manifest (%s); using %s",
@@ -868,7 +907,7 @@ def _focus_metric(img, metric_name: str = DEFAULT_METRIC_NAME) -> float:
             e,
             DEFAULT_METRIC_NAME,
         )
-        fn = resolve_metric(DEFAULT_METRIC_NAME)
+        fn = resolve_metric(DEFAULT_METRIC_NAME, red)
     try:
         return float(fn(img))
     except Exception as e:
@@ -4438,6 +4477,17 @@ def handle_streaming_focus(conn, client, hardware, settings, **kwargs):
     # yaml's per-objective `score_metric` wins over the modality
     # default; unknown names fall through with a warning.
     metric_name = _resolve_metric_name(client_modality, af_entry)
+    global _channel_reduction
+    _channel_reduction = _resolve_channel_reduction(af_entry)
+    logger.info(
+        "STREAM_AF:channel reduction = '%s'%s",
+        _channel_reduction,
+        (
+            " (colour frames scored on the green plane only)"
+            if _channel_reduction == "green"
+            else " (equal-weighted mean of the colour planes)"
+        ),
+    )
     yaml_score_metric = af_entry.get("score_metric") if af_entry else None
     if yaml_score_metric:
         logger.info(
