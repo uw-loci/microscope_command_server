@@ -880,6 +880,35 @@ def _resolve_channel_reduction(af_entry: Optional[Dict[str, Any]] = None) -> str
     return "equal_mean"
 
 
+_reduction_unsupported_logged = False
+
+
+def _resolve_metric_compat(name: str, reduction: str):
+    """resolve_metric, tolerating a microscope_imageprocessing that predates ``reduction``.
+
+    The two packages are separate repos installed separately, so an operator can update
+    one and not the other. Without this, that ordinary mistake is not a degraded focus
+    metric -- it is a TypeError raised inside the per-frame scoring loop, which is NOT an
+    UnknownMetricError and so escapes the handler, aborting the scan with the camera ROI
+    still cropped and the frame rate still overridden. A packaging mismatch must not be
+    able to leave the hardware in a modified state.
+    """
+    global _reduction_unsupported_logged
+    try:
+        return resolve_metric(name, reduction)
+    except TypeError:
+        if not _reduction_unsupported_logged:
+            _reduction_unsupported_logged = True
+            logger.warning(
+                "STREAM_AF:this microscope_imageprocessing does not support "
+                "channel_reduction; scoring with its built-in reduction instead of %r. "
+                "Update microscope_imageprocessing to match the server, or remove "
+                "channel_reduction from the autofocus YAML.",
+                reduction,
+            )
+        return resolve_metric(name)
+
+
 def _focus_metric(
     img, metric_name: str = DEFAULT_METRIC_NAME, reduction: Optional[str] = None
 ) -> float:
@@ -899,7 +928,7 @@ def _focus_metric(
         return 0.0
     red = _channel_reduction if reduction is None else reduction
     try:
-        fn = resolve_metric(metric_name, red)
+        fn = _resolve_metric_compat(metric_name, red)
     except UnknownMetricError as e:
         logger.debug(
             "focus metric '%s' not in manifest (%s); using %s",
@@ -907,7 +936,7 @@ def _focus_metric(
             e,
             DEFAULT_METRIC_NAME,
         )
-        fn = resolve_metric(DEFAULT_METRIC_NAME, red)
+        fn = _resolve_metric_compat(DEFAULT_METRIC_NAME, red)
     try:
         return float(fn(img))
     except Exception as e:
