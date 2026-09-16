@@ -2179,6 +2179,8 @@ def parse_acquisition_message(message: str) -> dict:
                 i += 2
             elif parts[i] == "--af-disabled":
                 params["af_disabled"] = True
+            elif parts[i] == "--af-skip-initial":
+                params["af_skip_initial"] = True
                 i += 1
             elif parts[i] == "--af-benchmark":
                 params["af_benchmark"] = True
@@ -4139,6 +4141,45 @@ def _guard_af_saturation(ctx: "AcquisitionContext", hardware, logger) -> None:
             ctx.af_saturation_scale = 1.0
 
 
+def _adopt_current_focus_as_initial(ctx: AcquisitionContext) -> None:
+    """Take the operator's existing focus instead of searching for it.
+
+    Sent as ``--af-skip-initial`` when the user ticks "sample is already in focus".
+    This is NOT ``--af-disabled``: per-tile autofocus, drift checks and the manual
+    fallback all still run. Only the pre-acquisition search is skipped.
+
+    That search is the part with no upper bound on cost. It drives to the first
+    diagonal AF position -- which is not where the operator focused -- optionally
+    hunts for tissue there, then sweeps. Measured 2026-09-10 on PPM 20x, that
+    sequence took 96 s and seven attempts, and committed a Z 120 um away from the
+    operator's own focus. On a small bounding box drawn over a field the user is
+    already looking at, it is pure cost and a real risk.
+
+    The current Z is recorded at the current XY as a completed AF position, so the
+    per-tile nearest-seed logic starts from a real, human-verified focus point
+    rather than from nothing.
+    """
+    logger = ctx.logger
+    pos = ctx.hardware.get_current_position()
+    first_af_idx = ctx.af_positions[0]
+
+    logger.info(
+        "=== PRE-ACQUISITION AUTOFOCUS SKIPPED (--af-skip-initial) === "
+        "adopting the current focus Z=%.2f um at X=%.1f Y=%.1f as the starting point. "
+        "Per-tile autofocus and drift correction are unaffected.",
+        pos.z,
+        pos.x,
+        pos.y,
+    )
+
+    ctx.first_tissue_autofocus_done = True
+    ctx.last_af_pos_idx = first_af_idx
+    ctx.completed_af_positions.append((pos.x, pos.y, pos.z))
+    ctx.dynamic_af_positions.discard(first_af_idx)
+
+    logger.info("=== Starting main acquisition loop ===")
+
+
 def _run_pre_acquisition_autofocus(ctx: AcquisitionContext) -> None:
     """Run initial autofocus at first tissue position before main loop.
 
@@ -4152,6 +4193,10 @@ def _run_pre_acquisition_autofocus(ctx: AcquisitionContext) -> None:
     hardware = ctx.hardware
 
     if len(ctx.positions) == 0 or len(ctx.af_positions) == 0:
+        return
+
+    if params.get("af_skip_initial"):
+        _adopt_current_focus_as_initial(ctx)
         return
 
     # Apply Z-focus hint if provided (predicted from tilt correction model)
