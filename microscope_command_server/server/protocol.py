@@ -186,6 +186,13 @@ class ExtendedCommand:
     # Payload: 32-byte device + 32-byte property + 64-byte value (all
     # null-padded UTF-8). Total 128 bytes.
     SETPROP = b"setprop_"
+    # Ask Micro-Manager what range it will accept for a numeric property, so a
+    # UI spinner can be bounded by the hardware instead of a guessed maximum.
+    # Payload: 32-byte device + 32-byte property (null-padded UTF-8), 64 total.
+    # Reply: 9 bytes = 1 availability byte + two big-endian floats (low, high).
+    # 0x00 means "no numeric limits" (discrete property, unknown device, or a
+    # Core that cannot answer) and the two floats are 0.
+    GETPROPL = b"getpropl"
     APPLYPR = b"applypr_"  # Apply acquisition profile (calls apply_mode_setup)
     # Apply a single channel from a profile's channel library: cube + light
     # source switch + per-channel intensity property write + exposure. Used

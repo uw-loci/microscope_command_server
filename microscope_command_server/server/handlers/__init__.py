@@ -91,6 +91,7 @@ from microscope_command_server.server.handlers.illumination import (
     handle_setillm,
     handle_setilmd,
     handle_setprop,
+    handle_getpropl,
     handle_applypr,
     handle_applych,
 )
@@ -185,6 +186,7 @@ COMMAND_HANDLERS = {
     ExtendedCommand.SETILLM: handle_setillm,
     ExtendedCommand.SETILLMD: handle_setilmd,
     ExtendedCommand.SETPROP: handle_setprop,
+    ExtendedCommand.GETPROPL: handle_getpropl,
     ExtendedCommand.APPLYPR: handle_applypr,
     ExtendedCommand.APPLYCH: handle_applych,
     # System & alignment

@@ -1,7 +1,7 @@
 """Illumination and acquisition profile command handlers.
 
 Handles real-time illumination control and acquisition profile switching:
-GETILLM, SETILLM, APPLYPR
+GETILLM, SETILLM, SETPROP, GETPROPL, APPLYPR
 
 These commands wrap the Illumination ABC (get_power, set_power, etc.)
 and the hardware.apply_mode_setup() method for profile switching.
@@ -482,3 +482,67 @@ def handle_setprop(conn, client, hardware, settings, **kwargs):
             e,
         )
         conn.sendall(b"ERR_PROP")
+
+
+def handle_getpropl(conn, client, hardware, settings, **kwargs):
+    """Report the range Micro-Manager will accept for a numeric property.
+
+    A UI that offers an intensity knob has no way to know what the device
+    allows -- on OWS3 a DLED wavelength is 0-100 while the DiaLamp runs to
+    2100 -- so without this it either guesses or lets the user enter a value
+    the hardware rejects. The Core already knows; this exposes it.
+
+    Protocol: 64-byte payload = 32 bytes device + 32 bytes property,
+    UTF-8, null-padded.
+
+    Response: always 9 bytes = 1 availability byte + 2 big-endian floats
+    (lower, upper). 0x00 with zeroed floats means the property has no
+    numeric limits, the device/property is unknown, or the Core could not
+    answer -- all cases where the caller should keep its own default range
+    rather than believe a fabricated one.
+    """
+    logger.debug("Client %s requesting property limits", client.addr)
+    unavailable = struct.pack(">Bff", 0x00, 0.0, 0.0)
+    device = "?"
+    prop = "?"
+    try:
+        data = conn.recv(64)
+        if len(data) < 64:
+            logger.error("GETPROPL: short payload (%d bytes, want 64)", len(data))
+            conn.sendall(unavailable)
+            return
+
+        device = data[0:32].rstrip(b"\x00").decode("utf-8", errors="replace").strip()
+        prop = data[32:64].rstrip(b"\x00").decode("utf-8", errors="replace").strip()
+        if not device or not prop:
+            logger.error(
+                "GETPROPL: empty device or property (device='%s', prop='%s')", device, prop
+            )
+            conn.sendall(unavailable)
+            return
+
+        core = getattr(hardware, "core", None)
+        if core is None:
+            logger.error("GETPROPL: hardware has no core attribute")
+            conn.sendall(unavailable)
+            return
+
+        if not core.has_property_limits(str(device), str(prop)):
+            logger.info("GETPROPL: %s.%s has no numeric limits", device, prop)
+            conn.sendall(unavailable)
+            return
+
+        low = float(core.get_property_lower_limit(str(device), str(prop)))
+        high = float(core.get_property_upper_limit(str(device), str(prop)))
+        if not (high > low):
+            logger.warning(
+                "GETPROPL: %s.%s reported degenerate limits %s..%s", device, prop, low, high
+            )
+            conn.sendall(unavailable)
+            return
+
+        logger.info("GETPROPL: %s.%s limits %s..%s", device, prop, low, high)
+        conn.sendall(struct.pack(">Bff", 0x01, low, high))
+    except Exception as e:
+        logger.error("GETPROPL failed for %s.%s: %s", device, prop, e)
+        conn.sendall(unavailable)
