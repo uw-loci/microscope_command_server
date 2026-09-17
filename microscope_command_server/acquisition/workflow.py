@@ -3050,6 +3050,19 @@ def _cleanup_acquisition(ctx: AcquisitionContext) -> None:
             pass
         ctx.tile_measurements_stream = None
 
+    # Leave the light path dark for channel modalities. The tile loop ends with the
+    # LAST acquired channel still applied and still exciting the sample, and the Live
+    # Viewer's Camera tab goes on describing whichever channel the operator last
+    # previewed -- so the displayed state and the hardware disagree, and a fluorescent
+    # sample bleaches under a channel nobody is looking at. Symmetric with the XY
+    # return below, and with the "None" channel radio, which uses the same helper.
+    if ctx.params.get("channels"):
+        try:
+            ctx.hardware._disable_all_modality_illuminations()
+            ctx.logger.info("Deactivated modality illumination at end of acquisition")
+        except Exception as e:
+            ctx.logger.warning("Could not deactivate illumination after acquisition: %s", e)
+
     # Return XY to starting position (preserve Z from last autofocus so the
     # next annotation's Z-hint starts near the actual focal plane rather than
     # resetting to the user's initial Z).
