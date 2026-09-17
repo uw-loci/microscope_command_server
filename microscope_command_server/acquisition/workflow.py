@@ -1597,6 +1597,71 @@ def write_acquisition_metadata(
         _log.warning("Failed to write acquisition metadata (non-fatal): %s", e)
 
 
+def apply_af_channel_state(ctx) -> bool:
+    """Put the light path on the dedicated focus channel before autofocus.
+
+    Without this, autofocus on a multi-channel modality runs under whatever channel
+    the previous tile last applied -- so the focus frame's brightness and contrast
+    depend on acquisition order rather than on anything chosen for focusing. With
+    ``--af-channel`` the operator names one channel to focus on (typically the
+    brightest with the most complete coverage) and, optionally, an exposure and
+    intensity for it: focus frames do not need to be publication quality, so a
+    shorter exposure than the imaging one keeps every focus attempt cheap.
+
+    Nothing is restored afterwards: the per-tile acquisition loop applies each
+    channel's own hardware state and exposure before it snaps, so the focus channel
+    never leaks into an acquired image.
+
+    Returns True when the channel was applied, False when there is nothing to do
+    (no --af-channel) or the channel could not be resolved.
+    """
+    ch_id = getattr(ctx, "af_channel", None)
+    if not ch_id:
+        return False
+
+    logger = ctx.logger
+    exposure = ctx.af_channel_exposure
+    plan = resolve_channel_plan(
+        ctx.ppm_settings,
+        ctx.params.get("scan_type", ""),
+        [ch_id],
+        [float(exposure)] if exposure and exposure > 0 else [],
+        channel_intensity_overrides=(
+            {ch_id: ctx.af_channel_intensity} if ctx.af_channel_intensity is not None else None
+        ),
+    )
+    if not plan:
+        logger.warning(
+            "Focus channel '%s' is not in this modality's channel library; "
+            "autofocus will run on the currently applied channel instead",
+            ch_id,
+        )
+        return False
+
+    entry = plan[0]
+    try:
+        apply_channel_hardware_state(
+            ctx.hardware, entry, logger, preset_cache=ctx.channel_preset_cache
+        )
+        exposure_ms = float(entry.get("exposure_ms") or 0)
+        if exposure_ms > 0:
+            ctx.hardware.set_exposure(exposure_ms)
+        logger.info(
+            "Autofocus on focus channel '%s' at %.2f ms",
+            ch_id,
+            exposure_ms,
+        )
+        return True
+    except Exception as e:
+        logger.error(
+            "Could not apply focus channel '%s' (%s); autofocus will run on the "
+            "currently applied channel instead",
+            ch_id,
+            e,
+        )
+        return False
+
+
 def autofocus_with_manual_fallback(
     hardware: PycromanagerHardware,
     logger,
@@ -2135,6 +2200,25 @@ def parse_acquisition_message(message: str) -> dict:
             elif parts[i] == "--focus-channel" and i + 1 < len(parts):
                 params["focus_channel"] = parts[i + 1]
                 i += 2
+            # Dedicated focus channel: autofocus runs on THIS channel's light path,
+            # at its own exposure/intensity, instead of whatever channel the previous
+            # tile happened to leave applied. Opt-in -- absent these flags, autofocus
+            # behaviour is unchanged.
+            elif parts[i] == "--af-channel" and i + 1 < len(parts):
+                params["af_channel"] = parts[i + 1]
+                i += 2
+            elif parts[i] == "--af-channel-exposure" and i + 1 < len(parts):
+                try:
+                    params["af_channel_exposure"] = float(parts[i + 1])
+                except ValueError:
+                    logger.warning("Ignoring non-numeric --af-channel-exposure %r", parts[i + 1])
+                i += 2
+            elif parts[i] == "--af-channel-intensity" and i + 1 < len(parts):
+                try:
+                    params["af_channel_intensity"] = float(parts[i + 1])
+                except ValueError:
+                    logger.warning("Ignoring non-numeric --af-channel-intensity %r", parts[i + 1])
+                i += 2
             elif parts[i] == "--af-strategy" and i + 1 < len(parts):
                 params["af_strategy"] = parts[i + 1]
                 i += 2
@@ -2495,6 +2579,11 @@ class AcquisitionContext:
     af_strategy: Any = None
     af_strategy_name: Optional[str] = None
     af_focus_channel: Optional[str] = None
+    # Dedicated focus channel (opt-in). When af_channel is set, autofocus applies that
+    # channel's hardware state and exposure before every focus attempt.
+    af_channel: Optional[str] = None
+    af_channel_exposure: Optional[float] = None
+    af_channel_intensity: Optional[float] = None
     af_positions: list = field(default_factory=list)
     af_min_distance: float = 0.0
     exposure_90: float = 0.0  # mutable: doubled during brightness checks
@@ -3988,6 +4077,17 @@ def _configure_autofocus(ctx: AcquisitionContext) -> None:
     ctx.af_strategy = af_strategy
     ctx.af_strategy_name = af_strategy_name
     ctx.af_focus_channel = af_focus_channel
+    ctx.af_channel = params.get("af_channel")
+    ctx.af_channel_exposure = params.get("af_channel_exposure")
+    ctx.af_channel_intensity = params.get("af_channel_intensity")
+    if ctx.af_channel:
+        logger.info(
+            "Dedicated focus channel: %s (exposure %s, intensity %s) -- autofocus will "
+            "apply this channel before each focus attempt",
+            ctx.af_channel,
+            ("%.2f ms" % ctx.af_channel_exposure) if ctx.af_channel_exposure else "channel default",
+            ctx.af_channel_intensity if ctx.af_channel_intensity is not None else "channel default",
+        )
     ctx.af_positions = af_positions
     ctx.af_min_distance = af_min_distance
     ctx.dynamic_af_positions = set(af_positions)
@@ -4292,6 +4392,10 @@ def _run_pre_acquisition_autofocus(ctx: AcquisitionContext) -> None:
                 logger.warning(f"Could not configure camera for AF: {e}")
 
         set_af_exposure(hardware, ctx, ctx.exposure_90, logger=logger, why="initial autofocus")
+
+    # Dedicated focus channel (opt-in) -- applies to tissue detection as well as the
+    # focus scan, since both snap frames and both want the same well-covered channel.
+    apply_af_channel_state(ctx)
 
     # Calculate direction toward center for tissue search loop
     start_pos = np.array([first_af_pos.x, first_af_pos.y])
@@ -4618,6 +4722,10 @@ def _handle_tile_autofocus(
 
     # Perform autofocus
     logger.info(f"Checking for autofocus at position {pos_idx}: X={pos.x}, Y={pos.y}, Z={pos.z}")
+
+    # Dedicated focus channel (opt-in). Applied per tile because the acquisition loop
+    # leaves the LAST acquired channel on the light path.
+    apply_af_channel_state(ctx)
 
     # For rotation modalities, always autofocus at the configured angle
     if ctx.mod_config.autofocus_angle is not None and hasattr(hardware, "set_psg_ticks"):
