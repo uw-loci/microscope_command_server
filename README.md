@@ -897,6 +897,70 @@ strategy:
 - Bounds travel distance (no open-ended walk)
 - Optionally validates tissue before committing to a focus peak
 
+### Dedicated Focus Channel (--af-channel)
+
+For multi-channel modalities (widefield IF, BF+IF), autofocus normally runs on
+whatever channel the previous tile happened to leave applied. This makes focus
+quality unpredictable and dependent on acquisition order. The `--af-channel`
+flag lets you name a single channel to use for all autofocus attempts, optionally
+at a dedicated exposure and intensity.
+
+**Motivation:** Focus frames need good contrast, but not publication quality, so
+a shorter exposure keeps every focus attempt cheap. A well-covered channel (e.g.,
+DAPI where nuclear signal is dense) provides consistent, robust focus metrics
+regardless of which angle or timepoint is being acquired.
+
+**Flag syntax:**
+```
+--af-channel <channel_id>              # Required: channel library id for focusing
+--af-channel-exposure <milliseconds>   # Optional: override channel's default exposure
+--af-channel-intensity <value>         # Optional: override channel's default intensity
+```
+
+**Parameters:**
+
+- `--af-channel <channel_id>` (required) -- The channel library id to use for
+  autofocus. Must match an entry in the modality's channel library declared in
+  the microscope YAML. When `--af-channel` is set, the server applies that
+  channel's hardware state (Micro-Manager presets and device properties) before
+  every autofocus scan, overriding whatever channel the previous tile left on
+  the light path.
+
+- `--af-channel-exposure <ms>` (optional) -- Exposure time in milliseconds for
+  autofocus frames on this channel. If omitted, the channel's library default
+  (`exposure_ms`) is used. Typically shorter than the imaging exposure to reduce
+  focus latency (e.g., 20 ms for focusing vs. 100 ms for acquisition).
+
+- `--af-channel-intensity <value>` (optional) -- Illumination intensity override
+  for autofocus frames on this channel. If omitted, the channel's library default
+  is used. Allows independent tuning of focus lighting vs. imaging lighting.
+
+**Behavior:**
+
+- Nothing is restored afterwards: the per-tile acquisition loop applies each
+  channel's own hardware state before it snaps, so the focus channel never leaks
+  into an acquired image.
+- If the named channel cannot be resolved (not in the channel library), the server
+  logs a warning and autofocus falls back to the last-applied channel.
+- Hardware failures during channel setup are logged and do not abort the
+  acquisition; focus proceeds on the currently-applied channel.
+
+**Example (widefield IF):**
+
+```
+--channels "(DAPI,TRITC,Alexa647)" --channel-exposures "(100,150,120)" \
+--af-channel DAPI --af-channel-exposure 20.0
+```
+
+Acquires three channels at their specified exposures, but autofocus always runs
+on DAPI at 20 ms (faster) instead of reusing whatever channel the previous tile
+left applied.
+
+**Backward compatibility:**
+
+Omitting `--af-channel` preserves the original behavior: autofocus runs on the
+currently-applied channel.
+
 ### Flag syntax
 
 ```
