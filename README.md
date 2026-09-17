@@ -707,6 +707,32 @@ instead of quantized 8-bit data.
 Omitting `--ppm-high-bit-depth` or setting it to `false` preserves the standard
 8-bit capture behavior, ensuring acquisitions are unchanged from prior releases.
 
+## Property Limits (GETPROPL)
+
+`GETPROPL` queries Micro-Manager's accepted range for a numeric device property. A UI that bounds an intensity knob or other control needs to know what the hardware allows — on OWS3 a DLED wavelength range is 0–100 while the DiaLamp runs to 2100. Without this, the UI either guesses a range or lets the user enter a value the hardware rejects.
+
+### Protocol
+
+**Request:** 64-byte payload
+- Bytes 0–31: Device name (UTF-8, null-padded to 32 bytes)
+- Bytes 32–63: Property name (UTF-8, null-padded to 32 bytes)
+
+**Response:** Always 9 bytes
+- Byte 0: Availability flag
+  - `0x01`: Numeric limits exist; bytes 1–8 contain valid floats (see below)
+  - `0x00`: No numeric limits, unknown device/property, or Core could not answer
+- Bytes 1–4: Lower bound (IEEE 754 big-endian float32; `0.0` if unavailable)
+- Bytes 5–8: Upper bound (IEEE 754 big-endian float32; `0.0` if unavailable)
+
+When the availability flag is `0x00`, the caller should keep its own default range instead of trusting a fabricated one.
+
+### Example
+
+```
+Request:  DLED (device, 32 bytes, null-padded) + Intensity-385nm (property, 32 bytes)
+Response: 0x01 + 0.0 (float) + 100.0 (float)  =>  The DLED intensity property accepts 0.0–100.0
+```
+
 ## Finding tissue before autofocus (FINDTISS)
 
 `FINDTISS` moves the stage in **XY** until the camera is looking at tissue. It never
