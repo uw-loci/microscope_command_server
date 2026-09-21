@@ -69,6 +69,8 @@ class Ctx:
         self.write_pool = FakePool()
         self.tile_measurements_stream = None
         self.starting_position = None
+        self.region_origin = None
+        self.batch_acquire = False
         self.params = {"channels": channels or []}
         self.hardware = hardware or FakeHardware()
         self.logger = FakeLogger()
@@ -110,3 +112,49 @@ def test_teardown_still_returns_the_stage():
     ctx.starting_position = Pos()
     cleanup(ctx)
     assert ctx.hardware.moves == [{"x": 1.0, "y": 2.0}]
+
+
+class Pos:
+    def __init__(self, x, y, z=0.0):
+        self.x, self.y, self.z = x, y, z
+
+
+def test_batch_run_parks_on_its_own_region_not_the_inherited_start():
+    """A batch inherits its "starting position" from whichever slide ran before it.
+
+    On the 4-slide PPM run of 2026-09-17 every acquisition ended with the same move,
+    to a point on slide 4, including the one that finished slide 3. Parking on this
+    region's own first tile keeps the stage on the slide it just acquired.
+    """
+    ctx = Ctx(channels=[])
+    ctx.batch_acquire = True
+    ctx.starting_position = Pos(-50564.0, 3523.0)  # a point on another slide
+    ctx.region_origin = (-17448.0, 1025.0)  # this region's first tile
+    cleanup(ctx)
+    assert ctx.hardware.moves == [{"x": -17448.0, "y": 1025.0}]
+    assert "this region's first tile" in ctx.logger.text()
+    # The coordinates must be in the log; their absence is what made the original
+    # incident unreadable.
+    assert "-17448.0" in ctx.logger.text()
+
+
+def test_single_slide_still_returns_to_the_operators_position():
+    # The whole point of the flag is that this path is untouched.
+    ctx = Ctx(channels=[])
+    ctx.batch_acquire = False
+    ctx.starting_position = Pos(-50564.0, 3523.0)
+    ctx.region_origin = (-17448.0, 1025.0)
+    cleanup(ctx)
+    assert ctx.hardware.moves == [{"x": -50564.0, "y": 3523.0}]
+    assert "starting XY" in ctx.logger.text()
+
+
+def test_batch_run_without_a_region_origin_falls_back_to_the_start():
+    # Defensive: an empty tile list leaves region_origin None. Better to park
+    # somewhere known than to skip the move.
+    ctx = Ctx(channels=[])
+    ctx.batch_acquire = True
+    ctx.starting_position = Pos(5.0, 6.0)
+    ctx.region_origin = None
+    cleanup(ctx)
+    assert ctx.hardware.moves == [{"x": 5.0, "y": 6.0}]

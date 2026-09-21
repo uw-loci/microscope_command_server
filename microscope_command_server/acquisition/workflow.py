@@ -2263,6 +2263,11 @@ def parse_acquisition_message(message: str) -> dict:
                 i += 2
             elif parts[i] == "--af-disabled":
                 params["af_disabled"] = True
+            elif parts[i] == "--batch-acquire":
+                # One slide of a multi-slide batch. Only changes where the stage is
+                # parked at the end; see _cleanup_acquisition.
+                params["batch_acquire"] = True
+                i += 1
             elif parts[i] == "--af-skip-initial":
                 params["af_skip_initial"] = True
                 i += 1
@@ -2620,6 +2625,13 @@ class AcquisitionContext:
     tile_measurements_stream: Any = None  # file handle
     stage_positions_collected: list = field(default_factory=list)
     starting_position: Any = None  # Position or None
+    # Where THIS region's own tiles begin, in stage um, as (x, y). Used as the
+    # end-of-acquisition XY target for a batch run instead of starting_position;
+    # see _cleanup_acquisition for why the two differ.
+    region_origin: Any = None  # tuple[float, float] or None
+    # True when this acquisition is one slide of a multi-slide batch
+    # (--batch-acquire on the wire). Single-slide runs leave this False.
+    batch_acquire: bool = False
     channel_consecutive_saturated: dict = field(default_factory=dict)
     progress_warning_fired: bool = False
     # One-shot latch for the time-lapse "falling behind" warning. Set True
@@ -3063,17 +3075,51 @@ def _cleanup_acquisition(ctx: AcquisitionContext) -> None:
         except Exception as e:
             ctx.logger.warning("Could not deactivate illumination after acquisition: %s", e)
 
-    # Return XY to starting position (preserve Z from last autofocus so the
-    # next annotation's Z-hint starts near the actual focal plane rather than
-    # resetting to the user's initial Z).
-    if ctx.starting_position is not None:
+    # Return XY at the end of the acquisition, preserving Z from the last autofocus
+    # so the next annotation's Z-hint starts near the actual focal plane rather than
+    # resetting to the user's initial Z.
+    #
+    # WHERE to return differs between a single-slide run and a batch, because
+    # starting_position is self-propagating. It is captured with
+    # get_current_position() at the top of the workflow -- i.e. wherever the stage
+    # was left by whatever ran last. In an interactive single-slide run that is the
+    # operator's own position, and returning there is the point: the stage ends up
+    # where they left it.
+    #
+    # In a multi-slide batch nobody is waiting at a position. Acquisition 1 captures
+    # wherever the setup pass finished, returns there; acquisition 2 then captures
+    # that same point, returns there; and so on, so every slide in the batch inherits
+    # slide 1's start and drives back to it. Measured on the 4-slide PPM run of
+    # 2026-09-17: all 9 acquisitions ended with the same G,-50564,3523 -- a point on
+    # slide 4, issued even at the end of slide 3 -- each one a full-width traverse of
+    # the carrier for no reason.
+    #
+    # So a batch returns to its OWN region's first tile instead. That is local, it is
+    # defined by this acquisition rather than inherited from another slide, and it
+    # leaves the stage on the slide it just finished.
+    return_xy = None
+    return_label = None
+    if ctx.batch_acquire and ctx.region_origin is not None:
+        return_xy = (ctx.region_origin[0], ctx.region_origin[1])
+        return_label = "this region's first tile"
+    elif ctx.starting_position is not None:
+        return_xy = (ctx.starting_position.x, ctx.starting_position.y)
+        return_label = "the acquisition's starting XY"
+
+    if return_xy is not None:
         try:
-            ctx.logger.info("Returning to starting XY position (preserving Z)")
-            ctx.hardware.move_to_position(
-                Position(x=ctx.starting_position.x, y=ctx.starting_position.y)
+            # Log the coordinates, not just the intent. The 2026-09-17 investigation
+            # could not tell where this move went because the old line named no
+            # position, and it turned out to be on a different slide.
+            ctx.logger.info(
+                "Returning to %s: X=%.1f, Y=%.1f (preserving Z)",
+                return_label,
+                return_xy[0],
+                return_xy[1],
             )
+            ctx.hardware.move_to_position(Position(x=return_xy[0], y=return_xy[1]))
         except Exception as e:
-            ctx.logger.warning(f"Failed to return to starting position: {e}")
+            ctx.logger.warning(f"Failed to return to {return_label}: {e}")
 
 
 def _initialize_loop_infrastructure(ctx: AcquisitionContext) -> None:
@@ -3759,6 +3805,11 @@ def _prepare_acquisition(
         request_hardware_error_recovery=request_hardware_error_recovery,
         request_saturation_decision=request_saturation_decision,
         starting_position=starting_position,
+        # First tile of this region, in stage um. Only the batch path uses it, but it
+        # is cheap and unconditional so the two paths cannot disagree about what
+        # "this region" means.
+        region_origin=(xy_positions[0][0], xy_positions[0][1]) if xy_positions else None,
+        batch_acquire=bool(params.get("batch_acquire", False)),
     )
 
 
