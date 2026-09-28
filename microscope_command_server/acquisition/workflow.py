@@ -2576,6 +2576,10 @@ class AcquisitionContext:
     af_interp_kind: str = "quadratic"
     af_score_metric: Optional[Callable] = None
     af_score_metric_name: str = "normalized_variance"
+    # Per-objective channel_reduction from autofocus_<scope>.yml, or None to keep the
+    # camera's own extract_green_channel. Streaming AF already honoured this key; this
+    # carries it to the standard scan too.
+    af_channel_reduction: Optional[str] = None
     af_sweep_range_um: float = 10.0
     af_sweep_n_steps: int = 5
     af_edge_retries: int = 2
@@ -3848,6 +3852,7 @@ def _configure_autofocus(ctx: AcquisitionContext) -> None:
     af_interp_strength = 100
     af_interp_kind = "quadratic"
     af_score_metric_name = "normalized_variance"
+    af_channel_reduction = None
     af_texture_threshold = 0.005
     af_tissue_area_threshold = 0.2
     af_rgb_brightness_threshold = 240.0
@@ -3888,6 +3893,7 @@ def _configure_autofocus(ctx: AcquisitionContext) -> None:
             af_interp_strength = af_setting.get("interp_strength", af_interp_strength)
             af_interp_kind = af_setting.get("interp_kind", af_interp_kind)
             af_score_metric_name = af_setting.get("score_metric", af_score_metric_name)
+            af_channel_reduction = af_setting.get("channel_reduction", af_channel_reduction)
             af_texture_threshold = af_setting.get("texture_threshold", af_texture_threshold)
             af_tissue_area_threshold = af_setting.get(
                 "tissue_area_threshold", af_tissue_area_threshold
@@ -3912,6 +3918,7 @@ def _configure_autofocus(ctx: AcquisitionContext) -> None:
                 f"n_steps={af_n_steps}, search_range={af_search_range}um, n_tiles={af_n_tiles}, "
                 f"interp_strength={af_interp_strength}, interp_kind={af_interp_kind}, "
                 f"score_metric={af_score_metric_name}, "
+                f"channel_reduction={af_channel_reduction or 'camera default'}, "
                 f"texture_threshold={af_texture_threshold}, tissue_area_threshold={af_tissue_area_threshold}, "
                 f"rgb_brightness_threshold={af_rgb_brightness_threshold}, "
                 f"sweep: range={af_sweep_range_um}um, n_steps={af_sweep_n_steps}, "
@@ -4133,6 +4140,7 @@ def _configure_autofocus(ctx: AcquisitionContext) -> None:
     ctx.af_interp_kind = af_interp_kind
     ctx.af_score_metric = af_score_metric
     ctx.af_score_metric_name = af_score_metric_name
+    ctx.af_channel_reduction = af_channel_reduction
     ctx.af_sweep_range_um = af_sweep_range_um
     ctx.af_sweep_n_steps = af_sweep_n_steps
     ctx.af_edge_retries = af_edge_retries
@@ -4564,6 +4572,7 @@ def _run_pre_acquisition_autofocus(ctx: AcquisitionContext) -> None:
                 edge_retries=ctx.af_edge_retries,
                 search_range=ctx.af_search_range,
                 score_metric=ctx.af_score_metric,
+                channel_reduction=ctx.af_channel_reduction,
                 diagnostic_output_path=str(ctx.output_path),
                 logger=logger,
             )
@@ -4579,6 +4588,7 @@ def _run_pre_acquisition_autofocus(ctx: AcquisitionContext) -> None:
                 edge_retries=ctx.af_edge_retries,
                 search_range=ctx.af_search_range,
                 score_metric=ctx.af_score_metric,
+                channel_reduction=ctx.af_channel_reduction,
                 diagnostic_output_path=str(ctx.output_path),
                 logger=logger,
             )
@@ -4898,6 +4908,7 @@ def _handle_tile_autofocus(
                 interp_strength=ctx.af_interp_strength,
                 interp_kind=ctx.af_interp_kind,
                 score_metric=ctx.af_score_metric,
+                channel_reduction=ctx.af_channel_reduction,
                 diagnostic_output_path=ctx.output_path,
                 position_index=pos_idx,
             )
