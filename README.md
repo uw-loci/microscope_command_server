@@ -980,8 +980,15 @@ starts, instead of discovering the plane one tile at a time:
   pay off.
 
 - **Cost:** Each point is one wide autofocus scan, roughly 10 s, so nine points
-  cost a couple of minutes. Measured on real regions, nine well-spread points
-  reproduce the plane to 0.32-1.37 um RMS.
+  cost a couple of minutes.
+
+- **Sizing:** replayed over 45 real regions, a 9-point survey licenses a surface in
+  91% of them and a 12-point survey in 91% with a slightly better median error;
+  past 12 the differences are noise. **A 5-point survey licenses nothing at all** --
+  the surface requires six mutually agreeing points. Scored against every autofocus
+  result in the region (not just the ones that agree), a 12-point survey predicts
+  them to a median 1.05 um with a p90 near 6 um; the gap is the outliers, which are
+  what the surface exists to catch.
 
 - **What the survey does and does not save:** it does not change how often the
   tile loop autofocuses. That is still `n_tiles` in `autofocus_<scope>.yml`, and
