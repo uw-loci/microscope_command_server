@@ -107,6 +107,14 @@ class TestTheSurveyCannotHurtARun:
         assert 'ctx.params.get("focus_survey_points") or 0' in body
         assert "if requested <= 0:\n        return" in body
 
+    def test_a_survey_with_autofocus_disabled_is_refused_not_crashed(self):
+        # --af-disabled returns from _configure_autofocus before a strategy exists, so a
+        # survey would hit an AttributeError on its first tissue check. The Java client
+        # never sends both, but a direct socket client can.
+        body = self.body()
+        assert 'ctx.params.get("af_disabled") or ctx.af_strategy is None' in body
+        assert "no focus to measure" in body
+
     def test_a_survey_without_a_surface_is_refused_not_wasted(self):
         body = self.body()
         assert "if surface is None or not surface.active:" in body

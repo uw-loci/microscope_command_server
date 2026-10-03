@@ -4740,6 +4740,17 @@ def _run_focus_survey(ctx: "AcquisitionContext") -> None:
         return
     if not ctx.positions:
         return
+    if ctx.params.get("af_disabled") or ctx.af_strategy is None:
+        # --af-disabled returns from _configure_autofocus before a strategy is resolved,
+        # so there is nothing to test a survey point's tissue with. The Java client does
+        # not send both, but a direct socket client can, and the alternative here is an
+        # AttributeError in the middle of a survey.
+        logger.warning(
+            "--focus-survey %d was requested but autofocus is disabled for this "
+            "acquisition, so there is no focus to measure. Skipping the survey.",
+            requested,
+        )
+        return
 
     from microscope_control.autofocus.strategies import StrategyFailureMode
 
