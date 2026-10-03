@@ -2279,6 +2279,19 @@ def parse_acquisition_message(message: str) -> dict:
                 # nothing about this gets exactly the previous behaviour.
                 params["focus_surface_mode"] = parts[i + 1]
                 i += 2
+            elif parts[i] == "--focus-survey" and i + 1 < len(parts):
+                # How many focus points to measure BEFORE the tile loop. 0 = none.
+                params["focus_survey_points"] = int(parts[i + 1])
+                i += 2
+            elif parts[i] == "--focus-survey-tiles" and i + 1 < len(parts):
+                # Comma-separated tile indices to survey, chosen by the client from
+                # the macro image (tissue content plus geometric spread). Without
+                # this the server spreads its own points over the tile positions and
+                # relies on the per-point tissue check to skip the empty ones.
+                params["focus_survey_tiles"] = [
+                    int(tok) for tok in parts[i + 1].split(",") if tok.strip()
+                ]
+                i += 2
             elif parts[i] == "--save-raw" and i + 1 < len(parts):
                 params["save_raw"] = parts[i + 1].lower() == "true"
                 i += 2
@@ -2779,6 +2792,11 @@ def _acquisition_workflow(
 
         # Phase 8: Initial autofocus at first tissue position
         _run_pre_acquisition_autofocus(ctx)
+
+        # Phase 8b: Measure the rest of the focus surface up front, if asked. Runs
+        # after Phase 8 on purpose -- that phase sets the AF rotation angle and
+        # exposure and produces the first focus point, and the survey needs all three.
+        _run_focus_survey(ctx)
 
         # Phase 9: Create saturation monitor, write pool, NDJSON stream
         _initialize_loop_infrastructure(ctx)
@@ -4652,6 +4670,217 @@ def _run_pre_acquisition_autofocus(ctx: AcquisitionContext) -> None:
             raise _AcquisitionCancelled() from e
 
     logger.info("=== Starting main acquisition loop ===")
+
+
+def _spread_survey_points(
+    xy_positions: List[Tuple[float, float]], already: List[Tuple[float, float]], n: int
+) -> List[int]:
+    """Pick n tile indices spread as far apart as possible (farthest-point sampling).
+
+    A plane needs its points spread in BOTH axes, and scan order gives the opposite:
+    the first tiles of a raster are a column. Each pick here is the tile furthest from
+    everything already chosen, which fills the region's extremes first -- exactly the
+    geometry that constrains a tilt.
+
+    Candidates include tiles with no tissue; the per-point tissue check rejects those
+    and the survey moves to the next one. Spread is what this function knows about,
+    tissue is what the strategy knows about.
+    """
+    if n <= 0 or not xy_positions:
+        return []
+    pts = np.asarray(xy_positions, dtype=float)
+    chosen: List[int] = []
+    if already:
+        seeds = np.asarray(already, dtype=float)
+        min_dist = _cdist_scipy(pts, seeds).min(axis=1)
+    else:
+        # Start from the tile furthest from the centroid: a corner, not the middle.
+        centre = pts.mean(axis=0, keepdims=True)
+        min_dist = _cdist_scipy(pts, centre).ravel()
+        first = int(np.argmax(min_dist))
+        chosen.append(first)
+        min_dist = _cdist_scipy(pts, pts[first : first + 1]).ravel()
+    while len(chosen) < n:
+        nxt = int(np.argmax(min_dist))
+        if min_dist[nxt] <= 0:
+            break  # every remaining tile coincides with one already chosen
+        chosen.append(nxt)
+        min_dist = np.minimum(min_dist, _cdist_scipy(pts, pts[nxt : nxt + 1]).ravel())
+    return chosen
+
+
+def _run_focus_survey(ctx: "AcquisitionContext") -> None:
+    """Measure the focus surface before the tile loop, instead of discovering it.
+
+    Why this is worth a couple of minutes: the 2026-09-24 session spent 8.95 hours in
+    per-tile autofocus, 2,084 sweeps at a mean 15.5 s, and 21% of those returned no
+    measurement at all. Nine well-spread points reproduce the same region's surface to
+    0.32-1.37 um RMS. Measuring the surface up front is the difference between paying
+    for it once and paying for it per tile.
+
+    Runs after Phase 8, which has already set the AF rotation angle and exposure and
+    measured the first point, so this only adds points.
+
+    Nothing here is load-bearing for the acquisition: a point that cannot be focused,
+    or has no tissue, is skipped, and if too few survive the surface simply stays
+    unlicensed and the tile loop behaves as it does today.
+    """
+    logger = ctx.logger
+    requested = int(ctx.params.get("focus_survey_points") or 0)
+    if requested <= 0:
+        return
+    surface = ctx.focus_surface
+    if surface is None or not surface.active:
+        logger.warning(
+            "--focus-survey %d was requested but the focus surface is off, so there "
+            "would be nothing to fit the points to. Skipping the survey rather than "
+            "spending the time. Pass --focus-surface observe or enforce as well.",
+            requested,
+        )
+        return
+    if not ctx.positions:
+        return
+
+    from microscope_control.autofocus.strategies import StrategyFailureMode
+
+    hardware = ctx.hardware
+    already = [(x, y) for x, y, _ in ctx.completed_af_positions]
+    # Offer more candidates than needed: tissue checks will reject some.
+    candidate_budget = max(requested * 3, requested + 6)
+
+    explicit = ctx.params.get("focus_survey_tiles")
+    if explicit:
+        candidates = [i for i in explicit if 0 <= i < len(ctx.positions)]
+        logger.info(
+            "Focus survey: %d candidate tiles supplied by the client "
+            "(scored for tissue on the macro image)",
+            len(candidates),
+        )
+    else:
+        candidates = _spread_survey_points(ctx.xy_positions, already, candidate_budget)
+        logger.info(
+            "Focus survey: %d candidate tiles chosen by spread over the region "
+            "(no client-supplied list)",
+            len(candidates),
+        )
+
+    target_total = len(already) + requested
+    logger.info(
+        "=== FOCUS SURVEY === measuring up to %d more focus points before the tile "
+        "loop (%d already measured, target %d)",
+        requested,
+        len(already),
+        target_total,
+    )
+    t_survey = time.perf_counter()
+    measured = 0
+    skipped_no_tissue = 0
+    failed = 0
+
+    for tile_idx in candidates:
+        if len(ctx.completed_af_positions) >= target_total:
+            break
+        if ctx.is_cancelled is not None and ctx.is_cancelled():
+            logger.info("Focus survey cancelled by the operator")
+            break
+        pos, _ = ctx.positions[tile_idx]
+        # Approach at the best Z we currently believe, so the search starts near focus.
+        seed_z = surface.predict(pos.x, pos.y)
+        if seed_z is None:
+            seed_z = hardware.get_current_position().z
+        try:
+            hardware.move_to_position(Position(x=pos.x, y=pos.y, z=seed_z))
+        except Exception as move_err:
+            logger.warning(
+                "Focus survey: could not move to tile %d (%s) -- skipping this point",
+                tile_idx,
+                move_err,
+            )
+            failed += 1
+            continue
+
+        # Tissue check. A survey point on blank glass is worse than no point: the
+        # metric still produces a peak there, and that peak is the coverslip.
+        try:
+            test_img, _ = hardware.snap_image()
+            signal_valid, strategy_stats = ctx.af_strategy.is_valid(test_img, logger_=logger)
+        except Exception as snap_err:
+            logger.warning(
+                "Focus survey: tissue check failed at tile %d (%s) -- skipping",
+                tile_idx,
+                snap_err,
+            )
+            failed += 1
+            continue
+        if not signal_valid and ctx.af_strategy.on_failure is not StrategyFailureMode.PROCEED:
+            logger.info(
+                "Focus survey: tile %d has no usable signal (%s) -- trying the next " "candidate",
+                tile_idx,
+                strategy_stats,
+            )
+            skipped_no_tissue += 1
+            continue
+
+        try:
+            z = autofocus_with_manual_fallback(
+                hardware=hardware,
+                logger=logger,
+                # No manual prompt during a survey: it runs unattended, and a point
+                # that will not focus is a point to skip, not a reason to stop.
+                request_manual_focus=None,
+                max_retries=0,
+                fallback_z=seed_z,
+                move_stage_to_estimate=True,
+                n_steps=ctx.af_n_steps,
+                search_range=ctx.af_search_range,
+                interp_strength=ctx.af_interp_strength,
+                interp_kind=ctx.af_interp_kind,
+                score_metric=ctx.af_score_metric,
+                channel_reduction=ctx.af_channel_reduction,
+                diagnostic_output_path=ctx.output_path,
+                position_index=tile_idx,
+            )
+        except Exception as af_err:
+            logger.warning(
+                "Focus survey: autofocus failed at tile %d (%s) -- skipping this point",
+                tile_idx,
+                af_err,
+            )
+            failed += 1
+            continue
+
+        achieved = hardware.get_current_position().z
+        ctx.completed_af_positions.append((pos.x, pos.y, achieved))
+        surface.add(pos.x, pos.y, achieved)
+        measured += 1
+        logger.info(
+            "Focus survey point %d/%d: tile %d at X=%.0f Y=%.0f -> Z=%.2f um " "(AF returned %.2f)",
+            measured,
+            requested,
+            tile_idx,
+            pos.x,
+            pos.y,
+            achieved,
+            z,
+        )
+
+    elapsed = time.perf_counter() - t_survey
+    logger.info(
+        "=== FOCUS SURVEY DONE === %d points measured, %d candidates had no usable "
+        "signal, %d failed, in %.1f s",
+        measured,
+        skipped_no_tissue,
+        failed,
+        elapsed,
+    )
+    logger.info("  %s", surface.describe())
+    if not surface.licensed:
+        logger.warning(
+            "The survey did not produce a usable surface, so this acquisition will "
+            "choose each tile's Z exactly as it does today. This is a safe outcome, "
+            "not an error -- but if it repeats, either the survey needs more points "
+            "or this sample is not planar."
+        )
 
 
 def _log_focus_surface_summary(ctx: "AcquisitionContext") -> None:

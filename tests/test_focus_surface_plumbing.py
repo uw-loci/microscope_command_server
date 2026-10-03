@@ -28,15 +28,24 @@ def test_the_flag_is_parsed_and_defaults_to_off():
 
 
 def test_every_recorded_focus_point_also_reaches_the_surface():
-    appends = len(re.findall(r"completed_af_positions\.append\(", SOURCE))
-    feeds = len(re.findall(r"focus_surface\.add\(", SOURCE))
-    assert appends == 3, (
-        "the bootstrap adopt-current path, the pre-acquisition AF, and the per-tile AF; "
-        "a new one must feed the surface too"
+    # Checked per call site rather than by counting two patterns: counting broke the
+    # first time a new path spelled it `surface.add(...)` through a local instead of
+    # `ctx.focus_surface.add(...)`, which is the same thing happening. What the
+    # invariant actually says is that each recorded point is handed over NEARBY.
+    lines = SOURCE.split("\n")
+    appends = [i for i, line in enumerate(lines) if "completed_af_positions.append(" in line]
+    assert len(appends) >= 4, (
+        "the adopt-current bootstrap, the pre-acquisition AF, the focus survey, and the "
+        "per-tile AF"
     )
-    assert feeds == appends, (
+    missing = []
+    for i in appends:
+        window = "\n".join(lines[max(0, i - 2) : i + 6])
+        if "surface.add(" not in window:
+            missing.append(lines[i].strip())
+    assert not missing, (
         "a focus point recorded without being given to the surface is one the surface "
-        "can neither learn from nor vet"
+        "can neither learn from nor vet: " + "; ".join(missing)
     )
 
 
