@@ -46,6 +46,9 @@ class _Ctx:
         self.completed_af_positions = []
         self.dynamic_af_positions = set(af_positions)
         self.deferred_af_positions = set()
+        # The adopted focus is a real measured point, so it is also given to the focus
+        # surface. None here means "no surface this run", which is the default.
+        self.focus_surface = None
 
 
 def _load_skip_fn():

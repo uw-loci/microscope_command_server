@@ -2274,6 +2274,11 @@ def parse_acquisition_message(message: str) -> dict:
             elif parts[i] == "--af-benchmark":
                 params["af_benchmark"] = True
                 i += 1
+            elif parts[i] == "--focus-surface" and i + 1 < len(parts):
+                # off | observe | enforce. Absent means off, so a client that knows
+                # nothing about this gets exactly the previous behaviour.
+                params["focus_surface_mode"] = parts[i + 1]
+                i += 2
             elif parts[i] == "--save-raw" and i + 1 < len(parts):
                 params["save_raw"] = parts[i + 1].lower() == "true"
                 i += 2
@@ -2623,6 +2628,9 @@ class AcquisitionContext:
     dynamic_af_positions: set = field(default_factory=set)
     deferred_af_positions: set = field(default_factory=set)
     completed_af_positions: list = field(default_factory=list)
+    # Robust plane through completed_af_positions. See acquisition/focus_surface.py.
+    # None until _setup_autofocus runs; inert unless --focus-surface says otherwise.
+    focus_surface: Any = None
     first_tissue_autofocus_done: bool = False
     last_af_pos_idx: int = -1
     tile_measurements: list = field(default_factory=list)
@@ -3038,6 +3046,7 @@ def _finalize_acquisition(ctx: AcquisitionContext) -> None:
     logger.info("=== ACQUISITION COMPLETED SUCCESSFULLY ===")
     ctx.sat_monitor.log_summary()
     logger.info(f"Final Z position: {final_z:.2f} um")
+    _log_focus_surface_summary(ctx)
     logger.info(f"Total images saved: {ctx.image_count}/{ctx.total_images}")
     logger.info(f"Output directory: {ctx.output_path}")
 
@@ -3841,6 +3850,9 @@ def _configure_autofocus(ctx: AcquisitionContext) -> None:
         ctx.dynamic_af_positions = set()
         ctx.deferred_af_positions = set()
         ctx.completed_af_positions = []
+        # No autofocus means no measurements, so there is nothing to fit. Build it
+        # anyway rather than leaving the previous region's surface in place.
+        ctx.focus_surface = _build_focus_surface(ctx)
         return
 
     fov = ctx.hardware.get_fov()
@@ -3923,7 +3935,8 @@ def _configure_autofocus(ctx: AcquisitionContext) -> None:
                 f"rgb_brightness_threshold={af_rgb_brightness_threshold}, "
                 f"sweep: range={af_sweep_range_um}um, n_steps={af_sweep_n_steps}, "
                 f"edge_retries={af_edge_retries}, "
-                f"gap_index_mult={af_gap_index_multiplier}, gap_spatial_mult={af_gap_spatial_multiplier}"
+                f"gap_index_mult={af_gap_index_multiplier}, gap_spatial_mult={af_gap_spatial_multiplier}, "
+                f"focus_surface={params.get('focus_surface_mode') or 'off'}"
             )
             af_settings_found = True
             break
@@ -4166,6 +4179,36 @@ def _configure_autofocus(ctx: AcquisitionContext) -> None:
     ctx.deferred_af_positions = set()
     ctx.first_tissue_autofocus_done = False
     ctx.completed_af_positions = []
+    ctx.focus_surface = _build_focus_surface(ctx)
+
+
+def _build_focus_surface(ctx: "AcquisitionContext"):
+    """Construct the focus surface for this region, per --focus-surface.
+
+    Per-region, not per-run: each annotation sits on its own patch of slide and gets
+    its own plane. Carrying one surface across regions would average two tissue
+    heights together, which is the mistake nearest-neighbour seeding already makes at
+    region boundaries.
+    """
+    from microscope_command_server.acquisition.focus_surface import FocusSurface, parse_mode
+
+    logger = ctx.logger
+    mode = parse_mode(ctx.params.get("focus_surface_mode"), logger)
+    surface = FocusSurface(mode=mode, logger=logger)
+    if surface.active:
+        logger.info(
+            "Focus surface ENABLED in '%s' mode: a robust plane is fitted through this "
+            "region's autofocus results, and each new result is checked against it. "
+            "%s",
+            mode,
+            (
+                "Nothing acts on the result -- this run only reports what enforcement "
+                "would have done."
+                if mode == "observe"
+                else "Disagreeing results are replaced by the surface's prediction."
+            ),
+        )
+    return surface
 
 
 def _guard_af_saturation(ctx: "AcquisitionContext", hardware, logger) -> None:
@@ -4347,6 +4390,8 @@ def _adopt_current_focus_as_initial(ctx: AcquisitionContext) -> None:
     ctx.first_tissue_autofocus_done = True
     ctx.last_af_pos_idx = first_af_idx
     ctx.completed_af_positions.append((pos.x, pos.y, pos.z))
+    if ctx.focus_surface is not None:
+        ctx.focus_surface.add(pos.x, pos.y, pos.z)
     ctx.dynamic_af_positions.discard(first_af_idx)
 
     logger.info("=== Starting main acquisition loop ===")
@@ -4597,6 +4642,8 @@ def _run_pre_acquisition_autofocus(ctx: AcquisitionContext) -> None:
         ctx.first_tissue_autofocus_done = True
         ctx.last_af_pos_idx = first_af_idx
         ctx.completed_af_positions.append((first_af_pos.x, first_af_pos.y, initial_z))
+        if ctx.focus_surface is not None:
+            ctx.focus_surface.add(first_af_pos.x, first_af_pos.y, initial_z)
         ctx.dynamic_af_positions.discard(first_af_idx)
 
     except RuntimeError as e:
@@ -4605,6 +4652,114 @@ def _run_pre_acquisition_autofocus(ctx: AcquisitionContext) -> None:
             raise _AcquisitionCancelled() from e
 
     logger.info("=== Starting main acquisition loop ===")
+
+
+def _log_focus_surface_summary(ctx: "AcquisitionContext") -> None:
+    """Report what the focus surface found, so an observe run is readable afterwards.
+
+    An observe-mode run exists to be read: the only product is this summary plus the
+    per-tile disagreement lines, so it has to say how many results the surface would
+    have overruled and out of how many.
+    """
+    surface = getattr(ctx, "focus_surface", None)
+    if surface is None or not surface.active:
+        return
+    logger = ctx.logger
+    logger.info("=== FOCUS SURFACE ===")
+    logger.info("  %s", surface.describe())
+    summary = surface.summary()
+    checks = summary.get("checks", 0)
+    flagged = summary.get("would_reject", 0)
+    if checks:
+        logger.info(
+            "  %d of %d autofocus results (%.1f%%) disagreed with the surface by more "
+            "than the gate%s",
+            flagged,
+            checks,
+            100.0 * flagged / checks,
+            (
+                " and were replaced by its prediction"
+                if surface.mode == "enforce"
+                else " and were kept anyway (observe mode)"
+            ),
+        )
+    if summary.get("resurfaces"):
+        logger.warning(
+            "  the surface reset onto new measurements %d time(s) -- the sample moved, "
+            "or the stage frame did",
+            summary["resurfaces"],
+        )
+    logger.info("  focus surface summary: %s", summary)
+
+
+def _vet_autofocus_result(ctx: "AcquisitionContext", pos, af_z: float, af_type: str) -> float:
+    """Check one autofocus result against the fitted focus surface.
+
+    Returns the Z to adopt: the measurement, or -- when the surface is enforcing and
+    the measurement disagrees with it beyond the gate -- the surface's prediction,
+    with the stage moved there.
+
+    This is the point of the whole mechanism. Measured over ten PPM regions, a wide
+    standard autofocus lands more than 5 um off the surface 25% of the time and more
+    than 15 um off 21% of the time, worst case 73 um; the narrow drift sweep does so
+    1.2% of the time. The wide search is what runs at the first tissue tile of every
+    region and after every jump, and until now its answer was appended to the seed
+    list unexamined and then handed to every tile around it. One bad result at the
+    start of a region put the whole region out of focus, unrecoverably, with nothing
+    in the log to say so.
+    """
+    surface = ctx.focus_surface
+    if surface is None or not surface.active:
+        return af_z
+    logger = ctx.logger
+    verdict = surface.check(pos.x, pos.y, af_z)
+    if verdict.predicted_z is None:
+        logger.debug("  Focus surface has no opinion yet: %s", verdict.reason)
+        return af_z
+    if not verdict.would_reject:
+        logger.debug(
+            "  Focus surface agrees: %s AF gave %.2f um, surface predicts %.2f um "
+            "(%.2f um apart)",
+            af_type,
+            af_z,
+            verdict.predicted_z,
+            verdict.residual_um,
+        )
+        return af_z
+
+    if not verdict.enforced:
+        # Observe mode: say exactly what enforcement would have done, and do nothing.
+        logger.warning(
+            "  FOCUS SURFACE DISAGREES (observe mode, result kept): %s AF gave "
+            "%.2f um, surface predicts %.2f um -- %s. In enforce mode this tile "
+            "would have used the prediction.",
+            af_type,
+            af_z,
+            verdict.predicted_z,
+            verdict.reason,
+        )
+        return af_z
+
+    logger.warning(
+        "  FOCUS SURFACE OVERRIDE: %s AF gave %.2f um, using the surface's %.2f um "
+        "instead -- %s",
+        af_type,
+        af_z,
+        verdict.predicted_z,
+        verdict.reason,
+    )
+    try:
+        ctx.hardware.move_to_position(Position(z=verdict.predicted_z))
+    except Exception as move_err:
+        logger.error(
+            "  Focus surface override could not move Z to %.2f um (%s) -- keeping the "
+            "autofocus result %.2f um for this tile",
+            verdict.predicted_z,
+            move_err,
+            af_z,
+        )
+        return af_z
+    return float(verdict.predicted_z)
 
 
 def _handle_tile_autofocus(
@@ -4702,18 +4857,38 @@ def _handle_tile_autofocus(
         nearest_idx = int(np.argmin(dists))
         nearest_af_dist = float(dists[nearest_idx])
         nearest_z = ctx.completed_af_positions[nearest_idx][2]
-        pos.z = nearest_z
+        # Prefer the fitted focus surface over the single nearest measurement when one
+        # is licensed. Nearest-neighbour holds a neighbour's Z across the gap to this
+        # tile, so on a tilted slide its error is the tilt times that gap -- 8 um/mm
+        # over a 250 um pitch is tolerable, but the same hold across a row wrap or a
+        # region jump is not. The surface interpolates instead, and it is also the only
+        # one of the two that a single bad measurement cannot poison.
+        seed_z = nearest_z
+        seed_source = "nearest AF"
+        surface_z = ctx.focus_surface.predict(pos.x, pos.y) if ctx.focus_surface else None
+        if surface_z is not None and ctx.focus_surface.enforcing:
+            seed_z = surface_z
+            seed_source = "focus surface"
+        elif surface_z is not None:
+            logger.debug(
+                "  Focus surface would seed %.2f um here; nearest AF says %.2f um "
+                "(observe mode -- using nearest AF)",
+                surface_z,
+                nearest_z,
+            )
+        pos.z = seed_z
         if not needs_af:
-            # Non-AF tile: the nearest-AF Z is the final focus for this tile, so
-            # move Z now; the XY move below is issued no-wait.
+            # Non-AF tile: this Z is the final focus for this tile, so move Z now;
+            # the XY move below is issued no-wait.
             current_z = hardware.get_current_position().z
-            if abs(nearest_z - current_z) > 0.1:
-                hardware.move_to_position(Position(z=nearest_z))
+            if abs(seed_z - current_z) > 0.1:
+                hardware.move_to_position(Position(z=seed_z))
                 logger.debug(
-                    "  Nearest-AF Z correction: %.2f -> %.2f um "
+                    "  %s Z correction: %.2f -> %.2f um "
                     "(nearest AF at X=%.0f, Y=%.0f, dist=%.0f um)",
+                    seed_source,
                     current_z,
-                    nearest_z,
+                    seed_z,
                     ctx.completed_af_positions[nearest_idx][0],
                     ctx.completed_af_positions[nearest_idx][1],
                     nearest_af_dist,
@@ -4955,7 +5130,10 @@ def _handle_tile_autofocus(
                 "in AF map (prevents stale Z propagation)"
             )
         else:
+            af_z = _vet_autofocus_result(ctx, pos, af_z, af_type_for_this_tile)
             ctx.completed_af_positions.append((pos.x, pos.y, af_z))
+            if ctx.focus_surface is not None:
+                ctx.focus_surface.add(pos.x, pos.y, af_z)
     else:
         # Strategy rejected this tile
         af_failed_for_this_tile = True
