@@ -938,7 +938,11 @@ The surface refuses to speak unless:
   RANSAC over a scattered set always finds some flat-looking subset, and the
   inlier RMS over that subset looks excellent; this gate detects that a
   surface is fitted to a minority.
-- The points span at least 0.5 mm in their weaker direction. Six points down
+- The points span enough in their weaker direction to constrain a tilt. The
+  absolute floor is 0.5 mm, but for narrow regions (e.g., a strip of tiles
+  only 0.4 mm wide), the requirement scales down to 60% of the region's narrower
+  dimension. An unconstrained tilt can only do harm over the distance it is
+  extrapolated, and in a thin strip that is almost nothing. Six points down
   one raster column are six points on a line; they constrain the tilt along
   the column and say nothing across it. The server checks this and refuses to
   extrapolate a tilt in an unconstrained axis.
@@ -958,9 +962,11 @@ starts, instead of discovering the plane one tile at a time:
 
 - **Point selection:** If `--focus-survey-tiles` is omitted, the server spreads
   its candidate tiles using farthest-point sampling: it picks positions that
-  span the region extremes first, which constrains both tilt terms. Tissue
-  checks reject empty fields automatically, and the survey moves to the next
-  candidate.
+  span the region extremes first, which constrains both tilt terms. To avoid
+  edge artifacts (boundary tiles are often half off the tissue), the server
+  keeps candidates inset from the region edge by approximately one camera FOV.
+  Tissue checks reject empty fields automatically, and the survey moves to the
+  next candidate.
 
 - **Explicit tiles:** If `--focus-survey-tiles` is provided (comma-separated
   indices like `"2,7,15,23"`), the survey measures those positions in order.
