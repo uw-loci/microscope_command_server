@@ -59,10 +59,14 @@ def test_an_overridden_result_does_not_teach_the_surface_its_own_answer():
     assert "if ctx.focus_surface is not None and learnable:" in SOURCE
     helper = SOURCE[SOURCE.index("def _vet_autofocus_result(") :]
     helper = helper[: helper.index("\ndef ")]
-    assert helper.count("return af_z, True") == 5, (
-        "every path that keeps the measurement is learnable: surface off, no opinion "
-        "yet, agreed, observe-mode disagreement, and a failed override move"
+    assert helper.count("return af_z, True") == 4, (
+        "learnable where nothing was rejected: surface off, no opinion yet, agreed, "
+        "and a failed override move (the stage is where autofocus left it)"
     )
+    # An observe-mode disagreement keeps the Z but is NOT learned, so that observe and
+    # enforce build the same surface from the same run. Otherwise an observe report
+    # stops predicting what enforcing would do, which is all observe is for.
+    assert helper.count("return af_z, False") == 1
     assert helper.count("return float(verdict.predicted_z), False") == 1
 
 

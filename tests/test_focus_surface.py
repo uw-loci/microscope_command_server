@@ -177,12 +177,88 @@ class TestObserveChangesNothing:
         assert not s.enforcing
 
     def test_observe_and_enforce_learn_the_same_surface(self):
-        # Learning is unconditional in both modes, so a run in observe measures the
-        # surface enforcement would have used. Otherwise the dry run proves nothing.
+        # A dry run has to measure the surface enforcement would have used, or it proves
+        # nothing. Driven through check()-then-add the way the acquisition does, and
+        # including a result both modes would reject, so the two can only agree if the
+        # rejected point is withheld from BOTH.
         points = tile_grid()
         obs = feed(surface(MODE_OBSERVE), points, seed=11)
         enf = feed(surface(MODE_ENFORCE), points, seed=11)
+        for s in (obs, enf):
+            x, y = CENTRE
+            bad = real_plane(x, y) + 43.0
+            verdict = s.check(x, y, bad)
+            assert verdict.would_reject
+            # _vet_autofocus_result returns learnable=False for this in either mode.
+            if not verdict.would_reject:
+                s.add(x, y, bad)
         assert obs.predict(*CENTRE) == pytest.approx(enf.predict(*CENTRE), abs=1e-9)
+        assert obs.summary()["would_reject"] == enf.summary()["would_reject"]
+
+
+class TestGatesThatRealLogsCorrected:
+    """Three defects that only a replay against real runs could show.
+
+    `focus_surface_replay.py` feeds the shipped class every region in every available
+    server log, in acquisition order. Each of these was invisible to synthetic tests
+    and obvious within one replay.
+    """
+
+    def test_more_points_can_never_license_less(self):
+        # The spread measure divided by the point count, so adding points to a thin
+        # cloud SHRANK the measured spread. Measured consequence: a 16-point survey was
+        # refused on five regions where the same region's 9-point survey was licensed.
+        tiles = tile_grid(n_side=4, pitch_um=600.0)
+        small = feed(surface(), tiles[:9], seed=2)
+        large = feed(surface(), tiles, seed=2)
+        assert small.licensed
+        assert large.licensed, large.describe()
+        assert large.summary()["spread_minor_mm"] >= small.summary()["spread_minor_mm"]
+
+    def test_a_thin_region_is_judged_against_its_own_width(self):
+        # An absolute 0.5 mm floor refused five real regions at 0.38-0.49 mm -- thin
+        # strips whose fits were excellent (0.22-0.41 um RMS, every point an inlier).
+        # An unconstrained across-tilt can only do harm over the distance it is
+        # extrapolated, and in a strip that is almost nothing.
+        strip = []
+        for i in range(12):
+            strip.append((CENTRE[0] + i * 400.0, CENTRE[1]))
+            strip.append((CENTRE[0] + i * 400.0, CENTRE[1] + 400.0))
+        without = feed(surface(), strip, seed=4)
+        assert not without.licensed, "0.4 mm of spread fails the absolute floor"
+        aware = feed(surface(region_extent_mm=(4.4, 0.4)), strip, seed=4)
+        assert aware.licensed, aware.describe()
+        assert aware.required_spread_mm() < aware.min_spread_mm
+
+    def test_three_identical_z_values_do_not_reset_a_good_surface(self):
+        # The counter-example from the replay: three rejected results with a Z spread of
+        # exactly 0.00 um reset a surface that 108 points defined to 0.27 um RMS. On a
+        # tilted slide a MOVED sample's focus still changes across the field, so
+        # identical Z at different XY is a stuck reading, not a translation -- and a
+        # stuck reading is the one thing that must not dislodge a good surface.
+        s = feed(surface(), tile_grid())
+        stuck = -250.0
+        for x, y in tile_grid(n_side=2, pitch_um=3000.0)[:3]:
+            s.check(x, y, stuck)
+        assert s.summary()["resurfaces"] == 0, s.describe()
+        assert s.licensed
+
+    def test_a_genuinely_translated_sample_still_resets_it(self):
+        # The flip side: points that sit on this surface's own tilt at a new height are
+        # what a re-seated slide looks like, and must still be conceded to.
+        s = feed(surface(), tile_grid())
+        shift = 60.0
+        for x, y in tile_grid(n_side=2, pitch_um=3000.0)[:3]:
+            s.check(x, y, real_plane(x, y) + shift)
+        assert s.summary()["resurfaces"] == 1, s.describe()
+
+    def test_the_summary_always_says_why_it_is_not_licensed(self):
+        # A region with one usable measurement in ninety tiles reported only
+        # "licensed: false", which says nothing about what to do next.
+        s = surface()
+        s.add(CENTRE[0], CENTRE[1], Z0)
+        assert s.summary()["unlicensed_reason"]
+        assert "not enough focus points" in s.summary()["unlicensed_reason"]
 
 
 class TestConcedingToReality:

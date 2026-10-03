@@ -93,6 +93,14 @@ DEFAULT_MIN_INLIER_FRACTION = 0.6
 # the surface sees, so this is not a hypothetical.
 DEFAULT_MIN_SPREAD_MM = 0.5
 
+# ...but a region only 0.5 mm wide cannot produce 0.5 mm of spread, and does not need
+# to: an unconstrained across-tilt can only do damage over the distance it is
+# extrapolated, which in a thin strip is almost nothing. Replaying 51 real regions, an
+# absolute floor refused five of them at 0.38-0.49 mm -- thin strips where the fit was
+# perfectly good (0.22-0.41 um RMS, every point an inlier). So the requirement is the
+# floor OR this fraction of the region's own narrow dimension, whichever is smaller.
+DEFAULT_SPREAD_COVERAGE = 0.6
+
 # Consecutive rejections that agree with each other and not with the surface, after
 # which the surface concedes that the sample moved.
 RESURFACE_AFTER_REJECTIONS = 3
@@ -155,6 +163,10 @@ class FocusSurface:
     max_rms_um: float = DEFAULT_MAX_RMS_UM
     min_inlier_fraction: float = DEFAULT_MIN_INLIER_FRACTION
     min_spread_mm: float = DEFAULT_MIN_SPREAD_MM
+    spread_coverage: float = DEFAULT_SPREAD_COVERAGE
+    # (dx, dy) extent of the tiles this surface will be asked about, in mm. Lets the
+    # spread requirement scale to the region instead of assuming every region is wide.
+    region_extent_mm: Optional[Tuple[float, float]] = None
     inlier_band_um: float = DEFAULT_INLIER_BAND_UM
     reject_margin_um: float = DEFAULT_REJECT_MARGIN_UM
     reject_sigma: float = DEFAULT_REJECT_SIGMA
@@ -208,13 +220,29 @@ class FocusSurface:
                 f"only {100.0 * f.n_inliers / f.n_points:.0f}% of focus points agree "
                 f"with the surface (need {100.0 * self.min_inlier_fraction:.0f}%)"
             )
-        if min(f.spread_mm) < self.min_spread_mm:
+        required = self.required_spread_mm()
+        if min(f.spread_mm) < required:
+            scaled = ""
+            if self.region_extent_mm is not None and required < self.min_spread_mm:
+                scaled = (
+                    f", scaled down from {self.min_spread_mm:.2f} mm because the region "
+                    f"is only {min(self.region_extent_mm):.2f} mm across"
+                )
             return (
                 f"focus points span only {min(f.spread_mm):.2f} mm across "
-                f"(need {self.min_spread_mm:.2f} mm) -- they do not constrain a tilt "
+                f"(need {required:.2f} mm{scaled}) -- they do not constrain a tilt "
                 f"in both axes"
             )
         return None
+
+    def required_spread_mm(self) -> float:
+        """How much spread this region's geometry can reasonably be asked for."""
+        if self.region_extent_mm is None:
+            return self.min_spread_mm
+        narrow = min(self.region_extent_mm)
+        if narrow <= 0:
+            return self.min_spread_mm
+        return min(self.min_spread_mm, self.spread_coverage * narrow)
 
     @property
     def enforcing(self) -> bool:
@@ -298,26 +326,53 @@ class FocusSurface:
         A surface that keeps vetoing is the worst outcome available: it is confident,
         wrong, and silent. The discriminator is whether the rejections are mutually
         consistent. Scattered rejections are failed autofocus attempts; rejections that
-        themselves form a plane mean the sample is no longer where the surface thinks
-        it is -- a re-seated slide, or one of the stage frame shifts this rig has had.
+        themselves describe one surface mean the sample is no longer where this one
+        thinks it is -- a re-seated slide, or one of the stage frame shifts this rig
+        has had.
+
+        "Consistent" has to mean consistent with a *translated version of this
+        surface*, not merely close to each other in Z. Replaying 51 real regions threw
+        up the counter-example: three rejected results with a Z spread of exactly
+        0.00 um reset a surface that 108 points defined to 0.27 um RMS. Three identical
+        Z values at different XY are not a moved sample -- on a tilted slide a moved
+        sample's focus still changes across the field. They are a stage or a sweep
+        returning a stale reading, which is the one thing that must not be allowed to
+        dislodge a good surface.
         """
         if len(self._rejected_streak) < RESURFACE_AFTER_REJECTIONS:
             return False
         recent = np.asarray(self._rejected_streak[-RESURFACE_AFTER_REJECTIONS:], dtype=float)
-        spread = float(np.std(recent[:, 2]))
-        if spread > self.max_rms_um:
+        if self._fit is None:
+            return False
+        # Distinct places, or this is one tile being retried rather than a moved slide.
+        if len(np.unique(np.round(recent[:, :2], 1), axis=0)) < RESURFACE_AFTER_REJECTIONS:
+            return False
+        # Keep this surface's tilt, re-fit the offset only, and see whether the rejected
+        # points actually lie on the result. A translated slide does; a stuck reading
+        # does not, because it ignores the tilt.
+        tilted = np.array(
+            [
+                self._fit.ax * (x - self._fit.centre[0]) / 1000.0
+                + self._fit.ay * (y - self._fit.centre[1]) / 1000.0
+                for x, y, _ in recent
+            ]
+        )
+        offsets = recent[:, 2] - tilted
+        if float(np.std(offsets)) > self.max_rms_um:
             # Not telling a coherent story -- these are failures, not a moved sample.
             return False
+        spread = float(np.std(offsets))
         old = self._fit
         self._points = [tuple(p) for p in recent]
         self._fit = None
         self._rejected_streak.clear()
         self._n_resurfaces += 1
         self.logger.warning(
-            "FOCUS SURFACE RESET: the last %d autofocus results agree with each other "
-            "(Z spread %.2f um) and not with the surface (which %d points defined to "
-            "%.2f um RMS). Treating the sample as having moved and rebuilding from "
-            "these points. If this repeats, suspect the stage frame or a re-seated slide.",
+            "FOCUS SURFACE RESET: the last %d autofocus results sit on this surface's "
+            "own tilt at a different height (offset spread %.2f um) and disagree with "
+            "it (which %d points defined to %.2f um RMS). That is what a moved sample "
+            "looks like, so rebuilding from these points. If this repeats, suspect the "
+            "stage frame or a re-seated slide.",
             RESURFACE_AFTER_REJECTIONS,
             spread,
             old.n_inliers if old else 0,
@@ -356,6 +411,12 @@ class FocusSurface:
             "would_reject": self._n_would_reject,
             "resurfaces": self._n_resurfaces,
             "licensed": self.licensed,
+            # Always present, including when there is no fit at all -- a summary that
+            # omits the reason precisely when the surface did nothing is the least
+            # useful version of itself. Replaying real logs turned up regions with one
+            # usable measurement in ninety tiles, and the summary said only "licensed:
+            # false".
+            "unlicensed_reason": self._unlicensed_reason(),
         }
         if self._fit is not None:
             out.update(
@@ -367,7 +428,7 @@ class FocusSurface:
                     "inliers": self._fit.n_inliers,
                     "spread_major_mm": round(self._fit.spread_mm[0], 3),
                     "spread_minor_mm": round(self._fit.spread_mm[1], 3),
-                    "unlicensed_reason": self._unlicensed_reason(),
+                    "required_spread_mm": round(self.required_spread_mm(), 3),
                 }
             )
         return out
@@ -385,21 +446,26 @@ def _design(xy: np.ndarray, centre: Tuple[float, float]) -> np.ndarray:
 
 
 def _spread_mm(xy: np.ndarray) -> Tuple[float, float]:
-    """How far the points spread, in mm, along their two principal directions.
+    """Peak-to-peak spread, in mm, along the points' two principal directions.
 
     The smaller value is the one that matters: it is how much evidence the fit has for
-    the second tilt term. A single raster column returns something near zero.
+    the second tilt term. A single raster column returns zero.
+
+    Peak-to-peak, not a standard deviation. An RMS-like measure divides by the point
+    count, so adding points to a thin cloud makes the measured spread *shrink* -- which
+    had the absurd consequence that a 16-point survey could be refused where the same
+    region's 9-point survey was licensed. More evidence must never license less.
     """
     if len(xy) < 2:
         return (0.0, 0.0)
     centred = (xy - xy.mean(axis=0)) / 1000.0
     try:
-        sv = np.linalg.svd(centred, compute_uv=False)
+        _, _, vt = np.linalg.svd(centred, full_matrices=False)
     except np.linalg.LinAlgError:
         return (0.0, 0.0)
-    scale = float(np.sqrt(max(len(xy) - 1, 1)))
-    major = float(sv[0]) / scale
-    minor = float(sv[1]) / scale if len(sv) > 1 else 0.0
+    projected = centred @ vt.T
+    major = float(np.ptp(projected[:, 0]))
+    minor = float(np.ptp(projected[:, 1])) if projected.shape[1] > 1 else 0.0
     return (major, minor)
 
 

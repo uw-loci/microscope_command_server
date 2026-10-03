@@ -4212,7 +4212,16 @@ def _build_focus_surface(ctx: "AcquisitionContext"):
 
     logger = ctx.logger
     mode = parse_mode(ctx.params.get("focus_surface_mode"), logger)
-    surface = FocusSurface(mode=mode, logger=logger)
+    # Hand it the region's own extent so the spread requirement scales to the geometry:
+    # a 0.5 mm-wide strip cannot produce 0.5 mm of spread and does not need to.
+    extent = None
+    if ctx.xy_positions:
+        xy = np.asarray(ctx.xy_positions, dtype=float)
+        extent = (
+            float(np.ptp(xy[:, 0]) / 1000.0),
+            float(np.ptp(xy[:, 1]) / 1000.0),
+        )
+    surface = FocusSurface(mode=mode, logger=logger, region_extent_mm=extent)
     if surface.active:
         logger.info(
             "Focus surface ENABLED in '%s' mode: a robust plane is fitted through this "
@@ -4673,7 +4682,10 @@ def _run_pre_acquisition_autofocus(ctx: AcquisitionContext) -> None:
 
 
 def _spread_survey_points(
-    xy_positions: List[Tuple[float, float]], already: List[Tuple[float, float]], n: int
+    xy_positions: List[Tuple[float, float]],
+    already: List[Tuple[float, float]],
+    n: int,
+    edge_margin_um: float = 0.0,
 ) -> List[int]:
     """Pick n tile indices spread as far apart as possible (farthest-point sampling).
 
@@ -4682,13 +4694,32 @@ def _spread_survey_points(
     everything already chosen, which fills the region's extremes first -- exactly the
     geometry that constrains a tilt.
 
-    Candidates include tiles with no tissue; the per-point tissue check rejects those
-    and the survey moves to the next one. Spread is what this function knows about,
-    tissue is what the strategy knows about.
+    And exactly the geometry where autofocus is least trustworthy, which is the catch.
+    Filling the extremes first means preferring boundary tiles, and a boundary tile is
+    the one most likely to be half off the tissue -- the same reason the first AF
+    position has been moved one diagonal FOV inward since 2025-12-12. Replaying real
+    regions showed the cost: a 16-point farthest-point survey produced a WORSE point set
+    than a 9-point one on five regions (8 of 16 points disagreeing with the fit, against
+    7 of 9), because the extra picks were all edge. So candidates are first restricted
+    to tiles at least ``edge_margin_um`` inside the region's bounding box, and the
+    unrestricted set is used only if that leaves too few.
+
+    Candidates can still include tiles with no tissue; the per-point tissue check
+    rejects those and the survey moves on. Spread and position are what this function
+    knows about, tissue is what the strategy knows about.
     """
     if n <= 0 or not xy_positions:
         return []
-    pts = np.asarray(xy_positions, dtype=float)
+    pts_all = np.asarray(xy_positions, dtype=float)
+    index_map = np.arange(len(pts_all))
+    if edge_margin_um > 0 and len(pts_all) > n:
+        lo = pts_all.min(axis=0) + edge_margin_um
+        hi = pts_all.max(axis=0) - edge_margin_um
+        inside = np.all((pts_all >= lo) & (pts_all <= hi), axis=1)
+        # Only worth insetting if it leaves a pool big enough to still spread over.
+        if inside.sum() >= max(n, 4):
+            index_map = index_map[inside]
+    pts = pts_all[index_map]
     chosen: List[int] = []
     if already:
         seeds = np.asarray(already, dtype=float)
@@ -4706,7 +4737,7 @@ def _spread_survey_points(
             break  # every remaining tile coincides with one already chosen
         chosen.append(nxt)
         min_dist = np.minimum(min_dist, _cdist_scipy(pts, pts[nxt : nxt + 1]).ravel())
-    return chosen
+    return [int(index_map[i]) for i in chosen]
 
 
 def _run_focus_survey(ctx: "AcquisitionContext") -> None:
@@ -4768,11 +4799,19 @@ def _run_focus_survey(ctx: "AcquisitionContext") -> None:
             len(candidates),
         )
     else:
-        candidates = _spread_survey_points(ctx.xy_positions, already, candidate_budget)
+        try:
+            fov_x, fov_y = ctx.hardware.get_fov()
+            edge_margin = float((fov_x + fov_y) / 2.0)
+        except Exception:
+            edge_margin = 0.0
+        candidates = _spread_survey_points(
+            ctx.xy_positions, already, candidate_budget, edge_margin_um=edge_margin
+        )
         logger.info(
-            "Focus survey: %d candidate tiles chosen by spread over the region "
-            "(no client-supplied list)",
+            "Focus survey: %d candidate tiles chosen by spread over the region, kept "
+            "%.0f um clear of its edge (no client-supplied list)",
             len(candidates),
+            edge_margin,
         )
 
     target_total = len(already) + requested
@@ -4979,7 +5018,17 @@ def _vet_autofocus_result(
         return af_z, True
 
     if not verdict.enforced:
-        # Observe mode: say exactly what enforcement would have done, and do nothing.
+        # Observe mode: say exactly what enforcement would have done, and do nothing to
+        # the acquisition -- this tile keeps the Z autofocus found and the stage is not
+        # moved.
+        #
+        # But the SURFACE must behave as it would under enforcement, which is why this
+        # returns learnable=False: a result enforcement would have rejected is one
+        # observe must not learn either. Otherwise the two modes build different
+        # surfaces from the same run, and an observe report stops predicting what
+        # enforcing would do -- which is the only reason observe exists. Caught by
+        # replaying both modes over 51 real regions and noticing the numbers could only
+        # match by accident.
         logger.warning(
             "  FOCUS SURFACE DISAGREES (observe mode, result kept): %s AF gave "
             "%.2f um, surface predicts %.2f um -- %s. In enforce mode this tile "
@@ -4989,7 +5038,7 @@ def _vet_autofocus_result(
             verdict.predicted_z,
             verdict.reason,
         )
-        return af_z, True
+        return af_z, False
 
     logger.warning(
         "  FOCUS SURFACE OVERRIDE: %s AF gave %.2f um, using the surface's %.2f um "

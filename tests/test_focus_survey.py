@@ -81,6 +81,33 @@ class TestSpreadSelection:
         for p in picked:
             assert np.hypot(p[0] - already[0][0], p[1] - already[0][1]) > 1000.0
 
+    def test_it_keeps_clear_of_the_region_edge(self):
+        # Farthest-point sampling fills the extremes first, which is also where
+        # autofocus is least trustworthy -- a boundary tile is the one most likely to be
+        # half off the tissue, which is why the first AF position has been inset one
+        # diagonal FOV since 2025-12-12. Replaying real regions measured the cost: a
+        # 16-point farthest-point survey produced a worse point set than a 9-point one
+        # on five regions, the extra picks all being edge.
+        tiles = raster()
+        arr = np.asarray(tiles)
+        lo, hi = arr.min(axis=0), arr.max(axis=0)
+        picked = np.asarray([tiles[i] for i in spread_survey_points(tiles, [], 9, 600.0)])
+        assert (picked.min(axis=0) >= lo + 599).all()
+        assert (picked.max(axis=0) <= hi - 599).all()
+
+    def test_the_inset_is_abandoned_rather_than_returning_too_few(self):
+        # A region barely wider than one FOV would inset to nothing. A smaller survey
+        # is worse than an edge-heavy one, so the inset gives way.
+        tiles = raster(n_cols=3, n_rows=3, pitch=300.0)
+        picked = spread_survey_points(tiles, [], 6, 10000.0)
+        assert len(picked) >= 5
+
+    def test_the_inset_still_spreads_in_both_axes(self):
+        tiles = raster()
+        picked = np.asarray([tiles[i] for i in spread_survey_points(tiles, [], 9, 600.0)])
+        assert np.ptp(picked[:, 0]) > 0
+        assert np.ptp(picked[:, 1]) > 0
+
     def test_picks_are_distinct(self):
         tiles = raster()
         picked = spread_survey_points(tiles, [], 12)
