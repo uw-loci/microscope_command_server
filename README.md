@@ -879,6 +879,142 @@ The `STRMAFZ` command supports multiple autofocus strategies. The default
 edge-retry walk is always available; an alternative approach-from-safe-Z strategy
 can be enabled via parameters measured during a separate validation run.
 
+## Focus Surface Fitting (--focus-surface, --focus-survey, --focus-survey-tiles)
+
+The BGACQUIRE (and ACQUIRE) acquisition message parser accepts optional flags
+to fit a robust plane through autofocus measurements and optionally validate or
+override per-tile autofocus results against that plane.
+
+### Why a focus surface
+
+Measured autofocus results occasionally land far from the true sample plane --
+wide-search autofocus lands more than 5 um off 25% of the time and more than
+15 um off 21% of the time, worst case 73 um. A single bad measurement adopted
+at the start of a region is then handed to every tile around it, putting the
+whole region out of focus with nothing in the log to say so.
+
+Nothing in the system could notice, because a single measurement has nothing to
+be wrong against. A plane fitted to the region's other measurements does: one
+region had 12 of 12 wide-search results a median 43 um away from a plane its 111
+drift sweeps defined to 0.27 um RMS. Full measurement and method:
+`claude-reports/design/autofocus-empirical/summaries/focus_surface.md`.
+
+### Flag syntax
+
+```
+--focus-surface <mode>          # off | observe | enforce (default: off)
+--focus-survey <points>         # Number of points to measure before the tile loop (0 = none)
+--focus-survey-tiles <indices>  # Comma-separated tile indices to survey (optional; server chooses if omitted)
+```
+
+### Focus surface modes
+
+- **`off`** (default) -- No focus surface; behavior is identical to prior
+  releases. The surface is not fitted or consulted.
+
+- **`observe`** -- Fit a robust plane and report what enforcement would do,
+  but change nothing. Every autofocus result is checked against the surface,
+  and the log reports disagreements. This mode is a dry run: use it to
+  measure what enforcement would have done over a real region before
+  committing to automatic overrides.
+
+- **`enforce`** -- Fit a robust plane and replace autofocus results that
+  disagree with it beyond a gate. When an autofocus result lands far from the
+  fitted plane (residual > max of a 5 um floor or 4 sigma of the fit's RMS),
+  that result is rejected and the tile uses the plane's prediction instead,
+  with the stage moved there.
+
+### Focus surface licensing
+
+The surface refuses to speak unless:
+
+- It has at least 6 points (three points fit a plane exactly; six is the
+  minimum that leaves enough redundancy that one bad point cannot silently
+  define the surface).
+- The fit's residual is below `max_rms_um` (default 3.0 um). Above that
+  threshold the sample is not planar -- a folded section, a cytology smear --
+  and the surface declines to predict.
+- At least 60% of the points agree with the fit (measured inlier fraction).
+  RANSAC over a scattered set always finds some flat-looking subset, and the
+  inlier RMS over that subset looks excellent; this gate detects that a
+  surface is fitted to a minority.
+- The points span at least 0.5 mm in their weaker direction. Six points down
+  one raster column are six points on a line; they constrain the tilt along
+  the column and say nothing across it. The server checks this and refuses to
+  extrapolate a tilt in an unconstrained axis.
+
+When any check fails, the mode is logged as "NOT licensed: ..." and the
+acquisition falls back to the nearest-neighbour seeding behavior from before
+this feature.
+
+### Pre-acquisition focus survey
+
+`--focus-survey N` measures N additional focus points **before** the tile loop
+starts, instead of discovering the plane one tile at a time:
+
+- **Timing:** Runs after Phase 8 (pre-acquisition autofocus at the first tissue
+  position), which sets the autofocus exposure and rotation angle. The survey
+  uses those settings.
+
+- **Point selection:** If `--focus-survey-tiles` is omitted, the server spreads
+  its candidate tiles using farthest-point sampling: it picks positions that
+  span the region extremes first, which constrains both tilt terms. Tissue
+  checks reject empty fields automatically, and the survey moves to the next
+  candidate.
+
+- **Explicit tiles:** If `--focus-survey-tiles` is provided (comma-separated
+  indices like `"2,7,15,23"`), the survey measures those positions in order.
+  The indices are from the tile grid; the client typically scores them for
+  tissue content on the macro image and supplies the well-covered ones.
+
+- **Cannot fail the run:** A point that cannot be focused, has no tissue, or
+  fails to focus is skipped. If too few points survive the surface stays
+  unlicensed and the tile loop behaves as it always did. A survey that
+  produces no usable surface is safe: it is a time investment that did not
+  pay off.
+
+- **Cost:** Each point is one wide autofocus scan, roughly 10 s, so nine points
+  cost a couple of minutes. Measured on real regions, nine well-spread points
+  reproduce the plane to 0.32-1.37 um RMS.
+
+- **What the survey does and does not save:** it does not change how often the
+  tile loop autofocuses. That is still `n_tiles` in `autofocus_<scope>.yml`, and
+  raising it is a separate, deliberate decision. What the survey buys is a
+  licensed surface from the first tile rather than after a region's worth of
+  measurements have accumulated -- which is what makes raising `n_tiles` safe.
+  The prize is large: the 2026-09-24 session spent **8.95 hours** in per-tile
+  autofocus (2,084 sweeps at a mean 15.5 s), and 21% of those sweeps returned no
+  measurement at all because the metric never bracketed focus.
+
+### Example: Observe mode dry-run
+
+```
+--focus-surface observe --focus-survey 9
+```
+
+Runs one survey with nine well-spread points, fits a plane, and logs every
+time the surface would have overruled a tile's autofocus result. Nothing acts on
+it: no tile's Z changes and the stage is never moved on the surface's say-so, so
+the acquisition is the one it would have produced anyway. The output is the
+per-tile disagreement lines plus the end-of-region `=== FOCUS SURFACE ===`
+summary, which reports how many results would have been overruled and out of how
+many. Run this before `enforce`.
+
+### Example: Enforce mode with client-selected points
+
+```
+--focus-surface enforce --focus-survey 6 --focus-survey-tiles "5,12,19,31,44,51"
+```
+
+Measures the six client-specified tiles, fits a plane, and replaces autofocus
+results that land far from it. The client (e.g., QuPath) scores tiles for
+tissue content and supplies the well-covered ones.
+
+### Backward compatibility
+
+Omitting `--focus-surface` or setting it to `off` preserves byte-identical
+behavior to pre-feature acquisitions. The focus surface is off by default.
+
 ### Two autofocus strategies
 
 **Edge-Retry Walk (default):**
