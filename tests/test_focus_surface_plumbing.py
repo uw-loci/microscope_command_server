@@ -49,10 +49,27 @@ def test_every_recorded_focus_point_also_reaches_the_surface():
     )
 
 
+def test_an_overridden_result_does_not_teach_the_surface_its_own_answer():
+    # The substituted Z came from the surface. Feeding it back would shrink the inlier
+    # RMS and raise the inlier fraction with no new evidence behind either, making the
+    # fit progressively harder to dislodge by exactly the measurements that disagree
+    # with it. Every other path stays learnable, including observe mode -- otherwise an
+    # observe run would not measure the surface an enforce run would have used.
+    assert "af_z, learnable = _vet_autofocus_result(" in SOURCE
+    assert "if ctx.focus_surface is not None and learnable:" in SOURCE
+    helper = SOURCE[SOURCE.index("def _vet_autofocus_result(") :]
+    helper = helper[: helper.index("\ndef ")]
+    assert helper.count("return af_z, True") == 5, (
+        "every path that keeps the measurement is learnable: surface off, no opinion "
+        "yet, agreed, observe-mode disagreement, and a failed override move"
+    )
+    assert helper.count("return float(verdict.predicted_z), False") == 1
+
+
 def test_results_are_vetted_before_they_are_recorded():
     # Order matters: vetting can substitute the surface's prediction, and what gets
     # recorded must be the Z the stage was actually left at.
-    vet = SOURCE.index("af_z = _vet_autofocus_result(")
+    vet = SOURCE.index("af_z, learnable = _vet_autofocus_result(")
     record = SOURCE.index("ctx.completed_af_positions.append((pos.x, pos.y, af_z))")
     assert vet < record
 

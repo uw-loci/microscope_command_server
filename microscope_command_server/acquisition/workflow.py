@@ -4932,12 +4932,23 @@ def _log_focus_surface_summary(ctx: "AcquisitionContext") -> None:
     logger.info("  focus surface summary: %s", summary)
 
 
-def _vet_autofocus_result(ctx: "AcquisitionContext", pos, af_z: float, af_type: str) -> float:
+def _vet_autofocus_result(
+    ctx: "AcquisitionContext", pos, af_z: float, af_type: str
+) -> Tuple[float, bool]:
     """Check one autofocus result against the fitted focus surface.
 
-    Returns the Z to adopt: the measurement, or -- when the surface is enforcing and
-    the measurement disagrees with it beyond the gate -- the surface's prediction,
-    with the stage moved there.
+    Returns ``(z_to_adopt, learnable)``.
+
+    ``z_to_adopt`` is the measurement, or -- when the surface is enforcing and the
+    measurement disagrees with it beyond the gate -- the surface's prediction, with the
+    stage moved there.
+
+    ``learnable`` is False only for an overridden result, and that matters more than it
+    looks. The substituted Z came from the surface, so feeding it back would have the
+    surface learning its own output: inlier RMS shrinks and inlier fraction rises with
+    no new evidence behind either, and the fit becomes progressively harder to dislodge
+    by exactly the measurements that disagree with it. A rejected measurement must
+    contribute nothing, in either direction.
 
     This is the point of the whole mechanism. Measured over ten PPM regions, a wide
     standard autofocus lands more than 5 um off the surface 25% of the time and more
@@ -4950,12 +4961,12 @@ def _vet_autofocus_result(ctx: "AcquisitionContext", pos, af_z: float, af_type: 
     """
     surface = ctx.focus_surface
     if surface is None or not surface.active:
-        return af_z
+        return af_z, True
     logger = ctx.logger
     verdict = surface.check(pos.x, pos.y, af_z)
     if verdict.predicted_z is None:
         logger.debug("  Focus surface has no opinion yet: %s", verdict.reason)
-        return af_z
+        return af_z, True
     if not verdict.would_reject:
         logger.debug(
             "  Focus surface agrees: %s AF gave %.2f um, surface predicts %.2f um "
@@ -4965,7 +4976,7 @@ def _vet_autofocus_result(ctx: "AcquisitionContext", pos, af_z: float, af_type: 
             verdict.predicted_z,
             verdict.residual_um,
         )
-        return af_z
+        return af_z, True
 
     if not verdict.enforced:
         # Observe mode: say exactly what enforcement would have done, and do nothing.
@@ -4978,7 +4989,7 @@ def _vet_autofocus_result(ctx: "AcquisitionContext", pos, af_z: float, af_type: 
             verdict.predicted_z,
             verdict.reason,
         )
-        return af_z
+        return af_z, True
 
     logger.warning(
         "  FOCUS SURFACE OVERRIDE: %s AF gave %.2f um, using the surface's %.2f um "
@@ -4998,8 +5009,8 @@ def _vet_autofocus_result(ctx: "AcquisitionContext", pos, af_z: float, af_type: 
             move_err,
             af_z,
         )
-        return af_z
-    return float(verdict.predicted_z)
+        return af_z, True
+    return float(verdict.predicted_z), False
 
 
 def _handle_tile_autofocus(
@@ -5370,9 +5381,12 @@ def _handle_tile_autofocus(
                 "in AF map (prevents stale Z propagation)"
             )
         else:
-            af_z = _vet_autofocus_result(ctx, pos, af_z, af_type_for_this_tile)
+            af_z, learnable = _vet_autofocus_result(ctx, pos, af_z, af_type_for_this_tile)
+            # The seed list records where the stage actually is, overridden or not, so
+            # the nearest-neighbour fallback stays truthful. The surface learns only
+            # from a Z that a measurement put there.
             ctx.completed_af_positions.append((pos.x, pos.y, af_z))
-            if ctx.focus_surface is not None:
+            if ctx.focus_surface is not None and learnable:
                 ctx.focus_surface.add(pos.x, pos.y, af_z)
     else:
         # Strategy rejected this tile
