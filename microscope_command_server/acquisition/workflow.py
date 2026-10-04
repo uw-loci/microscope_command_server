@@ -19,6 +19,11 @@ import numpy as np
 from scipy.spatial.distance import cdist as _cdist_scipy
 
 from microscope_control.hardware import Position
+
+from microscope_command_server.acquisition.frame_guard import (
+    raise_if_frame_suspect,
+    set_frame_check_armed,
+)
 from microscope_control.hardware.pycromanager import PycromanagerHardware
 from microscope_control.autofocus.core import AutofocusUtils
 from microscope_command_server.acquisition.tiles import TileConfigUtils
@@ -2787,6 +2792,11 @@ def _acquisition_workflow(
             connection_config_path=connection_config_path,
         )
 
+        # From here until cleanup we are the only thing that moves the stage,
+        # so the stage may hold us to it: a reported position that disagrees
+        # with the last one we commanded now means the frame itself moved.
+        set_frame_check_armed(hardware, True)
+
         # Phase 7: Load AF settings, resolve strategy, compute positions
         _configure_autofocus(ctx)
 
@@ -2842,6 +2852,8 @@ def _acquisition_workflow(
                     logger.warning(f"Acquisition cancelled by client {client_addr}")
                     ctx.set_state("CANCELLED")
                     return
+
+                raise_if_frame_suspect(hardware)
 
                 logger.info(f"Position {pos_idx + 1}/{len(ctx.positions)}: {filename}")
                 tile_start = time.perf_counter()
@@ -3078,6 +3090,11 @@ def _finalize_acquisition(ctx: AcquisitionContext) -> None:
 
 def _cleanup_acquisition(ctx: AcquisitionContext) -> None:
     """Guaranteed cleanup: shutdown write pool, return stage to start."""
+    # Hand the stage back: once the acquisition is over the operator may move it
+    # from the joystick or the Live Viewer, and a disagreement with our last
+    # commanded position stops being evidence of anything.
+    set_frame_check_armed(ctx.hardware, False)
+
     # Shut down background write pool (drains any remaining writes)
     if ctx.write_pool is not None:
         try:

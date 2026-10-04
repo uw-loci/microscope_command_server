@@ -78,9 +78,32 @@ class Ctx:
 
 def cleanup(ctx):
     # The annotation on the def line is evaluated at exec time, so the type must exist.
-    ns = {"Position": lambda **kw: dict(kw), "AcquisitionContext": object}
+    # Teardown also hands the stage back by disarming the frame check, so that name
+    # has to be in the namespace too; the stub records the call for the test below.
+    ctx.frame_check_calls = []
+    ns = {
+        "Position": lambda **kw: dict(kw),
+        "AcquisitionContext": object,
+        "set_frame_check_armed": lambda hw, armed: ctx.frame_check_calls.append(armed),
+    }
     load_function("_cleanup_acquisition", ns)(ctx)
     return ctx
+
+
+def test_teardown_hands_the_stage_back():
+    """Disarming is part of teardown, on every exit path.
+
+    Left armed, the next joystick nudge or Live Viewer move would be reported as
+    the stage origin having moved, which is a false alarm outside an acquisition.
+    """
+    ctx = cleanup(Ctx(channels=[]))
+    assert ctx.frame_check_calls == [False]
+
+
+def test_the_stage_is_handed_back_even_when_teardown_hits_an_error():
+    ctx = Ctx(channels=["DAPI"], hardware=FakeHardware(fail_disable=True))
+    cleanup(ctx)
+    assert ctx.frame_check_calls == [False]
 
 
 def test_channel_acquisition_switches_illumination_off():
