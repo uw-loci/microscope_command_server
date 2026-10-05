@@ -873,6 +873,78 @@ that one owns the camera state, this one borrows it.
   mid-move.
 - `FAILED:<reason>` -- could not run at all. Nothing moved.
 
+## Objective retraction when an acquisition finishes
+
+At the end of every acquisition -- success, cancel or failure -- the objective is retracted
+to the declared safe Z before any further stage motion. An acquisition covers one
+annotation, and no annotation spans two slides, so finishing one is the point at which the
+next motion is unconstrained: the next region, a slide change, or an operator on the
+joystick.
+
+### Configuration
+
+```yaml
+stage:
+  safe_z_um: 0                      # the declared retracted Z (um)
+  focus:
+    retract_sign: positive          # which Z direction moves AWAY from the sample
+```
+
+Both keys are optional, and the feature is off without them -- an acquisition that cannot
+retract safely proceeds exactly as before.
+
+**`stage.safe_z_um`** -- a Z at which the objective is clear of the sample. On PPM this is
+`0` while focus sits near -420 um, so retracting buys about 420 um of clearance.
+
+**`stage.focus.retract_sign`** -- `positive` or `negative` (case-insensitive; `1`/`+1` and
+`-1` also work). On PPM it is `positive` because, measured 2026-08-26, increasing Z moves
+the stage DOWN, away from the objective.
+
+This is a safety gate, not a convenience. A "safe" Z on the wrong side drives the
+objective into the slide, and `config_PPM.yml` carries the scar of exactly that: an earlier
+value of -500 was inferred from "focus is near -400, so retract further" without
+establishing the sign. Measure it; do not derive it.
+
+### What it does
+
+1. Resolve `stage.safe_z_um` and `stage.focus.retract_sign`. If either is missing or
+   malformed, log and do nothing.
+2. Read the current Z.
+3. If it is already within 1 um of the safe Z, do nothing.
+4. **Direction check:** if the safe Z lies on the sample side of the current Z, given the
+   declared sign, refuse and log an error naming both positions. This is what catches a
+   wrong-side declaration.
+5. Otherwise move, and log how much clearance was gained.
+
+It runs BEFORE the end-of-region return move, so that move is itself made retracted.
+
+The step never raises. A retraction that cannot be made must not turn a completed
+acquisition into a failed one, so a config problem, an unreadable Z, a stage error or a
+target outside the configured Z limits are all logged and stepped over.
+
+### Why
+
+On the 2026-10-02 four-slide run, every long XY move -- all fourteen, including an
+**85.9 mm** traverse across the whole holder -- ran at focus height, between -306 and
+-459 um, while the declared safe Z was 0. The end-of-region return move was among them, up
+to 12.7 mm, and its log line used to read "(preserving Z)"; it now reads "(at the retracted
+Z)".
+
+Clearance is not the only stake. The Prior XY stage is open loop, so an objective touching
+a slide or a holder rib mid-traverse is mechanical load, and lost steps cannot be reported:
+the controller tells you the count it was given, so arrivals read exact, and a slip during
+a move leaves no position discontinuity to find. The MicroManager CoreLog for that run
+shows a provably clean counter -- 293,227 position reads across the acquire pass with no
+unexplained change -- while three of the four slides came out offset in Y.
+
+### Per-insert safe Z is not resolved here
+
+`stage.inserts.configurations.<id>.safe_z_um` overrides are not applied, because the
+acquisition message does not say which insert is fitted. Declare a scope-level
+`safe_z_um` that is on the retracted side for every insert you use and inside
+`stage.limits.z_um`. The direction check is the backstop: a target on the sample side is
+refused rather than driven to.
+
 ## Autofocus / Streaming Focus (--safe-z, --approach-max, --tissue-gate)
 
 The `STRMAFZ` command supports multiple autofocus strategies. The default
