@@ -74,6 +74,7 @@ class Ctx:
         self.params = {"channels": channels or []}
         self.hardware = hardware or FakeHardware()
         self.logger = FakeLogger()
+        self.config_manager = None
 
 
 def cleanup(ctx):
@@ -81,10 +82,16 @@ def cleanup(ctx):
     # Teardown also hands the stage back by disarming the frame check, so that name
     # has to be in the namespace too; the stub records the call for the test below.
     ctx.frame_check_calls = []
+    # The retraction records into the SAME list as the stage moves, so the tests below
+    # assert its ORDER relative to the return move, not merely that it happened. That
+    # order is the point: the return move is itself a long move at focus height.
     ns = {
         "Position": lambda **kw: dict(kw),
         "AcquisitionContext": object,
         "set_frame_check_armed": lambda hw, armed: ctx.frame_check_calls.append(armed),
+        "retract_to_safe_z": lambda cm, read_z, move_z, log=None: bool(
+            ctx.hardware.moves.append("RETRACT")
+        ),
     }
     load_function("_cleanup_acquisition", ns)(ctx)
     return ctx
@@ -134,7 +141,7 @@ def test_teardown_still_returns_the_stage():
 
     ctx.starting_position = Pos()
     cleanup(ctx)
-    assert ctx.hardware.moves == [{"x": 1.0, "y": 2.0}]
+    assert ctx.hardware.moves == ["RETRACT", {"x": 1.0, "y": 2.0}]
 
 
 class Pos:
@@ -154,7 +161,7 @@ def test_batch_run_parks_on_its_own_region_not_the_inherited_start():
     ctx.starting_position = Pos(-50564.0, 3523.0)  # a point on another slide
     ctx.region_origin = (-17448.0, 1025.0)  # this region's first tile
     cleanup(ctx)
-    assert ctx.hardware.moves == [{"x": -17448.0, "y": 1025.0}]
+    assert ctx.hardware.moves == ["RETRACT", {"x": -17448.0, "y": 1025.0}]
     assert "this region's first tile" in ctx.logger.text()
     # The coordinates must be in the log; their absence is what made the original
     # incident unreadable.
@@ -168,7 +175,7 @@ def test_single_slide_still_returns_to_the_operators_position():
     ctx.starting_position = Pos(-50564.0, 3523.0)
     ctx.region_origin = (-17448.0, 1025.0)
     cleanup(ctx)
-    assert ctx.hardware.moves == [{"x": -50564.0, "y": 3523.0}]
+    assert ctx.hardware.moves == ["RETRACT", {"x": -50564.0, "y": 3523.0}]
     assert "starting XY" in ctx.logger.text()
 
 
@@ -180,4 +187,17 @@ def test_batch_run_without_a_region_origin_falls_back_to_the_start():
     ctx.starting_position = Pos(5.0, 6.0)
     ctx.region_origin = None
     cleanup(ctx)
-    assert ctx.hardware.moves == [{"x": 5.0, "y": 6.0}]
+    assert ctx.hardware.moves == ["RETRACT", {"x": 5.0, "y": 6.0}]
+
+
+def test_a_region_with_no_return_target_is_still_retracted():
+    """The retraction is unconditional; the return move is not.
+
+    An acquisition that recorded no starting position still has to end clear of the
+    sample, because whatever moves the stage next is not constrained by this region.
+    """
+    ctx = Ctx(channels=[])
+    ctx.starting_position = None
+    ctx.region_origin = None
+    cleanup(ctx)
+    assert ctx.hardware.moves == ["RETRACT"]

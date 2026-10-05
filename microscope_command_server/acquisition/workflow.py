@@ -24,6 +24,7 @@ from microscope_command_server.acquisition.frame_guard import (
     raise_if_frame_suspect,
     set_frame_check_armed,
 )
+from microscope_command_server.acquisition.retract import retract_to_safe_z
 from microscope_control.hardware.pycromanager import PycromanagerHardware
 from microscope_control.autofocus.core import AutofocusUtils
 from microscope_command_server.acquisition.tiles import TileConfigUtils
@@ -3154,13 +3155,25 @@ def _cleanup_acquisition(ctx: AcquisitionContext) -> None:
         return_xy = (ctx.starting_position.x, ctx.starting_position.y)
         return_label = "the acquisition's starting XY"
 
+    # Retract BEFORE the return move below, not after. That move is the first
+    # unconstrained motion after an acquisition and on the 2026-10-02 run it was itself
+    # up to 12.7 mm, taken at focus height. Retracting here covers it, every inter-region
+    # move, every slot change, and anything an operator does next -- an annotation never
+    # spans two slides, so finishing one is the right event to hang this on.
+    retract_to_safe_z(
+        ctx.config_manager,
+        read_z=lambda: ctx.hardware.get_current_position().z,
+        move_z=lambda z: ctx.hardware.move_to_position(Position(z=z)),
+        log=ctx.logger,
+    )
+
     if return_xy is not None:
         try:
             # Log the coordinates, not just the intent. The 2026-09-17 investigation
             # could not tell where this move went because the old line named no
             # position, and it turned out to be on a different slide.
             ctx.logger.info(
-                "Returning to %s: X=%.1f, Y=%.1f (preserving Z)",
+                "Returning to %s: X=%.1f, Y=%.1f (at the retracted Z)",
                 return_label,
                 return_xy[0],
                 return_xy[1],
