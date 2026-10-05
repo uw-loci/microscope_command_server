@@ -3120,6 +3120,9 @@ def _attempt_one_scan(
                 e,
             )
 
+        # Back to full speed before the fit, because the commit that follows moves the
+        # stage to the peak and that move should not crawl. The finally at the end of
+        # this function repeats it as the guarantee for paths that never reach here.
         _try_set(core, focus_device, speed_prop, normal_value)
 
         # --- Sample filtering and fit ---
@@ -3764,6 +3767,26 @@ def _attempt_one_scan(
             0.0,
             str(e),
         )
+    finally:
+        # The slow speed must not outlive this function, on ANY exit path.
+        #
+        # The scan sets the focus device to slow_value (MaxSpeed=1 on Prior, about
+        # 11.5 um/s) so that streamed frames sample Z densely. Two paths used to
+        # return from inside the try WITHOUT passing the restore below: the ABORTAF
+        # cancel and the rapid-jump abort. Both left the stage slow, and the caller's
+        # very next act on a cancel is to retract to the safe Z -- which on the
+        # approach-from-safe-Z scan can be the whole 693 um travel. At 11.5 um/s that
+        # is a MINUTE of the stage visibly still moving after the operator pressed
+        # cancel, which reads as the cancel having been ignored (observed 2026-10-04,
+        # 21:45:56 abort -> 21:46:27 retract, 31 s for about 350 um). Worse, nothing
+        # upstream restored it either, so every later Z move in the session -- the next
+        # retract, a hint-Z move, a Brent fallback -- crawled too.
+        #
+        # A finally cannot be skipped, so the guarantee lives here rather than in each
+        # exit path. The explicit restore before the fit stays: the commit that follows
+        # moves the stage to the peak, and that move must run at full speed.
+        if speed_prop is not None:
+            _try_set(core, focus_device, speed_prop, normal_value)
 
 
 def _tissue_present_at(
@@ -3893,6 +3916,12 @@ def _approach_from_safe_z(
         head_discard_ms=head_discard_ms,
     )
     if scan.status == "aborted":
+        # Say so before moving. A cancel is followed by a retract to the safe Z, and an
+        # operator who sees nothing in the log until the stage stops reasonably concludes
+        # the cancel was ignored.
+        logger.warning(
+            "STREAM_AF:approach: cancelled; retracting to the safe Z %.2f before returning", safe_z
+        )
         _retract(core, focus_device, safe_z, "aborted")
         return scan
     if not scan.samples_trace:
