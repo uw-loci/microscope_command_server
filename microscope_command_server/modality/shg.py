@@ -30,4 +30,10 @@ SHG_CONFIG = ModalityConfig(
 def register_shg():
     """Register SHG modality config with the registry."""
     register("shg", SHG_CONFIG)
+    # The other prefixes the Java LaserScanningModalityHandler is registered
+    # under. They share the PMT detection path, and without an entry here they
+    # fell through to the default config.
+    register("lsm", SHG_CONFIG)
+    register("2p", SHG_CONFIG)
+    register("confocal", SHG_CONFIG)
     logger.debug("Registered SHG modality config")

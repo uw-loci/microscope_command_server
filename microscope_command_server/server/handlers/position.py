@@ -70,6 +70,37 @@ def _pause_sequence_for_move(hardware, tag):
                 )
 
 
+def _recv_exact(conn, n):
+    """Read exactly n payload bytes, or return None if the client stops sending.
+
+    A single recv() may return fewer bytes than asked for. Unpacking a short
+    read raised struct.error inside the handler, and the unread remainder was
+    then taken for the next command.
+    """
+    data = b""
+    while len(data) < n:
+        chunk = conn.recv(n - len(data))
+        if not chunk:
+            return None
+        data += chunk
+    return data
+
+
+def _move_allowed(kwargs, client, tag):
+    """True once CONFIG has loaded a microscope configuration.
+
+    Until then the server holds the generic startup configuration, whose stage
+    limits are wide enough to be no protection at all, so a move is refused.
+    Callers read the payload BEFORE asking: an unread payload would be taken
+    for the next command. Move commands have no reply, so the refusal is
+    reported in the server log only.
+    """
+    if kwargs.get("server_configured", False):
+        return True
+    logger.warning("%s: refused for client %s - server not configured", tag, client.addr)
+    return False
+
+
 # GETXY / GETZ / GETXYZ handlers serve the live position display in
 # QuPath's StageControlPanel and the live-viewer overlay. Both poll
 # at ~500 ms and don't need sub-100 ms-accurate positions, so we
@@ -115,6 +146,8 @@ def handle_getz(conn, client, hardware, settings, **kwargs):
         logger.debug("Sent Z position: %.2f", pos.z)
     except Exception as e:
         logger.error("Failed to get Z position: %s", e, exc_info=True)
+        # 5 bytes where the value is 4. The client reads 4, recognizes "HWER",
+        # and reads the fifth; changing the length here would desynchronize it.
         conn.sendall(b"HWERR")
 
 
@@ -213,19 +246,21 @@ def handle_move(conn, client, hardware, settings, **kwargs):
     is not an issue on motorised stages and continuous joystick motion
     would otherwise starve the live frame stream.
     """
-    coords = conn.recv(8)
-    if len(coords) == 8:
-        x, y = struct.unpack("!ff", coords)
-        logger.info("Client %s requested move to: X=%.1f, Y=%.1f", client.addr, x, y)
-        try:
-            t0 = time.perf_counter()
-            hardware.move_to_position(Position(x, y))
-            t_ms = (time.perf_counter() - t0) * 1000
-            logger.info("MOVE completed to X=%.1f, Y=%.1f in %.0fms", x, y, t_ms)
-        except Exception as e:
-            logger.error("Failed to move to XY position: %s", e, exc_info=True)
-    else:
+    coords = _recv_exact(conn, 8)
+    if coords is None:
         logger.error("Client %s sent incomplete move coordinates", client.addr)
+        return
+    if not _move_allowed(kwargs, client, "MOVE"):
+        return
+    x, y = struct.unpack("!ff", coords)
+    logger.info("Client %s requested move to: X=%.1f, Y=%.1f", client.addr, x, y)
+    try:
+        t0 = time.perf_counter()
+        hardware.move_to_position(Position(x, y))
+        t_ms = (time.perf_counter() - t0) * 1000
+        logger.info("MOVE completed to X=%.1f, Y=%.1f in %.0fms", x, y, t_ms)
+    except Exception as e:
+        logger.error("Failed to move to XY position: %s", e, exc_info=True)
 
 
 def handle_movez(conn, client, hardware, settings, **kwargs):
@@ -235,7 +270,12 @@ def handle_movez(conn, client, hardware, settings, **kwargs):
     duration of the move (long Z moves on the PI stage hit MMCore
     contention with sequence acquisition; see _pause_sequence_for_move).
     """
-    z = conn.recv(4)
+    z = _recv_exact(conn, 4)
+    if z is None:
+        logger.error("Client %s sent an incomplete Z position", client.addr)
+        return
+    if not _move_allowed(kwargs, client, "MOVEZ"):
+        return
     z_position = struct.unpack("!f", z)[0]
     logger.info("Client %s requested move to Z=%.2f", client.addr, z_position)
     try:
@@ -252,7 +292,12 @@ def handle_movznw(conn, client, hardware, settings, **kwargs):
     Returns immediately without waiting for the stage to arrive, so it
     cannot stall on MMCore contention and does not need the pause helper.
     """
-    z = conn.recv(4)
+    z = _recv_exact(conn, 4)
+    if z is None:
+        logger.error("Client %s sent an incomplete Z position", client.addr)
+        return
+    if not _move_allowed(kwargs, client, "MOVZNW"):
+        return
     z_position = struct.unpack("!f", z)[0]
     logger.debug("Client %s non-blocking Z move to %.2f", client.addr, z_position)
     try:
@@ -268,7 +313,12 @@ def handle_movexyz(conn, client, hardware, settings, **kwargs):
     handle_move: blocking the live stream during ordinary stage motion
     is worse than the contention risk).
     """
-    xyz_data = conn.recv(12)
+    xyz_data = _recv_exact(conn, 12)
+    if xyz_data is None:
+        logger.error("Client %s sent incomplete XYZ coordinates", client.addr)
+        return
+    if not _move_allowed(kwargs, client, "MOVEXYZ"):
+        return
     x, y, z = struct.unpack("!fff", xyz_data)
     logger.info("Client %s requested move to XYZ=(%.1f, %.1f, %.2f)", client.addr, x, y, z)
     try:
@@ -280,7 +330,12 @@ def handle_movexyz(conn, client, hardware, settings, **kwargs):
 
 def handle_mover(conn, client, hardware, settings, **kwargs):
     """Move rotation stage (read 4 bytes: one float, angle in degrees)."""
-    coords = conn.recv(4)
+    coords = _recv_exact(conn, 4)
+    if coords is None:
+        logger.error("Client %s sent an incomplete rotation angle", client.addr)
+        return
+    if not _move_allowed(kwargs, client, "MOVER"):
+        return
     angle = struct.unpack("!f", coords)[0]
     logger.info("Client %s requested rotation to %.1f deg", client.addr, angle)
     try:

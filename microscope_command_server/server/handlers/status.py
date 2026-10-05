@@ -13,6 +13,9 @@ import logging
 
 logger = logging.getLogger(__name__)
 
+# Shortest FAILED reply sent to the client; see handle_status.
+_FAILED_MIN_BYTES = 32
+
 
 def handle_status(conn, client, hardware, settings, **kwargs):
     """Return current acquisition status.
@@ -21,7 +24,7 @@ def handle_status(conn, client, hardware, settings, **kwargs):
     acquisition_failure_messages, acquisition_final_z, acquisition_saturation_summary.
 
     Response formats:
-    - FAILED: 'FAILED: <message>' (up to 500 bytes)
+    - FAILED: 'FAILED: <message>' (32 to 500 bytes, space-padded when short)
     - COMPLETED: 'COMPLETED|final_z:<z>|sat:<summary>' (variable length)
     - Other: state name padded to 16 bytes
     """
@@ -44,8 +47,11 @@ def handle_status(conn, client, hardware, settings, **kwargs):
             # below that so long messages (e.g. the saturation-abort reason)
             # are not truncated mid-word.
             state_str = f"FAILED: {error_msg}"[:500]
-            # Pad to 16 bytes minimum for compatibility, but can be longer
-            response = state_str.encode("utf-8")
+            # The client reads exactly 16 bytes, then whatever else has arrived.
+            # A reply of 16 bytes or fewer leaves one of those two reads waiting
+            # for the socket timeout (30 s), so pad with spaces to 32. The client
+            # trims the message.
+            response = state_str.encode("utf-8").ljust(_FAILED_MIN_BYTES)
             conn.sendall(response)
             logger.debug(
                 "Sent FAILED status with message to %s: %s...",

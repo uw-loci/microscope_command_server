@@ -29,6 +29,7 @@ from microscope_control.hardware.pycromanager import PycromanagerHardware
 from microscope_control.autofocus.core import AutofocusUtils
 from microscope_command_server.acquisition.tiles import TileConfigUtils
 from microscope_command_server.modality import get_config as get_modality_config
+from microscope_command_server.server.protocol import END_MARKER
 from microscope_imageprocessing.io.writer import ome_tiff_writer
 from microscope_imageprocessing.correction.background import BackgroundCorrectionUtils
 from microscope_command_server.acquisition.timepoint_scheduler import TimepointScheduler
@@ -2153,7 +2154,7 @@ def parse_angles_exposures(angles_str, exposures_str=None) -> Tuple[List[float],
 def parse_acquisition_message(message: str) -> dict:
     """Parse acquisition message in flag-based format."""
     # Remove END_MARKER if present
-    message = message.replace(" END_MARKER", "").replace("END_MARKER", "").strip()
+    message = message.replace(" " + END_MARKER, "").replace(END_MARKER, "").strip()
 
     # Parse flag-based format
     if "--" in message:
@@ -2269,6 +2270,7 @@ def parse_acquisition_message(message: str) -> dict:
                 i += 2
             elif parts[i] == "--af-disabled":
                 params["af_disabled"] = True
+                i += 1
             elif parts[i] == "--batch-acquire":
                 # One slide of a multi-slide batch. Only changes where the stage is
                 # parked at the end; see _cleanup_acquisition.

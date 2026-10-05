@@ -1487,7 +1487,7 @@ present in both is a surface rather than the sample.
 **Part of [QPSC (QuPath Scope Control)](https://github.com/uw-loci/QPSC)**
 
 **Requirements:**
-- Python 3.9 or later
+- Python 3.10 or later
 - pip (Python package installer)
 - Git (for `pip install git+https://...` commands)
 
@@ -1606,10 +1606,10 @@ For more troubleshooting, see the [QPSC Installation Guide](https://github.com/u
 ### Server Side
 
 ```python
-from microscope_command_server.server.qp_server import run_server
+from microscope_command_server.server.qp_server import main
 
-# Start server
-run_server(host='0.0.0.0', port=5000)
+# Start the server. It listens on port 5000 (TCP_PORT in server/protocol.py).
+main()
 ```
 
 Or run from command line:

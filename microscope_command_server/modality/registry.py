@@ -2,7 +2,8 @@
 
 Modalities register themselves with a prefix (e.g. "ppm") and callers
 look up configs with the full modality string (e.g. "ppm_20x").
-The first matching prefix wins, mirroring the Java ModalityRegistry pattern.
+The longest matching prefix wins, as in the Java ModalityRegistry, so
+"bf_if_20x" resolves to the "bf_if" entry and not to "bf".
 """
 
 import logging
@@ -35,15 +36,19 @@ def get_config(modality: Optional[str] = None) -> ModalityConfig:
                   None returns the default config.
 
     Returns:
-        Matching ModalityConfig, or the default (no-capability) config.
+        The config registered under the longest prefix the modality string
+        starts with, or the default (no-capability) config.
     """
     if modality is None:
         return _default
     mod_lower = modality.lower()
-    for prefix, config in _registry.items():
-        if mod_lower.startswith(prefix):
-            return config
-    return _default
+    # Longest prefix, not first registered: "bf" is the start of "bf_if", and
+    # which of the two was registered first is an accident of import order.
+    best = None
+    for prefix in _registry:
+        if mod_lower.startswith(prefix) and (best is None or len(prefix) > len(best)):
+            best = prefix
+    return _registry[best] if best is not None else _default
 
 
 def registered_prefixes() -> list[str]:

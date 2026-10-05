@@ -34,4 +34,7 @@ def register_widefield():
     register("fluorescence", WIDEFIELD_CONFIG)
     register("widefield", WIDEFIELD_CONFIG)
     register("epi", WIDEFIELD_CONFIG)
+    # Brightfield + IF is channel-based like widefield. Registered so that a
+    # "bf_if_*" name is not resolved through the shorter "bf" prefix.
+    register("bf_if", WIDEFIELD_CONFIG)
     logger.debug("Registered widefield fluorescence modality config")
