@@ -1604,10 +1604,38 @@ Try running the server directly:
 # Using Python module
 python -m microscope_command_server.server.qp_server
 
-# Or with PYTHONPATH set (if needed)
+# Or with PYTHONPATH set (if needed). "parent directory" is the folder that
+# directly contains the microscope_command_server PACKAGE, i.e. this repo's
+# root -- NOT the folder that holds all the checkouts (see the next problem).
 export PYTHONPATH="/path/to/parent/directory:$PYTHONPATH"
 microscope-command-server
 ```
+
+#### Problem: `cannot import name '...' from 'polscope_library' (unknown location)`
+
+**Symptom:** the server starts, the version block prints the library's version,
+but its git line reads `unknown (namespace package ...)` and an ERROR follows
+naming the shadowing folder. The failure itself surfaces later, when something
+first does `from polscope_library import ...` -- on the LC-PolScope rig it was
+twenty seconds into an LC calibration (2026-10-12). Any of the lab packages can
+be affected; `polscope_library` was the one whose install mode allowed it.
+
+**Cause:** a bare folder named after the package, with no `__init__.py`, sits
+on `sys.path` ahead of the real install -- normally the package's own repo
+root, because Python was started in the folder that contains all the checkouts
+(`C:\qpsc-extension\python_server`), or that folder was put on `PYTHONPATH`.
+Python builds a namespace package from it, so the package's `__init__.py` never
+runs and its top-level names do not exist.
+
+**Solution:**
+
+1. Pull `polscope_library` (its install now registers the project root as a
+   path entry, which beats the bare folder) and re-run `update_env.bat`, or
+   `pip install -e "<checkout>"` for each package.
+2. Start the server from this repo's folder (`start_server.bat` here), not from
+   the folder above it, and keep that folder off `PYTHONPATH`.
+3. Check: `python -c "import polscope_library as p; print(p.__file__)"` must
+   print a path ending in `__init__.py`, not `None`.
 
 #### Problem: Port 5000 already in use
 

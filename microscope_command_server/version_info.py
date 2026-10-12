@@ -54,10 +54,15 @@ def _git_info(module_name: str) -> str:
     try:
         mod = sys.modules.get(module_name)
         if mod is None:
-            __import__(module_name)
+            try:
+                __import__(module_name)
+            except ImportError:
+                return "unknown (module not found)"
             mod = sys.modules.get(module_name)
-        if mod is None or not hasattr(mod, "__file__") or mod.__file__ is None:
+        if mod is None:
             return "unknown (module not found)"
+        if getattr(mod, "__file__", None) is None:
+            return "unknown (namespace package -- the install is shadowed, see the ERROR logged at startup)"
 
         # Walk up from the module file to find the git repo root
         path = Path(mod.__file__).resolve()
@@ -81,6 +86,47 @@ def _git_info(module_name: str) -> str:
         return "unknown (git error)"
     except Exception:
         return "unknown"
+
+
+def shadowed_modules() -> list[tuple[str, str]]:
+    """Lab packages that imported as namespace packages instead of their installs.
+
+    A package whose ``__file__`` is None after import never ran its
+    ``__init__.py``: Python assembled it from a bare directory of that name
+    found on ``sys.path`` -- in practice the package's own repo root, when the
+    process started in the folder that holds the checkouts -- and only its
+    subpackages resolve through the real install. Every
+    ``from <package> import name`` then fails with "(unknown location)". On the
+    LC-PolScope rig (2026-10-12) this surfaced twenty seconds into an LC
+    calibration, not at startup, which is why this check exists.
+
+    Returns:
+        ``(display_name, message)`` per shadowed package; empty when all is well.
+    """
+    found = []
+    for module_name, display_name in _GIT_MODULES:
+        mod = sys.modules.get(module_name)
+        if mod is None:
+            try:
+                __import__(module_name)
+            except ImportError:
+                continue  # optional library not installed on this rig
+            mod = sys.modules.get(module_name)
+        if mod is None or getattr(mod, "__file__", None) is not None:
+            continue
+        portions = ", ".join(str(p) for p in (getattr(mod, "__path__", None) or [])) or "?"
+        found.append(
+            (
+                display_name,
+                f"{module_name} imported as a NAMESPACE package (its __init__.py never ran) "
+                f"from [{portions}]. A bare folder named '{module_name}' on sys.path -- usually "
+                f"the repo root, because the server was started from the folder that contains "
+                f"the checkouts -- is shadowing the installed package, so every "
+                f"'from {module_name} import ...' will fail with '(unknown location)'. "
+                f"Fix: pull the checkout and re-run update_env.bat (pip install -e), then restart.",
+            )
+        )
+    return found
 
 
 def collect_versions() -> dict[str, str]:

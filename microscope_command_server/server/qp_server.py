@@ -79,12 +79,24 @@ from microscope_control.hardware.pycromanager import (
 )
 from microscope_command_server.server.protocol import TCP_PORT
 from microscope_command_server.acquisition.workflow import _acquisition_workflow
-from microscope_command_server.version_info import format_log_header
+from microscope_command_server.version_info import format_log_header, shadowed_modules
 
 # Boot/pre-connection logging is configured by initialize_server() at startup.
 # The logger itself is defined at import time because module-level functions
 # (e.g. _start_session_logging) reference it in their bodies.
 logger = logging.getLogger(__name__)
+
+
+def _log_version_header() -> None:
+    """Log the version/commit block, then an ERROR per lab package whose install is shadowed.
+
+    A shadowed package shows up in the block as "unknown (namespace package ...)" and
+    would otherwise fail only when something first does ``from <package> import``.
+    """
+    logger.info(format_log_header())
+    for _display_name, message in shadowed_modules():
+        logger.error(message)
+
 
 # Session log handler - added to root logger when CONFIG provides a config path,
 # removed on client disconnect. Writes to <config_dir>/logs/server_session_*.log
@@ -147,7 +159,7 @@ def _start_session_logging(config_path: str) -> None:
         _session_log_handler = handler
 
         logger.info(f"Session logging started: {session_log_file}")
-        logger.info(format_log_header())
+        _log_version_header()
     except Exception as e:
         logger.error(f"Failed to start session logging: {e}", exc_info=True)
 
@@ -776,7 +788,7 @@ def main():
     logger.info("=" * 60)
     logger.info("Microscope Command Server")
     logger.info("=" * 60)
-    logger.info(format_log_header())
+    _log_version_header()
 
     # Check for existing server instance BEFORE attempting to bind
     logger.info("Checking for existing server instance...")
