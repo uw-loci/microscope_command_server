@@ -9,6 +9,7 @@ etc.). These are passed via **kwargs for now.
 TODO: Migrate to a proper AcquisitionManager class that encapsulates this state.
 """
 
+import contextlib
 import socket
 import pathlib
 import threading
@@ -111,6 +112,7 @@ def handle_acquire(conn, client, hardware, settings, **kwargs):
             conn.sendall("BUSY:ACQUIRING".ljust(16)[:16].encode())
         except OSError as e:
             logger.warning("Could not send BUSY response to %s: %s", addr, e)
+        _drain_rejected_message(conn, addr)
         return None
 
     # Read the full message immediately
@@ -202,6 +204,40 @@ def handle_acquire(conn, client, hardware, settings, **kwargs):
         conn.settimeout(None)
 
     return acquisition_thread
+
+
+def _drain_rejected_message(conn, addr, timeout_s: float = 2.0, max_bytes: int = 10000) -> int:
+    """Consume the acquisition message that follows a refused ACQUIRE.
+
+    The client writes the 8-byte command and then the message body without waiting for
+    the acknowledgement, so by the time BUSY has been sent the body is already on the
+    wire. Left unread, the dispatch loop takes it 8 bytes at a time as commands: 82
+    "Unknown command" lines per refusal on 2026-10-12, and had any 8-byte slice matched
+    a real command the server would have executed it. Reads until END_MARKER, the size
+    cap, a closed socket or the timeout, and returns how many bytes were swallowed.
+    """
+    swallowed = 0
+    seen = ""
+    try:
+        conn.settimeout(timeout_s)
+        while swallowed < max_bytes:
+            chunk = conn.recv(1024)
+            if not chunk:
+                break
+            swallowed += len(chunk)
+            seen += chunk.decode("utf-8", errors="replace")
+            if END_MARKER in seen:
+                break
+    except (socket.timeout, OSError) as e:
+        logger.debug("Stopped draining the refused message from %s: %s", addr, e)
+    finally:
+        with contextlib.suppress(OSError):
+            conn.settimeout(None)
+    if swallowed:
+        logger.info(
+            "Discarded %d byte(s) of the refused acquisition message from %s", swallowed, addr
+        )
+    return swallowed
 
 
 def handle_bgacquire(conn, client, hardware, settings, **kwargs):

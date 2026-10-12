@@ -74,7 +74,7 @@ class Ctx:
         self.params = {"channels": channels or []}
         self.hardware = hardware or FakeHardware()
         self.logger = FakeLogger()
-        self.config_manager = None
+        self.ppm_settings = {}
 
 
 def cleanup(ctx):
@@ -89,7 +89,7 @@ def cleanup(ctx):
         "Position": lambda **kw: dict(kw),
         "AcquisitionContext": object,
         "set_frame_check_armed": lambda hw, armed: ctx.frame_check_calls.append(armed),
-        "retract_to_safe_z": lambda cm, read_z, move_z, log=None: bool(
+        "retract_to_safe_z": lambda settings, read_z, move_z, log=None: bool(
             ctx.hardware.moves.append("RETRACT")
         ),
     }

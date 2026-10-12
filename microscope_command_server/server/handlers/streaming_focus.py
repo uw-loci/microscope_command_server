@@ -107,6 +107,7 @@ origin of the ideas is traceable and so any reader who wants to
 cross-check the implementation can find the upstream source.
 """
 
+import contextlib
 import logging
 import math
 import re
@@ -119,6 +120,7 @@ from typing import Dict, Any, List, Optional, Tuple
 import numpy as np
 
 from microscope_command_server.server.focus_geometry import build_z_from_poll
+from microscope_command_server.server.handlers.busy import acquisition_in_progress, busy_reply
 from microscope_command_server.server.focus_peaks import (
     secondary_trend,
     first_prominent_peaks_in_scan_order,
@@ -4283,6 +4285,16 @@ def handle_streaming_focus(conn, client, hardware, settings, **kwargs):
             conn.sendall(f"FAILED:payload-read-error: {e}".encode())
         except Exception:
             pass
+        return
+
+    # One stage. If an acquisition thread is still entitled to it -- including one the
+    # client gave up on but never cancelled -- this scan must not move the focus stage
+    # out from under it. See handlers/busy.py for the run this is from.
+    busy_addr = acquisition_in_progress(kwargs.get("acquisition_states"))
+    if busy_addr is not None:
+        logger.warning("STREAM_AF:refused for %s: acquisition in progress for %s", addr, busy_addr)
+        with contextlib.suppress(Exception):
+            conn.sendall(busy_reply(busy_addr, "move the focus stage").encode())
         return
 
     params = parse_flags(

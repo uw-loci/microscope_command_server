@@ -3162,8 +3162,11 @@ def _cleanup_acquisition(ctx: AcquisitionContext) -> None:
     # up to 12.7 mm, taken at focus height. Retracting here covers it, every inter-region
     # move, every slot change, and anything an operator does next -- an annotation never
     # spans two slides, so finishing one is the right event to hang this on.
+    # ctx.ppm_settings is the YAML this acquisition loaded. NOT ctx.config_manager: the
+    # server's ConfigManager has no current config, so its get_config() is None on every
+    # rig, and reading it made this a silent no-op on the 2026-10-12 run.
     retract_to_safe_z(
-        ctx.config_manager,
+        ctx.ppm_settings,
         read_z=lambda: ctx.hardware.get_current_position().z,
         move_z=lambda z: ctx.hardware.move_to_position(Position(z=z)),
         log=ctx.logger,

@@ -6,7 +6,9 @@ Z of -500 inferred from "focus is near -400, so retract further" without establi
 which direction is away from the sample.
 
 ``retract.py`` takes plain callables for the stage, so these drive the real decision rather
-than a reimplementation of it.
+than a reimplementation of it. It takes the acquisition's loaded YAML as a dict, not the
+ConfigManager: the first version read ``config_manager.get_config()``, which is None on
+every rig because the server never names a current config, and so never retracted.
 """
 
 import importlib.util
@@ -30,17 +32,9 @@ def _load(name: str):
 rt = _load("retract")
 
 
-class FakeConfig:
-    """Stands in for ConfigManager, whose only dict accessor is get_config()."""
-
-    def __init__(self, stage=None, raises=False):
-        self._cfg = {"stage": stage} if stage is not None else {}
-        self._raises = raises
-
-    def get_config(self):
-        if self._raises:
-            raise RuntimeError("no config loaded")
-        return self._cfg
+def FakeConfig(stage=None):
+    """The loaded microscope YAML, as _prepare_acquisition hands it to the context."""
+    return {"stage": stage} if stage is not None else {}
 
 
 # PPM: safe Z is 0 and increasing Z moves the stage away from the objective.
@@ -128,10 +122,14 @@ def test_an_unrecognised_direction_is_refused():
     assert stage.moves == []
 
 
-def test_no_declared_safe_z_does_nothing():
+def test_no_declared_safe_z_does_nothing_but_says_so(caplog):
+    # A refusal that logs at DEBUG is invisible on the rig; that is how the first version
+    # went unnoticed. Every refusal is at WARNING or above.
     stage = Stage(-418.4)
-    assert run(FakeConfig({"focus": {"retract_sign": "positive"}}), stage) is False
+    with caplog.at_level(logging.WARNING):
+        assert run(FakeConfig({"focus": {"retract_sign": "positive"}}), stage) is False
     assert stage.moves == []
+    assert "safe_z_um is not declared" in caplog.text
 
 
 def test_a_non_numeric_safe_z_does_nothing():
@@ -146,10 +144,23 @@ def test_a_non_numeric_safe_z_does_nothing():
 # --------------------------------------------------------------------------
 
 
-def test_an_unreadable_config_does_not_raise():
+def test_missing_settings_do_not_raise_and_are_reported(caplog):
+    # None is what the old ConfigManager path produced on every rig. It must be loud.
     stage = Stage(-418.4)
-    assert run(FakeConfig(raises=True), stage) is False
+    with caplog.at_level(logging.WARNING):
+        assert run(None, stage) is False
     assert stage.moves == []
+    assert "no microscope settings were supplied" in caplog.text
+
+
+def test_the_call_site_passes_the_acquisitions_own_settings():
+    """ctx.ppm_settings is the YAML this acquisition loaded; ctx.config_manager has no
+    current config on the server, so get_config() there is None."""
+    source = WORKFLOW_SRC.read_text()
+    at = source.index("retract_to_safe_z(")
+    call = source[at : at + 200]
+    assert "ctx.ppm_settings" in call
+    assert "ctx.config_manager" not in call
 
 
 def test_an_unreadable_z_does_not_raise():

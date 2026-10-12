@@ -23,6 +23,15 @@ further" without establishing the sign. So this refuses to move unless
 that side of where the stage currently is. A refusal costs clearance; a wrong guess costs
 the objective and the slide.
 
+**Why it takes the settings dict and not the ConfigManager.** The server builds its
+``ConfigManager`` bare and never names a current config, so ``get_config()`` returns None on
+every rig. The first version of this module read that, took the one branch that logged at
+DEBUG, and the end-of-acquisition log then said "(at the retracted Z)" without a retraction
+having happened -- a silent no-op on the 2026-10-12 run, found only because a cancel
+cleanup finished in 2 ms. The acquisition's own loaded YAML is ``ctx.ppm_settings``; that is
+the dict passed here, and every refusal below is logged at WARNING or above because a
+refusal nobody can see is how clearance gets given back without anyone noticing.
+
 Takes plain callables for the stage so the decision can be tested without Micro-Manager.
 """
 
@@ -32,25 +41,15 @@ from typing import Any, Callable, Optional
 logger = logging.getLogger(__name__)
 
 
-def _stage_config(config_manager: Any) -> dict:
-    """Return the ``stage`` block, or an empty dict.
-
-    Deliberately goes through ``get_config()`` rather than a dotted-path accessor:
-    ConfigManager has no such method, and a call to one raises into whatever except
-    block surrounds it.
-    """
-    try:
-        cfg = config_manager.get_config()
-    except Exception as e:
-        logger.debug("Could not read the microscope config: %s", e)
+def _stage_config(settings: Any) -> dict:
+    """Return the ``stage`` block of a loaded microscope YAML, or an empty dict."""
+    if not isinstance(settings, dict):
         return {}
-    if not isinstance(cfg, dict):
-        return {}
-    stage = cfg.get("stage")
+    stage = settings.get("stage")
     return stage if isinstance(stage, dict) else {}
 
 
-def resolve_safe_z(config_manager: Any) -> Optional[float]:
+def resolve_safe_z(settings: Any) -> Optional[float]:
     """The declared retracted Z, from ``stage.safe_z_um``, or None.
 
     Per-insert and per-modality overrides (``stage.inserts.configurations.<id>.safe_z_um``)
@@ -59,7 +58,7 @@ def resolve_safe_z(config_manager: Any) -> Optional[float]:
     below is what keeps a scope-level value from being used unsafely: a target on the wrong
     side of the sample is refused rather than driven to.
     """
-    raw = _stage_config(config_manager).get("safe_z_um")
+    raw = _stage_config(settings).get("safe_z_um")
     if raw is None:
         return None
     try:
@@ -69,9 +68,9 @@ def resolve_safe_z(config_manager: Any) -> Optional[float]:
         return None
 
 
-def resolve_retract_sign(config_manager: Any) -> Optional[float]:
+def resolve_retract_sign(settings: Any) -> Optional[float]:
     """+1.0 when increasing Z retracts, -1.0 when decreasing does, else None."""
-    focus = _stage_config(config_manager).get("focus")
+    focus = _stage_config(settings).get("focus")
     raw = focus.get("retract_sign") if isinstance(focus, dict) else None
     if raw is None:
         return None
@@ -87,7 +86,7 @@ def resolve_retract_sign(config_manager: Any) -> Optional[float]:
 
 
 def retract_to_safe_z(
-    config_manager: Any,
+    settings: Any,
     read_z: Callable[[], float],
     move_z: Callable[[float], None],
     log: Any = None,
@@ -95,18 +94,31 @@ def retract_to_safe_z(
 ) -> bool:
     """Move the focus device to the declared safe Z. Returns True if it moved.
 
-    Never raises: a retraction that cannot be made safely, or at all, must not turn a
-    completed acquisition into a failed one. Every refusal says why, because a run that
-    quietly stopped retracting would give the clearance back without anyone noticing.
+    ``settings`` is the acquisition's loaded microscope YAML (``ctx.ppm_settings``), a dict
+    with a ``stage`` block. Never raises: a retraction that cannot be made safely, or at
+    all, must not turn a completed acquisition into a failed one. Every refusal is logged
+    at WARNING or above, because a run that quietly stopped retracting would give the
+    clearance back without anyone noticing -- which is exactly what the first version did.
     """
     out = log or logger
 
-    safe_z = resolve_safe_z(config_manager)
-    if safe_z is None:
-        out.debug("No stage.safe_z_um declared; leaving Z where the acquisition left it.")
+    if not isinstance(settings, dict):
+        out.warning(
+            "Not retracting to safe Z: no microscope settings were supplied (%s), so "
+            "stage.safe_z_um cannot be read.",
+            type(settings).__name__,
+        )
         return False
 
-    sign = resolve_retract_sign(config_manager)
+    safe_z = resolve_safe_z(settings)
+    if safe_z is None:
+        out.warning(
+            "Not retracting: stage.safe_z_um is not declared in the microscope YAML, so Z "
+            "stays where the acquisition left it and the next XY move runs at focus height."
+        )
+        return False
+
+    sign = resolve_retract_sign(settings)
     if sign is None:
         out.warning(
             "Not retracting to safe Z %.2f um: stage.focus.retract_sign is not declared, so "

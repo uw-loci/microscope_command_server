@@ -50,13 +50,19 @@ class FakeConn:
         self._message = message
         self.sent = b""
         self.timeout = None
+        self.recv_calls = 0
 
     def settimeout(self, value):
         self.timeout = value
 
     def recv(self, _size):
+        self.recv_calls += 1
         chunk, self._message = self._message, b""
         return chunk
+
+    @property
+    def unread(self):
+        return self._message
 
     def sendall(self, data):
         self.sent += data
@@ -158,3 +164,34 @@ def test_concurrent_requests_admit_exactly_one():
             assert conns[a].sent.decode().strip().startswith("BUSY")
     for t in threads:
         t.join(timeout=5)
+
+
+# --------------------------------------------------------------------------
+# a refusal must also swallow the message that follows the command
+# --------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("blocking_state", [AcquisitionState.RUNNING, AcquisitionState.CANCELLING])
+def test_a_refused_acquire_drains_the_message_body(blocking_state):
+    """The client sends the body without waiting for the ack. Unread, the dispatch loop
+    takes it 8 bytes at a time as commands (82 'Unknown command' lines on 2026-10-12)."""
+    states = {ADDR_MAIN: AcquisitionState.IDLE, ADDR_AUX: blocking_state}
+    conn = FakeConn(b"--yaml D:/x/config_PPM.yml --sample Test ENDOFSTR")
+    handle_acquire(conn, None, None, None, addr=ADDR_MAIN, **make_kwargs(states))
+    assert conn.sent.startswith(b"BUSY:ACQUIRING")
+    assert conn.recv_calls >= 1
+    assert conn.unread == b""
+    # And the socket is handed back blocking, as the dispatch loop expects.
+    assert conn.timeout is None
+
+
+def test_an_admitted_acquire_does_not_touch_the_drain():
+    # Admission reads the body itself; the drain is only for the refused path. The
+    # admitted path's own read must still see the whole message.
+    seen = {}
+    states = {ADDR_MAIN: AcquisitionState.IDLE}
+    kwargs = make_kwargs(states)
+    kwargs["acquisitionWorkflow"] = lambda message, addr: seen.setdefault("message", message)
+    conn = FakeConn(b"--sample Test ENDOFSTR")
+    handle_acquire(conn, None, None, None, addr=ADDR_MAIN, **kwargs)
+    assert conn.sent.startswith(b"STARTED:ACQUIRE")
