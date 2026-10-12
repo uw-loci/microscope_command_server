@@ -629,3 +629,90 @@ def test_missing_polscope_library_refuses_early_not_in_the_write_pool(monkeypatc
     assert "polscope_library is not installed" in message
     # The operator needs to know the run is not lost.
     assert "raw state images are still saved" in message.lower()
+
+
+# ---------------------------------------------------------------------------
+# reconstruction.method: QLIPP by default, OpenPolScope-exact as an option
+# ---------------------------------------------------------------------------
+
+
+def test_unknown_reconstruction_method_is_refused_before_anything_is_queued():
+    """A typo in the YAML must fail once at the start, not per tile in the pool."""
+    from microscope_command_server.modality.lcpolscope import ReconstructionRefused
+
+    with pytest.raises(ReconstructionRefused, match="reconstruction.method"):
+        _submit(
+            reconstruction_cfg={"swing_waves": 0.03, "wavelength_nm": 549, "method": "recorder"}
+        )
+
+
+def test_openpolscope_method_refuses_four_state():
+    from microscope_command_server.modality.lcpolscope import ReconstructionRefused
+
+    with pytest.raises(ReconstructionRefused, match="5-State only"):
+        _submit(
+            channel_images={f"State{i}": object() for i in range(4)},
+            channel_order=[f"State{i}" for i in range(4)],
+            reconstruction_cfg={
+                "swing_waves": 0.03,
+                "wavelength_nm": 549,
+                "scheme": "4-State",
+                "method": "openpolscope",
+            },
+        )
+
+
+@pytest.mark.parametrize(
+    "cfg_extra, expect_method, expect_black",
+    [
+        ({}, "qlipp", 0.0),
+        ({"method": "openpolscope", "black_level": 103}, "openpolscope", 103.0),
+    ],
+)
+def test_metadata_records_which_algorithm_made_the_file(
+    tmp_path, cfg_extra, expect_method, expect_black
+):
+    """The two methods agree without a background and differ ~0.5% with one.
+
+    A derived file found on its own therefore has to say which produced it,
+    and with what black level, or the number in it cannot be compared to
+    anything.
+    """
+    import numpy as np
+
+    pytest.importorskip("polscope_library")
+    from microscope_command_server.modality.lcpolscope import (
+        ORIENTATION_DIR,
+        RECONSTRUCTION_LABELS,
+        RETARDANCE_DIR,
+    )
+
+    seen = {}
+
+    def writer(*, filename, pixel_size_um, data, channel_name, map_annotations):
+        seen[filename.rsplit("/", 2)[-2]] = map_annotations
+
+    _, pool = _submit(
+        channel_images={
+            f"State{i}": np.full((4, 4), v, dtype=float)
+            for i, v in enumerate((110.0, 160.0, 155.0, 150.0, 145.0))
+        },
+        reconstruction_cfg={
+            "swing_waves": 0.03,
+            "wavelength_nm": 549,
+            "scheme": "5-State",
+            **cfg_extra,
+        },
+        output_path=tmp_path,
+        ome_writer=writer,
+    )
+    fn, kwargs = pool.submissions[0]
+    fn(**kwargs)
+
+    for key in (RETARDANCE_DIR, ORIENTATION_DIR):
+        meta = seen[key]
+        assert meta["polscope.reconstruction_method"] == expect_method
+        assert meta["polscope.reconstruction"] == RECONSTRUCTION_LABELS[expect_method]
+        assert meta["polscope.black_level"] == expect_black
+    assert "OpenPolScope" in RECONSTRUCTION_LABELS["openpolscope"]
+    assert "QLIPP" in RECONSTRUCTION_LABELS["qlipp"]

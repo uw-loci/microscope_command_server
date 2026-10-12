@@ -108,6 +108,15 @@ ORIENTATION_MAX_COUNTS = 18000
 RETARDANCE_COUNTS_PER_NM = 100.0
 _UINT16_MAX = 65535
 
+# modalities.lcpolscope.reconstruction.method. Validated up front so that an
+# unknown method is refused once at acquisition start, not raised per tile
+# inside the write pool. The labels are what the OME metadata carries.
+DEFAULT_RECONSTRUCTION_METHOD = "qlipp"
+RECONSTRUCTION_LABELS = {
+    "qlipp": "QLIPP Stokes inversion (polscope_library)",
+    "openpolscope": "OpenPolScope 3.20b 5-frame, bit-exact (polscope_library)",
+}
+
 
 class ReconstructionRefused(Exception):
     """Raised when the acquisition state makes a valid inversion impossible.
@@ -230,12 +239,16 @@ def _reconstruct_and_write(
     """Reconstruct one tile and write retardance + orientation. Runs in the write pool."""
     from polscope_library import reconstruct
 
+    method = str(reconstruction_cfg.get("method", DEFAULT_RECONSTRUCTION_METHOD))
+    black_level = float(reconstruction_cfg.get("black_level", 0.0))
     result = reconstruct(
         intensities=state_images,
         swing=float(reconstruction_cfg["swing_waves"]),
         wavelength_nm=float(reconstruction_cfg["wavelength_nm"]),
         scheme=str(reconstruction_cfg.get("scheme", "5-State")),
         background_intensities=background_images,
+        method=method,
+        black_level=black_level,
     )
 
     shared = {
@@ -244,7 +257,11 @@ def _reconstruct_and_write(
         "polscope.scheme": reconstruction_cfg.get("scheme", "5-State"),
         "polscope.state_order": ",".join(str(c) for c in (state_order or [])),
         "polscope.background_corrected": "true" if background_images else "false",
-        "polscope.reconstruction": "QLIPP Stokes inversion (polscope_library)",
+        # Which algorithm made this file. The two agree without a background
+        # and differ by ~0.5% with one, so a file found on its own has to say.
+        "polscope.reconstruction": RECONSTRUCTION_LABELS[method],
+        "polscope.reconstruction_method": method,
+        "polscope.black_level": black_level,
     }
     # Resampling policy uses the shared vocabulary rather than a polscope-specific
     # key: a mask, a label map or an object-id channel needs the same protection,
@@ -414,6 +431,19 @@ def submit_tile_reconstruction(
                 filename,
             )
             return False
+
+    method = str(reconstruction_cfg.get("method", DEFAULT_RECONSTRUCTION_METHOD))
+    if method not in RECONSTRUCTION_LABELS:
+        raise ReconstructionRefused(
+            f"reconstruction.method is {method!r}; expected one of {sorted(RECONSTRUCTION_LABELS)}. "
+            "Refused up front rather than per tile: a typo here would otherwise fail inside the "
+            "write pool on every tile of the slide."
+        )
+    if method == "openpolscope" and str(reconstruction_cfg.get("scheme", "5-State")) != "5-State":
+        raise ReconstructionRefused(
+            "reconstruction.method 'openpolscope' is 5-State only (OpenPolScope's 4-frame path has "
+            "not been verified against real output); use method 'qlipp' for a 4-State scheme."
+        )
 
     recon_order = resolve_state_order(channel_order, reconstruction_cfg.get("state_order"))
     ordered = [channel_images[cid] for cid in recon_order]
