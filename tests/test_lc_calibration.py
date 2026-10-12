@@ -188,6 +188,33 @@ class TestWorkflow:
         assert result["calibrated_at"]
         assert "trace" not in result, "but not in the socket reply, which should stay small"
 
+    def test_black_level_falls_back_to_the_yaml_before_assuming_zero(self, tmp_path):
+        # The rig cannot darken the field, so without this the library would
+        # report "0.0 (assumed)" with the camera's real offset sitting in the YAML.
+        result = run_lc_calibration(
+            FakeHardware(), self._yaml(black_level=103), output_folder=str(tmp_path)
+        )
+        assert result["black_level"] == 103.0
+        assert result["black_level_source"].startswith("config:")
+        assert "black_level" in result["black_level_source"]
+
+    def test_requested_black_level_wins_over_the_yaml(self, tmp_path):
+        result = run_lc_calibration(
+            FakeHardware(),
+            self._yaml(black_level=103),
+            output_folder=str(tmp_path),
+            black_level=102.0,
+        )
+        assert result["black_level"] == 102.0
+        assert result["black_level_source"] == "request"
+
+    def test_a_zero_black_level_in_the_yaml_is_not_treated_as_a_measurement(self, tmp_path):
+        result = run_lc_calibration(
+            FakeHardware(), self._yaml(black_level=0), output_folder=str(tmp_path)
+        )
+        assert result["black_level_source"] == "assumed"
+        assert any("assuming 0" in w for w in result["warnings"])
+
     def test_settings_come_from_the_yaml_so_they_cannot_drift(self, tmp_path):
         result = run_lc_calibration(
             FakeHardware(),

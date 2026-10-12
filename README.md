@@ -580,7 +580,7 @@ The command sends multiple responses as it progresses:
      "lc_control_mode": "MM-Retardance",
      "strategy": "single_pass",
      "black_level": 100.0,
-     "black_level_source": "configured|measured|assumed",
+     "black_level_source": "request|config: modalities.lcpolscope.reconstruction.black_level|measured|assumed",
      "extinction_ratio": 150.5,
      "assessment": "good|acceptable|poor|unmeasurable",
      "palette_waves": {
@@ -655,7 +655,7 @@ the metadata of a derived tile:
 | State roles | palette key order (State0 ext, State1 I0, State2 I45, State3 I90, State4 I135) | `reconstruction.state_order` (identity after Apply) | -- | `polscope.state_order` |
 | Swing, waves | `swing_waves` (read from the YAML, not chosen here) | `reconstruction.swing_waves` (unchanged) | -- | `polscope.swing_waves` |
 | Wavelength, nm | `wavelength_nm` + `wavelength_source`; adapter's own in `lc_adapter_wavelength_nm` | `reconstruction.wavelength_nm` (unchanged) | -- | `polscope.wavelength_nm` |
-| Black level, counts | `black_level` + `black_level_source` | `reconstruction.black_level` (set by hand) | -- | `polscope.black_level` |
+| Black level, counts | `black_level` + `black_level_source` (`--black-level`, else `reconstruction.black_level`, else a dark frame, else assumed 0) | `reconstruction.black_level` (set by hand) | -- | `polscope.black_level` |
 | Provenance | `calibrated_at`, `extinction_ratio`, `metadata_path` | `reconstruction.lc_calibrated_at`, `lc_extinction_ratio`, `lc_calibration_file` | logged at the first state of every run, or a WARNING that no calibration was applied | `polscope.lc_calibrated_at`, `polscope.lc_extinction_ratio`, `polscope.lc_calibration_file` |
 | LC adapter state | `lc_device_properties` (file only) | -- | -- | -- |
 

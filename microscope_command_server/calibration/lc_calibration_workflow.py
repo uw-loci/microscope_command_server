@@ -116,6 +116,23 @@ def run_lc_calibration(
             "this value, so if the acquisition uses a different one the two will disagree by "
             "that ratio with nothing to show for it. Set it in the microscope YAML."
         )
+    # Black level: the request, else the YAML, else the library measures one or
+    # assumes 0. The YAML value is the camera's own offset in counts (on the
+    # LC-PolScope it is OpenPolScope's stored 103, measured at 102 in its
+    # data), so it is a number; "assumed 0" is not, and it overstates the
+    # extinction ratio by about 10 percent per 50 counts. The first rig run
+    # (2026-10-12) reported "0.0 (assumed)" with 103 sitting in the YAML. A
+    # YAML 0 means "no clamp" to the reconstruction, not a measurement, so it
+    # is not used here.
+    if black_level is not None:
+        black_level = float(black_level)
+        black_level_origin: Optional[str] = "request"
+    elif recon.get("black_level"):
+        black_level = float(recon["black_level"])
+        black_level_origin = f"config: modalities.{modality}.reconstruction.black_level"
+    else:
+        black_level_origin = None
+
     mode = lc_control_mode or recon.get("lc_control_mode", "MM-Retardance")
 
     if mode == "MM-Voltage":
@@ -207,7 +224,7 @@ def run_lc_calibration(
         "lc_control_mode": mode,
         "strategy": strategy,
         "black_level": result.black_level,
-        "black_level_source": result.black_level_source,
+        "black_level_source": black_level_origin or result.black_level_source,
         "extinction_ratio": round(result.extinction_ratio, 2),
         "assessment": result.assessment,
         # Retardance in WAVES, (LC-A, LC-B), keyed by the Micro-Manager channel
@@ -261,6 +278,16 @@ def run_lc_calibration(
         result.exposures,
         payload["elapsed_s"],
     )
+    # The palette and the black level are what the operator acts on, and the
+    # dialog that shows them is not a record; the log is.
+    log.info(
+        "LC calibration black level %.1f (%s); palette_waves=%s",
+        result.black_level,
+        payload["black_level_source"],
+        payload["palette_waves"],
+    )
+    for message in warnings:
+        log.warning("LC calibration: %s", message)
     report(
         1, 1, "calibrate", f"extinction ratio {result.extinction_ratio:.1f} ({result.assessment})"
     )
