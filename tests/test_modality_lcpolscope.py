@@ -572,7 +572,7 @@ def test_round_trip_through_counts_preserves_the_physics(tmp_path):
     states = [rng.uniform(500, 4000, (16, 16)) for _ in range(5)]
     seen = _reconstructed(tmp_path, states)
 
-    exact = reconstruct(intensities=states, swing=0.03, wavelength_nm=549, scheme="5-State")
+    exact = reconstruct(intensities=states, swing_waves=0.03, wavelength_nm=549, scheme="5-State")
     ret_nm = seen[RETARDANCE_DIR][0].astype(float) / 100.0
     ori_deg = seen[ORIENTATION_DIR][0].astype(float) / 100.0
 
@@ -660,6 +660,82 @@ def test_openpolscope_method_refuses_four_state():
                 "method": "openpolscope",
             },
         )
+
+
+def test_metadata_carries_the_lc_readback_and_the_calibration_provenance(tmp_path):
+    """A derived tile says which calibration set the crystals and whether the
+    device agreed when the states were applied -- the end of the trace that
+    starts in the LCCALIB file."""
+    import numpy as np
+
+    pytest.importorskip("polscope_library")
+    from microscope_command_server.modality.lcpolscope import RETARDANCE_DIR
+
+    seen = {}
+
+    def writer(*, filename, pixel_size_um, data, channel_name, map_annotations):
+        seen[filename.rsplit("/", 2)[-2]] = map_annotations
+
+    readback = {
+        "State0": {
+            "Retardance LC-A [in waves]": {"commanded": "0.252", "read": "0.2520", "agrees": True},
+            "Retardance LC-B [in waves]": {"commanded": "0.442", "read": "0.4480", "agrees": False},
+        }
+    }
+    _, pool = _submit(
+        channel_images={
+            f"State{i}": np.full((4, 4), v, dtype=float)
+            for i, v in enumerate((110.0, 160.0, 155.0, 150.0, 145.0))
+        },
+        reconstruction_cfg={
+            "swing_waves": 0.03,
+            "wavelength_nm": 549,
+            "scheme": "5-State",
+            "lc_calibrated_at": "2026-10-12T14:03:00",
+            "lc_extinction_ratio": 267.3,
+            "lc_calibration_file": "C:/data/lc_calibration_20261012_140300.json",
+        },
+        output_path=tmp_path,
+        ome_writer=writer,
+        lc_state_readback=readback,
+    )
+    fn, kwargs = pool.submissions[0]
+    fn(**kwargs)
+
+    meta = seen[RETARDANCE_DIR]
+    assert meta["polscope.lc_calibrated_at"] == "2026-10-12T14:03:00"
+    assert meta["polscope.lc_extinction_ratio"] == "267.3"
+    assert meta["polscope.lc_calibration_file"].endswith("lc_calibration_20261012_140300.json")
+    assert meta["polscope.lc_readback"] == (
+        "State0 Retardance LC-A [in waves]=0.2520 Retardance LC-B [in waves]=0.4480"
+    )
+    assert meta["polscope.lc_readback_agrees"] == "false"
+
+
+def test_metadata_omits_provenance_a_config_never_had(tmp_path):
+    """A rig still on the shipped presets must not be given a fake provenance."""
+    import numpy as np
+
+    pytest.importorskip("polscope_library")
+    from microscope_command_server.modality.lcpolscope import RETARDANCE_DIR
+
+    seen = {}
+
+    def writer(*, filename, pixel_size_um, data, channel_name, map_annotations):
+        seen[filename.rsplit("/", 2)[-2]] = map_annotations
+
+    _, pool = _submit(
+        channel_images={
+            f"State{i}": np.full((4, 4), v, dtype=float)
+            for i, v in enumerate((110.0, 160.0, 155.0, 150.0, 145.0))
+        },
+        output_path=tmp_path,
+        ome_writer=writer,
+    )
+    fn, kwargs = pool.submissions[0]
+    fn(**kwargs)
+    meta = seen[RETARDANCE_DIR]
+    assert not any(k.startswith("polscope.lc_") for k in meta), sorted(meta)
 
 
 @pytest.mark.parametrize(

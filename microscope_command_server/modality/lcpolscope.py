@@ -235,6 +235,7 @@ def _reconstruct_and_write(
     log,
     tile_config_source=None,
     state_order=None,
+    lc_state_readback=None,
 ):
     """Reconstruct one tile and write retardance + orientation. Runs in the write pool."""
     from polscope_library import reconstruct
@@ -243,7 +244,7 @@ def _reconstruct_and_write(
     black_level = float(reconstruction_cfg.get("black_level", 0.0))
     result = reconstruct(
         intensities=state_images,
-        swing=float(reconstruction_cfg["swing_waves"]),
+        swing_waves=float(reconstruction_cfg["swing_waves"]),
         wavelength_nm=float(reconstruction_cfg["wavelength_nm"]),
         scheme=str(reconstruction_cfg.get("scheme", "5-State")),
         background_intensities=background_images,
@@ -263,6 +264,22 @@ def _reconstruct_and_write(
         "polscope.reconstruction_method": method,
         "polscope.black_level": black_level,
     }
+    # Which LC calibration set the states. Written into the YAML by QPSC's
+    # "Apply to acquisition"; absent on a rig still running OpenPolScope's
+    # presets, and then deliberately absent here too.
+    for key in ("lc_calibration_file", "lc_calibrated_at", "lc_extinction_ratio"):
+        if reconstruction_cfg.get(key) is not None:
+            shared["polscope." + key] = str(reconstruction_cfg[key])
+    # What the crystals READ when each state was applied, against what the
+    # YAML commanded -- the acquisition-side half of the trace the calibration
+    # file starts. "agrees" is the one word to look at.
+    if lc_state_readback:
+        shared["polscope.lc_readback"] = lc_readback_summary(lc_state_readback)
+        shared["polscope.lc_readback_agrees"] = (
+            "true"
+            if all(v["agrees"] for e in lc_state_readback.values() for v in e.values())
+            else "false"
+        )
     # Resampling policy uses the shared vocabulary rather than a polscope-specific
     # key: a mask, a label map or an object-id channel needs the same protection,
     # and a reader should only have to understand one convention.
@@ -340,6 +357,97 @@ def _reconstruct_and_write(
         log.debug("Reconstructed LC-PolScope tile %s", filename)
 
 
+#: Largest commanded-vs-read-back difference, in waves, that counts as the same
+#: setting. The calibration records what the crystals READ after each move, so
+#: a reproduced state should agree to the adapter's own rounding.
+LC_READBACK_TOLERANCE_WAVES = 0.001
+
+
+def record_state_readback(ctx, hardware, ch_entry, logger) -> None:
+    """On an LC-PolScope run, read the crystals back the first time each state is applied.
+
+    No-op for every other modality, and for repeat visits to a state. Closes the
+    loop the calibration opened: the YAML says what each state SHOULD be, this
+    records what the device reports it IS, and the comparison goes to the log
+    and (via the reconstruction) into every derived tile's metadata. The first
+    call also logs where the LC settings came from -- QPSC's own calibration,
+    or the presets the rig shipped with -- so an acquisition can never again be
+    silently running a calibration nobody applied.
+
+    Stored on the context as ``_lc_state_readback``:
+    ``{channel_id: {property: {"commanded": str, "read": str, "agrees": bool}}}``.
+    """
+    from .registry import get_config
+
+    if get_config(getattr(ctx, "modality", "") or "") is not LCPOLSCOPE_CONFIG:
+        return
+    readback = getattr(ctx, "_lc_state_readback", None)
+    if readback is None:
+        readback = {}
+        ctx._lc_state_readback = readback
+        modalities = (ctx.ppm_settings or {}).get("modalities", {}) or {}
+        recon = (modalities.get("lcpolscope") or {}).get("reconstruction") or {}
+        if recon.get("lc_calibrated_at") or recon.get("lc_calibration_file"):
+            logger.info(
+                "LC states come from QPSC's LC calibration of %s (extinction ratio %s, %s)",
+                recon.get("lc_calibrated_at", "?"),
+                recon.get("lc_extinction_ratio", "?"),
+                recon.get("lc_calibration_file", "no file recorded"),
+            )
+        else:
+            logger.warning(
+                "LC states come from the YAML device_properties / Micro-Manager Channel "
+                "presets; no QPSC LC calibration has been applied to this configuration "
+                "(modalities.lcpolscope.reconstruction has no lc_calibrated_at)."
+            )
+    ch_id = str(ch_entry.get("id"))
+    if ch_id in readback:
+        return
+    core = getattr(hardware, "core", None)
+    entry: dict = {}
+    for prop in ch_entry.get("device_properties", []) or []:
+        if not isinstance(prop, dict):
+            continue
+        device, name, commanded = prop.get("device"), prop.get("property"), prop.get("value")
+        if not (device and name) or core is None:
+            continue
+        try:
+            read = str(core.get_property(str(device), str(name)))
+        except Exception as exc:
+            logger.warning("LC state %s: could not read back %s.%s: %s", ch_id, device, name, exc)
+            continue
+        try:
+            agrees = abs(float(read) - float(commanded)) <= LC_READBACK_TOLERANCE_WAVES
+        except (TypeError, ValueError):
+            agrees = str(read).strip() == str(commanded).strip()
+        entry[str(name)] = {"commanded": str(commanded), "read": read, "agrees": agrees}
+        if agrees:
+            logger.info("LC state %s: %s commanded %s, read back %s", ch_id, name, commanded, read)
+        else:
+            logger.warning(
+                "LC state %s: %s commanded %s but the device reads %s -- the acquisition is "
+                "NOT reproducing the configured state; reconstruction from it will be biased.",
+                ch_id,
+                name,
+                commanded,
+                read,
+            )
+    readback[ch_id] = entry
+
+
+def lc_readback_summary(lc_state_readback) -> str:
+    """One line per acquisition: ``State0 Retardance LC-A [in waves]=0.2520 ...``.
+
+    Read values only; the commanded ones are in the YAML the metadata already
+    points at, and a disagreement is flagged by ``polscope.lc_readback_agrees``.
+    """
+    parts = []
+    for state, props in lc_state_readback.items():
+        settings = " ".join(f"{name}={v['read']}" for name, v in props.items())
+        parts.append(f"{state} {settings}".strip())
+    return "; ".join(parts)
+
+
 def resolve_state_order(channel_order, state_order):
     """Map acquisition order to the order ``reconstruct()`` expects.
 
@@ -384,6 +492,7 @@ def submit_tile_reconstruction(
     ome_writer,
     raw_tiles_flat_fielded=False,
     background_images=None,
+    lc_state_readback=None,
     logger_=None,
 ):
     """Queue birefringence reconstruction for one acquired tile.
@@ -463,6 +572,7 @@ def submit_tile_reconstruction(
         state_images=ordered,
         reconstruction_cfg=reconstruction_cfg,
         background_images=ordered_background,
+        lc_state_readback=lc_state_readback,
         output_path=output_path,
         filename=filename,
         pixel_size_um=pixel_size_um,

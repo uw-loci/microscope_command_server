@@ -2054,7 +2054,7 @@ def handle_lccalib(conn, client, hardware, settings, **kwargs):
             settings,
             output_folder=output_folder,
             modality=raw.get("--modality") or "lcpolscope",
-            swing=optional_float("--swing"),
+            swing_waves=optional_float("--swing"),
             scheme=raw.get("--scheme") or None,
             wavelength_nm=optional_float("--wavelength"),
             black_level=optional_float("--black-level"),

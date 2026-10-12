@@ -222,6 +222,36 @@ class MicroManagerLC:
                 except Exception as exc:
                     logger.error("Failed to restore exposure after a dark frame: %s", exc)
 
+    def device_snapshot(self) -> dict:
+        """Every property of the LC device, as strings, or ``{}`` if it cannot be asked.
+
+        Recorded with each calibration because the palette is in the ADAPTER's
+        waves: the MeadowlarkLC adapter converts waves to volts at its own
+        wavelength setting, so a palette is reproducible only while that
+        setting (and the rest of the adapter state) is what it was. Keeping
+        the snapshot is what makes a later disagreement diagnosable.
+        """
+        try:
+            core = self._core()
+            names = core.get_device_property_names(LC_DEVICE)
+        except Exception as exc:
+            logger.debug("Could not list %s properties: %s", LC_DEVICE, exc)
+            return {}
+        try:
+            names = list(names)
+        except TypeError:
+            try:
+                names = [names.get(i) for i in range(names.size())]
+            except Exception:
+                return {}
+        snapshot = {}
+        for name in names:
+            try:
+                snapshot[str(name)] = str(core.get_property(LC_DEVICE, str(name)))
+            except Exception as exc:
+                logger.debug("Could not read %s.%s: %s", LC_DEVICE, name, exc)
+        return snapshot
+
     # -- internals ---------------------------------------------------------
 
     def _core(self):

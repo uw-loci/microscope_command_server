@@ -25,6 +25,23 @@ logger = logging.getLogger(__name__)
 #: not a measurement.
 DEFAULT_WAVELENGTH_NM = 546.0
 
+
+def _adapter_wavelength_nm(device_properties: Dict[str, str]) -> Optional[float]:
+    """The LC adapter's own wavelength setting, in nm, if it exposes one.
+
+    Matched by name rather than hard-coded: the MeadowlarkLC adapter calls it
+    "Wavelength", other adapters may not, and a missing property is simply
+    "unknown", not an error.
+    """
+    for name, value in device_properties.items():
+        if "wavelength" in name.lower():
+            try:
+                return float(value)
+            except (TypeError, ValueError):
+                return None
+    return None
+
+
 DEFAULT_SETTLE_MS = 50.0
 
 
@@ -34,7 +51,7 @@ def run_lc_calibration(
     *,
     output_folder: str,
     modality: str = "lcpolscope",
-    swing: Optional[float] = None,
+    swing_waves: Optional[float] = None,
     scheme: Optional[str] = None,
     wavelength_nm: Optional[float] = None,
     black_level: Optional[float] = None,
@@ -70,12 +87,12 @@ def run_lc_calibration(
     except ImportError as exc:
         return fail(f"polscope_library is not installed: {exc}")
 
-    from .lc_instrument import MicroManagerLC
+    from .lc_instrument import LC_DEVICE, RETARDANCE_PROPERTY, MicroManagerLC
 
     recon = ((settings_yaml or {}).get("modalities", {}).get(modality, {}) or {}).get(
         "reconstruction", {}
     ) or {}
-    swing = float(swing if swing is not None else recon.get("swing_waves", 0.03))
+    swing_waves = float(swing_waves if swing_waves is not None else recon.get("swing_waves", 0.03))
     scheme = scheme or recon.get("scheme", "5-State")
 
     # Wavelength is a pure scale on reported retardance, so a wrong one is
@@ -118,6 +135,26 @@ def run_lc_calibration(
     except Exception as exc:
         return fail(f"could not reach the liquid crystals: {exc}")
 
+    # The adapter converts the palette's waves to volts at ITS wavelength. If
+    # that is not the reconstruction wavelength, the swing the crystals apply
+    # is swing * adapter / reconstruction waves, and every retardance comes
+    # out scaled by the same ratio with nothing to show for it. Recorded, and
+    # a disagreement is said out loud; it is not corrected here because the
+    # right fix is to make the two agree once the filter is identified.
+    lc_device_properties = instrument.device_snapshot()
+    lc_adapter_wavelength_nm = _adapter_wavelength_nm(lc_device_properties)
+    if lc_adapter_wavelength_nm is not None and abs(lc_adapter_wavelength_nm - wavelength_nm) > 0.5:
+        warnings.append(
+            f"The LC adapter converts waves to volts at {lc_adapter_wavelength_nm:g} nm but the "
+            f"reconstruction wavelength is {wavelength_nm:g} nm. The palette is reproducible "
+            "either way, but the swing the crystals apply is then "
+            f"{swing_waves * lc_adapter_wavelength_nm / wavelength_nm:.5f} waves at the "
+            f"reconstruction wavelength instead of {swing_waves:g}, a "
+            f"{abs(lc_adapter_wavelength_nm / wavelength_nm - 1) * 100:.2f} percent retardance "
+            "scale error. Set the adapter wavelength and modalities.lcpolscope.reconstruction."
+            "wavelength_nm to the same value."
+        )
+
     def report(step: int, total: int, stage: str, message: str) -> None:
         if progress_callback is not None:
             try:
@@ -128,19 +165,22 @@ def run_lc_calibration(
     log.info(
         "LC calibration starting: scheme=%s swing=%s wavelength=%snm mode=%s strategy=%s",
         scheme,
-        swing,
+        swing_waves,
         wavelength_nm,
         mode,
         strategy,
     )
-    report(0, 1, "calibrate", f"{scheme} at swing {swing}")
+    report(0, 1, "calibrate", f"{scheme} at swing {swing_waves} waves")
 
     started = time.time()
     try:
         result = calibrate(
             instrument,
             CalibrationSettings(
-                swing=swing, scheme=scheme, wavelength_nm=wavelength_nm, black_level=black_level
+                swing_waves=swing_waves,
+                scheme=scheme,
+                wavelength_nm=wavelength_nm,
+                black_level=black_level,
             ),
             strategy=strategy,
         )
@@ -161,7 +201,7 @@ def run_lc_calibration(
     payload = {
         "success": True,
         "scheme": result.scheme,
-        "swing_waves": result.swing,
+        "swing_waves": result.swing_waves,
         "wavelength_nm": result.wavelength_nm,
         "wavelength_source": wavelength_source,
         "lc_control_mode": mode,
@@ -170,8 +210,16 @@ def run_lc_calibration(
         "black_level_source": result.black_level_source,
         "extinction_ratio": round(result.extinction_ratio, 2),
         "assessment": result.assessment,
-        # Waves, keyed by the Micro-Manager channel the state becomes.
-        "palette": {state: list(values) for state, values in result.palette.items()},
+        # Retardance in WAVES, (LC-A, LC-B), keyed by the Micro-Manager channel
+        # the state becomes. Units are in the key on purpose: this crosses the
+        # socket and is written into the microscope YAML by QPSC.
+        "palette_waves": {state: list(values) for state, values in result.palette_waves.items()},
+        # What QPSC writes the palette to so the acquisition reproduces it.
+        # The adapter converts waves to volts; no voltage curve is involved.
+        "lc_device": LC_DEVICE,
+        "lc_retardance_properties_waves": dict(RETARDANCE_PROPERTY),
+        "lc_adapter_wavelength_nm": lc_adapter_wavelength_nm,
+        "calibrated_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
         "state_intensities": result.intensities,
         "exposures": result.exposures,
         "elapsed_s": round(time.time() - started, 1),
@@ -185,8 +233,16 @@ def run_lc_calibration(
         # The trace is written but kept out of the returned payload: it is one
         # entry per exposure and the socket reply should stay small.
         on_disk = dict(payload)
+        # The adapter state the palette was measured against. File only: it
+        # is a dozen strings the socket reply does not need.
+        on_disk["lc_device_properties"] = lc_device_properties
         on_disk["trace"] = [
-            {"state": p.state, "lca": p.lca, "lcb": p.lcb, "intensity": p.intensity}
+            {
+                "state": p.state,
+                "lca_waves": p.lca_waves,
+                "lcb_waves": p.lcb_waves,
+                "intensity": p.intensity,
+            }
             for p in result.trace
         ]
         path.write_text(json.dumps(on_disk, indent=1))

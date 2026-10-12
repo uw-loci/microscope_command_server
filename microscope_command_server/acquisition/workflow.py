@@ -6583,6 +6583,7 @@ def _acquire_tile_channels_z_outer(
             apply_channel_hardware_state(
                 hardware, ch_entry, logger, preset_cache=ctx.channel_preset_cache
             )
+            _record_lc_state_readback(ctx, hardware, ch_entry, logger)
             exposure_ms = float(ch_entry.get("exposure_ms") or 0)
             if exposure_ms > 0:
                 hardware.set_exposure(exposure_ms)
@@ -6796,6 +6797,17 @@ def _uses_stokes_background(ctx) -> bool:
     return get_modality_config(ctx.modality) is LCPOLSCOPE_CONFIG
 
 
+def _record_lc_state_readback(ctx, hardware, ch_entry, logger) -> None:
+    """LC-PolScope only: read the crystals back the first time each state is applied.
+
+    The work lives in the modality module (``lcpolscope.record_state_readback``)
+    so it can be tested without importing this one; this is the call site.
+    """
+    from microscope_command_server.modality.lcpolscope import record_state_readback
+
+    record_state_readback(ctx, hardware, ch_entry, logger)
+
+
 def _maybe_reconstruct_lcpolscope_tile(ctx, channel_plan, channel_images, filename) -> None:
     """Queue LC-PolScope birefringence reconstruction once a tile's states are in hand.
 
@@ -6835,6 +6847,7 @@ def _maybe_reconstruct_lcpolscope_tile(ctx, channel_plan, channel_images, filena
             # The divide was skipped for this modality, so the tiles are raw.
             raw_tiles_flat_fielded=False,
             background_images=ctx.channel_background_images or None,
+            lc_state_readback=getattr(ctx, "_lc_state_readback", None),
             logger_=ctx.logger,
         )
     except ReconstructionRefused as e:
@@ -6905,6 +6918,7 @@ def _acquire_tile_channels(
         apply_channel_hardware_state(
             hardware, ch_entry, logger, preset_cache=ctx.channel_preset_cache
         )
+        _record_lc_state_readback(ctx, hardware, ch_entry, logger)
         exposure_ms = float(ch_entry.get("exposure_ms") or 0)
         if exposure_ms > 0:
             hardware.set_exposure(exposure_ms)

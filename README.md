@@ -583,11 +583,15 @@ The command sends multiple responses as it progresses:
      "black_level_source": "configured|measured|assumed",
      "extinction_ratio": 150.5,
      "assessment": "good|acceptable|poor|unmeasurable",
-     "palette": {
+     "palette_waves": {
        "State0": [0.2500, 0.5000],
        "State1": [0.2200, 0.5000],
        "...": "[LC-A, LC-B] in waves, one entry per state"
      },
+     "lc_device": "MeadowlarkLC",
+     "lc_retardance_properties_waves": {"LCA": "Retardance LC-A [in waves]", "LCB": "Retardance LC-B [in waves]"},
+     "lc_adapter_wavelength_nm": 546.0,
+     "calibrated_at": "2026-10-12T14:03:00",
      "state_intensities": {...},
      "exposures": 42,
      "elapsed_s": 15.3,
@@ -603,7 +607,9 @@ The command sends multiple responses as it progresses:
    - `wavelength_source` indicates where the wavelength came from: `"request"` (command-line parameter), `"config"` (microscope YAML), or `"fallback"` (default 546.0 nm when neither is set; a warning is logged in this case)
    - `extinction_ratio` is the quality metric; higher is better (>100 is good)
    - `assessment` is a human-readable quality summary
-   - `palette` contains the retardance values (in waves) for each state and LC axis
+   - `palette_waves` contains the retardance values (in waves) for each state and LC axis, keyed by the channel the state becomes
+   - `lc_device` and `lc_retardance_properties_waves` name the Micro-Manager device and properties QPSC writes the palette to, so the property names live in one place (the server)
+   - `lc_adapter_wavelength_nm` is the LC adapter's own wavelength setting, if it exposes one. The palette is in the adapter's waves, so a value that differs from `wavelength_nm` scales every retardance by the ratio; the server adds a warning saying so. The full adapter property snapshot is in the metadata file (`lc_device_properties`), not the reply
    - `warnings` lists any issues that don't prevent use (e.g., a poor extinction ratio, or a missing wavelength configuration)
    - `metadata_path` points to a JSON file with the full trace (per-exposure details)
 
@@ -627,24 +633,31 @@ and decide whether to retry or investigate the hardware.
 
 ### Using the calibration result
 
-The generated palette should be stored and then referenced in your microscope YAML
-under `modalities.lcpolscope.reconstruction`:
+QPSC applies it: the result dialog's **Apply to acquisition** writes the palette into the
+microscope YAML through its comment-preserving editor. For every state, the channel's
+`device_properties` become the two retardance writes (`lc_retardance_properties_waves`,
+values in waves), its `mm_setup_presets` are removed (they hold the previous calibration as
+volts and would be applied before the retardance on every state), and under
+`modalities.lcpolscope.reconstruction` the `state_order` is reset to the palette's order and
+`lc_calibration_file`, `lc_calibrated_at`, `lc_extinction_ratio` are recorded. QPSC then
+reloads its configuration and sends `RECONFG` so this server does too.
 
-```yaml
-modalities:
-  lcpolscope:
-    reconstruction:
-      swing_waves: 0.03
-      wavelength_nm: 546.0
-      scheme: "5-State"
-      palette:
-        State0: [0.0, 0.0]
-        State1: [0.25, 0.0]
-        ...
-```
+The server does not write the YAML itself (PyYAML would drop every comment in it), and
+nothing here writes Micro-Manager presets: after an apply, the `Channel` ConfigGroup in
+Micro-Manager still holds the old calibration and is simply no longer used by QPSC.
 
-Or the palette can be burned into the microscope's persistent configuration so
-acquisitions always use the correct calibration.
+**Where each value goes** -- the full trace, so a value can be followed from measurement to
+the metadata of a derived tile:
+
+| Value | Calibration (`LCCALIB` reply / file) | Microscope YAML after Apply | Acquisition | Derived-tile metadata |
+|---|---|---|---|---|
+| Palette, waves | `palette_waves[State]` | `channels[State].device_properties` (retardance in waves) | written per state; read back on the first tile, compared within 0.001 waves | `polscope.lc_readback`, `polscope.lc_readback_agrees` |
+| State roles | palette key order (State0 ext, State1 I0, State2 I45, State3 I90, State4 I135) | `reconstruction.state_order` (identity after Apply) | -- | `polscope.state_order` |
+| Swing, waves | `swing_waves` (read from the YAML, not chosen here) | `reconstruction.swing_waves` (unchanged) | -- | `polscope.swing_waves` |
+| Wavelength, nm | `wavelength_nm` + `wavelength_source`; adapter's own in `lc_adapter_wavelength_nm` | `reconstruction.wavelength_nm` (unchanged) | -- | `polscope.wavelength_nm` |
+| Black level, counts | `black_level` + `black_level_source` | `reconstruction.black_level` (set by hand) | -- | `polscope.black_level` |
+| Provenance | `calibrated_at`, `extinction_ratio`, `metadata_path` | `reconstruction.lc_calibrated_at`, `lc_extinction_ratio`, `lc_calibration_file` | logged at the first state of every run, or a WARNING that no calibration was applied | `polscope.lc_calibrated_at`, `polscope.lc_extinction_ratio`, `polscope.lc_calibration_file` |
+| LC adapter state | `lc_device_properties` (file only) | -- | -- | -- |
 
 ### Black-level options
 

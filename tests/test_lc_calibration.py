@@ -44,6 +44,9 @@ class FakeCore:
     def get_property_upper_limit(self, device, prop):
         return self.limits[(device, prop)][1]
 
+    def get_device_property_names(self, device):
+        return [prop for (dev, prop) in self.properties if dev == device]
+
     def set_property(self, device, prop, value):
         if device == self.failing_device:
             raise RuntimeError("device on fire")
@@ -165,13 +168,24 @@ class TestWorkflow:
             FakeHardware(), self._yaml(), output_folder=str(tmp_path), black_level=102.0
         )
         assert result["success"] is True
-        assert set(result["palette"]) == {f"State{i}" for i in range(5)}
+        assert set(result["palette_waves"]) == {f"State{i}" for i in range(5)}
         assert result["extinction_ratio"] > 100
         assert result["assessment"] == "good"
 
         written = json.loads((tmp_path / result["metadata_path"].split("/")[-1]).read_text())
-        assert written["palette"] == result["palette"]
+        assert written["palette_waves"] == result["palette_waves"]
         assert written["trace"], "the per-exposure trace belongs in the file"
+        assert {"lca_waves", "lcb_waves"} <= set(
+            written["trace"][0]
+        ), "trace values carry their unit"
+        # QPSC writes the palette into the YAML against these names, so the
+        # server, which owns the adapter's property names, has to send them.
+        assert result["lc_device"] == "MeadowlarkLC"
+        assert result["lc_retardance_properties_waves"] == {
+            "LCA": "Retardance LC-A [in waves]",
+            "LCB": "Retardance LC-B [in waves]",
+        }
+        assert result["calibrated_at"]
         assert "trace" not in result, "but not in the socket reply, which should stay small"
 
     def test_settings_come_from_the_yaml_so_they_cannot_drift(self, tmp_path):
@@ -184,7 +198,41 @@ class TestWorkflow:
         assert result["swing_waves"] == 0.05
         assert result["scheme"] == "4-State"
         assert result["wavelength_nm"] == 549.0
-        assert len(result["palette"]) == 4
+        assert len(result["palette_waves"]) == 4
+
+    def test_adapter_state_is_recorded_and_a_wavelength_disagreement_is_said(self, tmp_path):
+        """The palette is in the ADAPTER's waves. Its wavelength setting is the
+        one value in this chain nobody had been reading; now it is recorded,
+        and compared with the reconstruction wavelength out loud."""
+        hw = FakeHardware()
+        hw.core.properties[("MeadowlarkLC", "Wavelength")] = "546.0"
+        result = run_lc_calibration(
+            hw, self._yaml(wavelength_nm=549.0), output_folder=str(tmp_path), black_level=102.0
+        )
+        assert result["success"] is True
+        assert result["lc_adapter_wavelength_nm"] == 546.0
+        assert any("546 nm" in w and "549 nm" in w and "percent" in w for w in result["warnings"])
+
+        written = json.loads((tmp_path / result["metadata_path"].split("/")[-1]).read_text())
+        snapshot = written["lc_device_properties"]
+        assert snapshot["Wavelength"] == "546.0"
+        assert "Retardance LC-A [in waves]" in snapshot
+        assert "lc_device_properties" not in result, "the snapshot stays out of the socket reply"
+
+    def test_matching_adapter_wavelength_raises_no_warning(self, tmp_path):
+        hw = FakeHardware()
+        hw.core.properties[("MeadowlarkLC", "Wavelength")] = "549.0"
+        result = run_lc_calibration(
+            hw, self._yaml(wavelength_nm=549.0), output_folder=str(tmp_path), black_level=102.0
+        )
+        assert result["lc_adapter_wavelength_nm"] == 549.0
+        assert not any("percent" in w for w in result["warnings"])
+
+    def test_an_adapter_without_a_wavelength_property_is_simply_unknown(self, tmp_path):
+        result = run_lc_calibration(
+            FakeHardware(), self._yaml(), output_folder=str(tmp_path), black_level=102.0
+        )
+        assert result["lc_adapter_wavelength_nm"] is None
 
     def test_voltage_mode_is_refused_not_silently_downgraded(self, tmp_path):
         """Quietly giving the operator retardance control would produce a
