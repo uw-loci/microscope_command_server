@@ -951,6 +951,20 @@ The `STRMAFZ` command supports multiple autofocus strategies. The default
 edge-retry walk is always available; an alternative approach-from-safe-Z strategy
 can be enabled via parameters measured during a separate validation run.
 
+### Refused while an acquisition is running
+
+The focus stage has one owner at a time. While any client's acquisition is in state
+`RUNNING` or `CANCELLING` -- including one whose client has timed out without cancelling
+it -- the `STRMAFZ` streaming-autofocus command (written `STREAMING_FOCUS` in the
+examples below) does not move the stage. It replies at once with
+
+```
+FAILED:busy: an acquisition is running for <addr>; refusing to move the focus stage under it
+```
+
+and nothing moves. Wait for the acquisition to finish, or send a cancel and wait for it to
+complete, then re-issue the autofocus command.
+
 ## Focus Surface Fitting (--focus-surface, --focus-survey, --focus-survey-tiles)
 
 The BGACQUIRE (and ACQUIRE) acquisition message parser accepts optional flags
