@@ -18,7 +18,9 @@ from pathlib import Path
 _PACKAGES = [
     ("microscope-command-server", "Microscope Command Server"),
     ("microscope-control", "Microscope Control"),
+    ("microscope-imageprocessing", "Microscope Image Processing"),
     ("ppm-library", "PPM Library"),
+    ("polscope-library", "PolScope Library"),
 ]
 
 # Repo directories to check git status for.
@@ -26,7 +28,9 @@ _PACKAGES = [
 _GIT_MODULES = [
     ("microscope_command_server", "Microscope Command Server"),
     ("microscope_control", "Microscope Control"),
+    ("microscope_imageprocessing", "Microscope Image Processing"),
     ("ppm_library", "PPM Library"),
+    ("polscope_library", "PolScope Library"),
 ]
 
 
@@ -97,8 +101,8 @@ def collect_versions() -> dict[str, str]:
 def collect_git_info() -> dict[str, str]:
     """Collect latest git commit info for each repo.
 
-    The three git subprocesses are run in parallel via a thread pool
-    (each call is independent), cutting total wall time roughly 3x.
+    The git subprocesses, one per repo, are run in parallel via a thread
+    pool (each call is independent).
     The result is memoized so subsequent calls are free; repo contents
     rarely change within a single server process, and a stale commit
     string in a log header is harmless.

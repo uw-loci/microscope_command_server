@@ -723,13 +723,14 @@ def initialize_server():
     # Actual microscope-specific config loaded during ACQUIRE command via --yaml parameter
     package_dir = pathlib.Path(__file__).parent.parent
 
-    # Try to load generic config
+    # config_generic.yml ships inside the package (configurations/), so the
+    # wheel and an editable install find it the same way. The fallback below
+    # mirrors it and only runs if the file has been removed.
     generic_config_path = package_dir / "configurations" / "config_generic.yml"
     if generic_config_path.exists():
         logger.info(f"Loading generic startup config from {generic_config_path}")
         startup_settings = config_manager.load_config_file(str(generic_config_path))
     else:
-        # Fallback to hardcoded minimal config if file doesn't exist
         logger.warning("Generic config file not found, using hardcoded minimal defaults")
         startup_settings = {
             "microscope": {"name": "Generic", "type": "Unconfigured"},
@@ -741,6 +742,7 @@ def initialize_server():
                     "z_um": {"low": -20000, "high": 20000},
                 },
             },
+            "ppm_optics": "NA",
             "modalities": {},
             "hardware": {},
             "id_stage": {},

@@ -298,3 +298,47 @@ def test_longest_prefix_wins_whatever_the_registration_order(monkeypatch):
 def test_unknown_and_missing_names_get_the_default():
     assert get_config("nothing_registered") is registry._default
     assert get_config(None) is registry._default
+
+
+# ------------------------------------------------ 6. GETXYZ / GETZF errors
+
+
+class _BrokenHardware:
+    """Every position read raises, as when Micro-Manager has no stage loaded."""
+
+    stage_cache = None
+
+    def get_current_position(self):
+        raise RuntimeError("stage not loaded")
+
+
+def test_getxyz_error_is_a_marker_the_width_of_the_reply():
+    conn = _Conn()
+    position.handle_getxyz(conn, _Client(), _BrokenHardware(), {})
+    # Twelve bytes, like the three floats it replaces, so the client's
+    # fixed-length read stays in step; not three zeros, which a client
+    # could not tell from the stage sitting at the origin.
+    assert len(conn.sent) == 12
+    assert conn.sent.startswith(b"HW_ERROR")
+
+
+def test_getzf_error_is_the_same_marker_as_getz():
+    conn_fast, conn_z = _Conn(), _Conn()
+    position.handle_getzf(conn_fast, _Client(), _BrokenHardware(), {})
+    position.handle_getz(conn_z, _Client(), _BrokenHardware(), {})
+    assert conn_fast.sent == conn_z.sent == b"HWERR"
+
+
+def test_getxyz_and_getzf_still_send_floats_when_the_read_works():
+    class _Ok:
+        stage_cache = None
+
+        def get_current_position(self):
+            return _Position(1.0, 2.0, 3.5)
+
+    conn = _Conn()
+    position.handle_getxyz(conn, _Client(), _Ok(), {})
+    assert struct.unpack("!fff", conn.sent) == (1.0, 2.0, 3.5)
+    conn = _Conn()
+    position.handle_getzf(conn, _Client(), _Ok(), {})
+    assert struct.unpack("!f", conn.sent) == (3.5,)

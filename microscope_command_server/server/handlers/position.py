@@ -109,6 +109,10 @@ def _move_allowed(kwargs, client, tag):
 # acceptable; older than that, force a live read.
 _POSITION_CACHE_STALE_MS = 250.0
 
+# GETXYZ hardware-error reply: 12 ASCII bytes, the width of the three floats
+# it replaces. GETXY uses the 8-byte "HW_ERROR" the same way.
+_HW_ERROR_XYZ = b"HW_ERROR".ljust(12, b"_")
+
 
 def _read_position_cached_or_live(hardware) -> Position:
     """Read position from the shared cache, falling back to live.
@@ -160,7 +164,10 @@ def handle_getxyz(conn, client, hardware, settings, **kwargs):
         logger.debug("Sent XYZ: (%.1f, %.1f, %.2f)", pos.x, pos.y, pos.z)
     except Exception as e:
         logger.error("Failed to get XYZ position: %s", e, exc_info=True)
-        conn.sendall(struct.pack("!fff", 0.0, 0.0, 0.0))
+        # Same convention as GETXY: an ASCII marker the width of the reply.
+        # Zeros used to go out here, and a client could not tell them from
+        # the stage sitting at the origin.
+        conn.sendall(_HW_ERROR_XYZ)
 
 
 def handle_getfov(conn, client, hardware, settings, **kwargs):
@@ -236,7 +243,8 @@ def handle_getzf(conn, client, hardware, settings, **kwargs):
         conn.sendall(struct.pack("!f", pos.z))
     except Exception as e:
         logger.error("Failed fast Z read: %s", e, exc_info=True)
-        conn.sendall(struct.pack("!f", 0.0))
+        # Same 5-byte marker as GETZ; the client reads it the same way.
+        conn.sendall(b"HWERR")
 
 
 def handle_move(conn, client, hardware, settings, **kwargs):

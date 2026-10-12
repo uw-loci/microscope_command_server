@@ -103,20 +103,6 @@ def disconnect():
         print("Disconnected from server.")
 
 
-def get():
-    message = ",".join(["MicroPublisher6", "Color - Blue scale"]) + "," + END_MARKER
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-        s.connect((HOST, PORT))
-        s.sendall(Command.GET.value + message.encode())
-        print("Getting", message)
-        data = s.recv(4)
-        if len(data) == 4:
-            prop_value = struct.unpack("!f", data)[0]
-            print(f"C: {prop_value:.2f} ms")
-        else:
-            print("Failed to receive exposure")
-
-
 class QuPathTestClient:
     """Test client for QuPath microscope server with persistent connection."""
 
@@ -342,9 +328,6 @@ def main():
             continue
         elif user_input == "R":
             get_stageR()
-            continue
-        elif user_input == "E":
-            get()
             continue
         else:
             print("Invalid commands. Please try again.")

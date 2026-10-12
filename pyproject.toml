@@ -28,8 +28,8 @@ dev = [
 ]
 
 [project.urls]
-"Homepage" = "https://github.com/your-org/microscope-server"
-"Bug Tracker" = "https://github.com/your-org/microscope-server/issues"
+"Homepage" = "https://github.com/uw-loci/microscope_command_server"
+"Bug Tracker" = "https://github.com/uw-loci/microscope_command_server/issues"
 
 [project.scripts]
 microscope-command-server = "microscope_command_server.server.qp_server:main"
