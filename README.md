@@ -14,6 +14,40 @@ Socket-based command server for remote microscope control and QuPath integration
 - **Real-time Monitoring**: Progress tracking and cancellation support
 - **Multi-Channel Widefield IF / BF+IF**: Vendor-agnostic channel library driven
   by Micro-Manager ConfigGroup presets and device property writes
+- **Demo mode**: `--demo` runs the whole server against a simulated microscope,
+  with no Micro-Manager and no hardware
+
+## Demo Mode (--demo)
+
+```bash
+microscope-command-server --demo
+```
+
+starts the server without Micro-Manager. The Pycro-Manager `Core` and `Studio` are
+replaced by `microscope_command_server.demo.virtual_microscope.DemoCore` and
+`DemoStudio`; everything above them -- the camera and stage classes in
+`microscope_control`, every socket handler, the acquisition workflow, autofocus -- is
+the production code. The core answers the subset of the MMCore API this code base
+calls: device properties with allowed values and limits, an XY stage and a focus
+stage with simulated travel time (`device_busy` is true while a move is under way),
+a camera that snaps and streams through a circular buffer, ROI and binning, config
+groups. Unknown devices and properties raise, as MMCore does.
+
+The camera looks at a procedurally generated H&E-like slide, 40 x 20 mm centred on
+the stage origin, with tissue islands, texture and nuclei on a focal surface that
+tilts and undulates within about +/-25 um of Z = 0. Moving the stage pans across it;
+moving Z defocuses it in proportion to the distance from that surface, so an
+autofocus sweep scores one clear peak. Rendering is seeded and deterministic. Bare
+glass renders white at 10 ms exposure and lamp intensity 25.
+
+Device names are those of Micro-Manager's Demo adapter: camera `DCam`, focus `DStage`,
+XY `XYStage`, transmitted lamp `DLamp` (`State`, `Intensity`). The matching
+`config_Demo.yml` (with its autofocus, imageprocessing and resources sidecars) ships
+inside the QPSC extension, which extracts it and starts this server when you choose
+**Extensions > QP Scope > Connect to a Demo Microscope...**; `--demo` is what that
+menu item passes. `start_server.bat` forwards its arguments, so
+`start_server.bat --demo` works too. A SNAP against a scope with no rotation stage
+(the demo, or any brightfield-only scope) now ignores `--angle` instead of failing.
 
 ## Multi-Channel Acquisition (Widefield IF, BF+IF)
 

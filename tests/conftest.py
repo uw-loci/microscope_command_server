@@ -8,6 +8,17 @@ import pytest
 from pathlib import Path
 import tempfile
 
+# Several test modules register stand-in modules for the hardware stack
+# (microscope_control.hardware, ...pycromanager) when those are not already
+# imported, and keep them for the rest of the session. Loading the real stack
+# first, where it is installed, keeps the stand-ins out of the way of the tests
+# that need the real classes (the demo microscope). Where the stack is not
+# installed this is a no-op and those tests skip themselves.
+try:  # pragma: no cover - environment dependent
+    import microscope_control.hardware.pycromanager  # noqa: F401,E402
+except Exception:  # noqa: BLE001
+    pass
+
 
 @pytest.fixture
 def sample_tile_configuration_txt():

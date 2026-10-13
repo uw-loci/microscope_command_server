@@ -703,8 +703,11 @@ def handle_client(conn, addr):
         logger.info(f"<<< Client {addr} disconnected and cleaned up")
 
 
-def initialize_server():
+def initialize_server(demo: bool = False):
     """Configure boot logging and initialize hardware for the server process.
+
+    ``demo=True`` skips Micro-Manager entirely and drives the simulated
+    microscope in :mod:`microscope_command_server.demo` instead.
 
     Must be called exactly once, by main(), before any handler thread runs.
     Splitting these side effects out of module top level is what makes
@@ -772,9 +775,20 @@ def initialize_server():
         logger.warning("LOCI resources file not found - device lookups may fail during ACQUIRE")
 
     # Initialize hardware with generic config (will be replaced during ACQUIRE)
-    # OPTION 1 (ACTIVE): Fail-fast - require Micro-Manager at startup
-    logger.info("Initializing Micro-Manager connection...")
-    core, studio = init_pycromanager_with_logger()
+    if demo:
+        # No Micro-Manager and no hardware: the production camera/stage classes
+        # and every handler run unchanged against an in-memory core.
+        from microscope_command_server.demo.virtual_microscope import DemoCore, DemoStudio
+
+        logger.info("=" * 60)
+        logger.info("DEMO MODE: no Micro-Manager, driving a simulated microscope")
+        logger.info("=" * 60)
+        core = DemoCore()
+        studio = DemoStudio(core)
+    else:
+        # OPTION 1 (ACTIVE): Fail-fast - require Micro-Manager at startup
+        logger.info("Initializing Micro-Manager connection...")
+        core, studio = init_pycromanager_with_logger()
     hardware = PycromanagerHardware(core, studio, startup_settings)
     logger.info("Hardware initialized with generic config")
     logger.info(
@@ -782,11 +796,33 @@ def initialize_server():
     )
 
 
-def main():
+def parse_args(argv=None):
+    """Command-line options. ``--demo`` runs without Micro-Manager or hardware."""
+    import argparse
+
+    parser = argparse.ArgumentParser(
+        prog="microscope-command-server",
+        description="Socket server that lets QuPath (QPSC) drive a Micro-Manager microscope.",
+    )
+    parser.add_argument(
+        "--demo",
+        action="store_true",
+        help=(
+            "Start without Micro-Manager, driving a simulated microscope "
+            "(a virtual H&E slide on an XYZ stage). For trying QPSC on any computer."
+        ),
+    )
+    return parser.parse_args(argv)
+
+
+def main(argv=None):
     """Main server loop that accepts client connections and spawns handler threads."""
-    initialize_server()
+    args = parse_args(argv)
+    initialize_server(demo=args.demo)
     logger.info("=" * 60)
-    logger.info("Microscope Command Server")
+    logger.info(
+        "Microscope Command Server" + (" (DEMO -- simulated microscope)" if args.demo else "")
+    )
     logger.info("=" * 60)
     _log_version_header()
 
@@ -814,7 +850,10 @@ def main():
     logger.info("Server configuration:")
     logger.info(f"  Host: {HOST}")
     logger.info(f"  Port: {PORT}")
-    logger.info(f"  Micro-Manager core: {'Connected' if core else 'Not connected'}")
+    if args.demo:
+        logger.info("  Micro-Manager core: SIMULATED (demo mode, no hardware)")
+    else:
+        logger.info(f"  Micro-Manager core: {'Connected' if core else 'Not connected'}")
     logger.info(f"  Hardware: {'Initialized' if hardware else 'Not initialized'}")
 
     # Log loaded configuration

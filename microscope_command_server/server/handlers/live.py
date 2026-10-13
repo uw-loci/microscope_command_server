@@ -526,10 +526,15 @@ def handle_snap(conn, client, hardware, settings, **kwargs):
                             exposure_ms,
                         )
 
-                    # Set rotation angle
-                    if hasattr(hardware, "set_psg_ticks"):
+                    # Set rotation angle -- only on a scope that has a rotation stage.
+                    # hasattr(hardware, "set_psg_ticks") is true for every hardware
+                    # class (the method raises when no stage is configured), so a
+                    # brightfield-only scope must be recognised by the component.
+                    if getattr(hardware, "rotation_stage", None) is not None:
                         hardware.set_psg_ticks(angle)
                         logger.info("Set rotation angle to %.2f deg", angle)
+                    else:
+                        logger.debug("No rotation stage; ignoring --angle %.2f for SNAP", angle)
 
                     # Snap image with simple acquisition
                     image, metadata = hardware.snap_image(debayering=debayer)

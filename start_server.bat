@@ -160,7 +160,7 @@ echo  Press Ctrl+C to stop the server.
 echo.
 
 REM -- Start the server --
-python -m microscope_command_server.server.qp_server
+python -m microscope_command_server.server.qp_server %*
 
 REM -- If server exits, pause so the user can see any error --
 echo.
