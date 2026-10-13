@@ -596,7 +596,7 @@ and metadata file that guides all subsequent LC-PolScope acquisitions.
 ```
 LCCALIB --yaml config.yml --output /path/to/output [--modality lcpolscope] \
         [--swing 0.03] [--scheme "5-State"] [--wavelength 546.0] \
-        [--black-level 100.0] [--strategy single_pass] ENDOFSTR
+        [--black-level 100.0] [--exposure-ms 50] [--strategy single_pass] ENDOFSTR
 ```
 
 ### Parameters
@@ -623,10 +623,23 @@ LCCALIB --yaml config.yml --output /path/to/output [--modality lcpolscope] \
   (1) an explicit value here or in the YAML, (2) an averaged dark frame if lamp
   control is configured, (3) zero, with a warning. The value matters: a 50-count
   error moves the extinction ratio by roughly 10%.
+- **`--exposure-ms 50`** (optional) -- Camera exposure for the calibration frames.
+  Set for the run and restored afterwards, on every exit path. If omitted the
+  calibration snaps at whatever Micro-Manager is set to. Either way the exposure
+  used is recorded in the reply (`camera.exposure_ms`, `camera.exposure_source`
+  `request` or `micro-manager`). The palette does not depend on exposure, so this
+  never changes the acquisition's exposure in the YAML; it only has to be long
+  enough for the field to register -- see the too-dark refusal below.
 - **`--strategy single_pass`** (optional) -- Search strategy. `single_pass`
   (default) makes one pass per state; `iterative` repeats, re-centring on the
   crystals, until the residual is small enough. The second costs roughly three
   times the exposures, so it is a trade rather than an upgrade.
+
+The black level must be in the counts of the camera's **current** pixel format.
+OpenPolScope's stored 103 for this instrument was recorded in its own format; the
+same camera in 8-bit, or with a different offset setting, has a different one. A
+black level above the darkest state measured is reported as a warning, with the
+camera state, and makes the extinction ratio unmeasurable.
 
 ### Response sequence
 
@@ -664,6 +677,12 @@ The command sends multiple responses as it progresses:
      "state_intensities": {...},
      "exposures": 42,
      "elapsed_s": 15.3,
+     "camera": {"device": "Oryx ORX-10G-51S5M", "exposure_ms": 50.0, "exposure_source": "request|micro-manager",
+                "bit_depth": 12, "bytes_per_pixel": 2, "width": 2448, "height": 2048,
+                "binning": "1", "pixel_type": "Mono12", "gain": "0"},
+     "signal": {"extinction": 410.2, "brightest_state": 1890.5, "grid_peak": 3950.0,
+                "full_scale": 4095.0, "grid_peak_fraction": 0.9646,
+                "frame_dtype": "uint16", "frame_max_seen": 4095.0},
      "warnings": [],
      "output_folder": "/path/to/output",
      "metadata_path": "/path/to/output/lc_calibration_YYYYMMDD_HHMMSS.json"
@@ -679,8 +698,19 @@ The command sends multiple responses as it progresses:
    - `palette_waves` contains the retardance values (in waves) for each state and LC axis, keyed by the channel the state becomes
    - `lc_device` and `lc_retardance_properties_waves` name the Micro-Manager device and properties QPSC writes the palette to, so the property names live in one place (the server)
    - `lc_adapter_wavelength_nm` is the LC adapter's own wavelength setting, if it exposes one. The palette is in the adapter's waves, so a value that differs from `wavelength_nm` scales every retardance by the ratio; the server adds a warning saying so. The full adapter property snapshot is in the metadata file (`lc_device_properties`), not the reply
+   - `camera` is the camera as the frames were taken: device, exposure and where it came from, bit depth, bytes per pixel, frame size, and binning / pixel type / gain when the adapter exposes them (matched loosely by property name; a camera without one does not report it). Every camera property as a string is in the metadata file (`camera_properties`), not the reply
+   - `signal` is what the frames held, in raw counts: the extinction state, the brightest swing state, the brightest frame of the extinction grid, and that peak as a fraction of the camera's full scale (`2^bit_depth - 1`). This is the one-line answer to "was the field bright enough" -- the first rig runs peaked at 16.7 counts
    - `warnings` lists any issues that don't prevent use (e.g., a poor extinction ratio, or a missing wavelength configuration)
    - `metadata_path` points to a JSON file with the full trace (per-exposure details)
+
+   The reply is written with `success: false` and an `error` instead when the field is
+   **too dark to calibrate**: the brightest frame of the extinction grid averaged less than a
+   tenth of full scale. A search on a dark field does not fail, it converges on noise and
+   returns a palette that looks like any other (2026-10-13: frame means of 1 to 17 counts,
+   a swing state 0.002 waves from extinction), so the run is stopped after the grid, about
+   25 exposures in, and the message carries the counts and the camera state. Raise the
+   exposure (`--exposure-ms`) or the illumination. When the camera cannot report its bit
+   depth the check is skipped and a warning says so.
 
 4. **`FAILED:<reason>`** -- Calibration could not complete. The reason string
    describes the error (e.g., "could not reach the liquid crystals", "polscope_library
@@ -727,6 +757,8 @@ the metadata of a derived tile:
 | Black level, counts | `black_level` + `black_level_source` (`--black-level`, else `reconstruction.black_level`, else a dark frame, else assumed 0) | `reconstruction.black_level` (set by hand) | -- | `polscope.black_level` |
 | Provenance | `calibrated_at`, `extinction_ratio`, `metadata_path` | `reconstruction.lc_calibrated_at`, `lc_extinction_ratio`, `lc_calibration_file` | logged at the first state of every run, or a WARNING that no calibration was applied | `polscope.lc_calibrated_at`, `polscope.lc_extinction_ratio`, `polscope.lc_calibration_file` |
 | LC adapter state | `lc_device_properties` (file only) | -- | -- | -- |
+| Camera state | `camera` (exposure + source, bit depth, size, binning, pixel type, gain); `camera_properties` (file only) | `channels[State].exposure_ms` (set by hand, identical across states) | -- | -- |
+| Frame counts | `signal` (extinction, brightest state, grid peak, fraction of full scale) | -- | -- | -- |
 
 ### Black-level options
 

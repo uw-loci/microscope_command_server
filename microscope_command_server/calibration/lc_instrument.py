@@ -83,6 +83,13 @@ class MicroManagerLC:
         self.lamp = lamp
         self.dark_exposure_ms = dark_exposure_ms
         self.exposures = 0
+        #: What the frames looked like, so a mean of 9 counts can be read as
+        #: "dark" or "fine" later: the array dtype and the brightest and
+        #: darkest single pixel seen over the run. ``None`` until a snap.
+        self.frame_dtype: Optional[str] = None
+        self.frame_shape: Optional[tuple] = None
+        self.frame_max_seen: Optional[float] = None
+        self.frame_min_seen: Optional[float] = None
         self.limits = limits if limits is not None else self._device_limits()
 
     def _device_limits(self):
@@ -187,7 +194,20 @@ class MicroManagerLC:
     def measure_intensity(self) -> float:
         self.exposures += 1
         image, _ = self.hardware.snap_image()
-        return float(np.asarray(image, dtype=np.float64).mean())
+        frame = np.asarray(image)
+        self._note_frame(frame)
+        return float(frame.astype(np.float64).mean())
+
+    def _note_frame(self, frame: np.ndarray) -> None:
+        self.frame_dtype = str(frame.dtype)
+        self.frame_shape = tuple(int(n) for n in frame.shape)
+        if frame.size == 0:
+            return
+        high, low = float(frame.max()), float(frame.min())
+        self.frame_max_seen = (
+            high if self.frame_max_seen is None else max(self.frame_max_seen, high)
+        )
+        self.frame_min_seen = low if self.frame_min_seen is None else min(self.frame_min_seen, low)
 
     def measure_dark(self) -> float:
         """Mean of a frame with the field darkened.
@@ -251,6 +271,83 @@ class MicroManagerLC:
             except Exception as exc:
                 logger.debug("Could not read %s.%s: %s", LC_DEVICE, name, exc)
         return snapshot
+
+    def camera_snapshot(self) -> tuple:
+        """``(summary, properties)``: the camera as it is set right now.
+
+        The calibration measures whole-frame means in raw counts, and a count
+        means nothing without the exposure and the pixel format it was taken
+        at. The first two rig runs were analysed blind -- frame means of 1 to
+        17 counts, and no record of whether that was 8-bit or 16-bit, 1 ms or
+        100 ms -- so every run now records both. The summary is a handful of
+        values for the socket reply and the log; ``properties`` is every
+        camera property as a string, for the metadata file only.
+
+        Nothing here is fatal: a camera that cannot be asked something is
+        recorded as not knowing it, and the calibration proceeds.
+        """
+        summary: dict = {}
+        properties: dict = {}
+        try:
+            summary["exposure_ms"] = float(self.hardware.get_exposure())
+        except Exception as exc:
+            logger.debug("Could not read the exposure: %s", exc)
+        try:
+            core = self._core()
+        except RuntimeError:
+            return summary, properties
+
+        camera = None
+        for getter in (lambda: core.get_camera_device(), lambda: self.hardware.get_camera_name()):
+            try:
+                camera = str(getter())
+                if camera:
+                    break
+            except Exception as exc:
+                logger.debug("Could not name the camera: %s", exc)
+        if camera:
+            summary["device"] = camera
+
+        for key, getter in (
+            ("bit_depth", lambda: int(core.get_image_bit_depth())),
+            ("bytes_per_pixel", lambda: int(core.get_bytes_per_pixel())),
+            ("width", lambda: int(core.get_image_width())),
+            ("height", lambda: int(core.get_image_height())),
+        ):
+            try:
+                summary[key] = getter()
+            except Exception as exc:
+                logger.debug("Could not read camera %s: %s", key, exc)
+
+        if camera:
+            try:
+                names = core.get_device_property_names(camera)
+                try:
+                    names = list(names)
+                except TypeError:
+                    names = [names.get(i) for i in range(names.size())]
+            except Exception as exc:
+                logger.debug("Could not list %s properties: %s", camera, exc)
+                names = []
+            for name in names:
+                try:
+                    properties[str(name)] = str(core.get_property(camera, str(name)))
+                except Exception as exc:
+                    logger.debug("Could not read %s.%s: %s", camera, name, exc)
+            # The handful worth putting in front of the operator. Adapters
+            # name these differently, so it is a loose match on the name,
+            # and a camera without one simply does not report it.
+            for key, needles in (
+                ("binning", ("binning",)),
+                ("pixel_type", ("pixeltype", "pixelformat", "pixel type", "pixel format")),
+                ("gain", ("gain",)),
+            ):
+                for name, value in properties.items():
+                    lowered = name.lower()
+                    if any(needle in lowered for needle in needles) and "auto" not in lowered:
+                        summary[key] = value
+                        break
+        return summary, properties
 
     # -- internals ---------------------------------------------------------
 

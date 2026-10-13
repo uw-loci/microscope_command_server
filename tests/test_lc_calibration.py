@@ -22,12 +22,17 @@ from microscope_command_server.calibration.lc_instrument import MicroManagerLC  
 class FakeCore:
     """Records property traffic and answers reads consistently."""
 
-    def __init__(self, failing_device=None, limits=None):
+    def __init__(self, failing_device=None, limits=None, bit_depth=12):
         self.properties = {
             ("MeadowlarkLC", "Retardance LC-A [in waves]"): "0.25",
             ("MeadowlarkLC", "Retardance LC-B [in waves]"): "0.50",
             ("LED", "Intensity"): "100",
+            ("FakeCam", "Binning"): "1",
+            ("FakeCam", "PixelType"): "12bit",
+            ("FakeCam", "Gain"): "0",
+            ("FakeCam", "GainAuto"): "Off",
         }
+        self.bit_depth = bit_depth
         self.writes = []
         self.waits = []
         self.failing_device = failing_device
@@ -59,13 +64,37 @@ class FakeCore:
     def wait_for_device(self, device):
         self.waits.append(device)
 
+    # -- camera, as CMMCore exposes it --------------------------------------
+
+    def get_camera_device(self):
+        return "FakeCam"
+
+    def get_image_bit_depth(self):
+        return self.bit_depth
+
+    def get_bytes_per_pixel(self):
+        return 2
+
+    def get_image_width(self):
+        return 4
+
+    def get_image_height(self):
+        return 4
+
 
 class FakeHardware:
-    """A microscope whose camera sees the polarimetric forward model."""
+    """A microscope whose camera sees the polarimetric forward model.
 
-    def __init__(self, core=None):
+    ``transmittance`` is the camera counts at full transmission, so a dark
+    field is one number away; ``black_level`` is the camera's own offset.
+    """
+
+    def __init__(self, core=None, transmittance=4000.0, black_level=102.0):
         self.core = core or FakeCore()
         self.exposure = 50.0
+        self.exposure_log = []
+        self.transmittance = transmittance
+        self.black_level = black_level
 
     def snap_image(self):
         from polscope_library.calibration.simulator import SimulatedPolScope
@@ -73,12 +102,18 @@ class FakeHardware:
         lca = float(self.core.get_property("MeadowlarkLC", "Retardance LC-A [in waves]"))
         lcb = float(self.core.get_property("MeadowlarkLC", "Retardance LC-B [in waves]"))
         lamp_on = self.core.get_property("LED", "Intensity") != "0"
-        scope = SimulatedPolScope(read_noise=0.0)
+        scope = SimulatedPolScope(
+            read_noise=0.0, transmittance=self.transmittance, black_level=self.black_level
+        )
         value = scope.intensity_at(lca, lcb) if lamp_on else scope.black_level
-        return np.full((4, 4), value, dtype=np.float64), {}
+        return np.full((4, 4), value, dtype=np.uint16), {}
+
+    def get_camera_name(self):
+        return "FakeCam"
 
     def set_exposure(self, ms):
         self.exposure = float(ms)
+        self.exposure_log.append(float(ms))
 
     def get_exposure(self):
         return self.exposure
@@ -260,6 +295,83 @@ class TestWorkflow:
             FakeHardware(), self._yaml(), output_folder=str(tmp_path), black_level=102.0
         )
         assert result["lc_adapter_wavelength_nm"] is None
+
+    def test_camera_state_is_recorded_with_every_calibration(self, tmp_path):
+        """A frame mean in counts is unreadable without the exposure and the
+        pixel format. The first two rig runs were analysed without either."""
+        result = run_lc_calibration(
+            FakeHardware(), self._yaml(), output_folder=str(tmp_path), black_level=102.0
+        )
+        camera = result["camera"]
+        assert camera["device"] == "FakeCam"
+        assert camera["exposure_ms"] == 50.0
+        assert camera["exposure_source"] == "micro-manager"
+        assert camera["bit_depth"] == 12
+        assert camera["binning"] == "1"
+        assert camera["pixel_type"] == "12bit"
+        assert camera["gain"] == "0", "GainAuto must not be mistaken for the gain"
+        signal = result["signal"]
+        assert signal["full_scale"] == 4095.0
+        assert signal["frame_dtype"] == "uint16"
+        assert signal["grid_peak"] > signal["brightest_state"] > signal["extinction"]
+        assert 0 < signal["grid_peak_fraction"] <= 1
+
+        written = json.loads((tmp_path / result["metadata_path"].split("/")[-1]).read_text())
+        assert written["camera_properties"]["PixelType"] == "12bit"
+        assert "camera_properties" not in result, "every camera property stays in the file"
+
+    def test_a_requested_exposure_is_set_recorded_and_restored(self, tmp_path):
+        hw = FakeHardware()
+        result = run_lc_calibration(
+            hw, self._yaml(), output_folder=str(tmp_path), black_level=102.0, exposure_ms=120.0
+        )
+        assert result["camera"]["exposure_ms"] == 120.0
+        assert result["camera"]["exposure_source"] == "request"
+        assert hw.exposure_log[0] == 120.0
+        assert hw.exposure == 50.0, "the acquisition's exposure is put back"
+
+    def test_a_dark_field_is_refused_early_with_the_camera_state(self, tmp_path):
+        """The 2026-10-13 rig run: frame means of 1 to 17 counts, searched for
+        32 s, and handed back a palette with an Apply button."""
+        hw = FakeHardware(transmittance=15.0, black_level=1.0)
+        result = run_lc_calibration(
+            hw, self._yaml(), output_folder=str(tmp_path), black_level=1.0, exposure_ms=5.0
+        )
+        assert result["success"] is False
+        assert "too dark" in result["error"]
+        assert "5 ms" in result["error"] and "12-bit" in result["error"]
+        assert result["camera"]["exposure_ms"] == 5.0
+        assert hw.exposure == 50.0, "restored on the failure path too"
+        assert hw.core.writes, "it did look before refusing"
+
+    def test_a_black_level_above_the_darkest_frame_is_called_out(self, tmp_path):
+        """103 against frames that never reached 17: not this camera's offset
+        in these units. The ratio is unmeasurable and the warning says why."""
+        result = run_lc_calibration(
+            FakeHardware(transmittance=4000.0, black_level=5.0),
+            self._yaml(black_level=103),
+            output_folder=str(tmp_path),
+        )
+        assert result["success"] is True
+        assert result["assessment"] == "unmeasurable"
+        assert any(
+            "above the darkest state" in w and "pixel format" in w for w in result["warnings"]
+        )
+
+    def test_an_unknown_bit_depth_disables_the_guard_and_says_so(self, tmp_path):
+        class NoDepthCore(FakeCore):
+            def get_image_bit_depth(self):
+                raise RuntimeError("no camera")
+
+        result = run_lc_calibration(
+            FakeHardware(core=NoDepthCore(), transmittance=15.0, black_level=1.0),
+            self._yaml(),
+            output_folder=str(tmp_path),
+            black_level=1.0,
+        )
+        assert result["success"] is True, "no bit depth means no threshold, not a refusal"
+        assert result["signal"]["full_scale"] is None
+        assert any("bit depth" in w for w in result["warnings"])
 
     def test_voltage_mode_is_refused_not_silently_downgraded(self, tmp_path):
         """Quietly giving the operator retardance control would produce a

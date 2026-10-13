@@ -18,11 +18,10 @@ logger = logging.getLogger(__name__)
 
 #: Used only when the microscope YAML declares no wavelength, and always with
 #: a warning. 546 nm is what OpenPolScope persists in its own registry entry
-#: (ps.acq.MeadowlarkLC.wavelength) for this instrument. Its 2026-08-25
-#: acquisition summary says 549 instead, so the two disagree; the registry is
-#: machine-written and is what the plugin reloads, so it is the one copied
-#: here. The interference filter has never been identified -- a placeholder,
-#: not a measurement.
+#: (ps.acq.MeadowlarkLC.wavelength) for this instrument, and what its device
+#: adapter converts waves to volts at. The lamp filter was read on 2026-10-13:
+#: a Semrock FF01-549/15, so the LC-PolScope's YAML says 549 and this default
+#: is only ever a placeholder for a YAML that says nothing.
 DEFAULT_WAVELENGTH_NM = 546.0
 
 
@@ -44,6 +43,35 @@ def _adapter_wavelength_nm(device_properties: Dict[str, str]) -> Optional[float]
 
 DEFAULT_SETTLE_MS = 50.0
 
+#: The brightest frame of the extinction grid must average at least this
+#: fraction of the camera's full scale, or the run is refused as too dark. A
+#: tenth: the grid visits settings far from extinction, which at any usable
+#: exposure are far brighter than the swing states, so a field that cannot
+#: reach a tenth of full scale anywhere has nothing for the search to see.
+#: The two first rig runs peaked at 16.7 counts (2026-10-12 and -13).
+MIN_GRID_PEAK_FRACTION = 0.10
+
+
+def _describe_camera(camera: Dict[str, Any]) -> str:
+    """One line for the log and an error message: ``Oryx, 50.0 ms (request), 12-bit, 2448x2048, binning 1``."""
+    parts = []
+    if camera.get("device"):
+        parts.append(str(camera["device"]))
+    if camera.get("exposure_ms") is not None:
+        source = camera.get("exposure_source")
+        parts.append(f"{camera['exposure_ms']:g} ms" + (f" ({source})" if source else ""))
+    if camera.get("bit_depth") is not None:
+        parts.append(f"{camera['bit_depth']}-bit")
+    if camera.get("pixel_type"):
+        parts.append(str(camera["pixel_type"]))
+    if camera.get("width") is not None and camera.get("height") is not None:
+        parts.append(f"{camera['width']}x{camera['height']}")
+    if camera.get("binning") is not None:
+        parts.append(f"binning {camera['binning']}")
+    if camera.get("gain") is not None:
+        parts.append(f"gain {camera['gain']}")
+    return ", ".join(parts) if parts else "unknown (the camera could not be asked)"
+
 
 def run_lc_calibration(
     hardware,
@@ -55,6 +83,7 @@ def run_lc_calibration(
     scheme: Optional[str] = None,
     wavelength_nm: Optional[float] = None,
     black_level: Optional[float] = None,
+    exposure_ms: Optional[float] = None,
     strategy: str = "single_pass",
     lc_control_mode: Optional[str] = None,
     progress_callback: Optional[Callable[[int, int, str, str], None]] = None,
@@ -65,7 +94,11 @@ def run_lc_calibration(
 
     Every parameter left as ``None`` is taken from
     ``modalities.<modality>.reconstruction`` in the microscope YAML, so the
-    calibration and the acquisition cannot drift apart.
+    calibration and the acquisition cannot drift apart. ``exposure_ms`` is the
+    exception: ``None`` means "whatever Micro-Manager is set to", and either
+    way the exposure used is recorded in the result, with the camera's bit
+    depth and pixel format, because a frame mean in counts is unreadable
+    without them.
 
     Returns
     -------
@@ -83,7 +116,12 @@ def run_lc_calibration(
         return {"success": False, "error": message, "warnings": warnings, "output_folder": str(out)}
 
     try:
-        from polscope_library.calibration import CalibrationSettings, calibrate
+        from polscope_library.calibration import (
+            CalibrationSettings,
+            InsufficientSignalError,
+            calibrate,
+            moves_for,
+        )
     except ImportError as exc:
         return fail(f"polscope_library is not installed: {exc}")
 
@@ -172,6 +210,44 @@ def run_lc_calibration(
             "wavelength_nm to the same value."
         )
 
+    # Exposure: set when asked, and always recorded. The calibration measures
+    # whole-frame means in raw counts; without the exposure and the pixel
+    # format those numbers cannot be read later, and the first two rig runs
+    # (frame means of 1 to 17 counts) could not be diagnosed for exactly that
+    # reason. The previous exposure is restored on every exit path so a
+    # calibration never leaves the camera where the acquisition did not set it.
+    restore_exposure_ms: Optional[float] = None
+    if exposure_ms is not None:
+        try:
+            restore_exposure_ms = float(hardware.get_exposure())
+            hardware.set_exposure(float(exposure_ms))
+        except Exception as exc:
+            return fail(f"could not set the camera exposure to {exposure_ms:g} ms: {exc}")
+        exposure_source = "request"
+    else:
+        exposure_source = "micro-manager"
+    camera, camera_properties = instrument.camera_snapshot()
+    camera["exposure_source"] = exposure_source
+    full_scale: Optional[float] = None
+    if isinstance(camera.get("bit_depth"), int) and camera["bit_depth"] > 0:
+        full_scale = float(2 ** camera["bit_depth"] - 1)
+    log.info("LC calibration camera: %s", _describe_camera(camera))
+    if full_scale is None:
+        warnings.append(
+            "The camera did not report its bit depth, so the calibration could not check that "
+            "the field is bright enough; read the frame means against the pixel format by hand."
+        )
+
+    def restore_exposure() -> None:
+        if restore_exposure_ms is None:
+            return
+        try:
+            hardware.set_exposure(restore_exposure_ms)
+        except Exception as exc:
+            log.error(
+                "Could not restore the camera exposure to %g ms: %s", restore_exposure_ms, exc
+            )
+
     def report(step: int, total: int, stage: str, message: str) -> None:
         if progress_callback is not None:
             try:
@@ -198,12 +274,24 @@ def run_lc_calibration(
                 scheme=scheme,
                 wavelength_nm=wavelength_nm,
                 black_level=black_level,
+                min_grid_peak=(
+                    MIN_GRID_PEAK_FRACTION * full_scale if full_scale is not None else None
+                ),
             ),
             strategy=strategy,
         )
+    except InsufficientSignalError as exc:
+        # Not a crash: the search was stopped on purpose, with the camera state
+        # it was stopped under, because that state is the thing to change.
+        failure = fail(f"{exc} Camera: {_describe_camera(camera)}.")
+        failure["camera"] = camera
+        restore_exposure()
+        return failure
     except Exception as exc:
         log.exception("LC calibration raised")
+        restore_exposure()
         return fail(str(exc))
+    restore_exposure()
 
     if should_abort is not None and should_abort():
         return {
@@ -215,6 +303,36 @@ def run_lc_calibration(
         }
 
     warnings.extend(result.warnings)
+
+    # What the camera saw, in one place: the counts the ratio was computed
+    # from, against the camera's range. This is the line that says "dark" or
+    # "fine" without anyone opening the trace.
+    extinction_move = moves_for(result.scheme)[0].name
+    grid_points = [p.intensity for p in result.trace if p.state == extinction_move]
+    state_values = list(result.intensities.values())
+    signal: Dict[str, Any] = {
+        "extinction": round(state_values[0], 2) if state_values else None,
+        "brightest_state": round(max(state_values), 2) if state_values else None,
+        "grid_peak": round(max(grid_points), 2) if grid_points else None,
+        "full_scale": full_scale,
+        "frame_dtype": instrument.frame_dtype,
+        "frame_max_seen": instrument.frame_max_seen,
+    }
+    if full_scale and signal["grid_peak"] is not None:
+        signal["grid_peak_fraction"] = round(signal["grid_peak"] / full_scale, 4)
+    if result.black_level is not None and state_values and result.black_level > state_values[0]:
+        # 103 above frames that never exceed 17: the number is not in these
+        # units. OpenPolScope recorded its 103 in its own pixel format, and a
+        # camera switched to another format (or 8-bit) has a different offset.
+        warnings.append(
+            f"Black level {result.black_level:.1f} is above the darkest state measured "
+            f"({state_values[0]:.1f} counts, camera {_describe_camera(camera)}). It cannot be "
+            "this camera's offset in these units -- OpenPolScope's 103 was recorded in its own "
+            "pixel format -- so the extinction ratio is unmeasurable. Measure the offset in the "
+            "current pixel format (a frame with the lamp blocked) and set "
+            f"modalities.{modality}.reconstruction.black_level to it."
+        )
+
     payload = {
         "success": True,
         "scheme": result.scheme,
@@ -240,6 +358,11 @@ def run_lc_calibration(
         "state_intensities": result.intensities,
         "exposures": result.exposures,
         "elapsed_s": round(time.time() - started, 1),
+        # The camera as the frames were taken, and what the frames held. A
+        # frame mean in counts means nothing without the first, and the
+        # second is the one-line answer to "was the field bright enough".
+        "camera": camera,
+        "signal": signal,
         "warnings": warnings,
         "output_folder": str(out),
     }
@@ -253,6 +376,7 @@ def run_lc_calibration(
         # The adapter state the palette was measured against. File only: it
         # is a dozen strings the socket reply does not need.
         on_disk["lc_device_properties"] = lc_device_properties
+        on_disk["camera_properties"] = camera_properties
         on_disk["trace"] = [
             {
                 "state": p.state,
@@ -285,6 +409,19 @@ def run_lc_calibration(
         result.black_level,
         payload["black_level_source"],
         payload["palette_waves"],
+    )
+    log.info(
+        "LC calibration signal: extinction %s, brightest state %s, grid peak %s of %s%s; camera %s",
+        signal["extinction"],
+        signal["brightest_state"],
+        signal["grid_peak"],
+        "unknown full scale" if full_scale is None else f"{full_scale:g}",
+        (
+            f" ({signal['grid_peak_fraction'] * 100:.1f}%)"
+            if signal.get("grid_peak_fraction") is not None
+            else ""
+        ),
+        _describe_camera(camera),
     )
     for message in warnings:
         log.warning("LC calibration: %s", message)
