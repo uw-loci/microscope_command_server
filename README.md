@@ -80,7 +80,7 @@ been tried. That config (with its autofocus, imageprocessing and resources sidec
 ships inside the QPSC extension, which extracts it and starts this server when you choose
 **Extensions > QP Scope > Connect to a Demo Microscope...**; `--demo` is what that menu
 item passes. `start_server.bat` forwards its arguments, so `start_server.bat --demo`
-works too (ignore its "Make sure Micro-Manager is running" reminder). A SNAP against a
+works too and its banner then says so instead of asking for Micro-Manager. A SNAP against a
 scope with no rotation stage (the demo, or any brightfield-only scope) ignores `--angle`
 instead of failing.
 

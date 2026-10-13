@@ -4,11 +4,14 @@ REM  Start QPSC Microscope Command Server
 REM
 REM  Prerequisites:
 REM    1. Micro-Manager must be running with hardware loaded
+REM       (not for --demo: that runs a simulated microscope instead)
 REM    2. A Python environment with the QPSC packages installed
 REM
 REM  Usage:
 REM    Double-click this file, or run from command prompt.
 REM    The server will start and wait for QuPath connections.
+REM    Arguments are passed to the server: start_server.bat --demo
+REM    starts it against the simulated microscope (no Micro-Manager).
 REM
 REM  Tip: Place a shortcut to this file on your desktop alongside
 REM       shortcuts for Micro-Manager and QuPath. Launch all three
@@ -154,8 +157,15 @@ echo.
 echo ============================================================
 echo  QPSC Microscope Command Server
 echo ============================================================
+set "QPSC_DEMO="
+set "QPSC_ARGS=%*"
+if defined QPSC_ARGS echo %QPSC_ARGS% | findstr /C:"--demo" >nul && set "QPSC_DEMO=1"
 echo.
-echo  Make sure Micro-Manager is running before proceeding.
+if defined QPSC_DEMO (
+    echo  DEMO MODE: a simulated microscope. Micro-Manager is not needed.
+) else (
+    echo  Make sure Micro-Manager is running before proceeding.
+)
 echo  Press Ctrl+C to stop the server.
 echo.
 
