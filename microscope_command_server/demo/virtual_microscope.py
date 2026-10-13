@@ -8,14 +8,17 @@ circular buffer, ROI, config groups -- and nothing more. Unknown devices and
 properties raise, the way MMCore does, so a typo in a config fails here too.
 
 The camera looks at a :class:`VirtualSlide`: a procedurally generated H&E-like
-section with tissue islands, texture and nuclei, lying on a gently tilted focal
-plane. Moving the stage pans across it; moving Z defocuses it, so autofocus
-sweeps produce a real focus curve with a single peak. Rendering is seeded and
-deterministic -- the same stage position always shows the same field.
+section with tissue islands, texture and nuclei, lying on a tilted, gently
+undulating focal surface within about +/-22 um of Z = 0. Moving the stage pans
+across it; moving Z defocuses it, so autofocus sweeps produce a real focus curve
+with a single peak. The slide pattern is seeded, so the same stage position
+always shows the same field, up to per-frame Gaussian read noise (sigma 2 gray
+levels).
 
-Device names match Micro-Manager's Demo adapter (``DCam``, ``DStage``,
-``XYStage``, ``DLamp``) so a config written for this core also drives a real
-Micro-Manager Demo configuration.
+Device labels follow Micro-Manager's Demo adapter where it has an obvious
+counterpart (``DCam``, ``DStage``); ``XYStage`` and ``DLamp`` are this core's own
+labels. Running the demo config against a real Micro-Manager Demo configuration
+has not been tried.
 """
 
 from __future__ import annotations

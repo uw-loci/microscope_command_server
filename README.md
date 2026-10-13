@@ -23,7 +23,18 @@ Socket-based command server for remote microscope control and QuPath integration
 microscope-command-server --demo
 ```
 
-starts the server without Micro-Manager. The Pycro-Manager `Core` and `Studio` are
+starts the server without Micro-Manager. Run it in the environment that holds the QPSC
+packages (activate it first, or call the script by path, for example
+`C:\Users\<you>\venv_qpsc\Scripts\microscope-command-server.exe --demo`). Within a
+second or two the console prints `DEMO MODE: no Micro-Manager, driving a simulated
+microscope` and `Micro-Manager core: SIMULATED (demo mode, no hardware)`, then the server
+listens on port 5000 on all interfaces. Stop it with Ctrl+C. `ERROR: Another server
+instance is already running on port 5000!` means a server is already up; QPSC's demo
+connect reuses one that is listening.
+
+Use `--demo` to develop or test a handler, an acquisition workflow or autofocus logic on
+any machine: every handler runs unchanged, and the slide pattern is seeded, so a stage
+position always returns the same content. The Pycro-Manager `Core` and `Studio` are
 replaced by `microscope_command_server.demo.virtual_microscope.DemoCore` and
 `DemoStudio`; everything above them -- the camera and stage classes in
 `microscope_control`, every socket handler, the acquisition workflow, autofocus -- is
@@ -33,21 +44,45 @@ stage with simulated travel time (`device_busy` is true while a move is under wa
 a camera that snaps and streams through a circular buffer, ROI and binning, config
 groups. Unknown devices and properties raise, as MMCore does.
 
-The camera looks at a procedurally generated H&E-like slide, 40 x 20 mm centred on
-the stage origin, with tissue islands, texture and nuclei on a focal surface that
-tilts and undulates within about +/-25 um of Z = 0. Moving the stage pans across it;
-moving Z defocuses it in proportion to the distance from that surface, so an
-autofocus sweep scores one clear peak. Rendering is seeded and deterministic. Bare
-glass renders white at 10 ms exposure and lamp intensity 25.
+The camera looks at a procedurally generated H&E-like slide (bilinearly interpolated
+lattice value noise summed over two to three octaves), 40 x 20 mm centered on the stage
+origin, with tissue islands, texture and nuclei on a focal surface that tilts and
+undulates between about -22 and +20 um of Z = 0. Moving the stage pans across it; moving
+Z defocuses it in proportion to the distance from that surface, so an autofocus sweep
+scores one clear peak. The slide pattern is deterministic (`VirtualSlide.seed`); each
+frame adds Gaussian read noise of sigma 2 gray levels from a generator seeded once per
+server start, so runs repeat in content, not bit for bit. Bare glass renders near-white
+(about 243 of 255) at 10 ms exposure and lamp intensity 25, just under clipping.
 
-Device names are those of Micro-Manager's Demo adapter: camera `DCam`, focus `DStage`,
-XY `XYStage`, transmitted lamp `DLamp` (`State`, `Intensity`). The matching
-`config_Demo.yml` (with its autofocus, imageprocessing and resources sidecars) ships
-inside the QPSC extension, which extracts it and starts this server when you choose
-**Extensions > QP Scope > Connect to a Demo Microscope...**; `--demo` is what that
-menu item passes. `start_server.bat` forwards its arguments, so
-`start_server.bat --demo` works too. A SNAP against a scope with no rotation stage
-(the demo, or any brightfield-only scope) now ignores `--angle` instead of failing.
+All of these are `DemoCore` and `VirtualSlide` constructor defaults; no command-line flag
+or YAML key changes them.
+
+| Quantity | Value |
+|---|---|
+| Pixel size | 0.65 um/px (a 6.5 um sensor pixel at 10x); binning 1, 2 or 4 scales it |
+| Sensor | 512 x 512 px, a 332.8 x 332.8 um field |
+| Pixel types | `32bitRGB` (default, 8-bit RGB) and `8bit` (mono) |
+| Exposure | 0.1 to 10000 ms; brightness is linear in (exposure / 10 ms) x (intensity / 25) |
+| Lamp `DLamp` | `State` 0/1, `Intensity` 0 to 100 |
+| Gain | accepted, -5 to 8, no effect on the image |
+| Defocus blur | Gaussian, sigma 0.35 px per um from the focal surface, capped at 30 px (about 86 um out) |
+| Stage speeds | XY 4000 um/s, Z 800 um/s, minimum move 20 ms; `device_busy` is true while moving |
+| Live frames | one per max(exposure, 10 ms); 32-frame circular buffer |
+
+Not simulated: a shutter device, a rotation stage, Z sequencing, 16-bit output,
+vignetting or illumination non-uniformity, stage backlash or drift. `wait_for_device`
+times out after `TimeoutMs` (5000 ms by default).
+
+Device labels follow Micro-Manager's Demo adapter where it has an obvious counterpart
+(`DCam`, `DStage`); `XYStage` and `DLamp` (`State`, `Intensity`) are this core's own
+labels. Running `config_Demo.yml` against a real Micro-Manager Demo configuration has not
+been tried. That config (with its autofocus, imageprocessing and resources sidecars)
+ships inside the QPSC extension, which extracts it and starts this server when you choose
+**Extensions > QP Scope > Connect to a Demo Microscope...**; `--demo` is what that menu
+item passes. `start_server.bat` forwards its arguments, so `start_server.bat --demo`
+works too (ignore its "Make sure Micro-Manager is running" reminder). A SNAP against a
+scope with no rotation stage (the demo, or any brightfield-only scope) ignores `--angle`
+instead of failing.
 
 ## Multi-Channel Acquisition (Widefield IF, BF+IF)
 
