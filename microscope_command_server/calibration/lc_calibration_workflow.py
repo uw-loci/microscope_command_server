@@ -14,6 +14,8 @@ import time
 from pathlib import Path
 from typing import Any, Callable, Dict, Optional
 
+import numpy as np
+
 logger = logging.getLogger(__name__)
 
 #: Used only when the microscope YAML declares no wavelength, and always with
@@ -50,6 +52,84 @@ DEFAULT_SETTLE_MS = 50.0
 #: reach a tenth of full scale anywhere has nothing for the search to see.
 #: The two first rig runs peaked at 16.7 counts (2026-10-12 and -13).
 MIN_GRID_PEAK_FRACTION = 0.10
+
+#: The swing contrast -- brightest swing state minus extinction -- is what the
+#: palette is resolved from, and by design it is small: sin^2(pi * 0.03) is
+#: 0.9% of the open intensity. Under a hundredth of full scale the search is
+#: resolving a few counts, and the palette is noise with a straight face.
+MIN_SWING_CONTRAST_FRACTION = 0.01
+#: A state with more than this fraction of its pixels at the top of the range
+#: has a mean biased low, and the search converges on the wrong place.
+MAX_STATE_SATURATED_FRACTION = 0.001
+#: Headroom when suggesting the longest usable exposure: the brightest pixel
+#: of the brightest state should land here, not at full scale.
+EXPOSURE_HEADROOM_FRACTION = 0.9
+
+
+def _acquisition_exposure_ms(settings_yaml, modality: str, warnings: list) -> Optional[float]:
+    """The one exposure the acquisition's states share, from the YAML, or None.
+
+    The states must share an exposure (the Stokes inversion treats them as one
+    radiometric scale), so a set of channels that disagree is reported and
+    nothing is projected onto it.
+    """
+    channels = ((settings_yaml or {}).get("modalities", {}).get(modality, {}) or {}).get("channels")
+    if not isinstance(channels, list):
+        return None
+    values = set()
+    for channel in channels:
+        if isinstance(channel, dict) and channel.get("exposure_ms") is not None:
+            try:
+                values.add(float(channel["exposure_ms"]))
+            except (TypeError, ValueError):
+                continue
+    if not values:
+        return None
+    if len(values) > 1:
+        warnings.append(
+            f"The {modality} channels declare different exposures ({sorted(values)} ms). The five "
+            "states must share one exposure or the Stokes inversion is biased; nothing was "
+            "projected onto the acquisition exposure."
+        )
+        return None
+    return values.pop()
+
+
+def _write_state_histograms(path: Path, states: Dict[str, dict], black_level, full_scale) -> None:
+    """One log-scale histogram per state, so a human can tell a dim lamp from a
+    closed diaphragm or a slide left in the beam -- which a frame mean cannot."""
+    import matplotlib
+
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    n = max(1, len(states))
+    fig, axes = plt.subplots(1, n, figsize=(3.2 * n, 3.0), squeeze=False)
+    for ax, (state, stats) in zip(axes[0], states.items()):
+        hist = stats["histogram"]
+        top = stats["histogram_top"]
+        edges = np.linspace(0.0, top, len(hist) + 1)
+        ax.stairs(np.maximum(hist, 0.5), edges, fill=True, color="0.6")
+        ax.set_yscale("log")
+        ax.axvline(stats["mean"], color="C0", lw=1.2, label=f"mean {stats['mean']:.1f}")
+        if black_level is not None:
+            ax.axvline(black_level, color="C3", lw=1.0, ls="--", label=f"black {black_level:.0f}")
+        if full_scale is not None:
+            ax.set_xlim(0, full_scale)
+        saturated = stats.get("saturated_fraction")
+        title = state
+        if saturated is not None and saturated > 0:
+            title += f"  {saturated * 100:.2f}% saturated"
+        ax.set_title(title, fontsize=9)
+        ax.set_xlabel("counts", fontsize=8)
+        ax.tick_params(labelsize=7)
+        ax.legend(fontsize=7, loc="upper right")
+    fig.suptitle(
+        "LC calibration: final frame of each state (pixel histograms, log scale)", fontsize=9
+    )
+    fig.tight_layout()
+    fig.savefig(path, dpi=110)
+    plt.close(fig)
 
 
 def _describe_camera(camera: Dict[str, Any]) -> str:
@@ -231,6 +311,7 @@ def run_lc_calibration(
     full_scale: Optional[float] = None
     if isinstance(camera.get("bit_depth"), int) and camera["bit_depth"] > 0:
         full_scale = float(2 ** camera["bit_depth"] - 1)
+    instrument.full_scale = full_scale
     log.info("LC calibration camera: %s", _describe_camera(camera))
     if full_scale is None:
         warnings.append(
@@ -320,6 +401,110 @@ def run_lc_calibration(
     }
     if full_scale and signal["grid_peak"] is not None:
         signal["grid_peak_fraction"] = round(signal["grid_peak"] / full_scale, 4)
+
+    # The final frame of each state, matched to the library's trace: one
+    # frame record per measure_intensity call, one trace point per call.
+    state_frames: Dict[str, dict] = {}
+    if len(instrument.frames) == len(result.trace):
+        channel_of = {m.name: m.channel for m in moves_for(result.scheme)}
+        for index in range(len(result.trace) - 1, -1, -1):
+            channel = channel_of.get(result.trace[index].state)
+            if channel is not None and channel not in state_frames:
+                state_frames[channel] = instrument.frames[index]
+    else:
+        log.debug(
+            "frame records (%d) and trace points (%d) differ; no per-state frame statistics",
+            len(instrument.frames),
+            len(result.trace),
+        )
+
+    # The two numbers a palette stands or falls on. Leakage is what the
+    # extinction ratio divides by; swing contrast is what the search resolved
+    # the swing states from. Both in raw counts, both against full scale.
+    if state_values:
+        extinction = state_values[0]
+        brightest = max(state_values)
+        leakage = extinction - result.black_level if result.black_level is not None else None
+        contrast = brightest - extinction
+        signal["extinction_above_black"] = round(leakage, 2) if leakage is not None else None
+        signal["swing_contrast"] = round(contrast, 2)
+        if full_scale:
+            signal["swing_contrast_fraction"] = round(contrast / full_scale, 4)
+            if contrast < MIN_SWING_CONTRAST_FRACTION * full_scale:
+                warnings.append(
+                    f"Swing contrast is {contrast:.1f} counts ({contrast / full_scale * 100:.2f}% of "
+                    f"the camera's range), under the {MIN_SWING_CONTRAST_FRACTION * 100:.0f}% a "
+                    "palette needs to be resolved from signal rather than noise. Raise the "
+                    "exposure or the illumination and calibrate again before applying this."
+                )
+    if state_frames:
+        saturated = {
+            state: stats["saturated_fraction"]
+            for state, stats in state_frames.items()
+            if stats.get("saturated_fraction") is not None
+        }
+        signal["state_saturated_fraction"] = {k: round(v, 5) for k, v in saturated.items()}
+        signal["state_brightest_pixel"] = {k: stats["max"] for k, stats in state_frames.items()}
+        clipped = [k for k, v in saturated.items() if v > MAX_STATE_SATURATED_FRACTION]
+        if clipped:
+            worst = max(clipped, key=lambda k: saturated[k])
+            warnings.append(
+                f"{', '.join(clipped)} had pixels at the top of the camera's range "
+                f"({saturated[worst] * 100:.2f}% in {worst}). A clipped state's mean is biased low "
+                "and the search converges on the wrong setting. Lower the exposure and calibrate "
+                "again."
+            )
+
+    # The palette does not depend on exposure, but the acquisition does, and
+    # it runs at the YAML's exposure, not this one. Scale the counts there.
+    acquisition_exposure = _acquisition_exposure_ms(settings_yaml, modality, warnings)
+    signal["acquisition_exposure_ms"] = acquisition_exposure
+    calibration_exposure = camera.get("exposure_ms")
+    if (
+        acquisition_exposure
+        and calibration_exposure
+        and full_scale
+        and state_values
+        and signal.get("swing_contrast") is not None
+    ):
+        factor = acquisition_exposure / calibration_exposure
+        projected_contrast = signal["swing_contrast"] * factor
+        signal["projected_swing_contrast"] = round(projected_contrast, 2)
+        brightest_pixel = max(
+            (stats["max"] for stats in state_frames.values()), default=max(state_values)
+        )
+        signal["projected_brightest_pixel"] = round(brightest_pixel * factor, 1)
+        low = high = None
+        if signal["swing_contrast"] > 0:
+            low = (
+                calibration_exposure
+                * MIN_SWING_CONTRAST_FRACTION
+                * full_scale
+                / signal["swing_contrast"]
+            )
+        if brightest_pixel > 0:
+            high = calibration_exposure * EXPOSURE_HEADROOM_FRACTION * full_scale / brightest_pixel
+        signal["usable_exposure_ms"] = [
+            None if low is None else round(low, 1),
+            None if high is None else round(high, 1),
+        ]
+        if projected_contrast < MIN_SWING_CONTRAST_FRACTION * full_scale:
+            warnings.append(
+                f"At the acquisition exposure of {acquisition_exposure:g} ms the swing states would "
+                f"be {projected_contrast:.1f} counts apart, under {MIN_SWING_CONTRAST_FRACTION * 100:.0f}% "
+                f"of the camera's range. The palette is fine; the acquisition would be dark. Set "
+                f"modalities.{modality}.channels exposure_ms to at least "
+                f"{low:.0f} ms (all states the same)."
+                if low is not None
+                else f"At the acquisition exposure of {acquisition_exposure:g} ms the swing states "
+                f"would be {projected_contrast:.1f} counts apart. The acquisition would be dark."
+            )
+        elif brightest_pixel * factor >= full_scale:
+            warnings.append(
+                f"At the acquisition exposure of {acquisition_exposure:g} ms the brightest state "
+                f"would reach {brightest_pixel * factor:.0f} counts and clip at {full_scale:g}. Set "
+                f"modalities.{modality}.channels exposure_ms to at most {high:.0f} ms."
+            )
     if result.black_level is not None and state_values and result.black_level > state_values[0]:
         # 103 above frames that never exceed 17: the number is not in these
         # units. OpenPolScope recorded its 103 in its own pixel format, and a
@@ -367,9 +552,19 @@ def run_lc_calibration(
         "output_folder": str(out),
     }
 
+    stamp = time.strftime("%Y%m%d_%H%M%S")
+    if state_frames:
+        try:
+            out.mkdir(parents=True, exist_ok=True)
+            histogram_path = out / f"lc_calibration_{stamp}_histograms.png"
+            _write_state_histograms(histogram_path, state_frames, result.black_level, full_scale)
+            signal["histogram_path"] = str(histogram_path)
+        except Exception as exc:
+            # A missing picture is not a failed calibration.
+            log.warning("Could not write the LC calibration histograms: %s", exc)
     try:
         out.mkdir(parents=True, exist_ok=True)
-        path = out / f"lc_calibration_{time.strftime('%Y%m%d_%H%M%S')}.json"
+        path = out / f"lc_calibration_{stamp}.json"
         # The trace is written but kept out of the returned payload: it is one
         # entry per exposure and the socket reply should stay small.
         on_disk = dict(payload)
@@ -411,9 +606,11 @@ def run_lc_calibration(
         payload["palette_waves"],
     )
     log.info(
-        "LC calibration signal: extinction %s, brightest state %s, grid peak %s of %s%s; camera %s",
+        "LC calibration signal: extinction %s (%s above black), swing contrast %s, grid peak %s of "
+        "%s%s; camera %s",
         signal["extinction"],
-        signal["brightest_state"],
+        signal.get("extinction_above_black"),
+        signal.get("swing_contrast"),
         signal["grid_peak"],
         "unknown full scale" if full_scale is None else f"{full_scale:g}",
         (

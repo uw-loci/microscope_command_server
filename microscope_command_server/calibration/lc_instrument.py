@@ -90,6 +90,15 @@ class MicroManagerLC:
         self.frame_shape: Optional[tuple] = None
         self.frame_max_seen: Optional[float] = None
         self.frame_min_seen: Optional[float] = None
+        #: Top of the camera's range, set by the caller once it has asked the
+        #: camera its bit depth. Without it the dtype's maximum stands in,
+        #: which overstates a 12-bit camera delivering uint16 by 16x.
+        self.full_scale: Optional[float] = None
+        #: One entry per :meth:`measure_intensity`, in order: mean, brightest
+        #: pixel, fraction of pixels at the top of the range, and a 256-bin
+        #: histogram of a subsample. The library's trace has one point per
+        #: call too, so index i here is trace point i.
+        self.frames: list = []
         self.limits = limits if limits is not None else self._device_limits()
 
     def _device_limits(self):
@@ -208,6 +217,27 @@ class MicroManagerLC:
             high if self.frame_max_seen is None else max(self.frame_max_seen, high)
         )
         self.frame_min_seen = low if self.frame_min_seen is None else min(self.frame_min_seen, low)
+
+        top = self.full_scale
+        if top is None and np.issubdtype(frame.dtype, np.integer):
+            top = float(np.iinfo(frame.dtype).max)
+        saturated = float(np.mean(frame >= top)) if top is not None else None
+        # A histogram of every pixel of a 5 MP frame costs as much as the
+        # exposure; one of a 16x subsample is a few ms and the same shape.
+        step = max(1, int(np.sqrt(frame.size / 400_000)))
+        sample = frame[tuple(slice(None, None, step) for _ in frame.shape)]
+        upper = top if top is not None else max(high, 1.0)
+        hist, _ = np.histogram(sample, bins=256, range=(0.0, upper))
+        self.frames.append(
+            {
+                "mean": float(frame.astype(np.float64).mean()),
+                "max": high,
+                "min": low,
+                "saturated_fraction": saturated,
+                "histogram": hist,
+                "histogram_top": upper,
+            }
+        )
 
     def measure_dark(self) -> float:
         """Mean of a frame with the field darkened.

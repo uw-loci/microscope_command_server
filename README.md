@@ -682,6 +682,10 @@ The command sends multiple responses as it progresses:
                 "binning": "1", "pixel_type": "Mono12", "gain": "0"},
      "signal": {"extinction": 410.2, "brightest_state": 1890.5, "grid_peak": 3950.0,
                 "full_scale": 4095.0, "grid_peak_fraction": 0.9646,
+                "extinction_above_black": 307.2, "swing_contrast": 1480.3, "swing_contrast_fraction": 0.3615,
+                "state_saturated_fraction": {"State0": 0.0, "...": 0.0}, "state_brightest_pixel": {"State0": 612.0, "...": 0.0},
+                "acquisition_exposure_ms": 50.0, "projected_swing_contrast": 1480.3, "projected_brightest_pixel": 2210.0,
+                "usable_exposure_ms": [1.4, 83.4], "histogram_path": "/path/to/output/lc_calibration_YYYYMMDD_HHMMSS_histograms.png",
                 "frame_dtype": "uint16", "frame_max_seen": 4095.0},
      "warnings": [],
      "output_folder": "/path/to/output",
@@ -699,7 +703,11 @@ The command sends multiple responses as it progresses:
    - `lc_device` and `lc_retardance_properties_waves` name the Micro-Manager device and properties QPSC writes the palette to, so the property names live in one place (the server)
    - `lc_adapter_wavelength_nm` is the LC adapter's own wavelength setting, if it exposes one. The palette is in the adapter's waves, so a value that differs from `wavelength_nm` scales every retardance by the ratio; the server adds a warning saying so. The full adapter property snapshot is in the metadata file (`lc_device_properties`), not the reply
    - `camera` is the camera as the frames were taken: device, exposure and where it came from, bit depth, bytes per pixel, frame size, and binning / pixel type / gain when the adapter exposes them (matched loosely by property name; a camera without one does not report it). Every camera property as a string is in the metadata file (`camera_properties`), not the reply
-   - `signal` is what the frames held, in raw counts: the extinction state, the brightest swing state, the brightest frame of the extinction grid, and that peak as a fraction of the camera's full scale (`2^bit_depth - 1`). This is the one-line answer to "was the field bright enough" -- the first rig runs peaked at 16.7 counts
+   - `signal` is what the frames held, in raw counts: the extinction state, the brightest swing state, the brightest frame of the extinction grid, and that peak as a fraction of the camera's full scale (`2^bit_depth - 1`). This is the one-line answer to "was the field bright enough" -- the first rig runs peaked at 16.7 counts. It also carries the two numbers a palette stands or falls on, and three checks on them:
+     - `extinction_above_black` is what the extinction ratio divides by; `swing_contrast` (brightest swing state minus extinction) is what the swing states were resolved from. By design the contrast is small, sin^2(pi * 0.03) = 0.9% of the open intensity, so a field can pass the grid check and still leave the states a few counts apart. **Under 1% of full scale a warning says the palette was resolved from noise.**
+     - `state_saturated_fraction` and `state_brightest_pixel`, per state, from the final frame of each. The far grid points are allowed to clip; the states are not. **Over 0.1% of pixels at the top of the range in any state is warned about** (a clipped mean is biased low and the search converges on the wrong setting).
+     - `acquisition_exposure_ms` is the one exposure the YAML's `channels` share (channels that disagree are reported and nothing is projected). `projected_swing_contrast` and `projected_brightest_pixel` scale the measured counts to it, and `usable_exposure_ms` is the range at this illumination that keeps the contrast over 1% and the brightest pixel under 90% of range. **A warning names the exposure to set when the acquisition would be dark or would clip.** The palette does not depend on exposure; the acquisition does, so a calibration taken at 500 ms that leaves a 50 ms acquisition dark is reported here, not discovered later.
+     - `histogram_path`: a PNG beside the metadata file, one log-scale pixel histogram per state (final frame), with the mean and the black level marked. For the human check a frame mean cannot make: a dim lamp, a closed diaphragm and a slide left in the beam all give a low mean and different histograms
    - `warnings` lists any issues that don't prevent use (e.g., a poor extinction ratio, or a missing wavelength configuration)
    - `metadata_path` points to a JSON file with the full trace (per-exposure details)
 
@@ -758,7 +766,7 @@ the metadata of a derived tile:
 | Provenance | `calibrated_at`, `extinction_ratio`, `metadata_path` | `reconstruction.lc_calibrated_at`, `lc_extinction_ratio`, `lc_calibration_file` | logged at the first state of every run, or a WARNING that no calibration was applied | `polscope.lc_calibrated_at`, `polscope.lc_extinction_ratio`, `polscope.lc_calibration_file` |
 | LC adapter state | `lc_device_properties` (file only) | -- | -- | -- |
 | Camera state | `camera` (exposure + source, bit depth, size, binning, pixel type, gain); `camera_properties` (file only) | `channels[State].exposure_ms` (set by hand, identical across states) | -- | -- |
-| Frame counts | `signal` (extinction, brightest state, grid peak, fraction of full scale) | -- | -- | -- |
+| Frame counts | `signal` (extinction, leakage above black, swing contrast, grid peak, per-state saturation, projection to the acquisition exposure, `usable_exposure_ms`); `*_histograms.png` beside the file | `channels[State].exposure_ms` is what the projection is made for | -- | -- |
 
 ### Black-level options
 

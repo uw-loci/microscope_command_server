@@ -89,7 +89,12 @@ class FakeHardware:
     field is one number away; ``black_level`` is the camera's own offset.
     """
 
-    def __init__(self, core=None, transmittance=4000.0, black_level=102.0):
+    # 20000 counts at full transmission on a 12-bit camera: the far grid points
+    # clip (allowed) and the swing states, at 0.9% of that, sit ~180 counts
+    # above extinction -- a properly exposed calibration. The simulator's own
+    # default of 4000 puts the contrast at 40 counts, 0.98% of range, right on
+    # the warning threshold.
+    def __init__(self, core=None, transmittance=20000.0, black_level=102.0):
         self.core = core or FakeCore()
         self.exposure = 50.0
         self.exposure_log = []
@@ -106,7 +111,8 @@ class FakeHardware:
             read_noise=0.0, transmittance=self.transmittance, black_level=self.black_level
         )
         value = scope.intensity_at(lca, lcb) if lamp_on else scope.black_level
-        return np.full((4, 4), value, dtype=np.uint16), {}
+        # A 12-bit camera delivering uint16: clip at full scale as the real one does.
+        return np.full((4, 4), min(value, 4095.0), dtype=np.uint16), {}
 
     def get_camera_name(self):
         return "FakeCam"
@@ -187,7 +193,7 @@ class TestInstrument:
 
 
 class TestWorkflow:
-    def _yaml(self, **recon):
+    def _yaml(self, channel_exposures=None, **recon):
         base = {
             "swing_waves": 0.03,
             "scheme": "5-State",
@@ -196,7 +202,12 @@ class TestWorkflow:
             "lc_settle_ms": 0,
         }
         base.update(recon)
-        return {"modalities": {"lcpolscope": {"reconstruction": base}}}
+        modality = {"reconstruction": base}
+        if channel_exposures is not None:
+            modality["channels"] = [
+                {"id": f"State{i}", "exposure_ms": ms} for i, ms in enumerate(channel_exposures)
+            ]
+        return {"modalities": {"lcpolscope": modality}}
 
     def test_calibrates_and_writes_a_file(self, tmp_path):
         result = run_lc_calibration(
@@ -356,6 +367,115 @@ class TestWorkflow:
         assert result["assessment"] == "unmeasurable"
         assert any(
             "above the darkest state" in w and "pixel format" in w for w in result["warnings"]
+        )
+
+    def test_swing_contrast_and_leakage_are_reported(self, tmp_path):
+        """The two numbers a palette stands or falls on, in raw counts."""
+        result = run_lc_calibration(
+            FakeHardware(), self._yaml(), output_folder=str(tmp_path), black_level=102.0
+        )
+        signal = result["signal"]
+        assert signal["extinction_above_black"] == pytest.approx(
+            signal["extinction"] - 102.0, abs=0.01
+        )
+        assert signal["swing_contrast"] == pytest.approx(
+            signal["brightest_state"] - signal["extinction"], abs=0.01
+        )
+        assert signal["swing_contrast_fraction"] > 0.01
+        assert not any("Swing contrast" in w for w in result["warnings"])
+        assert set(signal["state_saturated_fraction"]) == {f"State{i}" for i in range(5)}
+        assert all(v == 0 for v in signal["state_saturated_fraction"].values())
+
+    def test_a_low_swing_contrast_passes_the_grid_guard_but_is_warned_about(self, tmp_path):
+        # Bright enough for the grid (a tenth of 4095 is 410; the far grid
+        # points reach ~half of transmittance) yet the swing states, at 0.9%
+        # of transmittance, are a handful of counts apart.
+        result = run_lc_calibration(
+            FakeHardware(transmittance=1500.0, black_level=5.0),
+            self._yaml(),
+            output_folder=str(tmp_path),
+            black_level=5.0,
+        )
+        assert result["success"] is True
+        assert result["signal"]["swing_contrast"] < 41
+        assert any("Swing contrast" in w and "noise" in w for w in result["warnings"])
+
+    def test_a_clipped_state_is_warned_about(self, tmp_path):
+        # Swing states at 0.9% of 500k transmittance sit at ~4500 counts, over
+        # a 12-bit camera's 4095; the grid points clip too, which is allowed.
+        result = run_lc_calibration(
+            FakeHardware(transmittance=500_000.0, black_level=5.0),
+            self._yaml(),
+            output_folder=str(tmp_path),
+            black_level=5.0,
+        )
+        assert result["success"] is True
+        saturated = result["signal"]["state_saturated_fraction"]
+        assert any(v > 0.001 for v in saturated.values())
+        assert any("top of the camera's range" in w for w in result["warnings"])
+
+    def test_the_acquisition_exposure_is_projected_and_a_dark_one_is_warned_about(self, tmp_path):
+        """A palette taken at 500 ms is fine; an acquisition at 50 ms is dark.
+        That is this week's problem moved one step along, so say it now."""
+        result = run_lc_calibration(
+            FakeHardware(),
+            self._yaml(channel_exposures=[5, 5, 5, 5, 5]),
+            output_folder=str(tmp_path),
+            black_level=102.0,
+            exposure_ms=50.0,
+        )
+        signal = result["signal"]
+        assert signal["acquisition_exposure_ms"] == 5.0
+        assert signal["projected_swing_contrast"] == pytest.approx(
+            signal["swing_contrast"] / 10, rel=1e-6
+        )
+        low, high = signal["usable_exposure_ms"]
+        assert low is not None and high is not None and low < high
+        assert any(
+            "acquisition exposure of 5 ms" in w and "at least" in w for w in result["warnings"]
+        )
+
+    def test_an_acquisition_exposure_that_would_clip_is_warned_about(self, tmp_path):
+        result = run_lc_calibration(
+            FakeHardware(),
+            self._yaml(channel_exposures=[5000, 5000, 5000, 5000, 5000]),
+            output_folder=str(tmp_path),
+            black_level=102.0,
+            exposure_ms=50.0,
+        )
+        assert result["signal"]["projected_brightest_pixel"] >= 4095
+        assert any("would reach" in w and "at most" in w for w in result["warnings"])
+
+    def test_a_matching_acquisition_exposure_raises_no_projection_warning(self, tmp_path):
+        result = run_lc_calibration(
+            FakeHardware(),
+            self._yaml(channel_exposures=[50, 50, 50, 50, 50]),
+            output_folder=str(tmp_path),
+            black_level=102.0,
+            exposure_ms=50.0,
+        )
+        assert result["signal"]["projected_swing_contrast"] == result["signal"]["swing_contrast"]
+        assert not any("acquisition exposure" in w for w in result["warnings"])
+
+    def test_disagreeing_channel_exposures_are_reported_not_projected(self, tmp_path):
+        result = run_lc_calibration(
+            FakeHardware(),
+            self._yaml(channel_exposures=[50, 50, 60, 50, 50]),
+            output_folder=str(tmp_path),
+            black_level=102.0,
+        )
+        assert result["signal"]["acquisition_exposure_ms"] is None
+        assert any("different exposures" in w for w in result["warnings"])
+
+    def test_a_histogram_image_is_written_beside_the_json(self, tmp_path):
+        result = run_lc_calibration(
+            FakeHardware(), self._yaml(), output_folder=str(tmp_path), black_level=102.0
+        )
+        image = tmp_path / result["signal"]["histogram_path"].split("/")[-1]
+        assert image.exists() and image.stat().st_size > 1000
+        assert (
+            image.stem
+            == result["metadata_path"].split("/")[-1].replace(".json", "") + "_histograms"
         )
 
     def test_an_unknown_bit_depth_disables_the_guard_and_says_so(self, tmp_path):
