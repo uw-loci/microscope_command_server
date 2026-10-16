@@ -680,7 +680,7 @@ The command sends multiple responses as it progresses:
      "exposures": 42,
      "elapsed_s": 15.3,
      "camera": {"device": "Oryx ORX-10G-51S5M", "exposure_ms": 50.0, "exposure_source": "request|micro-manager",
-                "bit_depth": 12, "bytes_per_pixel": 2, "width": 2448, "height": 2048,
+                "bit_depth": 12, "significant_bits": 12, "bytes_per_pixel": 2, "width": 2448, "height": 2048,
                 "binning": "1", "pixel_type": "Mono12", "gain": "0"},
      "signal": {"extinction": 410.2, "brightest_state": 1890.5, "grid_peak": 3950.0,
                 "full_scale": 4095.0, "grid_peak_fraction": 0.9646,
