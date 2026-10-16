@@ -29,8 +29,8 @@ packages (activate it first, or call the script by path, for example
 second or two the console prints `DEMO MODE: no Micro-Manager, driving a simulated
 microscope` and `Micro-Manager core: SIMULATED (demo mode, no hardware)`, then the server
 listens on port 5000 on all interfaces. Stop it with Ctrl+C. `ERROR: Another server
-instance is already running on port 5000!` means a server is already up; QPSC's demo
-connect reuses one that is listening.
+instance is already running on port 5000!` means a server is already up. QPSC's demo
+connect reuses it only if it reports the demo camera `DCam`, and refuses one with a real camera.
 
 Use `--demo` to develop or test a handler, an acquisition workflow or autofocus logic on
 any machine: every handler runs unchanged, and the slide pattern is seeded, so a stage
