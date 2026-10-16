@@ -273,24 +273,48 @@ class TestWorkflow:
         assert result["wavelength_nm"] == 549.0
         assert len(result["palette_waves"]) == 4
 
-    def test_adapter_state_is_recorded_and_a_wavelength_disagreement_is_said(self, tmp_path):
-        """The palette is in the ADAPTER's waves. Its wavelength setting is the
-        one value in this chain nobody had been reading; now it is recorded,
-        and compared with the reconstruction wavelength out loud."""
+    def test_the_adapter_is_set_to_the_reconstruction_wavelength_before_measuring(self, tmp_path):
+        """The palette is in the ADAPTER's waves. On the rig it sat at 546 while
+        the lamp filter is a 549/15; the calibration now puts it at 549 first,
+        records both values, and the reply carries what Apply must write."""
         hw = FakeHardware()
         hw.core.properties[("MeadowlarkLC", "Wavelength")] = "546.0"
         result = run_lc_calibration(
             hw, self._yaml(wavelength_nm=549.0), output_folder=str(tmp_path), black_level=102.0
         )
         assert result["success"] is True
-        assert result["lc_adapter_wavelength_nm"] == 546.0
-        assert any("546 nm" in w and "549 nm" in w and "percent" in w for w in result["warnings"])
+        assert result["lc_adapter_wavelength_before_nm"] == 546.0
+        assert result["lc_adapter_wavelength_nm"] == 549.0
+        assert result["lc_wavelength_property"] == "Wavelength"
+        assert not any("percent" in w for w in result["warnings"]), "no mismatch left to warn about"
+        # Set before any crystal moved.
+        writes = [(d, prop) for d, prop, _ in hw.core.writes]
+        first_lc = next(i for i, w in enumerate(writes) if w[1].startswith("Retardance"))
+        assert writes.index(("MeadowlarkLC", "Wavelength")) < first_lc
 
         written = json.loads((tmp_path / result["metadata_path"].split("/")[-1]).read_text())
-        snapshot = written["lc_device_properties"]
-        assert snapshot["Wavelength"] == "546.0"
-        assert "Retardance LC-A [in waves]" in snapshot
+        assert written["lc_device_properties"]["Wavelength"] == "549"
         assert "lc_device_properties" not in result, "the snapshot stays out of the socket reply"
+
+    def test_an_adapter_that_refuses_the_wavelength_fails_the_calibration(self, tmp_path):
+        """Measuring at one wavelength and labelling the palette with another is
+        worse than not calibrating."""
+
+        class StubbornCore(FakeCore):
+            def set_property(self, device, prop, value):
+                if prop == "Wavelength":
+                    self.writes.append((device, prop, value))
+                    return  # accepted silently, not applied
+                super().set_property(device, prop, value)
+
+        hw = FakeHardware(core=StubbornCore())
+        hw.core.properties[("MeadowlarkLC", "Wavelength")] = "546.0"
+        result = run_lc_calibration(
+            hw, self._yaml(wavelength_nm=549.0), output_folder=str(tmp_path), black_level=102.0
+        )
+        assert result["success"] is False
+        assert "reads back 546" in result["error"] and "Device Property Browser" in result["error"]
+        assert not any(w[1].startswith("Retardance") for w in hw.core.writes)
 
     def test_matching_adapter_wavelength_raises_no_warning(self, tmp_path):
         hw = FakeHardware()

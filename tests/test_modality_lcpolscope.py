@@ -914,3 +914,100 @@ def test_the_first_state_of_a_run_records_the_camera_and_logs_auto_gain_as_an_er
     before = len(records)
     record_state_readback(ctx, hardware, dict(ch_entry, id="State1"), log)
     assert not any("camera" in r.getMessage().lower() for r in records[before:])
+
+
+def _lc_hardware(adapter_nm):
+    from types import SimpleNamespace
+
+    class Core:
+        props = {
+            ("MeadowlarkLC", "Wavelength"): str(adapter_nm),
+            ("MeadowlarkLC", "Retardance LC-A [in waves]"): "0.2589",
+        }
+
+        def get_camera_device(self):
+            raise RuntimeError("no camera in this test")
+
+        def get_device_property_names(self, device):
+            return [p for (d, p) in self.props if d == device]
+
+        def get_property(self, device, prop):
+            return self.props[(device, prop)]
+
+    return SimpleNamespace(core=Core(), get_exposure=lambda: 50.0)
+
+
+def _first_state(adapter_nm, recon_nm):
+    import logging
+    from types import SimpleNamespace
+
+    from microscope_command_server.modality.lcpolscope import record_state_readback
+
+    ctx = SimpleNamespace(
+        modality="lcpolscope",
+        ppm_settings={
+            "modalities": {"lcpolscope": {"reconstruction": {"wavelength_nm": recon_nm}}}
+        },
+    )
+    records = []
+
+    class Log(logging.Logger):
+        def handle(self, record):
+            records.append(record)
+
+    log = Log("test")
+    log.setLevel(logging.DEBUG)
+    ch_entry = {
+        "id": "State0",
+        "device_properties": [
+            {"device": "MeadowlarkLC", "property": "Wavelength", "value": adapter_nm},
+            {"device": "MeadowlarkLC", "property": "Retardance LC-A [in waves]", "value": 0.2589},
+        ],
+    }
+    record_state_readback(ctx, _lc_hardware(adapter_nm), ch_entry, log)
+    return ctx, records
+
+
+def test_the_first_state_records_the_adapter_wavelength_and_warns_on_a_mismatch():
+    import logging
+
+    ctx, records = _first_state(546.0, 549)
+    assert ctx._lc_adapter_wavelength_nm == 546.0
+    warnings = [r.getMessage() for r in records if r.levelno == logging.WARNING]
+    assert any("546" in m and "549" in m and "Recalibrate" in m for m in warnings)
+    # The Wavelength write is read back like any other state property.
+    assert ctx._lc_state_readback["State0"]["Wavelength"]["agrees"] is True
+
+
+def test_a_matching_adapter_wavelength_is_logged_at_info_only():
+    import logging
+
+    ctx, records = _first_state(549.0, 549)
+    assert ctx._lc_adapter_wavelength_nm == 549.0
+    assert not any("Recalibrate" in r.getMessage() for r in records if r.levelno >= logging.WARNING)
+
+
+def test_metadata_carries_the_adapter_wavelength(tmp_path):
+    import numpy as np
+
+    pytest.importorskip("polscope_library")
+    from microscope_command_server.modality.lcpolscope import RETARDANCE_DIR
+
+    seen = {}
+
+    def writer(*, filename, pixel_size_um, data, channel_name, map_annotations):
+        seen[filename.rsplit("/", 2)[-2]] = map_annotations
+
+    _, pool = _submit(
+        channel_images={
+            f"State{i}": np.full((4, 4), v, dtype=float)
+            for i, v in enumerate((110.0, 160.0, 155.0, 150.0, 145.0))
+        },
+        reconstruction_cfg={"swing_waves": 0.03, "wavelength_nm": 549, "scheme": "5-State"},
+        output_path=tmp_path,
+        ome_writer=writer,
+        lc_adapter_wavelength_nm=549.0,
+    )
+    fn, kwargs = pool.submissions[0]
+    fn(**kwargs)
+    assert seen[RETARDANCE_DIR]["polscope.lc_adapter_wavelength_nm"] == "549.0"

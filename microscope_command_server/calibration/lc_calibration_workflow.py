@@ -27,6 +27,18 @@ logger = logging.getLogger(__name__)
 DEFAULT_WAVELENGTH_NM = 546.0
 
 
+def _adapter_wavelength_property(device_properties: Dict[str, str]) -> Optional[str]:
+    """The name of the LC adapter's wavelength property, or None if it has none."""
+    for name in device_properties:
+        if "wavelength" in name.lower():
+            return name
+    return None
+
+
+#: How close the adapter's wavelength must read back to the one written, in nm.
+ADAPTER_WAVELENGTH_TOLERANCE_NM = 0.05
+
+
 def _adapter_wavelength_nm(device_properties: Dict[str, str]) -> Optional[float]:
     """The LC adapter's own wavelength setting, in nm, if it exposes one.
 
@@ -263,6 +275,51 @@ def run_lc_calibration(
     # a disagreement is said out loud; it is not corrected here because the
     # right fix is to make the two agree once the filter is identified.
     lc_device_properties = instrument.device_snapshot()
+    lc_wavelength_property = _adapter_wavelength_property(lc_device_properties)
+    lc_adapter_wavelength_before_nm = _adapter_wavelength_nm(lc_device_properties)
+    # Put the adapter at the reconstruction wavelength BEFORE measuring. The
+    # MeadowlarkLC adapter converts the palette's waves to volts at its own
+    # Wavelength property, which on the LC-PolScope sits at OpenPolScope's 546
+    # while the lamp filter is a 549/15 (identified 2026-10-13); the swing it
+    # applied was then 0.02984 waves at 549, not 0.03. The value is set every
+    # run because Micro-Manager restarts and OpenPolScope both put it back.
+    # A write that does not take is a failure, not a warning: the palette
+    # would be measured at one wavelength and labelled with another.
+    if lc_wavelength_property is not None and (
+        lc_adapter_wavelength_before_nm is None
+        or abs(lc_adapter_wavelength_before_nm - wavelength_nm) > ADAPTER_WAVELENGTH_TOLERANCE_NM
+    ):
+        try:
+            core = hardware.core
+            core.set_property(LC_DEVICE, lc_wavelength_property, f"{wavelength_nm:g}")
+            try:
+                core.wait_for_device(LC_DEVICE)
+            except Exception as exc:  # not fatal; the readback below decides
+                log.debug("wait_for_device(%s) failed: %s", LC_DEVICE, exc)
+            read_back = float(core.get_property(LC_DEVICE, lc_wavelength_property))
+        except Exception as exc:
+            return fail(
+                f"could not set {LC_DEVICE} '{lc_wavelength_property}' to {wavelength_nm:g} nm "
+                f"(it was {lc_adapter_wavelength_before_nm}): {exc}. Set it by hand in "
+                "Micro-Manager's Device Property Browser, or make "
+                f"modalities.{modality}.reconstruction.wavelength_nm match the adapter."
+            )
+        if abs(read_back - wavelength_nm) > ADAPTER_WAVELENGTH_TOLERANCE_NM:
+            return fail(
+                f"{LC_DEVICE} '{lc_wavelength_property}' was written as {wavelength_nm:g} nm but "
+                f"reads back {read_back:g} nm, so the adapter did not accept it. The palette would "
+                "be measured at one wavelength and labelled with another. Set it by hand in "
+                "Micro-Manager's Device Property Browser, or make "
+                f"modalities.{modality}.reconstruction.wavelength_nm match the adapter."
+            )
+        log.info(
+            "LC adapter %s '%s' set from %s to %g nm (the reconstruction wavelength)",
+            LC_DEVICE,
+            lc_wavelength_property,
+            lc_adapter_wavelength_before_nm,
+            read_back,
+        )
+        lc_device_properties = instrument.device_snapshot()
     lc_adapter_wavelength_nm = _adapter_wavelength_nm(lc_device_properties)
     if lc_adapter_wavelength_nm is not None and abs(lc_adapter_wavelength_nm - wavelength_nm) > 0.5:
         warnings.append(
@@ -557,7 +614,13 @@ def run_lc_calibration(
         # The adapter converts waves to volts; no voltage curve is involved.
         "lc_device": LC_DEVICE,
         "lc_retardance_properties_waves": dict(RETARDANCE_PROPERTY),
+        # The adapter wavelength the palette was MEASURED at, and the property
+        # that holds it. QPSC's Apply writes this value ahead of each state's
+        # retardances, so the acquisition replays the palette at the same
+        # waves-to-volts conversion it was found with.
         "lc_adapter_wavelength_nm": lc_adapter_wavelength_nm,
+        "lc_adapter_wavelength_before_nm": lc_adapter_wavelength_before_nm,
+        "lc_wavelength_property": lc_wavelength_property,
         "calibrated_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
         "state_intensities": result.intensities,
         "exposures": result.exposures,

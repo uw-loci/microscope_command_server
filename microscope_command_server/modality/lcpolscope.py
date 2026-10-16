@@ -238,6 +238,7 @@ def _reconstruct_and_write(
     lc_state_readback=None,
     camera=None,
     camera_problems=None,
+    lc_adapter_wavelength_nm=None,
 ):
     """Reconstruct one tile and write retardance + orientation. Runs in the write pool."""
     from polscope_library import reconstruct
@@ -292,6 +293,8 @@ def _reconstruct_and_write(
                 shared[f"polscope.camera_{key}"] = str(camera[key])
     if camera_problems:
         shared["polscope.camera_problems"] = " | ".join(str(p) for p in camera_problems)
+    if lc_adapter_wavelength_nm is not None:
+        shared["polscope.lc_adapter_wavelength_nm"] = str(lc_adapter_wavelength_nm)
     # Resampling policy uses the shared vocabulary rather than a polscope-specific
     # key: a mask, a label map or an object-id channel needs the same protection,
     # and a reader should only have to understand one convention.
@@ -400,6 +403,7 @@ def record_state_readback(ctx, hardware, ch_entry, logger) -> None:
         _record_camera_state(ctx, hardware, logger)
         modalities = (ctx.ppm_settings or {}).get("modalities", {}) or {}
         recon = (modalities.get("lcpolscope") or {}).get("reconstruction") or {}
+        _record_adapter_wavelength(ctx, hardware, ch_entry, recon, logger)
         if recon.get("lc_calibrated_at") or recon.get("lc_calibration_file"):
             logger.info(
                 "LC states come from QPSC's LC calibration of %s (extinction ratio %s, %s)",
@@ -446,6 +450,61 @@ def record_state_readback(ctx, hardware, ch_entry, logger) -> None:
                 read,
             )
     readback[ch_id] = entry
+
+
+LC_DEVICE = "MeadowlarkLC"
+
+
+def _record_adapter_wavelength(ctx, hardware, ch_entry, recon, logger) -> None:
+    """Once per LC-PolScope run: the LC adapter's wavelength, after the first state was applied.
+
+    The palette is in the adapter's waves, converted to volts at the adapter's
+    own Wavelength property. QPSC's Apply writes the wavelength the palette was
+    measured at into every state, so after the first state is applied the
+    adapter should read that value. Compared with the reconstruction
+    wavelength: a difference scales every retardance by the ratio, with
+    nothing in the maps to show it. Stored as ``ctx._lc_adapter_wavelength_nm``
+    for the tile metadata.
+    """
+    ctx._lc_adapter_wavelength_nm = None
+    core = getattr(hardware, "core", None)
+    if core is None:
+        return
+    device = LC_DEVICE
+    for prop in ch_entry.get("device_properties", []) or []:
+        if isinstance(prop, dict) and prop.get("device"):
+            device = str(prop["device"])
+            break
+    try:
+        names = core.get_device_property_names(device)
+        try:
+            names = list(names)
+        except TypeError:
+            names = [names.get(i) for i in range(names.size())]
+        name = next((str(n) for n in names if "wavelength" in str(n).lower()), None)
+        if name is None:
+            return
+        adapter = float(core.get_property(device, name))
+    except Exception as exc:
+        logger.debug("Could not read the LC adapter wavelength: %s", exc)
+        return
+    ctx._lc_adapter_wavelength_nm = adapter
+    try:
+        reconstruction = float(recon.get("wavelength_nm"))
+    except (TypeError, ValueError):
+        reconstruction = None
+    if reconstruction is not None and abs(adapter - reconstruction) > 0.05:
+        logger.warning(
+            "LC adapter %s converts waves to volts at %g nm but the reconstruction uses %g nm: "
+            "every retardance in this run is scaled by %.4f. Recalibrate (the calibration sets the "
+            "adapter to the reconstruction wavelength) and Apply.",
+            device,
+            adapter,
+            reconstruction,
+            adapter / reconstruction,
+        )
+    else:
+        logger.info("LC adapter %s wavelength %g nm, matching the reconstruction", device, adapter)
 
 
 def _record_camera_state(ctx, hardware, logger) -> None:
@@ -547,6 +606,7 @@ def submit_tile_reconstruction(
     lc_state_readback=None,
     camera=None,
     camera_problems=None,
+    lc_adapter_wavelength_nm=None,
     logger_=None,
 ):
     """Queue birefringence reconstruction for one acquired tile.
@@ -629,6 +689,7 @@ def submit_tile_reconstruction(
         lc_state_readback=lc_state_readback,
         camera=camera,
         camera_problems=camera_problems,
+        lc_adapter_wavelength_nm=lc_adapter_wavelength_nm,
         output_path=output_path,
         filename=filename,
         pixel_size_um=pixel_size_um,
