@@ -239,6 +239,7 @@ def _reconstruct_and_write(
     camera=None,
     camera_problems=None,
     lc_adapter_wavelength_nm=None,
+    background_provenance=None,
 ):
     """Reconstruct one tile and write retardance + orientation. Runs in the write pool."""
     from polscope_library import reconstruct
@@ -303,6 +304,12 @@ def _reconstruct_and_write(
         shared["polscope.camera_problems"] = " | ".join(str(p) for p in camera_problems)
     if lc_adapter_wavelength_nm is not None:
         shared["polscope.lc_adapter_wavelength_nm"] = str(lc_adapter_wavelength_nm)
+    # Which background corrected this tile, so a tile found on its own says
+    # what it was corrected against (or that it was not).
+    if background_images and background_provenance:
+        for key in ("collected_at", "lc_calibrated_at", "frames", "folder"):
+            if background_provenance.get(key) is not None:
+                shared[f"polscope.background_{key}"] = str(background_provenance[key])
     # Resampling policy uses the shared vocabulary rather than a polscope-specific
     # key: a mask, a label map or an object-id channel needs the same protection,
     # and a reader should only have to understand one convention.
@@ -462,6 +469,76 @@ def record_state_readback(ctx, hardware, ch_entry, logger) -> None:
 
 LC_DEVICE = "MeadowlarkLC"
 
+#: Written beside the five background states by the background collector:
+#: which LC calibration, exposure, camera and adapter wavelength they were
+#: taken under. A Stokes-space background is only valid for the calibration it
+#: was collected with -- OpenPolScope requires a new one after every
+#: calibration -- so the acquisition reads this and refuses a mismatch.
+BACKGROUND_PROVENANCE_FILE = "background_provenance.json"
+
+#: Frames averaged per state when collecting a background. A single frame's
+#: shot noise is copied into every tile the background corrects; averaging N
+#: frames cuts it by sqrt(N).
+DEFAULT_BACKGROUND_FRAMES = 10
+
+
+def background_problems(provenance, recon, channel_exposures=None):
+    """``(fatal, advisory)`` reasons a collected background does not fit this run.
+
+    Fatal: no provenance (collected before it was recorded, or by hand), or a
+    different LC calibration than the one the YAML now applies. Either way the
+    background describes different polarization states from the ones being
+    acquired, and correcting with it biases every tile. Advisory: a different
+    exposure or adapter wavelength, which the normalised correction largely
+    absorbs but which is worth knowing.
+    """
+    fatal, advisory = [], []
+    if not provenance:
+        fatal.append(
+            f"the background has no {BACKGROUND_PROVENANCE_FILE}, so which LC calibration it was "
+            "taken with is unknown. Collect the background again (Utilities > Background "
+            "Collection) after calibrating."
+        )
+        return fatal, advisory
+    current = (recon or {}).get("lc_calibrated_at")
+    taken = provenance.get("lc_calibrated_at")
+    if current is not None and str(taken) != str(current):
+        fatal.append(
+            f"the background was collected under the LC calibration of {taken}, but the states "
+            f"now come from the calibration of {current}. A background is valid only for the "
+            "calibration it was collected with. Collect it again."
+        )
+    elif current is None and taken is not None:
+        fatal.append(
+            f"the background was collected under the LC calibration of {taken}, but no QPSC LC "
+            "calibration is applied now (the states come from the Micro-Manager presets)."
+        )
+    if channel_exposures:
+        taken_exposures = provenance.get("exposure_ms") or {}
+        differ = {
+            cid: (taken_exposures.get(cid), ms)
+            for cid, ms in channel_exposures.items()
+            if taken_exposures.get(cid) is not None
+            and abs(float(taken_exposures[cid]) - float(ms)) > 0.05
+        }
+        if differ:
+            advisory.append(
+                "the background was collected at a different exposure than this run "
+                + ", ".join(f"{cid} {a:g} vs {b:g} ms" for cid, (a, b) in sorted(differ.items()))
+                + "; the black level then has a different share of each state."
+            )
+    try:
+        taken_nm = float(provenance.get("lc_adapter_wavelength_nm"))
+        now_nm = float((recon or {}).get("wavelength_nm"))
+        if abs(taken_nm - now_nm) > 0.05:
+            advisory.append(
+                f"the background was collected with the LC adapter at {taken_nm:g} nm; the "
+                f"reconstruction uses {now_nm:g} nm."
+            )
+    except (TypeError, ValueError):
+        pass
+    return fatal, advisory
+
 
 def _record_adapter_wavelength(ctx, hardware, ch_entry, recon, logger) -> None:
     """Once per LC-PolScope run: the LC adapter's wavelength, after the first state was applied.
@@ -617,6 +694,7 @@ def submit_tile_reconstruction(
     camera=None,
     camera_problems=None,
     lc_adapter_wavelength_nm=None,
+    background_provenance=None,
     logger_=None,
 ):
     """Queue birefringence reconstruction for one acquired tile.
@@ -700,6 +778,7 @@ def submit_tile_reconstruction(
         camera=camera,
         camera_problems=camera_problems,
         lc_adapter_wavelength_nm=lc_adapter_wavelength_nm,
+        background_provenance=background_provenance,
         output_path=output_path,
         filename=filename,
         pixel_size_um=pixel_size_um,

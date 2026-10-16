@@ -2548,6 +2548,8 @@ class AcquisitionContext:
     background_images: dict = field(default_factory=dict)
     background_scaling_factors: dict = field(default_factory=dict)
     channel_background_images: dict = field(default_factory=dict)
+    #: LC-PolScope only: background_provenance.json of the background in use.
+    lcps_background_provenance: dict = field(default_factory=dict)
 
     # -- White balance --
     white_balance_enabled: bool = True
@@ -3439,6 +3441,7 @@ def _prepare_acquisition(
     background_scaling_factors = {}
     background_wb_coeffs = {}
     channel_background_images: Dict[str, Any] = {}
+    lcps_background_provenance: Dict[str, Any] = {}
 
     if background_correction_enabled:
         background_dir = None
@@ -3532,6 +3535,18 @@ def _prepare_acquisition(
                         )
                 except Exception as e:
                     logger.warning("Per-channel background load failed: %s", e)
+
+            # LC-PolScope: the five states are a Stokes-space background, valid only
+            # for the LC calibration they were collected under. Check before use.
+            if channel_background_images:
+                lcps_background_provenance = _check_lcpolscope_background(
+                    modality,
+                    background_dir,
+                    ppm_settings,
+                    params,
+                    channel_background_images,
+                    logger,
+                )
         else:
             logger.warning(f"Background directory not found: {background_dir}")
             logger.warning("Disabling background correction")
@@ -3842,6 +3857,7 @@ def _prepare_acquisition(
         background_images=background_images,
         background_scaling_factors=background_scaling_factors,
         channel_background_images=channel_background_images,
+        lcps_background_provenance=lcps_background_provenance,
         white_balance_enabled=white_balance_enabled,
         white_balance_per_angle=white_balance_per_angle,
         wb_mode=wb_mode,
@@ -6782,6 +6798,69 @@ def _write_derived_polscope_tile(*, filename, pixel_size_um, data, channel_name,
         writer.close()
 
 
+def _check_lcpolscope_background(
+    modality, background_dir, settings, params, channel_background_images, logger
+) -> Dict[str, Any]:
+    """LC-PolScope only: validate the loaded background states, dropping them if they do not fit.
+
+    Returns the background's provenance (empty when none is used). On a fatal
+    mismatch the backgrounds are REMOVED from ``channel_background_images`` and
+    the run reconstructs uncorrected, with an ERROR saying why: an uncorrected
+    retardance map is honest, one corrected against the wrong polarization
+    states is quietly wrong everywhere.
+    """
+    import json
+
+    from microscope_command_server.modality.lcpolscope import (
+        BACKGROUND_PROVENANCE_FILE,
+        LCPOLSCOPE_CONFIG,
+        background_problems,
+    )
+
+    if get_modality_config(modality) is not LCPOLSCOPE_CONFIG:
+        return {}
+    provenance: Dict[str, Any] = {}
+    path = Path(background_dir) / BACKGROUND_PROVENANCE_FILE
+    if path.is_file():
+        try:
+            provenance = json.loads(path.read_text())
+        except Exception as exc:
+            logger.warning("Could not read %s: %s", path, exc)
+    recon = (((settings or {}).get("modalities", {}) or {}).get("lcpolscope", {}) or {}).get(
+        "reconstruction"
+    ) or {}
+    exposures = {}
+    for cid, ms in zip(params.get("channels") or [], params.get("channel_exposures") or []):
+        try:
+            exposures[str(cid)] = float(ms)
+        except (TypeError, ValueError):
+            continue
+    fatal, advisory = background_problems(provenance, recon, exposures)
+    if fatal:
+        for message in fatal:
+            logger.error(
+                "LC-PolScope background in %s NOT used: %s This run reconstructs WITHOUT "
+                "background correction.",
+                background_dir,
+                message,
+            )
+        channel_background_images.clear()
+        return {}
+    for message in advisory:
+        logger.warning("LC-PolScope background: %s", message)
+    provenance = dict(provenance)
+    provenance["folder"] = str(background_dir)
+    logger.info(
+        "LC-PolScope background from %s: collected %s under the LC calibration of %s, %s frames "
+        "per state",
+        background_dir,
+        provenance.get("collected_at", "?"),
+        provenance.get("lc_calibrated_at", "?"),
+        provenance.get("frames", "?"),
+    )
+    return provenance
+
+
 def _uses_stokes_background(ctx) -> bool:
     """True when this acquisition corrects background in Stokes space.
 
@@ -6851,6 +6930,7 @@ def _maybe_reconstruct_lcpolscope_tile(ctx, channel_plan, channel_images, filena
             camera=getattr(ctx, "_lc_camera", None),
             camera_problems=getattr(ctx, "_lc_camera_problems", None),
             lc_adapter_wavelength_nm=getattr(ctx, "_lc_adapter_wavelength_nm", None),
+            background_provenance=ctx.lcps_background_provenance or None,
             logger_=ctx.logger,
         )
     except ReconstructionRefused as e:
@@ -8498,6 +8578,49 @@ def _collect_channel_backgrounds(
     channel_intensities = {}
     total = len(channels)
 
+    # LC-PolScope: the five states are a Stokes-space background, so they are
+    # averaged (single-frame noise would be copied into every tile), taken
+    # through a camera that is linear and not adjusting itself, and recorded
+    # against the LC calibration they belong to.
+    from microscope_command_server.modality.lcpolscope import LCPOLSCOPE_CONFIG
+
+    is_lcps = get_modality_config(modality_name) is LCPOLSCOPE_CONFIG
+    recon = (modality_cfg.get("reconstruction") or {}) if is_lcps else {}
+    frames = 1
+    lcps_state_stats: Dict[str, Any] = {}
+    camera_summary: Dict[str, Any] = {}
+    full_scale = None
+    adapter_wavelength_nm = None
+    if is_lcps:
+        from microscope_command_server.calibration.camera_checks import (
+            camera_setting_problems,
+            camera_snapshot,
+            describe_camera,
+        )
+        from microscope_command_server.modality.lcpolscope import DEFAULT_BACKGROUND_FRAMES
+
+        try:
+            frames = max(1, int(recon.get("background_frames", DEFAULT_BACKGROUND_FRAMES)))
+        except (TypeError, ValueError):
+            frames = DEFAULT_BACKGROUND_FRAMES
+        camera_summary, camera_properties = camera_snapshot(hardware)
+        bits = camera_summary.get("significant_bits", camera_summary.get("bit_depth"))
+        full_scale = float(2**bits - 1) if isinstance(bits, int) and bits > 0 else None
+        fatal, advisory = camera_setting_problems(camera_properties, bits)
+        if fatal:
+            raise RuntimeError(
+                "LC-PolScope background refused: "
+                + " ".join(fatal)
+                + f" Camera: {describe_camera(camera_summary)}."
+            )
+        for message in advisory:
+            logger.warning("LC-PolScope background camera: %s", message)
+        logger.info(
+            "LC-PolScope background: %d frames per state, camera %s",
+            frames,
+            describe_camera(camera_summary),
+        )
+
     for idx, channel_id in enumerate(channels):
         # Resolve the channel entry from the modality library and merge the
         # profile's channel_overrides (same logic as the APPLYCH handler).
@@ -8536,10 +8659,42 @@ def _collect_channel_backgrounds(
             logger.warning("Channel background: exposure write failed for '%s': %s", channel_id, e)
 
         try:
-            image, _ = hardware.snap_image()
+            if frames > 1:
+                total_frame = None
+                for _ in range(frames):
+                    frame, _ = hardware.snap_image()
+                    frame = np.asarray(frame, dtype=np.float64)
+                    total_frame = frame if total_frame is None else total_frame + frame
+                image = (total_frame / frames).astype(np.float32)
+            else:
+                image, _ = hardware.snap_image()
         except Exception as e:
             logger.error("Channel background: snap failed for '%s': %s", channel_id, e)
             continue
+
+        if is_lcps:
+            if adapter_wavelength_nm is None:
+                try:
+                    adapter_wavelength_nm = float(
+                        hardware.core.get_property("MeadowlarkLC", "Wavelength")
+                    )
+                except Exception as exc:
+                    logger.debug("Could not read the LC adapter wavelength: %s", exc)
+            arr = np.asarray(image, dtype=np.float64)
+            saturated = float(np.mean(arr >= full_scale)) if full_scale is not None else None
+            lcps_state_stats[channel_id] = {
+                "mean": round(float(arr.mean()), 3),
+                "max": float(arr.max()),
+                "saturated_fraction": saturated,
+            }
+            if saturated is not None and saturated > 0.001:
+                logger.warning(
+                    "LC-PolScope background %s: %.2f%% of pixels at the top of the camera's "
+                    "range. A clipped background corrects every tile wrongly; lower the exposure "
+                    "and collect again.",
+                    channel_id,
+                    saturated * 100,
+                )
 
         background_path = output_path / f"{channel_id}.tif"
         ome_tiff_writer(
@@ -8559,6 +8714,41 @@ def _collect_channel_backgrounds(
         if ch_intensity is not None:
             channel_intensities[channel_id] = ch_intensity
         update_progress(idx + 1, total)
+
+    if is_lcps:
+        import json
+        import time as _time
+
+        from microscope_command_server.modality.lcpolscope import BACKGROUND_PROVENANCE_FILE
+
+        provenance = {
+            "modality": modality_name,
+            "profile": profile_key,
+            "collected_at": _time.strftime("%Y-%m-%dT%H:%M:%S"),
+            "frames": frames,
+            "states": list(channel_exposures),
+            "exposure_ms": channel_exposures,
+            "state_stats": lcps_state_stats,
+            "lc_calibrated_at": recon.get("lc_calibrated_at"),
+            "lc_calibration_file": recon.get("lc_calibration_file"),
+            "lc_extinction_ratio": recon.get("lc_extinction_ratio"),
+            "wavelength_nm": recon.get("wavelength_nm"),
+            "lc_adapter_wavelength_nm": adapter_wavelength_nm,
+            "black_level": recon.get("black_level"),
+            "camera": camera_summary,
+        }
+        (output_path / BACKGROUND_PROVENANCE_FILE).write_text(json.dumps(provenance, indent=1))
+        logger.info(
+            "LC-PolScope background provenance written: calibration %s, %d frames, means %s",
+            provenance["lc_calibrated_at"],
+            frames,
+            {k: v["mean"] for k, v in lcps_state_stats.items()},
+        )
+        if not recon.get("lc_calibrated_at"):
+            logger.warning(
+                "LC-PolScope background collected with no QPSC LC calibration applied; it will "
+                "be refused once one is. Calibrate and Apply first, then collect the background."
+            )
 
     logger.info(
         "=== PER-CHANNEL BACKGROUND COLLECTION COMPLETE: %d/%d channels ===",

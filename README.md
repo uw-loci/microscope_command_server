@@ -786,6 +786,31 @@ the metadata of a derived tile:
 | Camera state | `camera` (exposure + source, bit depth, size, binning, pixel type, gain); `camera_properties` (file only); auto gain/exposure refused, gamma / 8-bit -> `unreliable` | `channels[State].exposure_ms` (set by hand, identical across states) | snapshot + the same checks on the first state; ERROR / WARNING | `polscope.camera_*`, `polscope.camera_problems` |
 | Frame counts | `signal` (extinction, leakage above black, swing contrast, grid peak, per-state saturation, projection to the acquisition exposure, `usable_exposure_ms`); `*_histograms.png` beside the file | `channels[State].exposure_ms` is what the projection is made for | -- | -- |
 
+### LC-PolScope background correction
+
+The background is a set of the five states taken on a specimen-free, slightly defocused
+field (10-20 um), as OpenPolScope does it. It is applied **per tile inside the reconstruction**,
+in Stokes space (QLIPP) or in OpenPolScope's normalised difference space
+(`reconstruction.method: openpolscope`), never by dividing the raw states, which the channel
+acquisition paths skip for this modality.
+
+- **Collect it** with QPSC's background collection for the LC-PolScope profile, after the LC
+  calibration has been applied. The collector applies each state exactly as the acquisition
+  does, at the profile exposure, averages `reconstruction.background_frames` frames per state
+  (default 10; a single frame's noise would be copied into every tile), refuses a camera on
+  auto gain or auto exposure, warns on clipped pixels, and writes `<State>.tif` (float32) plus
+  `background_provenance.json`: the LC calibration time and file, exposures, frames, adapter
+  wavelength, black level, camera summary and per-state means.
+- **At acquisition** the five states are loaded from the profile's background folder and checked
+  against the current calibration. A background with no provenance, or one collected under a
+  different LC calibration, is **not used**: an ERROR says why and the run reconstructs without
+  background correction, because an uncorrected map is honest and one corrected against the wrong
+  states is wrong everywhere. A different exposure or adapter wavelength is a WARNING. Collect a
+  new background after every calibration.
+- Derived tiles record `polscope.background_corrected` and, when corrected,
+  `polscope.background_collected_at`, `polscope.background_lc_calibrated_at`,
+  `polscope.background_frames` and `polscope.background_folder`.
+
 ### Black-level options
 
 The `--black-level` parameter controls the dark-frame correction, which improves
