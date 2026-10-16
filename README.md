@@ -733,8 +733,9 @@ The command sends multiple responses as it progresses:
    returns a palette that looks like any other (2026-10-13: frame means of 1 to 17 counts,
    a swing state 0.002 waves from extinction), so the run is stopped after the grid, about
    25 exposures in, and the message carries the counts and the camera state. Raise the
-   exposure (`--exposure-ms`) or the illumination. When the camera cannot report its bit
-   depth the check is skipped and a warning says so.
+   exposure (`--exposure-ms`) or the illumination. When the camera reports neither a bit depth
+   nor a bit count in its pixel format name (`significant_bits` is unknown), the check is skipped
+   and a warning says so.
 
 4. **`FAILED:<reason>`** -- Calibration could not complete. The reason string
    describes the error (e.g., "could not reach the liquid crystals", "polscope_library
