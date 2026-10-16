@@ -133,24 +133,9 @@ def _write_state_histograms(path: Path, states: Dict[str, dict], black_level, fu
 
 
 def _describe_camera(camera: Dict[str, Any]) -> str:
-    """One line for the log and an error message: ``Oryx, 50.0 ms (request), 12-bit, 2448x2048, binning 1``."""
-    parts = []
-    if camera.get("device"):
-        parts.append(str(camera["device"]))
-    if camera.get("exposure_ms") is not None:
-        source = camera.get("exposure_source")
-        parts.append(f"{camera['exposure_ms']:g} ms" + (f" ({source})" if source else ""))
-    if camera.get("bit_depth") is not None:
-        parts.append(f"{camera['bit_depth']}-bit")
-    if camera.get("pixel_type"):
-        parts.append(str(camera["pixel_type"]))
-    if camera.get("width") is not None and camera.get("height") is not None:
-        parts.append(f"{camera['width']}x{camera['height']}")
-    if camera.get("binning") is not None:
-        parts.append(f"binning {camera['binning']}")
-    if camera.get("gain") is not None:
-        parts.append(f"gain {camera['gain']}")
-    return ", ".join(parts) if parts else "unknown (the camera could not be asked)"
+    from .camera_checks import describe_camera
+
+    return describe_camera(camera)
 
 
 def run_lc_calibration(
@@ -205,6 +190,7 @@ def run_lc_calibration(
     except ImportError as exc:
         return fail(f"polscope_library is not installed: {exc}")
 
+    from .camera_checks import camera_setting_problems
     from .lc_instrument import LC_DEVICE, RETARDANCE_PROPERTY, MicroManagerLC
 
     recon = ((settings_yaml or {}).get("modalities", {}).get(modality, {}) or {}).get(
@@ -329,6 +315,29 @@ def run_lc_calibration(
                 "Could not restore the camera exposure to %g ms: %s", restore_exposure_ms, exc
             )
 
+    # A camera that adjusts its own gain or exposure between frames makes the
+    # search meaningless: every state settles where the camera's target puts
+    # it (2026-10-16: five states at 173 counts, the auto-gain target). That is
+    # refused outright. Gamma and 8-bit frames leave the palette findable but
+    # the acquisition quantitative in name only, so they are warned about and
+    # mark the result unreliable.
+    fatal_camera, advisory_camera = camera_setting_problems(
+        camera_properties, camera.get("bit_depth")
+    )
+    if fatal_camera:
+        failure = fail(
+            "the camera is not in a state a calibration can measure through. "
+            + " ".join(fatal_camera)
+            + f" Camera: {_describe_camera(camera)}."
+        )
+        failure["camera"] = camera
+        restore_exposure()
+        return failure
+    warnings.extend(advisory_camera)
+    reliability_issues: list = [
+        "camera gamma curve" if "gamma" in w.lower() else "8-bit frames" for w in advisory_camera
+    ]
+
     def report(step: int, total: int, stage: str, message: str) -> None:
         if progress_callback is not None:
             try:
@@ -431,6 +440,7 @@ def run_lc_calibration(
         if full_scale:
             signal["swing_contrast_fraction"] = round(contrast / full_scale, 4)
             if contrast < MIN_SWING_CONTRAST_FRACTION * full_scale:
+                reliability_issues.append("swing contrast under 1% of range")
                 warnings.append(
                     f"Swing contrast is {contrast:.1f} counts ({contrast / full_scale * 100:.2f}% of "
                     f"the camera's range), under the {MIN_SWING_CONTRAST_FRACTION * 100:.0f}% a "
@@ -448,6 +458,7 @@ def run_lc_calibration(
         clipped = [k for k, v in saturated.items() if v > MAX_STATE_SATURATED_FRACTION]
         if clipped:
             worst = max(clipped, key=lambda k: saturated[k])
+            reliability_issues.append(f"{', '.join(clipped)} clipped")
             warnings.append(
                 f"{', '.join(clipped)} had pixels at the top of the camera's range "
                 f"({saturated[worst] * 100:.2f}% in {worst}). A clipped state's mean is biased low "
@@ -509,6 +520,7 @@ def run_lc_calibration(
         # 103 above frames that never exceed 17: the number is not in these
         # units. OpenPolScope recorded its 103 in its own pixel format, and a
         # camera switched to another format (or 8-bit) has a different offset.
+        reliability_issues.append("black level above the darkest state")
         warnings.append(
             f"Black level {result.black_level:.1f} is above the darkest state measured "
             f"({state_values[0]:.1f} counts, camera {_describe_camera(camera)}). It cannot be "
@@ -529,7 +541,14 @@ def run_lc_calibration(
         "black_level": result.black_level,
         "black_level_source": black_level_origin or result.black_level_source,
         "extinction_ratio": round(result.extinction_ratio, 2),
-        "assessment": result.assessment,
+        # The ratio's band, unless something about the frames means the ratio
+        # cannot be trusted: a clipped state, a black level in the wrong units,
+        # a contrast resolved from noise, a camera that is not linear. Then the
+        # assessment says so, because "good" with a clipped State1 (2026-10-16,
+        # ER 133.8) is the wrong headline for a palette that must not be applied.
+        "assessment": "unreliable" if reliability_issues else result.assessment,
+        "assessment_by_ratio": result.assessment,
+        "reliability_issues": reliability_issues,
         # Retardance in WAVES, (LC-A, LC-B), keyed by the Micro-Manager channel
         # the state becomes. Units are in the key on purpose: this crosses the
         # socket and is written into the microscope YAML by QPSC.
@@ -593,7 +612,7 @@ def run_lc_calibration(
     log.info(
         "LC calibration done: ER %.1f (%s), %d exposures in %.1fs",
         result.extinction_ratio,
-        result.assessment,
+        payload["assessment"],
         result.exposures,
         payload["elapsed_s"],
     )
@@ -623,6 +642,9 @@ def run_lc_calibration(
     for message in warnings:
         log.warning("LC calibration: %s", message)
     report(
-        1, 1, "calibrate", f"extinction ratio {result.extinction_ratio:.1f} ({result.assessment})"
+        1,
+        1,
+        "calibrate",
+        f"extinction ratio {result.extinction_ratio:.1f} ({payload['assessment']})",
     )
     return payload

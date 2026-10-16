@@ -664,7 +664,9 @@ The command sends multiple responses as it progresses:
      "black_level": 100.0,
      "black_level_source": "request|config: modalities.lcpolscope.reconstruction.black_level|measured|assumed",
      "extinction_ratio": 150.5,
-     "assessment": "good|acceptable|poor|unmeasurable",
+     "assessment": "good|acceptable|poor|unmeasurable|unreliable",
+     "assessment_by_ratio": "good|acceptable|poor|unmeasurable",
+     "reliability_issues": [],
      "palette_waves": {
        "State0": [0.2500, 0.5000],
        "State1": [0.2200, 0.5000],
@@ -698,7 +700,7 @@ The command sends multiple responses as it progresses:
    - `wavelength_nm` is the wavelength used for reconstruction (in nanometers)
    - `wavelength_source` indicates where the wavelength came from: `"request"` (command-line parameter), `"config"` (microscope YAML), or `"fallback"` (default 546.0 nm when neither is set; a warning is logged in this case)
    - `extinction_ratio` is the quality metric; higher is better (>100 is good)
-   - `assessment` is a human-readable quality summary
+   - `assessment` is the headline. It is the ratio's band (`assessment_by_ratio`) unless something about the frames means the ratio cannot be trusted, in which case it is **`unreliable`** and `reliability_issues` names why: a clipped state, a swing contrast under 1% of range, a black level above the darkest state (wrong units), a camera gamma curve, 8-bit frames. The 2026-10-16 rig run reported `good` at ER 133.8 with State1 at 99.9% saturation under auto gain; that is now `unreliable`, and QPSC asks before applying it
    - `palette_waves` contains the retardance values (in waves) for each state and LC axis, keyed by the channel the state becomes
    - `lc_device` and `lc_retardance_properties_waves` name the Micro-Manager device and properties QPSC writes the palette to, so the property names live in one place (the server)
    - `lc_adapter_wavelength_nm` is the LC adapter's own wavelength setting, if it exposes one. The palette is in the adapter's waves, so a value that differs from `wavelength_nm` scales every retardance by the ratio; the server adds a warning saying so. The full adapter property snapshot is in the metadata file (`lc_device_properties`), not the reply
@@ -710,6 +712,18 @@ The command sends multiple responses as it progresses:
      - `histogram_path`: a PNG beside the metadata file, one log-scale pixel histogram per state (final frame), with the mean and the black level marked. For the human check a frame mean cannot make: a dim lamp, a closed diaphragm and a slide left in the beam all give a low mean and different histograms
    - `warnings` lists any issues that don't prevent use (e.g., a poor extinction ratio, or a missing wavelength configuration)
    - `metadata_path` points to a JSON file with the full trace (per-exposure details)
+
+   **Camera settings are checked before the first frame** (`camera_properties`, matched loosely by
+   name). Auto gain or auto exposure on (any `*Auto*` gain/exposure property not `Off`) is
+   **refused**: the camera steers every state to its own brightness target and the search
+   settles wherever that is (2026-10-16: five states at 173 counts, `Gain Auto: Continuous`).
+   A gamma curve (`Gamma Enabled` on, or `Gamma` not 1.0) and an 8-bit pixel format are warned
+   about and mark the result `unreliable`: the palette is findable, the acquisition is not
+   quantitative. The same check runs on the first state of every LC-PolScope **acquisition**
+   (`modality/lcpolscope.py`): fatal cases log an ERROR, the rest a WARNING, and every derived
+   tile carries `polscope.camera_exposure_ms`, `polscope.camera_bit_depth`,
+   `polscope.camera_pixel_type`, `polscope.camera_gain`, `polscope.camera_binning`,
+   `polscope.camera_device` and, when anything was wrong, `polscope.camera_problems`.
 
    The reply is written with `success: false` and an `error` instead when the field is
    **too dark to calibrate**: the brightest frame of the extinction grid averaged less than a
@@ -765,7 +779,7 @@ the metadata of a derived tile:
 | Black level, counts | `black_level` + `black_level_source` (`--black-level`, else `reconstruction.black_level`, else a dark frame, else assumed 0) | `reconstruction.black_level` (set by hand) | -- | `polscope.black_level` |
 | Provenance | `calibrated_at`, `extinction_ratio`, `metadata_path` | `reconstruction.lc_calibrated_at`, `lc_extinction_ratio`, `lc_calibration_file` | logged at the first state of every run, or a WARNING that no calibration was applied | `polscope.lc_calibrated_at`, `polscope.lc_extinction_ratio`, `polscope.lc_calibration_file` |
 | LC adapter state | `lc_device_properties` (file only) | -- | -- | -- |
-| Camera state | `camera` (exposure + source, bit depth, size, binning, pixel type, gain); `camera_properties` (file only) | `channels[State].exposure_ms` (set by hand, identical across states) | -- | -- |
+| Camera state | `camera` (exposure + source, bit depth, size, binning, pixel type, gain); `camera_properties` (file only); auto gain/exposure refused, gamma / 8-bit -> `unreliable` | `channels[State].exposure_ms` (set by hand, identical across states) | snapshot + the same checks on the first state; ERROR / WARNING | `polscope.camera_*`, `polscope.camera_problems` |
 | Frame counts | `signal` (extinction, leakage above black, swing contrast, grid peak, per-state saturation, projection to the acquisition exposure, `usable_exposure_ms`); `*_histograms.png` beside the file | `channels[State].exposure_ms` is what the projection is made for | -- | -- |
 
 ### Black-level options

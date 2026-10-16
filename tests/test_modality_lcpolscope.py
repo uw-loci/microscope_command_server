@@ -792,3 +792,125 @@ def test_metadata_records_which_algorithm_made_the_file(
         assert meta["polscope.black_level"] == expect_black
     assert "OpenPolScope" in RECONSTRUCTION_LABELS["openpolscope"]
     assert "QLIPP" in RECONSTRUCTION_LABELS["qlipp"]
+
+
+def test_metadata_carries_the_camera_state_and_its_problems(tmp_path):
+    """A tile reconstructed under auto gain or a gamma curve says so about itself."""
+    import numpy as np
+
+    pytest.importorskip("polscope_library")
+    from microscope_command_server.modality.lcpolscope import RETARDANCE_DIR
+
+    seen = {}
+
+    def writer(*, filename, pixel_size_um, data, channel_name, map_annotations):
+        seen[filename.rsplit("/", 2)[-2]] = map_annotations
+
+    _, pool = _submit(
+        channel_images={
+            f"State{i}": np.full((4, 4), v, dtype=float)
+            for i, v in enumerate((110.0, 160.0, 155.0, 150.0, 145.0))
+        },
+        reconstruction_cfg={"swing_waves": 0.03, "wavelength_nm": 549, "scheme": "5-State"},
+        output_path=tmp_path,
+        ome_writer=writer,
+        camera={"exposure_ms": 50.0, "bit_depth": 8, "pixel_type": "Mono8", "device": "Oryx"},
+        camera_problems=["Gain Auto is Continuous: ...", "Gamma Enabled is 1: ..."],
+    )
+    fn, kwargs = pool.submissions[0]
+    fn(**kwargs)
+    meta = seen[RETARDANCE_DIR]
+    assert meta["polscope.camera_exposure_ms"] == "50.0"
+    assert meta["polscope.camera_bit_depth"] == "8"
+    assert meta["polscope.camera_pixel_type"] == "Mono8"
+    assert "Gain Auto" in meta["polscope.camera_problems"]
+    assert "Gamma" in meta["polscope.camera_problems"]
+
+
+def test_a_clean_camera_leaves_no_problems_key(tmp_path):
+    import numpy as np
+
+    pytest.importorskip("polscope_library")
+    from microscope_command_server.modality.lcpolscope import RETARDANCE_DIR
+
+    seen = {}
+
+    def writer(*, filename, pixel_size_um, data, channel_name, map_annotations):
+        seen[filename.rsplit("/", 2)[-2]] = map_annotations
+
+    _, pool = _submit(
+        channel_images={
+            f"State{i}": np.full((4, 4), v, dtype=float)
+            for i, v in enumerate((110.0, 160.0, 155.0, 150.0, 145.0))
+        },
+        reconstruction_cfg={"swing_waves": 0.03, "wavelength_nm": 549, "scheme": "5-State"},
+        output_path=tmp_path,
+        ome_writer=writer,
+        camera={"exposure_ms": 50.0, "bit_depth": 12},
+        camera_problems=[],
+    )
+    fn, kwargs = pool.submissions[0]
+    fn(**kwargs)
+    assert "polscope.camera_problems" not in seen[RETARDANCE_DIR]
+    assert seen[RETARDANCE_DIR]["polscope.camera_bit_depth"] == "12"
+
+
+def test_the_first_state_of_a_run_records_the_camera_and_logs_auto_gain_as_an_error():
+    """The calibration refuses a camera on auto gain; an acquisition is already
+    under way for an operator who may not be watching, so it shouts and records."""
+    import logging
+    from types import SimpleNamespace
+
+    from microscope_command_server.modality.lcpolscope import record_state_readback
+
+    class Core:
+        props = {
+            ("Cam", "Gain Auto"): "Continuous",
+            ("Cam", "Gamma Enabled"): "1",
+            ("Cam", "PixelFormat"): "Mono8",
+            ("MeadowlarkLC", "Retardance LC-A [in waves]"): "0.25",
+        }
+
+        def get_camera_device(self):
+            return "Cam"
+
+        def get_image_bit_depth(self):
+            return 8
+
+        def get_device_property_names(self, device):
+            return [p for (d, p) in self.props if d == device]
+
+        def get_property(self, device, prop):
+            return self.props[(device, prop)]
+
+    hardware = SimpleNamespace(
+        core=Core(), get_exposure=lambda: 50.0, get_camera_name=lambda: "Cam"
+    )
+    ctx = SimpleNamespace(modality="lcpolscope", ppm_settings={})
+    records = []
+
+    class Log(logging.Logger):
+        def handle(self, record):
+            records.append(record)
+
+    log = Log("test")
+    log.setLevel(logging.DEBUG)
+    ch_entry = {
+        "id": "State0",
+        "device_properties": [
+            {"device": "MeadowlarkLC", "property": "Retardance LC-A [in waves]", "value": 0.25}
+        ],
+    }
+    record_state_readback(ctx, hardware, ch_entry, log)
+
+    assert ctx._lc_camera["bit_depth"] == 8 and ctx._lc_camera["pixel_type"] == "Mono8"
+    problems = ctx._lc_camera_problems
+    assert any("Gain Auto" in p for p in problems)
+    assert any("Gamma" in p for p in problems)
+    assert any("8-bit" in p for p in problems)
+    errors = [r.getMessage() for r in records if r.levelno == logging.ERROR]
+    assert any("Gain Auto" in m and "NOT comparable" in m for m in errors)
+    # A second state does not repeat the camera check.
+    before = len(records)
+    record_state_readback(ctx, hardware, dict(ch_entry, id="State1"), log)
+    assert not any("camera" in r.getMessage().lower() for r in records[before:])

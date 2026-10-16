@@ -364,7 +364,9 @@ class TestWorkflow:
             output_folder=str(tmp_path),
         )
         assert result["success"] is True
-        assert result["assessment"] == "unmeasurable"
+        assert result["assessment_by_ratio"] == "unmeasurable"
+        assert result["assessment"] == "unreliable"
+        assert "black level above the darkest state" in result["reliability_issues"]
         assert any(
             "above the darkest state" in w and "pixel format" in w for w in result["warnings"]
         )
@@ -478,6 +480,51 @@ class TestWorkflow:
             == result["metadata_path"].split("/")[-1].replace(".json", "") + "_histograms"
         )
 
+    def test_auto_gain_is_refused_before_the_search(self, tmp_path):
+        """2026-10-16: Gain Auto Continuous; five states at 173 counts, the
+        camera's target; "good". The frames were the camera's doing."""
+        hw = FakeHardware()
+        hw.core.properties[("FakeCam", "GainAuto")] = "Continuous"
+        result = run_lc_calibration(
+            hw, self._yaml(), output_folder=str(tmp_path), black_level=102.0, exposure_ms=20.0
+        )
+        assert result["success"] is False
+        assert "GainAuto" in result["error"] and "Off" in result["error"]
+        assert "camera" in result
+        assert hw.exposure == 50.0, "exposure restored on this failure path too"
+        assert not any(
+            w[1] == "Retardance LC-A [in waves]" for w in hw.core.writes
+        ), "refused before moving a crystal"
+
+    def test_gamma_and_8_bit_mark_the_result_unreliable_without_refusing(self, tmp_path):
+        hw = FakeHardware(core=FakeCore(bit_depth=8), transmittance=200.0, black_level=2.0)
+        hw.core.properties[("FakeCam", "Gamma Enabled")] = "1"
+        result = run_lc_calibration(hw, self._yaml(), output_folder=str(tmp_path), black_level=2.0)
+        assert result["success"] is True
+        assert result["assessment"] == "unreliable"
+        assert result["assessment_by_ratio"] in ("good", "acceptable", "poor", "unmeasurable")
+        assert "camera gamma curve" in result["reliability_issues"]
+        assert "8-bit frames" in result["reliability_issues"]
+
+    def test_a_clipped_state_makes_the_assessment_unreliable_not_good(self, tmp_path):
+        """The 2026-10-16 headline: "Good. This calibration is ready to use."
+        over a State1 that was 99.9% saturated."""
+        result = run_lc_calibration(
+            FakeHardware(transmittance=500_000.0, black_level=5.0),
+            self._yaml(),
+            output_folder=str(tmp_path),
+            black_level=5.0,
+        )
+        assert result["assessment"] == "unreliable"
+        assert any("clipped" in issue for issue in result["reliability_issues"])
+
+    def test_a_clean_run_keeps_the_ratio_band_as_its_assessment(self, tmp_path):
+        result = run_lc_calibration(
+            FakeHardware(), self._yaml(), output_folder=str(tmp_path), black_level=102.0
+        )
+        assert result["assessment"] == result["assessment_by_ratio"] == "good"
+        assert result["reliability_issues"] == []
+
     def test_an_unknown_bit_depth_disables_the_guard_and_says_so(self, tmp_path):
         class NoDepthCore(FakeCore):
             def get_image_bit_depth(self):
@@ -523,7 +570,10 @@ class TestWorkflow:
             hw, self._yaml(), output_folder=str(tmp_path), black_level=102.0
         )
         assert result["success"] is True, "a poor calibration is still a result"
-        assert result["assessment"] in ("poor", "unmeasurable")
+        assert result["assessment_by_ratio"] in ("poor", "unmeasurable")
+        # Flat frames have no swing contrast, one of the things that makes the
+        # ratio untrustworthy, so the headline says so rather than "poor".
+        assert result["assessment"] == "unreliable"
 
     def test_progress_callback_failures_do_not_kill_the_run(self, tmp_path):
         def bad(*_a):

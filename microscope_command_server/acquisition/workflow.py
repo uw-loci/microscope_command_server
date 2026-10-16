@@ -6848,6 +6848,8 @@ def _maybe_reconstruct_lcpolscope_tile(ctx, channel_plan, channel_images, filena
             raw_tiles_flat_fielded=False,
             background_images=ctx.channel_background_images or None,
             lc_state_readback=getattr(ctx, "_lc_state_readback", None),
+            camera=getattr(ctx, "_lc_camera", None),
+            camera_problems=getattr(ctx, "_lc_camera_problems", None),
             logger_=ctx.logger,
         )
     except ReconstructionRefused as e:

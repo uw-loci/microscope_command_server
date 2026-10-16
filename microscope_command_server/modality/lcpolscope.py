@@ -236,6 +236,8 @@ def _reconstruct_and_write(
     tile_config_source=None,
     state_order=None,
     lc_state_readback=None,
+    camera=None,
+    camera_problems=None,
 ):
     """Reconstruct one tile and write retardance + orientation. Runs in the write pool."""
     from polscope_library import reconstruct
@@ -280,6 +282,16 @@ def _reconstruct_and_write(
             if all(v["agrees"] for e in lc_state_readback.values() for v in e.values())
             else "false"
         )
+    # The camera as the states were taken, and anything about its settings
+    # that makes the counts non-linear or non-comparable (auto gain, gamma,
+    # 8-bit). A tile reconstructed under those carries the fact with it; the
+    # 2026-10-16 rig had Gain Auto Continuous and Gamma 0.8 enabled.
+    if camera:
+        for key in ("exposure_ms", "bit_depth", "pixel_type", "gain", "binning", "device"):
+            if camera.get(key) is not None:
+                shared[f"polscope.camera_{key}"] = str(camera[key])
+    if camera_problems:
+        shared["polscope.camera_problems"] = " | ".join(str(p) for p in camera_problems)
     # Resampling policy uses the shared vocabulary rather than a polscope-specific
     # key: a mask, a label map or an object-id channel needs the same protection,
     # and a reader should only have to understand one convention.
@@ -385,6 +397,7 @@ def record_state_readback(ctx, hardware, ch_entry, logger) -> None:
     if readback is None:
         readback = {}
         ctx._lc_state_readback = readback
+        _record_camera_state(ctx, hardware, logger)
         modalities = (ctx.ppm_settings or {}).get("modalities", {}) or {}
         recon = (modalities.get("lcpolscope") or {}).get("reconstruction") or {}
         if recon.get("lc_calibrated_at") or recon.get("lc_calibration_file"):
@@ -433,6 +446,45 @@ def record_state_readback(ctx, hardware, ch_entry, logger) -> None:
                 read,
             )
     readback[ch_id] = entry
+
+
+def _record_camera_state(ctx, hardware, logger) -> None:
+    """Once per LC-PolScope run: the camera's settings, and what is wrong with them.
+
+    The Stokes inversion needs five linear, mutually comparable intensities. A
+    camera adjusting its own gain between states, or applying a gamma curve,
+    produces data that reconstructs without complaint into numbers that mean
+    nothing. The calibration refuses such a camera; the acquisition has already
+    been asked for by an operator who may not be watching, so it logs an ERROR
+    for the fatal cases, a WARNING for the rest, and writes both into every
+    derived tile's metadata (``polscope.camera_problems``) so the data says so
+    about itself. Stored on the context as ``_lc_camera`` and
+    ``_lc_camera_problems`` for :func:`submit_tile_reconstruction`.
+    """
+    from microscope_command_server.calibration.camera_checks import (
+        camera_setting_problems,
+        camera_snapshot,
+        describe_camera,
+    )
+
+    try:
+        summary, properties = camera_snapshot(hardware)
+    except Exception as exc:
+        logger.warning("Could not read the camera state for the LC-PolScope run: %s", exc)
+        ctx._lc_camera, ctx._lc_camera_problems = {}, []
+        return
+    fatal, advisory = camera_setting_problems(properties, summary.get("bit_depth"))
+    logger.info("LC-PolScope camera: %s", describe_camera(summary))
+    for message in fatal:
+        logger.error(
+            "LC-PolScope acquisition camera: %s The states of this run are NOT comparable and "
+            "the reconstruction from them is meaningless.",
+            message,
+        )
+    for message in advisory:
+        logger.warning("LC-PolScope acquisition camera: %s", message)
+    ctx._lc_camera = summary
+    ctx._lc_camera_problems = fatal + advisory
 
 
 def lc_readback_summary(lc_state_readback) -> str:
@@ -493,6 +545,8 @@ def submit_tile_reconstruction(
     raw_tiles_flat_fielded=False,
     background_images=None,
     lc_state_readback=None,
+    camera=None,
+    camera_problems=None,
     logger_=None,
 ):
     """Queue birefringence reconstruction for one acquired tile.
@@ -573,6 +627,8 @@ def submit_tile_reconstruction(
         reconstruction_cfg=reconstruction_cfg,
         background_images=ordered_background,
         lc_state_readback=lc_state_readback,
+        camera=camera,
+        camera_problems=camera_problems,
         output_path=output_path,
         filename=filename,
         pixel_size_um=pixel_size_um,
