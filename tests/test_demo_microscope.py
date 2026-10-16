@@ -328,3 +328,74 @@ class TestVirtualSlide:
     def test_beyond_the_slide_is_glass(self):
         slide = VirtualSlide()
         assert slide.tissue_fraction(30000.0, 0.0, 333.0) == 0.0
+
+
+class TestAutofocusValidationCancel:
+    """The Validate AF test (TESTAFV) stops on the client's Cancel and leaves Z where it was.
+
+    The acquisition wizard's Cancel sends ABORTAF; the handler turns it into should_abort.
+    Run on the demo hardware so the real sweep and the real full autofocus are what stop.
+    """
+
+    @staticmethod
+    def _run(hardware, tmp_path, should_abort):
+        from microscope_control.autofocus.test import test_autofocus_validation
+
+        return test_autofocus_validation(
+            hardware=hardware,
+            config_manager=None,
+            yaml_file_path=str(tmp_path / "config_Demo.yml"),  # no sidecar: built-in defaults
+            objective="DEMO_OBJECTIVE_10X",
+            should_abort=should_abort,
+        )
+
+    @staticmethod
+    def _focus_at(core, z):
+        core.set_position(z)
+        core.wait_for_device(core.get_focus_device())
+
+    @staticmethod
+    def _z_after(core):
+        core.wait_for_device(core.get_focus_device())
+        return core.get_position()
+
+    @staticmethod
+    def _abort_after(n):
+        calls = {"n": 0}
+
+        def should_abort():
+            calls["n"] += 1
+            return calls["n"] > n
+
+        return should_abort, calls
+
+    def test_uninterrupted_validation_completes(self, hardware, core, tmp_path):
+        self._focus_at(core, 4.0)
+        result = self._run(hardware, tmp_path, lambda: False)
+        assert result["success"] is True
+        assert result["cancelled"] is False
+        assert self._z_after(core) == pytest.approx(4.0, abs=0.01)
+        assert float(result["ground_truth_z"]) == pytest.approx(4.0, abs=0.01)
+
+    def test_cancel_during_the_sweep_returns_z_and_reports_a_cancel(self, hardware, core, tmp_path):
+        self._focus_at(core, 4.0)
+        should_abort, _ = self._abort_after(2)
+        result = self._run(hardware, tmp_path, should_abort)
+        assert result["cancelled"] is True
+        assert result["success"] is False
+        assert result["recovery_z"] == "N/A", "phase 2 never started"
+        assert self._z_after(core) == pytest.approx(4.0, abs=0.01)
+        assert float(result["ground_truth_z"]) == pytest.approx(4.0, abs=0.01)
+
+    def test_cancel_during_the_full_autofocus_returns_z(self, hardware, core, tmp_path):
+        self._focus_at(core, 4.0)
+        # The sweep polls once per step (6 by default) and once more before phase 2,
+        # so a cancel after 9 polls lands inside the full autofocus.
+        should_abort, calls = self._abort_after(9)
+        result = self._run(hardware, tmp_path, should_abort)
+        assert result["cancelled"] is True
+        assert result["sweep_z"] != "N/A", "phase 1 finished"
+        assert result["recovery_z"] == "N/A", "phase 2 did not finish"
+        assert calls["n"] > 9
+        assert self._z_after(core) == pytest.approx(4.0, abs=0.01)
+        assert float(result["ground_truth_z"]) == pytest.approx(4.0, abs=0.01)
