@@ -352,8 +352,9 @@ def run_lc_calibration(
     camera, camera_properties = instrument.camera_snapshot()
     camera["exposure_source"] = exposure_source
     full_scale: Optional[float] = None
-    if isinstance(camera.get("bit_depth"), int) and camera["bit_depth"] > 0:
-        full_scale = float(2 ** camera["bit_depth"] - 1)
+    bits = camera.get("significant_bits", camera.get("bit_depth"))
+    if isinstance(bits, int) and bits > 0:
+        full_scale = float(2**bits - 1)
     instrument.full_scale = full_scale
     log.info("LC calibration camera: %s", _describe_camera(camera))
     if full_scale is None:
@@ -379,7 +380,7 @@ def run_lc_calibration(
     # the acquisition quantitative in name only, so they are warned about and
     # mark the result unreliable.
     fatal_camera, advisory_camera = camera_setting_problems(
-        camera_properties, camera.get("bit_depth")
+        camera_properties, camera.get("significant_bits", camera.get("bit_depth"))
     )
     if fatal_camera:
         failure = fail(

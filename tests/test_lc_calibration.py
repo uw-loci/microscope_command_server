@@ -355,6 +355,18 @@ class TestWorkflow:
         assert written["camera_properties"]["PixelType"] == "12bit"
         assert "camera_properties" not in result, "every camera property stays in the file"
 
+    def test_a_12_bit_packed_format_reported_as_16_bit_uses_a_4095_full_scale(self, tmp_path):
+        """Mono12p in a 16-bit buffer: full scale is 4095, or the too-dark guard
+        refuses every run and saturation is never seen."""
+        core = FakeCore(bit_depth=16)
+        core.properties[("FakeCam", "PixelType")] = "Mono12p"
+        result = run_lc_calibration(
+            FakeHardware(core=core), self._yaml(), output_folder=str(tmp_path), black_level=102.0
+        )
+        assert result["success"] is True
+        assert result["camera"]["significant_bits"] == 12
+        assert result["signal"]["full_scale"] == 4095.0
+
     def test_a_requested_exposure_is_set_recorded_and_restored(self, tmp_path):
         hw = FakeHardware()
         result = run_lc_calibration(
@@ -554,8 +566,12 @@ class TestWorkflow:
             def get_image_bit_depth(self):
                 raise RuntimeError("no camera")
 
+        core = NoDepthCore()
+        # Nor does the pixel format name say: nothing knows the range.
+        del core.properties[("FakeCam", "PixelType")]
+
         result = run_lc_calibration(
-            FakeHardware(core=NoDepthCore(), transmittance=15.0, black_level=1.0),
+            FakeHardware(core=core, transmittance=15.0, black_level=1.0),
             self._yaml(),
             output_folder=str(tmp_path),
             black_level=1.0,

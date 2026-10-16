@@ -48,3 +48,17 @@ def test_gamma_without_an_enable_flag_is_judged_by_its_value():
 
 def test_a_camera_without_these_properties_reports_nothing():
     assert camera_setting_problems({"Binning": "1"}, None) == ([], [])
+
+
+def test_significant_bits_takes_the_smaller_of_the_adapter_and_the_pixel_format():
+    from microscope_command_server.calibration.camera_checks import significant_bits
+
+    # Mono12p unpacked into a 16-bit buffer: the values still run 0 to 4095.
+    assert significant_bits(16, "Mono12p") == 12
+    assert significant_bits(16, "Mono12Packed") == 12
+    assert significant_bits(16, "Mono16") == 16
+    assert significant_bits(8, "Mono8") == 8
+    assert significant_bits(12, None) == 12
+    assert significant_bits(None, "Mono12p") == 12
+    assert significant_bits(16, "Raw") == 16
+    assert significant_bits(None, None) is None

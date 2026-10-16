@@ -288,7 +288,15 @@ def _reconstruct_and_write(
     # 8-bit). A tile reconstructed under those carries the fact with it; the
     # 2026-10-16 rig had Gain Auto Continuous and Gamma 0.8 enabled.
     if camera:
-        for key in ("exposure_ms", "bit_depth", "pixel_type", "gain", "binning", "device"):
+        for key in (
+            "exposure_ms",
+            "bit_depth",
+            "significant_bits",
+            "pixel_type",
+            "gain",
+            "binning",
+            "device",
+        ):
             if camera.get(key) is not None:
                 shared[f"polscope.camera_{key}"] = str(camera[key])
     if camera_problems:
@@ -532,7 +540,9 @@ def _record_camera_state(ctx, hardware, logger) -> None:
         logger.warning("Could not read the camera state for the LC-PolScope run: %s", exc)
         ctx._lc_camera, ctx._lc_camera_problems = {}, []
         return
-    fatal, advisory = camera_setting_problems(properties, summary.get("bit_depth"))
+    fatal, advisory = camera_setting_problems(
+        properties, summary.get("significant_bits", summary.get("bit_depth"))
+    )
     logger.info("LC-PolScope camera: %s", describe_camera(summary))
     for message in fatal:
         logger.error(

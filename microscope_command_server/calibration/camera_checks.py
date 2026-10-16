@@ -20,7 +20,7 @@ from typing import Dict, List, Optional, Tuple
 _OFF_VALUES = {"off", "0", "false", "none", "", "disabled"}
 _ON_VALUES = {"1", "on", "true", "enabled"}
 
-__all__ = ["camera_setting_problems", "camera_snapshot", "describe_camera"]
+__all__ = ["camera_setting_problems", "camera_snapshot", "describe_camera", "significant_bits"]
 
 logger = logging.getLogger(__name__)
 
@@ -97,7 +97,33 @@ def camera_snapshot(hardware) -> Tuple[Dict[str, object], Dict[str, str]]:
                 if any(needle in lowered for needle in needles) and "auto" not in lowered:
                     summary[key] = value
                     break
+    bits = significant_bits(summary.get("bit_depth"), summary.get("pixel_type"))
+    if bits is not None:
+        summary["significant_bits"] = bits
     return summary, properties
+
+
+def significant_bits(bit_depth: Optional[int], pixel_type: Optional[str]) -> Optional[int]:
+    """How many bits of each pixel carry data: the smaller of Micro-Manager's bit depth
+    and the number in the pixel format's name (``Mono12p`` -> 12, ``Mono16`` -> 16).
+
+    The two can disagree. An adapter may report a 12-bit packed format as 16-bit
+    because it unpacks into a 16-bit buffer, while the values still run 0 to 4095;
+    taking the 16 would put full scale at 65535, so the too-dark guard would refuse
+    every run and a clipped state would never be seen. A name with no number
+    leaves the bit depth as it is.
+    """
+    import re
+
+    from_name = None
+    if pixel_type:
+        match = re.search(r"(\d+)", str(pixel_type))
+        if match:
+            value = int(match.group(1))
+            if 1 <= value <= 32:
+                from_name = value
+    candidates = [b for b in (bit_depth, from_name) if isinstance(b, int) and b > 0]
+    return min(candidates) if candidates else None
 
 
 def describe_camera(camera: Dict[str, object]) -> str:
@@ -108,8 +134,9 @@ def describe_camera(camera: Dict[str, object]) -> str:
     if camera.get("exposure_ms") is not None:
         source = camera.get("exposure_source")
         parts.append(f"{camera['exposure_ms']:g} ms" + (f" ({source})" if source else ""))
-    if camera.get("bit_depth") is not None:
-        parts.append(f"{camera['bit_depth']}-bit")
+    bits = camera.get("significant_bits", camera.get("bit_depth"))
+    if bits is not None:
+        parts.append(f"{bits}-bit")
     if camera.get("pixel_type"):
         parts.append(str(camera["pixel_type"]))
     if camera.get("width") is not None and camera.get("height") is not None:
