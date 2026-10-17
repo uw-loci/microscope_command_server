@@ -2074,3 +2074,61 @@ def handle_lccalib(conn, client, hardware, settings, **kwargs):
     except Exception as e:
         logger.exception("LCCALIB raised")
         conn.sendall(f"FAILED:{str(e)}".encode())
+
+
+def lcpolscope_readiness(hardware, settings) -> dict:
+    """What the LC-PolScope acquisition panel shows before a run: the camera as it is
+    set, what is wrong with it, and whether the LC adapter converts at the
+    reconstruction's wavelength. Read-only; moves nothing."""
+    from microscope_command_server.calibration.camera_checks import (
+        camera_setting_problems,
+        camera_snapshot,
+        describe_camera,
+    )
+
+    report: dict = {"camera": {}, "camera_fatal": [], "camera_advisory": []}
+    try:
+        summary, properties = camera_snapshot(hardware)
+        fatal, advisory = camera_setting_problems(
+            properties, summary.get("significant_bits", summary.get("bit_depth"))
+        )
+        report.update(
+            camera=summary,
+            camera_text=describe_camera(summary),
+            camera_fatal=fatal,
+            camera_advisory=advisory,
+        )
+    except Exception as exc:
+        report["camera_error"] = str(exc)
+    recon = (((settings or {}).get("modalities", {}) or {}).get("lcpolscope", {}) or {}).get(
+        "reconstruction"
+    ) or {}
+    report["reconstruction_wavelength_nm"] = recon.get("wavelength_nm")
+    core = getattr(hardware, "core", None)
+    try:
+        report["adapter_wavelength_nm"] = (
+            float(core.get_property("MeadowlarkLC", "Wavelength")) if core is not None else None
+        )
+    except Exception as exc:
+        report["adapter_wavelength_nm"] = None
+        report["adapter_error"] = str(exc)
+    return report
+
+
+def handle_lcready(conn, client, hardware, settings, **kwargs):
+    """LC-PolScope readiness report for QPSC's acquisition panel (see lcpolscope_readiness).
+
+    Reply: 4-byte big-endian length + UTF-8 JSON. Never fails the connection: an
+    error becomes a field in the report.
+    """
+    import json
+
+    active = getattr(hardware, "settings", None) or settings
+    try:
+        report = lcpolscope_readiness(hardware, active)
+    except Exception as exc:  # the report is advisory; never take the socket down
+        logger.error("LCREADY failed: %s", exc)
+        report = {"error": str(exc)}
+    data = json.dumps(report).encode("utf-8")
+    conn.sendall(struct.pack("!I", len(data)))
+    conn.sendall(data)

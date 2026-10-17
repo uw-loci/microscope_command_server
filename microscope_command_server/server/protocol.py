@@ -73,6 +73,10 @@ class ExtendedCommand:
     PPMBIREF = b"ppmbiref"  # PPM Birefringence Maximization Test
     SBCALIB = b"sbcalib_"  # Sunburst Calibration for hue-to-angle mapping
     LCCALIB = b"lccalib_"  # LC-PolScope liquid-crystal voltage/retardance calibration
+    # LC-PolScope readiness: camera settings and their problems, and the LC
+    # adapter's wavelength against the reconstruction's. No payload. Reply:
+    # 4-byte big-endian length + that many UTF-8 bytes of JSON.
+    LCREADY = b"lcready_"
 
     # ---- JAI-Specific: White Balance Calibration Commands ----
     # These commands require a JAI trilinear color camera with per-channel

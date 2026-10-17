@@ -62,3 +62,46 @@ def test_significant_bits_takes_the_smaller_of_the_adapter_and_the_pixel_format(
     assert significant_bits(None, "Mono12p") == 12
     assert significant_bits(16, "Raw") == 16
     assert significant_bits(None, None) is None
+
+
+def test_lcready_reports_camera_problems_and_the_adapter_wavelength():
+    import json
+    import struct
+    from types import SimpleNamespace
+
+    from microscope_command_server.server.handlers.calibration import handle_lcready
+
+    class Core:
+        props = {
+            ("Cam", "Gain Auto"): "Continuous",
+            ("Cam", "Pixel Format"): "Mono12p",
+            ("MeadowlarkLC", "Wavelength"): "546.0000",
+        }
+
+        def get_camera_device(self):
+            return "Cam"
+
+        def get_image_bit_depth(self):
+            return 16
+
+        def get_device_property_names(self, device):
+            return [p for (d, p) in self.props if d == device]
+
+        def get_property(self, device, prop):
+            return self.props[(device, prop)]
+
+    sent = []
+    conn = SimpleNamespace(sendall=sent.append)
+    hardware = SimpleNamespace(
+        core=Core(),
+        get_exposure=lambda: 33.0,
+        settings={"modalities": {"lcpolscope": {"reconstruction": {"wavelength_nm": 549}}}},
+    )
+    handle_lcready(conn, SimpleNamespace(addr="t"), hardware, None)
+    (length,) = struct.unpack("!I", sent[0])
+    report = json.loads(sent[1].decode("utf-8"))
+    assert length == len(sent[1])
+    assert report["camera"]["significant_bits"] == 12, "Mono12p in a 16-bit buffer"
+    assert any("Gain Auto" in p for p in report["camera_fatal"])
+    assert report["adapter_wavelength_nm"] == 546.0
+    assert report["reconstruction_wavelength_nm"] == 549

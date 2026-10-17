@@ -582,6 +582,14 @@ Omitting the `modalities.lcpolscope.reconstruction` block disables
 reconstruction. Raw state images are still acquired and saved normally, and
 reconstruction can be performed offline using the `polscope-library` directly.
 
+## LC-PolScope readiness (LCREADY)
+
+No payload. Replies with a 4-byte big-endian length and UTF-8 JSON: `camera` (the summary
+`camera_snapshot` takes), `camera_text`, `camera_fatal` (auto gain or exposure on),
+`camera_advisory` (gamma, 8-bit), `adapter_wavelength_nm` and `reconstruction_wavelength_nm`.
+Read-only. QPSC shows it in the LC-PolScope acquisition panel before a run; the same camera
+checks also run at the start of the calibration and on the first state of every acquisition.
+
 ## LC-PolScope Calibration (LCCALIB)
 
 The `LCCALIB` command calibrates the liquid crystals on an LC-PolScope system,
