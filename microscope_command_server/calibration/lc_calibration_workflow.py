@@ -144,6 +144,70 @@ def _write_state_histograms(path: Path, states: Dict[str, dict], black_level, fu
     plt.close(fig)
 
 
+#: Fractions of the calibration exposure the black-level series is taken at, and
+#: frames averaged at each. Extinction is the darkest state, so even the full
+#: exposure is far from clipping.
+BLACK_LEVEL_SERIES_FRACTIONS = (0.25, 0.5, 0.75, 1.0)
+BLACK_LEVEL_SERIES_FRAMES = 3
+#: Below this the fit is not a straight line, and the camera is not linear.
+BLACK_LEVEL_MIN_R_SQUARED = 0.999
+
+
+def _estimate_black_level(instrument, hardware, result, camera, log) -> Optional[Dict[str, Any]]:
+    """Hold the crystals at extinction, snap an exposure series, fit the offset.
+
+    Never fails the calibration: any error is logged and the estimate is absent.
+    The exposure is put back to what it was at the start of the series.
+    """
+    from .camera_checks import black_level_from_exposure_series
+
+    base = camera.get("exposure_ms")
+    if not base:
+        return None
+    extinction = next(iter(result.palette_waves.values()), None)
+    if extinction is None:
+        return None
+    try:
+        before = float(hardware.get_exposure())
+    except Exception:
+        before = float(base)
+    exposures, means = [], []
+    # The per-frame record is matched one-to-one against the search trace for the
+    # per-state saturation check; the series frames are not part of the search.
+    frames_before = len(getattr(instrument, "frames", []))
+    try:
+        instrument.set_retardance("LCA", float(extinction[0]))
+        instrument.set_retardance("LCB", float(extinction[1]))
+        for fraction in BLACK_LEVEL_SERIES_FRACTIONS:
+            ms = float(base) * fraction
+            hardware.set_exposure(ms)
+            total = 0.0
+            for _ in range(BLACK_LEVEL_SERIES_FRAMES):
+                total += instrument.measure_intensity()
+            exposures.append(ms)
+            means.append(total / BLACK_LEVEL_SERIES_FRAMES)
+    except Exception as exc:
+        log.warning("Black-level exposure series failed: %s", exc)
+        return None
+    finally:
+        if hasattr(instrument, "frames"):
+            del instrument.frames[frames_before:]
+        try:
+            hardware.set_exposure(before)
+        except Exception as exc:
+            log.error("Could not restore the exposure after the black-level series: %s", exc)
+    estimate = black_level_from_exposure_series(exposures, means)
+    if estimate is not None:
+        log.info(
+            "LC calibration black level from an exposure series at extinction: %.1f counts "
+            "(R^2 %.5f over %s ms)",
+            estimate["black_level"],
+            estimate["r_squared"],
+            estimate["exposures_ms"],
+        )
+    return estimate
+
+
 def _describe_camera(camera: Dict[str, Any]) -> str:
     from .camera_checks import describe_camera
 
@@ -439,6 +503,10 @@ def run_lc_calibration(
         log.exception("LC calibration raised")
         restore_exposure()
         return fail(str(exc))
+
+    # Black level from an exposure series at extinction (see
+    # black_level_from_exposure_series): the offset without blocking the lamp.
+    black_level_estimate = _estimate_black_level(instrument, hardware, result, camera, log)
     restore_exposure()
 
     if should_abort is not None and should_abort():
@@ -574,6 +642,25 @@ def run_lc_calibration(
                 f"would reach {brightest_pixel * factor:.0f} counts and clip at {full_scale:g}. Set "
                 f"modalities.{modality}.channels exposure_ms to at most {high:.0f} ms."
             )
+    if black_level_estimate is not None:
+        if black_level_estimate["r_squared"] < BLACK_LEVEL_MIN_R_SQUARED:
+            reliability_issues.append("camera response not linear")
+            warnings.append(
+                f"Counts at extinction are not proportional to exposure (R^2 "
+                f"{black_level_estimate['r_squared']:.4f} over "
+                f"{black_level_estimate['exposures_ms']} ms): the camera is not linear -- a gamma "
+                "curve, or gain changing between frames. Neither the black level estimate nor the "
+                "reconstruction can be trusted until it is."
+            )
+        elif result.black_level is not None and abs(
+            black_level_estimate["black_level"] - result.black_level
+        ) > max(2.0, 0.02 * abs(black_level_estimate["black_level"])):
+            warnings.append(
+                f"The black level in use is {result.black_level:g} counts; an exposure series at "
+                f"extinction measures {black_level_estimate['black_level']:g} (R^2 "
+                f"{black_level_estimate['r_squared']:.5f}). Apply can write the measured value to "
+                f"modalities.{modality}.reconstruction.black_level."
+            )
     if result.black_level is not None and state_values and result.black_level > state_values[0]:
         # 103 above frames that never exceed 17: the number is not in these
         # units. OpenPolScope recorded its 103 in its own pixel format, and a
@@ -631,6 +718,9 @@ def run_lc_calibration(
         # second is the one-line answer to "was the field bright enough".
         "camera": camera,
         "signal": signal,
+        # The camera offset measured from an exposure series at extinction, and
+        # how straight the line was. QPSC offers to write it on Apply.
+        "black_level_estimate": black_level_estimate,
         "warnings": warnings,
         "output_folder": str(out),
     }

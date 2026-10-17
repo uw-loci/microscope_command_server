@@ -105,3 +105,16 @@ def test_lcready_reports_camera_problems_and_the_adapter_wavelength():
     assert any("Gain Auto" in p for p in report["camera_fatal"])
     assert report["adapter_wavelength_nm"] == 546.0
     assert report["reconstruction_wavelength_nm"] == 549
+
+
+def test_the_intercept_of_counts_against_exposure_is_the_offset():
+    from microscope_command_server.calibration.camera_checks import (
+        black_level_from_exposure_series,
+    )
+
+    est = black_level_from_exposure_series([10, 20, 30, 40], [150, 200, 250, 300])
+    assert est["black_level"] == 100.0 and est["slope_per_ms"] == 5.0 and est["r_squared"] == 1.0
+    assert black_level_from_exposure_series([10, 20], [1, 2]) is None, "two points is not a fit"
+    assert (
+        black_level_from_exposure_series([10, 10, 10], [1, 2, 3]) is None
+    ), "no spread in exposure"

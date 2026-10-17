@@ -111,6 +111,8 @@ class FakeHardware:
             read_noise=0.0, transmittance=self.transmittance, black_level=self.black_level
         )
         value = scope.intensity_at(lca, lcb) if lamp_on else scope.black_level
+        # Light scales with exposure; the camera offset does not (50 ms = as simulated).
+        value = self.black_level + (value - self.black_level) * self.exposure / 50.0
         # A 12-bit camera delivering uint16: clip at full scale as the real one does.
         return np.full((4, 4), min(value, 4095.0), dtype=np.uint16), {}
 
@@ -560,6 +562,44 @@ class TestWorkflow:
         )
         assert result["assessment"] == result["assessment_by_ratio"] == "good"
         assert result["reliability_issues"] == []
+
+    def test_the_black_level_is_measured_from_an_exposure_series(self, tmp_path):
+        """The scope cannot block its lamp; the intercept of counts against exposure
+        at extinction is the offset anyway. The fake camera's offset is 102."""
+        hw = FakeHardware(black_level=102.0)
+        result = run_lc_calibration(
+            hw, self._yaml(black_level=103), output_folder=str(tmp_path), exposure_ms=50.0
+        )
+        est = result["black_level_estimate"]
+        assert est["black_level"] == pytest.approx(102.0, abs=1.0)
+        assert est["r_squared"] > 0.999
+        assert est["exposures_ms"] == [12.5, 25.0, 37.5, 50.0]
+        assert hw.exposure == 50.0, "the exposure is put back"
+        # Per-state statistics still line up with the search, not the series.
+        assert set(result["signal"]["state_saturated_fraction"]) == {f"State{i}" for i in range(5)}
+
+    def test_a_black_level_far_from_the_measured_one_is_said(self, tmp_path):
+        result = run_lc_calibration(
+            FakeHardware(black_level=20.0), self._yaml(black_level=103), output_folder=str(tmp_path)
+        )
+        assert result["black_level_estimate"]["black_level"] == pytest.approx(20.0, abs=1.0)
+        assert any("exposure series at extinction measures" in w for w in result["warnings"])
+
+    def test_a_non_linear_camera_is_caught_by_the_series(self, tmp_path):
+        class GammaHardware(FakeHardware):
+            def snap_image(self, **kw):
+                image, meta = super().snap_image()
+                # counts ~ exposure ** 0.6 above the offset: a gamma curve
+                signal = (image.astype(float) - self.black_level).clip(0)
+                bent = self.black_level + signal**0.6 * 10
+                return bent.clip(0, 4095).astype(np.uint16), meta
+
+        result = run_lc_calibration(
+            GammaHardware(), self._yaml(black_level=102), output_folder=str(tmp_path)
+        )
+        assert result["black_level_estimate"]["r_squared"] < 0.999
+        assert "camera response not linear" in result["reliability_issues"]
+        assert result["assessment"] == "unreliable"
 
     def test_an_unknown_bit_depth_disables_the_guard_and_says_so(self, tmp_path):
         class NoDepthCore(FakeCore):

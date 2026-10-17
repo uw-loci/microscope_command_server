@@ -648,6 +648,17 @@ LCCALIB --yaml config.yml --output /path/to/output [--modality lcpolscope] \
   crystals, until the residual is small enough. The second costs roughly three
   times the exposures, so it is a trade rather than an upgrade.
 
+**The black level is also measured on every run.** After the search, the crystals are held at
+extinction and four frames-averaged snaps are taken at 25, 50, 75 and 100% of the calibration
+exposure. Light scales with exposure and the camera offset does not, so the intercept of a
+straight-line fit is the offset: the black level without blocking the lamp, which this scope
+cannot do. The reply carries it as `black_level_estimate` (`black_level`, `slope_per_ms`,
+`r_squared`, `residual_rms`, the exposures and means); a configured value more than 2 counts (or
+2%) away is warned about, and QPSC's Apply offers to write the measured one. The fit doubles as
+a linearity check: R^2 under 0.999 means the camera is not linear (gamma, or gain changing between
+frames), adds `camera response not linear` to `reliability_issues`, and makes the result
+`unreliable`.
+
 The black level must be in the counts of the camera's **current** pixel format.
 OpenPolScope's stored 103 for this instrument was recorded in its own format; the
 same camera in 8-bit, or with a different offset setting, has a different one. A

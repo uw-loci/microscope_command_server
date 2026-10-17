@@ -20,7 +20,13 @@ from typing import Dict, List, Optional, Tuple
 _OFF_VALUES = {"off", "0", "false", "none", "", "disabled"}
 _ON_VALUES = {"1", "on", "true", "enabled"}
 
-__all__ = ["camera_setting_problems", "camera_snapshot", "describe_camera", "significant_bits"]
+__all__ = [
+    "black_level_from_exposure_series",
+    "camera_setting_problems",
+    "camera_snapshot",
+    "describe_camera",
+    "significant_bits",
+]
 
 logger = logging.getLogger(__name__)
 
@@ -203,3 +209,38 @@ def camera_setting_problems(
             "re-measure the black level in that format."
         )
     return fatal, advisory
+
+
+def black_level_from_exposure_series(exposures_ms, means):
+    """The camera offset as the intercept of mean counts against exposure.
+
+    Light in the frame scales with exposure; the camera's offset does not. At a
+    fixed LC setting (extinction, which never clips), a straight-line fit of mean
+    counts on exposure therefore has the offset as its intercept -- the black
+    level without blocking the lamp, which this scope cannot do. Dark current
+    scales with exposure too and lands in the slope, not the intercept.
+
+    Returns ``{"black_level", "slope_per_ms", "r_squared", "residual_rms",
+    "exposures_ms", "means"}``, or None with fewer than three points or no
+    spread in exposure. ``r_squared`` doubles as a linearity check: a camera
+    applying gamma, or adjusting its own gain, does not give a straight line.
+    """
+    import numpy as np
+
+    x = np.asarray(exposures_ms, dtype=np.float64)
+    y = np.asarray(means, dtype=np.float64)
+    if x.size < 3 or x.size != y.size or np.ptp(x) <= 0:
+        return None
+    slope, intercept = np.polyfit(x, y, 1)
+    fit = intercept + slope * x
+    ss_res = float(np.sum((y - fit) ** 2))
+    ss_tot = float(np.sum((y - y.mean()) ** 2))
+    r2 = 1.0 - ss_res / ss_tot if ss_tot > 0 else 0.0
+    return {
+        "black_level": round(float(intercept), 2),
+        "slope_per_ms": round(float(slope), 4),
+        "r_squared": round(r2, 5),
+        "residual_rms": round(float(np.sqrt(ss_res / x.size)), 3),
+        "exposures_ms": [round(float(v), 3) for v in x],
+        "means": [round(float(v), 3) for v in y],
+    }
