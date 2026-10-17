@@ -207,9 +207,10 @@ def test_reconstruction_runs_end_to_end(tmp_path):
 
     assert (tmp_path / RETARDANCE_DIR).is_dir()
     assert (tmp_path / ORIENTATION_DIR).is_dir()
-    assert len(written) == 2
-    for data, _ in written.values():
-        assert data.shape == (8, 8)
+    # Retardance and orientation, plus the display-only orientation colour image.
+    assert len(written) == 3
+    for path, (data, _) in written.items():
+        assert data.shape == ((8, 8, 3) if "orientation_color" in path else (8, 8))
 
 
 def test_derived_dirs_get_a_tile_configuration(tmp_path):
@@ -1011,3 +1012,56 @@ def test_metadata_carries_the_adapter_wavelength(tmp_path):
     fn, kwargs = pool.submissions[0]
     fn(**kwargs)
     assert seen[RETARDANCE_DIR]["polscope.lc_adapter_wavelength_nm"] == "549.0"
+
+
+def test_orientation_colour_is_cyclic_and_scaled_by_retardance():
+    import numpy as np
+
+    from microscope_command_server.modality.lcpolscope import orientation_color_rgb
+
+    ret = np.array([[20.0, 20.0, 10.0, 0.0, np.nan]])
+    ori = np.radians(np.array([[0.0, 179.999, 90.0, 45.0, 30.0]]))
+    rgb = orientation_color_rgb(ret, ori, 20.0).astype(int)
+    assert rgb.shape == (1, 5, 3)
+    # 0 and ~180 deg are the same colour: the map is cyclic like the data.
+    assert np.abs(rgb[0, 0] - rgb[0, 1]).max() <= 2
+    assert tuple(rgb[0, 0]) == (255, 0, 0)
+    # 90 deg is the opposite hue, at half brightness for half the ceiling.
+    assert tuple(rgb[0, 2]) == (0, 128, 128)
+    # No retardance, no light; undefined pixels are black.
+    assert tuple(rgb[0, 3]) == (0, 0, 0)
+    assert tuple(rgb[0, 4]) == (0, 0, 0)
+
+
+def test_the_colour_image_is_written_beside_retardance_and_orientation(tmp_path):
+    import numpy as np
+
+    pytest.importorskip("polscope_library")
+    from microscope_command_server.modality.lcpolscope import ORIENTATION_COLOR_DIR
+
+    seen = {}
+
+    def writer(*, filename, pixel_size_um, data, channel_name, map_annotations):
+        seen[filename.rsplit("/", 2)[-2]] = (np.asarray(data), map_annotations)
+
+    _, pool = _submit(
+        channel_images={
+            f"State{i}": np.full((4, 4), v, dtype=float)
+            for i, v in enumerate((110.0, 160.0, 155.0, 150.0, 145.0))
+        },
+        reconstruction_cfg={
+            "swing_waves": 0.03,
+            "wavelength_nm": 549,
+            "scheme": "5-State",
+            "display_retardance_ceiling_nm": 5,
+        },
+        output_path=tmp_path,
+        ome_writer=writer,
+    )
+    fn, kwargs = pool.submissions[0]
+    fn(**kwargs)
+    data, meta = seen[ORIENTATION_COLOR_DIR]
+    assert data.shape == (4, 4, 3) and data.dtype == np.uint8
+    assert meta["polscope.display_only"].startswith("true")
+    assert "5 nm" in meta["polscope.brightness"]
+    assert (tmp_path / ORIENTATION_COLOR_DIR).is_dir()

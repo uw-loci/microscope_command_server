@@ -83,6 +83,43 @@ def register_lcpolscope():
 
 RETARDANCE_DIR = "retardance"
 ORIENTATION_DIR = "orientation"
+#: Display-only colour map: hue = slow-axis orientation over [0, 180) (cyclic,
+#: so 0 and 180 deg are the same colour), brightness = retardance up to the
+#: display ceiling. The image OpenPolScope and recOrder show; QuPath cannot
+#: put a cyclic colour map on an image channel, so it is written as RGB.
+ORIENTATION_COLOR_DIR = "orientation_color"
+#: Retardance at full brightness in the colour image, unless the YAML sets
+#: reconstruction.display_retardance_ceiling_nm. OpenPolScope's own ceiling on
+#: this instrument (its 2026-10-16 metadata).
+DEFAULT_DISPLAY_CEILING_NM = 20.0
+
+
+def orientation_color_rgb(retardance_nm, orientation_rad, ceiling_nm):
+    """``(Y, X, 3)`` uint8: hue from the axial orientation, value from retardance.
+
+    Hue runs once round the colour circle over 0..180 deg, so the map is cyclic
+    the way the data is. Undefined pixels (NaN) are black.
+    """
+    ret = np.asarray(retardance_nm, dtype=np.float64)
+    ori = np.asarray(orientation_rad, dtype=np.float64)
+    hue = np.mod(ori, np.pi) / np.pi  # 0..1, one cycle per 180 deg
+    value = np.clip(ret / float(ceiling_nm), 0.0, 1.0)
+    bad = ~np.isfinite(ret) | ~np.isfinite(ori)
+    hue = np.where(bad, 0.0, hue)
+    value = np.where(bad, 0.0, value)
+    # HSV -> RGB with saturation 1.
+    h6 = hue * 6.0
+    sector = np.floor(h6).astype(int) % 6
+    f = h6 - np.floor(h6)
+    p = np.zeros_like(value)
+    q = value * (1.0 - f)
+    t = value * f
+    r = np.choose(sector, [value, q, p, p, t, value])
+    g = np.choose(sector, [t, value, value, q, p, p])
+    b = np.choose(sector, [p, p, t, value, value, q])
+    rgb = np.stack([r, g, b], axis=-1)
+    return np.rint(rgb * 255.0).astype(np.uint8)
+
 
 # Derived tiles are written as uint16, not float, because the stitcher cannot
 # consume anything else: ChunkCompositor builds TYPE_USHORT_GRAY / TYPE_BYTE_GRAY
@@ -383,6 +420,30 @@ def _reconstruct_and_write(
             channel_name=channel_label[subdir],
             map_annotations={**shared, **per_channel[subdir]},
         )
+    # Display-only colour image. Same grid and TileConfiguration as the others,
+    # so it stitches beside them; marked as not for measurement.
+    try:
+        ceiling = float(
+            reconstruction_cfg.get("display_retardance_ceiling_nm") or DEFAULT_DISPLAY_CEILING_NM
+        )
+    except (TypeError, ValueError):
+        ceiling = DEFAULT_DISPLAY_CEILING_NM
+    color_dir = output_path / ORIENTATION_COLOR_DIR
+    color_dir.mkdir(parents=True, exist_ok=True)
+    _copy_tile_configuration(tile_config_source, color_dir)
+    ome_writer(
+        filename=str(color_dir / filename),
+        pixel_size_um=pixel_size_um,
+        data=orientation_color_rgb(result.retardance_nm, result.orientation_rad, ceiling),
+        channel_name="Orientation colour (hue = orientation, brightness = retardance)",
+        map_annotations={
+            **shared,
+            "polscope.quantity": "orientation_colour_display",
+            "polscope.display_only": "true -- for viewing; measure on the retardance and orientation images",
+            "polscope.hue": "slow-axis orientation, one colour cycle over 0..180 deg",
+            "polscope.brightness": f"retardance, full brightness at {ceiling:g} nm",
+        },
+    )
     if log is not None:
         log.debug("Reconstructed LC-PolScope tile %s", filename)
 

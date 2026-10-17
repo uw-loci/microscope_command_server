@@ -6812,7 +6812,8 @@ def _write_derived_polscope_tile(*, filename, pixel_size_um, data, channel_name,
         map_annotations=map_annotations,
         granularity="single",
         bigtiff=False,
-        photometric="minisblack",
+        # The orientation colour image is (Y, X, 3) RGB; the others are scalar.
+        photometric="rgb" if arr.ndim == 3 else "minisblack",
     )
     try:
         writer.write_frame(arr, t=0, z=0, c=0)

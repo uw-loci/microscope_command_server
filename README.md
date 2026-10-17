@@ -791,6 +791,19 @@ the metadata of a derived tile:
 | Camera state | `camera` (exposure + source, bit depth, size, binning, pixel type, gain); `camera_properties` (file only); auto gain/exposure refused, gamma / 8-bit -> `unreliable` | `channels[State].exposure_ms` (set by hand, identical across states) | snapshot + the same checks on the first state; ERROR / WARNING | `polscope.camera_*`, `polscope.camera_problems` |
 | Frame counts | `signal` (extinction, leakage above black, swing contrast, grid peak, per-state saturation, projection to the acquisition exposure, `usable_exposure_ms`); `*_histograms.png` beside the file | `channels[State].exposure_ms` is what the projection is made for | -- | -- |
 
+### LC-PolScope outputs per tile
+
+Each tile's five states are reconstructed during acquisition into three folders beside the
+state folders, each with its own `TileConfiguration.txt` so it stitches on the same grid:
+
+- `retardance/`: uint16, nanometres x 100.
+- `orientation/`: uint16, slow-axis degrees x 100 over [0, 180), axial (declared in the OME
+  metadata, so downsampling and blending average it on the doubled angle).
+- `orientation_color/`: **display only**, 8-bit RGB. Hue is the orientation, one colour cycle
+  over 0..180 deg, so 0 and 180 are the same colour; brightness is the retardance, full at
+  `reconstruction.display_retardance_ceiling_nm` (default 20 nm). QuPath cannot put a cyclic
+  colour map on an image channel, so the server renders it. Measure on the other two.
+
 ### LC-PolScope background correction
 
 The background is a set of the five states taken on a specimen-free, slightly defocused
