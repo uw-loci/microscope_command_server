@@ -3334,6 +3334,28 @@ def _prepare_acquisition(
     mod_config = get_modality_config(params.get("scan_type", ""))
     logger.info(f"Using modality: {modality}")
 
+    # LC-PolScope: refuse a state plan the reconstruction cannot use, before
+    # anything moves. All five states, one exposure.
+    from microscope_command_server.modality.lcpolscope import (
+        LCPOLSCOPE_CONFIG,
+        state_plan_problems,
+    )
+
+    if mod_config is LCPOLSCOPE_CONFIG and params.get("channels"):
+        library_ids = [
+            str(c.get("id"))
+            for c in ((ppm_settings.get("modalities", {}) or {}).get("lcpolscope", {}) or {}).get(
+                "channels", []
+            )
+            or []
+            if isinstance(c, dict) and c.get("id")
+        ]
+        problems = state_plan_problems(
+            params.get("channels"), params.get("channel_exposures"), library_ids
+        )
+        if problems:
+            raise ValueError("LC-PolScope acquisition refused: " + "; ".join(problems) + ".")
+
     # Get processing settings from parameters
     background_correction_enabled = params.get("background_correction_enabled", False)
     background_correction_method = params.get("background_correction_method", "divide")

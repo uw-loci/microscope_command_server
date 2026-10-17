@@ -217,3 +217,25 @@ class TestCollector:
         with pytest.raises(RuntimeError, match="Gain Auto"):
             self._collect(tmp_path, self._hardware(auto_gain="Continuous"))
         assert not (tmp_path / BACKGROUND_PROVENANCE_FILE).exists()
+
+
+class TestStatePlan:
+    LIB = [f"State{i}" for i in range(5)]
+
+    def test_all_states_at_one_exposure_is_fine(self):
+        from microscope_command_server.modality.lcpolscope import state_plan_problems
+
+        order = ["State1", "State0", "State2", "State3", "State4"]  # focus state first
+        assert state_plan_problems(order, [33.0] * 5, self.LIB) == []
+
+    def test_a_missing_state_is_refused(self):
+        from microscope_command_server.modality.lcpolscope import state_plan_problems
+
+        problems = state_plan_problems(self.LIB[:4], [33.0] * 4, self.LIB)
+        assert problems and "State4" in problems[0]
+
+    def test_unequal_exposures_are_refused(self):
+        from microscope_command_server.modality.lcpolscope import state_plan_problems
+
+        problems = state_plan_problems(self.LIB, [33, 33, 40, 33, 33], self.LIB)
+        assert problems and "State2=40 ms" in problems[0]

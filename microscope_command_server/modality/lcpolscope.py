@@ -482,6 +482,38 @@ BACKGROUND_PROVENANCE_FILE = "background_provenance.json"
 DEFAULT_BACKGROUND_FRAMES = 10
 
 
+def state_plan_problems(channel_ids, channel_exposures, library_ids, tolerance_ms=0.01):
+    """Reasons a requested LC-PolScope state plan cannot be reconstructed, or [].
+
+    QPSC's acquisition panel already sends all five states at one exposure; this
+    is the second line, for anything that bypasses the panel (a script, an old
+    QPSC, a saved preset). Both conditions produce data that LOOKS fine: a
+    missing state makes the reconstruction refuse silently per tile, and an
+    unequal exposure rescales one row of the instrument matrix and biases every
+    retardance and orientation with no symptom in the images.
+    """
+    problems = []
+    requested = [str(c) for c in (channel_ids or [])]
+    library = [str(c) for c in (library_ids or [])]
+    if library:
+        missing = [c for c in library if c not in requested]
+        extra = [c for c in requested if c not in library]
+        if missing:
+            problems.append(
+                f"the run leaves out {missing}; the reconstruction needs all of {library}"
+            )
+        if extra:
+            problems.append(f"{extra} are not LC-PolScope states (the states are {library})")
+    exposures = [float(e) for e in (channel_exposures or [])]
+    if exposures and max(exposures) - min(exposures) > tolerance_ms:
+        problems.append(
+            "the states have different exposures "
+            + ", ".join(f"{c}={e:g} ms" for c, e in zip(requested, exposures))
+            + "; all five must share one exposure"
+        )
+    return problems
+
+
 def background_problems(provenance, recon, channel_exposures=None):
     """``(fatal, advisory)`` reasons a collected background does not fit this run.
 
