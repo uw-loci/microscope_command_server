@@ -481,11 +481,16 @@ map to these state names in your configuration.
 the state intensities as samples of a single radiometric scale, so a per-state
 difference biases the result.
 
-- **All states must share one exposure and gain.** Three layers cooperate to
+- **All states must share one exposure and gain.** Several layers cooperate to
   hold this: the QuPath extension equalises the exposures before sending them,
   every channel in `config_LCPolScope.yml` carries the same `exposure_ms`,
   and the LC-PolScope acquisition profiles deliberately carry no
   `channel_overrides`. Do not add per-channel exposure tuning to any of them.
+  The server also checks the plan before anything moves: an acquisition that
+  leaves out one of the configured states, adds a non-state channel, or gives
+  the states unequal exposures (more than 0.01 ms apart) is refused at the start
+  with an error naming the problem. Requests that omit `--channels` are not
+  checked here.
 
 **State order is configurable.** The `state_order` parameter in the YAML
 reorders states before inversion to match the calibration scheme. When omitted,
