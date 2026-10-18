@@ -69,6 +69,8 @@ def test_skip_sets_the_same_four_fields_the_real_search_sets():
     assert 7 not in ctx.dynamic_af_positions, "else the first tile autofocuses anyway"
     # The recorded point is where the OPERATOR focused, not the diagonal AF position.
     assert ctx.completed_af_positions == [(1234.0, -5678.0, -331.5)]
+    # ... and it is what a later skipped autofocus falls back to.
+    assert ctx.last_accepted_af_z == -331.5
 
 
 def test_skip_does_not_disable_autofocus_for_the_remaining_positions():
@@ -93,6 +95,7 @@ def test_the_real_path_sets_exactly_these_fields_and_no_others():
         "last_af_pos_idx",
         "completed_af_positions",
         "dynamic_af_positions",
+        "last_accepted_af_z",
     }, f"real AF path now sets {assigned}; mirror the change in the skip path"
 
 

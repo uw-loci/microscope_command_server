@@ -399,3 +399,125 @@ class TestAutofocusValidationCancel:
         assert calls["n"] > 9
         assert self._z_after(core) == pytest.approx(4.0, abs=0.01)
         assert float(result["ground_truth_z"]) == pytest.approx(4.0, abs=0.01)
+
+
+class TestFarFromFocus:
+    """Autofocus that starts far from focus, the slide-4 trap of 2026-10-04.
+
+    The demo's focal surface at the origin is +3.96 um; starting 71 um above it puts the
+    true plane outside a 100 um window. See
+    claude-reports/2026-10-06_slide4-autofocus-stale-seed-z.md.
+    """
+
+    START = 75.0
+    TRUTH = 3.96
+
+    @staticmethod
+    def _at(core, z):
+        core.set_position(z)
+        core.wait_for_device(core.get_focus_device())
+
+    def _af(self, hardware, **kw):
+        from microscope_control.autofocus.core import AutofocusUtils
+
+        # Brenner, the PPM metric; far from focus a Laplacian trend can point the wrong way.
+        kw.setdefault("score_metric", AutofocusUtils.autofocus_profile_brenner_gradient)
+        return hardware.autofocus(n_steps=21, search_range=100.0, move_stage_to_estimate=True, **kw)
+
+    def test_without_edge_retries_the_window_cannot_reach_focus(self, hardware, core):
+        self._at(core, self.START)
+        result = self._af(hardware, edge_retries=0)
+        assert isinstance(result, dict) and result["success"] is False
+
+    def test_edge_retries_follow_the_trend_to_focus(self, hardware, core):
+        # The per-tile standard AF did not pass edge_retries before 2026-10-17.
+        self._at(core, self.START)
+        result = self._af(hardware, edge_retries=2)
+        assert isinstance(result, float)
+        assert result == pytest.approx(self.TRUTH, abs=3.0)
+
+    def test_a_flat_primary_metric_follows_the_p98_p2_trend(self, hardware, core):
+        # A constant primary score models slide 4's "score range too small": only the
+        # p98_p2 values from the same frames know which way focus lies.
+        self._at(core, self.START)
+        result = self._af(hardware, edge_retries=2, score_metric=lambda img: 1.0)
+        assert isinstance(result, float)
+        assert result == pytest.approx(self.TRUTH, abs=3.0)
+
+
+class TestSkipFallback:
+    """A skipped autofocus falls back to the last accepted focus and says it was skipped."""
+
+    class _FailingHardware:
+        """Hardware whose autofocus always fails; records how often it was asked."""
+
+        def __init__(self):
+            self.calls = 0
+            self.z = 0.0
+
+        def get_current_position(self):
+            from microscope_control.hardware.base import Position
+
+            return Position(0.0, 0.0, self.z)
+
+        def move_to_position(self, pos):
+            self.z = pos.z
+
+        def autofocus(self, **_kw):
+            self.calls += 1
+            return {
+                "success": False,
+                "message": "flat",
+                "quality_score": 0.1,
+                "peak_prominence": 0.0,
+                "attempted_z": -285.8,
+                "original_z": -285.8,
+            }
+
+    def test_max_retries_zero_still_makes_one_attempt(self, hardware, core):
+        from microscope_command_server.acquisition.workflow import autofocus_with_manual_fallback
+        from microscope_control.autofocus.core import AutofocusUtils
+
+        core.set_position(4.0)
+        core.wait_for_device(core.get_focus_device())
+        z = autofocus_with_manual_fallback(
+            hardware=hardware,
+            logger=hardware_logger(),
+            request_manual_focus=None,
+            max_retries=0,
+            n_steps=11,
+            search_range=20.0,
+            score_metric=AutofocusUtils.autofocus_profile_laplacian_variance,
+        )
+        assert isinstance(z, float)
+
+    def test_a_skip_is_reported_and_uses_the_fallback(self):
+        from microscope_command_server.acquisition.workflow import autofocus_with_manual_fallback
+
+        hw = self._FailingHardware()
+        outcome = {}
+        z = autofocus_with_manual_fallback(
+            hardware=hw,
+            logger=hardware_logger(),
+            request_manual_focus=lambda remaining: "skip",
+            max_retries=3,
+            fallback_z=-350.0,
+            outcome=outcome,
+        )
+        assert z == -350.0 and hw.z == -350.0
+        assert outcome == {"skipped": True}
+        assert hw.calls == 1
+
+    def test_the_fallback_prefers_the_last_accepted_focus(self):
+        from types import SimpleNamespace
+
+        from microscope_command_server.acquisition.workflow import _skip_fallback_z
+
+        assert _skip_fallback_z(SimpleNamespace(last_accepted_af_z=None, hint_z=-285.8)) == -285.8
+        assert _skip_fallback_z(SimpleNamespace(last_accepted_af_z=-352.1, hint_z=-285.8)) == -352.1
+
+
+def hardware_logger():
+    import logging
+
+    return logging.getLogger("test_far_from_focus")

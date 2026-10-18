@@ -1675,6 +1675,7 @@ def autofocus_with_manual_fallback(
     request_manual_focus: Optional[Callable[[int], str]] = None,
     max_retries: int = 3,
     fallback_z: Optional[float] = None,
+    outcome: Optional[dict] = None,
     **autofocus_kwargs,
 ):
     """
@@ -1696,6 +1697,11 @@ def autofocus_with_manual_fallback(
         max_retries: Maximum number of retry attempts after manual focus
         fallback_z: Z position to use when user skips (e.g., the Z-hint from
                     the tilt model). If None, uses the failed AF's attempted_z.
+        outcome: Optional dict the caller passes in; set to ``{"skipped": True}``
+                 when the returned Z is a fallback rather than a measured focus, so
+                 the caller does not record it as one. A skipped tile that is
+                 recorded spreads its unmeasured Z to every neighbour (slide 4,
+                 2026-10-04).
         **autofocus_kwargs: Arguments to pass to hardware.autofocus(). Pass
                             ``edge_retries=N`` to enable transparent
                             peak-at-edge widen-and-shift retries inside the
@@ -1711,8 +1717,15 @@ def autofocus_with_manual_fallback(
     # User may move XY during manual focus dialog to find tissue
     original_pos = hardware.get_current_position()
     original_x, original_y = original_pos.x, original_pos.y
+    if outcome is not None:
+        outcome["skipped"] = False
 
-    for attempt in range(max_retries):
+    # max_retries counts retries after a failed attempt, so 0 still means one attempt.
+    # It used to mean none: range(0) never ran, and the function raised "retry loop
+    # exited unexpectedly" -- every focus-survey point and the no-tissue initial AF
+    # failed without ever focusing.
+    attempts = max(1, max_retries)
+    for attempt in range(attempts):
         result = hardware.autofocus(**autofocus_kwargs)
 
         # Check if autofocus succeeded (returns float) or failed (returns dict)
@@ -1734,7 +1747,7 @@ def autofocus_with_manual_fallback(
 
             if request_manual_focus is not None:
                 # Always show dialog, even on last attempt
-                retries_remaining = max_retries - attempt - 1
+                retries_remaining = max(0, max_retries - attempt - 1)
                 logger.info(
                     f"Requesting manual focus from user (retries remaining: {retries_remaining})..."
                 )
@@ -1767,6 +1780,8 @@ def autofocus_with_manual_fallback(
                         restore_pos = Position(original_x, original_y, skip_z)
                         hardware.move_to_position(restore_pos)
                     logger.info("User chose to skip autofocus")
+                    if outcome is not None:
+                        outcome["skipped"] = True
                     return skip_z
                 elif user_choice == "cancel":
                     # User chose to cancel acquisition. Raise the sentinel the
@@ -1815,10 +1830,14 @@ def autofocus_with_manual_fallback(
                         logger.warning(
                             "User chose retry but no retries remaining - using fallback Z"
                         )
+                        if outcome is not None:
+                            outcome["skipped"] = True
                         return fallback_z if fallback_z is not None else result["attempted_z"]
                 else:
                     # Unknown choice - default to skip
                     logger.warning(f"Unknown user choice '{user_choice}' - using fallback Z")
+                    if outcome is not None:
+                        outcome["skipped"] = True
                     return fallback_z if fallback_z is not None else result["attempted_z"]
             else:
                 # No callback provided, raise exception
@@ -1833,6 +1852,18 @@ def autofocus_with_manual_fallback(
 
     # Should never reach here
     raise RuntimeError("Autofocus retry loop exited unexpectedly")
+
+
+def _skip_fallback_z(ctx) -> Optional[float]:
+    """Where a skipped autofocus leaves Z: the last accepted focus, else the request's hint.
+
+    hint_z is fixed for the whole acquisition, so resetting to it after a failure hands
+    the next tile the same value that just failed. The last accepted focus is a
+    measurement from this acquisition, on this slide.
+    """
+    if ctx.last_accepted_af_z is not None:
+        return ctx.last_accepted_af_z
+    return ctx.hint_z
 
 
 def calculate_luminance_gain(r, g, b):
@@ -2655,6 +2686,10 @@ class AcquisitionContext:
     # None until _setup_autofocus runs; inert unless --focus-surface says otherwise.
     focus_surface: Any = None
     first_tissue_autofocus_done: bool = False
+    # The last Z a measurement accepted in this acquisition. A skipped autofocus falls
+    # back to this rather than to hint_z, which is set once from the request and may be
+    # the very value that keeps failing (slide 4, 2026-10-04: -285.8 um, 98 failures).
+    last_accepted_af_z: Optional[float] = None
     last_af_pos_idx: int = -1
     tile_measurements: list = field(default_factory=list)
     tile_measurements_stream: Any = None  # file handle
@@ -2669,6 +2704,8 @@ class AcquisitionContext:
     batch_acquire: bool = False
     channel_consecutive_saturated: dict = field(default_factory=dict)
     progress_warning_fired: bool = False
+    # Standard autofocus attempts that ended in a skip (fallback Z, nothing measured).
+    af_skip_count: int = 0
     # One-shot latch for the time-lapse "falling behind" warning. Set True
     # after the first overrunning timepoint so the warning fires exactly once.
     time_lapse_warning_fired: bool = False
@@ -4490,6 +4527,8 @@ def _adopt_current_focus_as_initial(ctx: AcquisitionContext) -> None:
     ctx.first_tissue_autofocus_done = True
     ctx.last_af_pos_idx = first_af_idx
     ctx.completed_af_positions.append((pos.x, pos.y, pos.z))
+    # The operator's own focus is an accepted focus: a later skipped AF falls back here.
+    ctx.last_accepted_af_z = pos.z
     if ctx.focus_surface is not None:
         ctx.focus_surface.add(pos.x, pos.y, pos.z)
     ctx.dynamic_af_positions.discard(first_af_idx)
@@ -4706,9 +4745,11 @@ def _run_pre_acquisition_autofocus(ctx: AcquisitionContext) -> None:
 
     # Run autofocus (with manual fallback if no tissue found)
     try:
+        initial_outcome: dict = {}
         if tissue_found:
             logger.info("Tissue found - running autofocus with manual fallback")
             initial_z = autofocus_with_manual_fallback(
+                outcome=initial_outcome,
                 hardware=hardware,
                 request_manual_focus=ctx.request_manual_focus,
                 max_retries=3,
@@ -4725,6 +4766,7 @@ def _run_pre_acquisition_autofocus(ctx: AcquisitionContext) -> None:
             logger.warning(f"No tissue found after {max_tissue_search_attempts} search attempts")
             logger.warning("Attempting autofocus anyway - will go to manual dialog if it fails")
             initial_z = autofocus_with_manual_fallback(
+                outcome=initial_outcome,
                 hardware=hardware,
                 request_manual_focus=ctx.request_manual_focus,
                 max_retries=0,
@@ -4739,6 +4781,8 @@ def _run_pre_acquisition_autofocus(ctx: AcquisitionContext) -> None:
             )
 
         logger.info(f"Initial autofocus completed: Z={initial_z:.2f} um")
+        if not initial_outcome.get("skipped"):
+            ctx.last_accepted_af_z = initial_z
         ctx.first_tissue_autofocus_done = True
         ctx.last_af_pos_idx = first_af_idx
         ctx.completed_af_positions.append((first_af_pos.x, first_af_pos.y, initial_z))
@@ -4949,7 +4993,8 @@ def _run_focus_survey(ctx: "AcquisitionContext") -> None:
                 hardware=hardware,
                 logger=logger,
                 # No manual prompt during a survey: it runs unattended, and a point
-                # that will not focus is a point to skip, not a reason to stop.
+                # that will not focus is a point to skip, not a reason to stop. (With no
+                # callback a failed AF raises, so a survey point is always measured.)
                 request_manual_focus=None,
                 max_retries=0,
                 fallback_z=seed_z,
@@ -5444,13 +5489,18 @@ def _handle_tile_autofocus(
                     full_af_gap_um,
                 )
             t_af = time.perf_counter()
+            tile_outcome: dict = {}
             new_z = autofocus_with_manual_fallback(
                 hardware=hardware,
                 logger=logger,
                 request_manual_focus=ctx.request_manual_focus,
                 max_retries=3,
-                fallback_z=ctx.hint_z,
+                fallback_z=_skip_fallback_z(ctx),
+                outcome=tile_outcome,
                 move_stage_to_estimate=True,
+                # The same widening budget as the initial AF: a far-off window can then
+                # follow the trend toward focus instead of failing in place.
+                edge_retries=ctx.af_edge_retries,
                 n_steps=ctx.af_n_steps,
                 search_range=ctx.af_search_range,
                 interp_strength=ctx.af_interp_strength,
@@ -5462,7 +5512,9 @@ def _handle_tile_autofocus(
             )
             t_af = log_timing(logger, "STANDARD autofocus", t_af)
             ctx.first_tissue_autofocus_done = True
-            af_type_for_this_tile = "standard"
+            af_type_for_this_tile = (
+                "standard_skipped" if tile_outcome.get("skipped") else "standard"
+            )
             logger.info(f"  Standard autofocus :: New Z {new_z}")
         else:
             SMALL_GRID_SKIP_DRIFT_MAX_TILES = 9
@@ -5502,8 +5554,18 @@ def _handle_tile_autofocus(
                 "  Sweep produced no drift -- not recording "
                 "in AF map (prevents stale Z propagation)"
             )
+        elif af_type_for_this_tile == "standard_skipped":
+            ctx.af_skip_count += 1
+            af_failed_for_this_tile = True
+            logger.warning(
+                "  Autofocus skipped; Z %.2f um is a fallback, not a measurement -- not "
+                "recording in AF map so neighbouring tiles do not inherit it",
+                af_z,
+            )
         else:
             af_z, learnable = _vet_autofocus_result(ctx, pos, af_z, af_type_for_this_tile)
+            if af_type_for_this_tile in ("standard", "sweep"):
+                ctx.last_accepted_af_z = af_z
             # The seed list records where the stage actually is, overridden or not, so
             # the nearest-neighbour fallback stays truthful. The surface learns only
             # from a Z that a measurement put there.
@@ -7363,18 +7425,32 @@ def _record_tile_measurement(
         avg_recent_ms = sum(completed_tile_times_ms) / len(completed_tile_times_ms)
         baseline_ms = ctx.tile_measurements[0]["tile_time_ms"]
         if baseline_ms > 0 and avg_recent_ms > 3.0 * baseline_ms:
+            if ctx.af_skip_count > 0:
+                # Tissue checks pass but autofocus keeps failing: the strategy is doing
+                # its job and the Z the searches start from is wrong. Changing the
+                # strategy would not help (slide 4, 2026-10-04).
+                cause = (
+                    "%d autofocus attempt(s) have failed and been skipped while the tissue "
+                    "check passed, which points to a starting Z far from the focal plane "
+                    "rather than to the strategy (%s). Check the seed focus for this slide; "
+                    "if the live view is out of focus, refocus and restart."
+                    % (ctx.af_skip_count, ctx.af_strategy_name)
+                )
+            else:
+                cause = (
+                    "This usually means the autofocus strategy is a poor match for the "
+                    "sample (e.g. dense_texture applied to sparse IF). Current strategy: "
+                    "%s. Consider cancelling and picking a different strategy from the "
+                    "AUTOFOCUS section." % ctx.af_strategy_name
+                )
             logger.error(
                 "PROGRESS SANITY CHECK: average tile time over last %d tiles is "
-                "%.1fs, which is %.1fx the first tile's %.1fs. This usually means "
-                "the autofocus strategy is a poor match for the sample (e.g. "
-                "dense_texture applied to sparse IF). Current strategy: %s. "
-                "Consider cancelling and picking a different strategy from the "
-                "Advanced panel dropdown.",
+                "%.1fs, which is %.1fx the first tile's %.1fs. %s",
                 len(completed_tile_times_ms),
                 avg_recent_ms / 1000.0,
                 avg_recent_ms / baseline_ms,
                 baseline_ms / 1000.0,
-                ctx.af_strategy_name,
+                cause,
             )
             ctx.progress_warning_fired = True
 
