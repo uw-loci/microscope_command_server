@@ -191,6 +191,68 @@ def handle_getfov(conn, client, hardware, settings, **kwargs):
         conn.sendall(struct.pack("!ff", -1.0, -1.0))
 
 
+_last_zero_pixel_size_report = None
+
+
+def describe_pixel_size_presets(core) -> str:
+    """Why Micro-Manager reports no pixel size: every preset with what it needs and what is set.
+
+    MMCore returns 0 when no pixel-size preset matches the current hardware state, which a
+    preset that exists and is correct cannot fix on its own. The LC-PolScope keys its presets
+    on a DemoCamera "DObjective" labelling device that nothing turns with the nosepiece, so
+    the usual cause is that its label was never set to the objective in use (2026-10-19:
+    "20x 0.4 ORYX" defined, 0 read). Returns one line per preset, e.g.
+    ``'20x 0.4 ORYX' needs DObjective.Label=20x (now 4x)``.
+    """
+    names = core.get_available_pixel_size_configs()
+    try:
+        names = list(names)
+    except TypeError:
+        names = [names.get(i) for i in range(names.size())]
+    if not names:
+        return "Micro-Manager has no pixel-size presets at all; calibrate one (Devices > Pixel Size Calibration)."
+    lines = []
+    for name in names:
+        name = str(name)
+        data = core.get_pixel_size_config_data(name)
+        needs = []
+        for i in range(int(data.size())):
+            setting = data.get_setting(i)
+            device = str(setting.get_device_label())
+            prop = str(setting.get_property_name())
+            wanted = str(setting.get_property_value())
+            try:
+                now = str(core.get_property(device, prop))
+            except Exception as exc:  # a missing device is itself the answer
+                now = f"unreadable: {exc}"
+            mark = "" if now == wanted else " <- differs"
+            needs.append(f"{device}.{prop}={wanted} (now {now}){mark}")
+        lines.append(
+            f"'{name}' needs " + (", ".join(needs) if needs else "nothing (matches any state)")
+        )
+    return "; ".join(lines)
+
+
+def _explain_zero_pixel_size(core):
+    """Log, once per distinct state, why the pixel size is 0 (see describe_pixel_size_presets)."""
+    global _last_zero_pixel_size_report
+    if core is None:
+        return
+    try:
+        report = describe_pixel_size_presets(core)
+    except Exception as exc:
+        report = f"the presets could not be listed: {exc}"
+    if report == _last_zero_pixel_size_report:
+        return
+    _last_zero_pixel_size_report = report
+    logger.warning(
+        "GETPXSZ: Micro-Manager reports pixel size 0, so no pixel-size preset matches the current "
+        "state. Set the state a preset needs (for a hand-turned nosepiece, the matching 'Objective "
+        "Lens' preset) or calibrate one for it. Presets: %s",
+        report,
+    )
+
+
 def handle_getpxsz(conn, client, hardware, settings, **kwargs):
     """Return pixel size in micrometers as one big-endian float."""
     server_configured = kwargs.get("server_configured", False)
@@ -202,6 +264,8 @@ def handle_getpxsz(conn, client, hardware, settings, **kwargs):
         pixel_size = hardware.get_pixel_size_um()
         conn.sendall(struct.pack("!f", float(pixel_size)))
         logger.debug("Sent pixel size: %.4f um/px", pixel_size)
+        if not pixel_size or pixel_size <= 0:
+            _explain_zero_pixel_size(getattr(hardware, "core", None))
     except Exception as e:
         logger.error("Failed to get pixel size: %s", e)
         conn.sendall(struct.pack("!f", 0.0))
