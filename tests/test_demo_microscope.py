@@ -941,3 +941,13 @@ class TestChannelBackgroundsOnTheDemo:
         assert spreads["glass"] < 0.02, spreads
         assert spreads["tissue"] > 0.10, spreads
         assert "probably taken on specimen" in caplog.text
+
+
+class TestGetCapBitDepth:
+    def test_getcap_reports_the_active_cameras_significant_bits(self, mm_hardware, core):
+        from microscope_command_server.server.handlers.camera import _significant_bits
+
+        mm_hardware.apply_mode_setup("Brightfield_10x")
+        assert _significant_bits(mm_hardware) == 8
+        mm_hardware.apply_mode_setup("lcpolscope_10x")
+        assert _significant_bits(mm_hardware) == 12, "12 bits in a 16-bit buffer"

@@ -800,6 +800,26 @@ def _modality_rotation_angles(mod_config):
     return angles or None
 
 
+def _significant_bits(hardware):
+    """Bits of each pixel that carry data, for the active camera, or None if unknown.
+
+    A 12-bit camera delivers 16-bit buffers whose values stop at 4095. The Live
+    Viewer needs the real depth to scale its histogram and to count clipped
+    pixels; from the buffer alone a 12-bit frame spans 1/16 of the axis and can
+    never read as saturated. Micro-Manager's bit depth and the pixel format's name
+    are both consulted (see camera_checks.significant_bits).
+    """
+    try:
+        from microscope_command_server.calibration.camera_checks import camera_snapshot
+
+        summary, _ = camera_snapshot(hardware)
+        bits = summary.get("significant_bits", summary.get("bit_depth"))
+        return int(bits) if bits else None
+    except Exception as e:
+        logger.warning("GETCAP: could not read the camera's bit depth: %s", e)
+        return None
+
+
 def handle_getcap(conn, client, hardware, settings, **kwargs):
     """Return a JSON capability descriptor for Camera Control v2.
 
@@ -874,6 +894,7 @@ def handle_getcap(conn, client, hardware, settings, **kwargs):
                 None if exp_min is None or exp_max is None else [exp_min, exp_max]
             ),
             "gain_range": gain_range,
+            "significant_bits": _significant_bits(hardware),
         }
 
         if mod_config is not None:
