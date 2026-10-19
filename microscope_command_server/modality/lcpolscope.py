@@ -155,6 +155,51 @@ RECONSTRUCTION_LABELS = {
 }
 
 
+def estimated_background_settings(reconstruction_cfg):
+    """``reconstruction.estimated_background`` as polscope_library settings,
+    or None when the block is absent or ``enabled`` is not true.
+
+    The opt-in per-tile fit of a smooth residual left after the measured
+    background (recOrder's "estimated background"). It cannot tell a smooth
+    residual from smooth specimen retardance, so it stays off unless the
+    config asks; see polscope_library.background_fit. Unknown keys and bad
+    values raise ValueError, so a typo is refused at acquisition start rather
+    than ignored.
+    """
+    block = (reconstruction_cfg or {}).get("estimated_background")
+    if not block:
+        return None
+    if not isinstance(block, dict):
+        raise ValueError(f"reconstruction.estimated_background must be a mapping, got {block!r}")
+    allowed = {
+        "enabled",
+        "order",
+        "block_size",
+        "max_block_retardance_nm",
+        "min_background_fraction",
+    }
+    unknown = sorted(set(block) - allowed)
+    if unknown:
+        raise ValueError(
+            f"reconstruction.estimated_background has unknown key(s) {unknown}; expected {sorted(allowed)}"
+        )
+    if block.get("enabled") is not True:
+        return None
+    from polscope_library import EstimatedBackground
+
+    kwargs = {}
+    if "order" in block:
+        kwargs["order"] = int(block["order"])
+    if "block_size" in block:
+        kwargs["block_size"] = int(block["block_size"])
+    if "max_block_retardance_nm" in block:
+        value = block["max_block_retardance_nm"]
+        kwargs["max_block_retardance_nm"] = None if value is None else float(value)
+    if "min_background_fraction" in block:
+        kwargs["min_background_fraction"] = float(block["min_background_fraction"])
+    return EstimatedBackground(**kwargs)
+
+
 class ReconstructionRefused(Exception):
     """Raised when the acquisition state makes a valid inversion impossible.
 
@@ -277,6 +322,7 @@ def _reconstruct_and_write(
     camera_problems=None,
     lc_adapter_wavelength_nm=None,
     background_provenance=None,
+    estimated_background=None,
 ):
     """Reconstruct one tile and write retardance + orientation. Runs in the write pool."""
     from polscope_library import reconstruct
@@ -291,6 +337,7 @@ def _reconstruct_and_write(
         background_intensities=background_images,
         method=method,
         black_level=black_level,
+        estimated_background=estimated_background,
     )
 
     shared = {
@@ -347,6 +394,34 @@ def _reconstruct_and_write(
         for key in ("collected_at", "lc_calibrated_at", "frames", "folder"):
             if background_provenance.get(key) is not None:
                 shared[f"polscope.background_{key}"] = str(background_provenance[key])
+    # The estimated background, when asked for: whether it ran on this tile
+    # and how big the residual it removed was. peak/mean_removed_nm compared
+    # between tiles is the tile-to-tile residual the measured background
+    # missed; "skipped" marks a tile that looked mostly like specimen.
+    fit = result.background_fit
+    if fit is not None:
+        shared["polscope.estimated_background"] = fit.reason
+        shared["polscope.estimated_background_applied"] = "true" if fit.applied else "false"
+        shared["polscope.estimated_background_order"] = estimated_background.order
+        shared["polscope.estimated_background_block_size"] = estimated_background.block_size
+        shared["polscope.estimated_background_max_block_retardance_nm"] = str(
+            estimated_background.max_block_retardance_nm
+        )
+        shared["polscope.estimated_background_blocks_used"] = (
+            f"{fit.blocks_used}/{fit.blocks_total}"
+        )
+        if fit.applied:
+            shared["polscope.estimated_background_peak_removed_nm"] = round(fit.peak_removed_nm, 3)
+            shared["polscope.estimated_background_mean_removed_nm"] = round(fit.mean_removed_nm, 3)
+            log.info(
+                "Estimated background on %s: %s; removed %.2f nm peak, %.2f nm mean",
+                filename,
+                fit.reason,
+                fit.peak_removed_nm,
+                fit.mean_removed_nm,
+            )
+        else:
+            log.info("Estimated background on %s: %s", filename, fit.reason)
     # Resampling policy uses the shared vocabulary rather than a polscope-specific
     # key: a mask, a label map or an object-id channel needs the same protection,
     # and a reader should only have to understand one convention.
@@ -848,6 +923,10 @@ def submit_tile_reconstruction(
             "reconstruction.method 'openpolscope' is 5-State only (OpenPolScope's 4-frame path has "
             "not been verified against real output); use method 'qlipp' for a 4-State scheme."
         )
+    try:
+        estimated_background = estimated_background_settings(reconstruction_cfg)
+    except (TypeError, ValueError) as exc:
+        raise ReconstructionRefused(f"reconstruction.estimated_background: {exc}") from exc
 
     recon_order = resolve_state_order(channel_order, reconstruction_cfg.get("state_order"))
     ordered = [channel_images[cid] for cid in recon_order]
@@ -872,6 +951,7 @@ def submit_tile_reconstruction(
         camera_problems=camera_problems,
         lc_adapter_wavelength_nm=lc_adapter_wavelength_nm,
         background_provenance=background_provenance,
+        estimated_background=estimated_background,
         output_path=output_path,
         filename=filename,
         pixel_size_um=pixel_size_um,

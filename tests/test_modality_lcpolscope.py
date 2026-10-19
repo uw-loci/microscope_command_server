@@ -1065,3 +1065,126 @@ def test_the_colour_image_is_written_beside_retardance_and_orientation(tmp_path)
     assert meta["polscope.display_only"].startswith("true")
     assert "5 nm" in meta["polscope.brightness"]
     assert (tmp_path / ORIENTATION_COLOR_DIR).is_dir()
+
+
+# ---------------------------------------------------------------------------
+# Estimated background (reconstruction.estimated_background)
+# ---------------------------------------------------------------------------
+
+
+def _ramp_states(lo_nm=1.0, hi_nm=3.0, shape=(128, 160), extra_nm=0.0):
+    """Five states of a clear field carrying a smooth 1-3 nm residual."""
+    import numpy as np
+    from polscope_library import calculate_stokes_to_intensity_matrix, mmul, stokes_after_adr
+
+    _, x = np.mgrid[0 : shape[0], 0 : shape[1]]
+    ret_nm = lo_nm + (hi_nm - lo_nm) * x / (shape[1] - 1) + extra_nm
+    ret = ret_nm * 2 * np.pi / 549.0
+    s = stokes_after_adr(ret, np.full(shape, 0.4), np.full(shape, 2000.0), np.ones(shape))
+    states = mmul(calculate_stokes_to_intensity_matrix(0.03), np.stack(s))
+    return {f"State{i}": states[i] for i in range(5)}
+
+
+def _run_with_estimated_background(tmp_path, block, method="openpolscope", **state_kw):
+    pytest.importorskip("polscope_library")
+    from microscope_command_server.modality.lcpolscope import RETARDANCE_DIR
+
+    seen = {}
+
+    def writer(*, filename, pixel_size_um, data, channel_name, map_annotations):
+        seen[filename.rsplit("/", 2)[-2]] = (data, map_annotations)
+
+    cfg = {"swing_waves": 0.03, "wavelength_nm": 549, "scheme": "5-State", "method": method}
+    if block is not None:
+        cfg["estimated_background"] = block
+    _, pool = _submit(
+        channel_images=_ramp_states(**state_kw),
+        reconstruction_cfg=cfg,
+        output_path=tmp_path,
+        ome_writer=writer,
+    )
+    fn, kwargs = pool.submissions[0]
+    fn(**kwargs)
+    return seen[RETARDANCE_DIR]
+
+
+@pytest.mark.parametrize("block", [None, {}, {"enabled": False, "order": 1}])
+def test_estimated_background_is_off_unless_enabled(block):
+    from microscope_command_server.modality.lcpolscope import estimated_background_settings
+
+    cfg = {} if block is None else {"estimated_background": block}
+    assert estimated_background_settings(cfg) is None
+
+
+def test_estimated_background_settings_are_read_from_the_config():
+    from microscope_command_server.modality.lcpolscope import estimated_background_settings
+
+    s = estimated_background_settings(
+        {
+            "estimated_background": {
+                "enabled": True,
+                "order": 1,
+                "block_size": 64,
+                "max_block_retardance_nm": None,
+                "min_background_fraction": 0.5,
+            }
+        }
+    )
+    assert (s.order, s.block_size, s.max_block_retardance_nm, s.min_background_fraction) == (
+        1,
+        64,
+        None,
+        0.5,
+    )
+
+
+@pytest.mark.parametrize(
+    "block, match",
+    [
+        ({"enabled": True, "ordr": 2}, "unknown key"),
+        ({"enabled": True, "block_size": 1}, "block_size"),
+        ("yes", "mapping"),
+    ],
+)
+def test_a_bad_estimated_background_block_is_refused_before_queueing(block, match):
+    """Like a bad method: refused once at the start, not per tile in the pool."""
+    pytest.importorskip("polscope_library")
+    from microscope_command_server.modality.lcpolscope import ReconstructionRefused
+
+    with pytest.raises(ReconstructionRefused, match=match):
+        _submit(
+            reconstruction_cfg={
+                "swing_waves": 0.03,
+                "wavelength_nm": 549,
+                "estimated_background": block,
+            }
+        )
+
+
+@pytest.mark.parametrize("method", ["qlipp", "openpolscope"])
+def test_estimated_background_removes_the_residual_and_says_so(tmp_path, method):
+    import numpy as np
+
+    from microscope_command_server.modality.lcpolscope import RETARDANCE_COUNTS_PER_NM
+
+    plain, plain_meta = _run_with_estimated_background(tmp_path / "a", None, method=method)
+    data, meta = _run_with_estimated_background(tmp_path / "b", {"enabled": True}, method=method)
+
+    assert "polscope.estimated_background" not in plain_meta
+    assert np.ptp(plain) / RETARDANCE_COUNTS_PER_NM > 1.9
+    assert np.max(data) / RETARDANCE_COUNTS_PER_NM < 0.05
+    assert meta["polscope.estimated_background_applied"] == "true"
+    assert meta["polscope.estimated_background"].startswith("applied")
+    assert meta["polscope.estimated_background_order"] == 2
+    assert meta["polscope.estimated_background_peak_removed_nm"] == pytest.approx(3.0, abs=0.05)
+
+
+def test_a_tile_that_is_mostly_specimen_is_skipped_and_marked(tmp_path):
+    import numpy as np
+
+    plain, _ = _run_with_estimated_background(tmp_path / "a", None, extra_nm=30.0)
+    data, meta = _run_with_estimated_background(tmp_path / "b", {"enabled": True}, extra_nm=30.0)
+    assert meta["polscope.estimated_background_applied"] == "false"
+    assert "mostly specimen" in meta["polscope.estimated_background"]
+    assert "polscope.estimated_background_peak_removed_nm" not in meta
+    np.testing.assert_array_equal(data, plain)

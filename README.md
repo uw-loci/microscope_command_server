@@ -848,6 +848,31 @@ acquisition paths skip for this modality.
   `polscope.background_collected_at`, `polscope.background_lc_calibrated_at`,
   `polscope.background_frames` and `polscope.background_folder`.
 
+#### Estimated background (opt-in, per tile)
+
+A residual the measured background missed (strain elsewhere on the slide, a different focus,
+drift) is a smooth ramp of a few nm that differs from tile to tile and steps at the seams.
+`reconstruction.estimated_background` fits a low-order polynomial surface to it in each tile and
+removes it, after the measured background (recOrder's "estimated background", ported in
+`polscope_library.background_fit`):
+
+```yaml
+estimated_background:
+  enabled: true                  # off when absent or false
+  order: 2                       # polynomial degree; 1 = plane
+  block_size: 32                 # px; block medians are what is fitted
+  max_block_retardance_nm: 5     # blocks above this are specimen, left out; null keeps all
+  min_background_fraction: 0.25  # fewer background blocks than this: tile left uncorrected
+```
+
+It cannot tell a smooth residual from smooth specimen retardance. A tile that is mostly
+specimen is therefore skipped, not fitted, and weakly birefringent tissue under the threshold
+can still be removed, so it is off unless enabled. Unknown keys or bad values refuse the run at
+the first tile. Every derived tile records `polscope.estimated_background` (the reason line),
+`..._applied`, `..._order`, `..._block_size`, `..._max_block_retardance_nm`, `..._blocks_used`
+and, when applied, `..._peak_removed_nm` / `..._mean_removed_nm`, which compared across tiles is
+the size of the residual the measured background missed. The server logs one INFO line per tile.
+
 ### Black-level options
 
 The `--black-level` parameter controls the dark-frame correction, which improves
