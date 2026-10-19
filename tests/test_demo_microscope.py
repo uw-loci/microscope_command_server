@@ -281,6 +281,9 @@ class TestCamera:
         assert core.get_remaining_image_count() >= 1
         pix = core.pop_next_image()
         assert pix.shape == (512 * 512 * 4,)
+        # A 10 s frame period, so no new frame can arrive between the clear and the pop:
+        # at 1 ms a slow CI runner produced one in between and the pop succeeded.
+        core.set_exposure(10000.0)
         core.clear_circular_buffer()
         assert core.get_remaining_image_count() == 0
         with pytest.raises(RuntimeError):
