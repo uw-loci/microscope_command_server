@@ -150,7 +150,7 @@ on top of the existing angle-based flags:
 - `--profile <key>` -- acquisition profile key to apply for background
   collection (e.g., `profile=Brightfield_10x` or `profile=IF_40x`). If
   omitted, the profile is resolved automatically from modality and objective.
-  The profile determines which illumination intensity and device properties are
+  The profile determines which camera, illumination intensity and device properties are
   applied during background collection.
 - `--channels "(id1,id2,...)"` -- when used with BGACQUIRE, enables
   per-channel background collection: the server collects one background image
@@ -647,6 +647,12 @@ and metadata file that guides all subsequent LC-PolScope acquisitions.
   falling value is the signal to recalibrate. How often that happens on this
   rig is not yet known.
 
+Calibration does not need the microscope left in the right state. Before it searches,
+it applies the first state's hardware state (its lamp, light-path presets and crystal
+settings) and, on a two-camera scope whose modality uses one detector, switches to that
+camera. Starting it straight after a fluorescence or brightfield profile therefore
+measures the LC-PolScope field, not a dark one.
+
 ### Command syntax
 
 ```
@@ -880,7 +886,10 @@ acquisition paths skip for this modality.
   (default 10; a single frame's noise would be copied into every tile), refuses a camera on
   auto gain or auto exposure, warns on clipped pixels, and writes `<State>.tif` (float32) plus
   `background_provenance.json`: the LC calibration time and file, exposures, frames, adapter
-  wavelength, black level, camera summary and per-state means.
+  wavelength, black level, camera summary, per-state means and `swing_state_spread` (how far
+  apart the swing states' background means lie, as a fraction of their mean). Above 10% the
+  collector logs a WARNING that the field probably had specimen or debris in it; move to an
+  empty area and collect again.
 - **At acquisition** the five states are loaded from the profile's background folder and checked
   against the current calibration. A background with no provenance, or one collected under a
   different LC calibration, is **not used**: an ERROR says why and the run reconstructs without
@@ -1464,7 +1473,12 @@ left applied.
 **Backward compatibility:**
 
 Omitting `--af-channel` preserves the original behavior: autofocus runs on the
-currently-applied channel.
+currently-applied channel. The exception is `--focus-channel <channel_id>`, the
+autofocus reference channel the QPSC dialog sends with every acquisition. Without
+`--af-channel`, that channel's hardware state is applied before each autofocus scan,
+at its own library exposure and intensity (the `--af-channel-exposure` and
+`--af-channel-intensity` overrides apply only to `--af-channel`). `--af-channel` wins
+when both are given.
 
 ### Flag syntax
 
