@@ -214,6 +214,61 @@ def _describe_camera(camera: Dict[str, Any]) -> str:
     return describe_camera(camera)
 
 
+def prepare_extinction_hardware(
+    hardware, settings_yaml: Optional[Dict[str, Any]], modality: str, log: logging.Logger
+) -> list:
+    """Put the microscope in the extinction state's hardware state before searching.
+
+    The search moves only the crystals; everything else the frames depend on --
+    which camera, the lamp, a light-path preset -- is whatever the microscope was
+    last left in. A profile switch turns every declared lamp off, and a two-camera
+    scope may be on the other camera, so a calibration started straight after one
+    measured a dark field, or the wrong camera. This applies what State0 applies
+    (its ``mm_setup_presets`` and ``device_properties``, crystals included; the
+    search starts from there anyway) and, when every profile of the modality names
+    the same detector and it is not the active one, switches to it.
+
+    On the LC-PolScope rig, whose lamp is manual and which has one camera per
+    config, both are no-ops. Returns warnings; never raises.
+    """
+    notes: list = []
+    settings_yaml = settings_yaml or {}
+    profiles = settings_yaml.get("acquisition_profiles", {}) or {}
+    detectors = {
+        p.get("detector")
+        for p in profiles.values()
+        if isinstance(p, dict) and str(p.get("modality", "")).lower() == modality.lower()
+    }
+    detectors.discard(None)
+    if len(detectors) == 1:
+        detector = next(iter(detectors))
+        active = getattr(hardware, "_active_detector_id", None)
+        if active is not None and detector != active and hasattr(hardware, "set_active_camera"):
+            try:
+                hardware.set_active_camera(detector)
+                log.info("LC calibration: switched to the %s camera, %s", modality, detector)
+            except Exception as exc:
+                notes.append(f"Could not switch to the {modality} camera {detector}: {exc}")
+
+    channels = (settings_yaml.get("modalities", {}).get(modality, {}) or {}).get("channels") or []
+    order = (
+        (settings_yaml.get("modalities", {}).get(modality, {}) or {}).get("reconstruction") or {}
+    ).get("state_order") or ["State0"]
+    extinction = next(
+        (c for c in channels if isinstance(c, dict) and c.get("id") == order[0]), None
+    )
+    if extinction is None:
+        return notes
+    try:
+        from microscope_command_server.acquisition.workflow import apply_channel_hardware_state
+
+        apply_channel_hardware_state(hardware, extinction, log)
+        log.info("LC calibration: applied %s's hardware state before the search", order[0])
+    except Exception as exc:
+        notes.append(f"Could not apply {order[0]}'s hardware state before calibrating: {exc}")
+    return notes
+
+
 def run_lc_calibration(
     hardware,
     settings_yaml: Optional[Dict[str, Any]] = None,
@@ -324,6 +379,8 @@ def run_lc_calibration(
             "Set lc_control_mode: MM-Retardance to calibrate now -- the device adapter "
             "does the conversion, and the resulting palette is equally valid."
         )
+
+    warnings.extend(prepare_extinction_hardware(hardware, settings_yaml, modality, log))
 
     try:
         instrument = MicroManagerLC(
