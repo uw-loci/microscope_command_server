@@ -1620,22 +1620,34 @@ def apply_af_channel_state(ctx) -> bool:
     channel's own hardware state and exposure before it snaps, so the focus channel
     never leaks into an acquired image.
 
+    Without ``--af-channel``, the acquisition's ``--focus-channel`` (the dialog's
+    autofocus reference channel) is applied the same way at its own configured
+    exposure. QPSC documents that the server does this, and until 2026-10-19 the
+    flag was parsed and ignored: the first tile was focused under whatever light
+    the profile switch left, which on a scope with a controllable lamp or LED is
+    off, so the sweep scored read noise and fell back to manual focus.
+
     Returns True when the channel was applied, False when there is nothing to do
-    (no --af-channel) or the channel could not be resolved.
+    (neither flag) or the channel could not be resolved.
     """
     ch_id = getattr(ctx, "af_channel", None)
+    dedicated = bool(ch_id)
+    if not ch_id:
+        ch_id = getattr(ctx, "af_focus_channel", None)
     if not ch_id:
         return False
 
     logger = ctx.logger
-    exposure = ctx.af_channel_exposure
+    exposure = ctx.af_channel_exposure if dedicated else None
     plan = resolve_channel_plan(
         ctx.ppm_settings,
         ctx.params.get("scan_type", ""),
         [ch_id],
         [float(exposure)] if exposure and exposure > 0 else [],
         channel_intensity_overrides=(
-            {ch_id: ctx.af_channel_intensity} if ctx.af_channel_intensity is not None else None
+            {ch_id: ctx.af_channel_intensity}
+            if dedicated and ctx.af_channel_intensity is not None
+            else None
         ),
     )
     if not plan:
@@ -8734,6 +8746,12 @@ def _channel_intensity_value(ch_entry):
     return None
 
 
+#: Largest (max - min) / mean of the LC-PolScope swing states' background means
+#: (above the black level) that still looks like a clear field. Calibrated states
+#: on glass agree to well under 1%; a specimen spreads them by tens of percent.
+LC_BACKGROUND_MAX_SWING_SPREAD = 0.10
+
+
 def _collect_channel_backgrounds(
     channels,
     output_folder_path,
@@ -8768,6 +8786,25 @@ def _collect_channel_backgrounds(
     modality_cfg = modalities.get(modality_name) or {}
     library = modality_cfg.get("channels", []) or []
     overrides = profile_cfg.get("channel_overrides") or {}
+
+    # The profile's camera. Collection does not run the profile's mode setup (it
+    # must not move the stage or re-light the field), so on a scope with one
+    # camera per modality the active camera can still be the last profile's.
+    detector = profile_cfg.get("detector")
+    active = getattr(hardware, "_active_detector_id", None)
+    if (
+        detector
+        and active is not None
+        and detector != active
+        and hasattr(hardware, "set_active_camera")
+    ):
+        try:
+            hardware.set_active_camera(detector)
+            logger.info("Background collection: switched to %s's camera %s", profile_key, detector)
+        except Exception as exc:
+            logger.warning(
+                "Background collection: could not switch to camera %s: %s", detector, exc
+            )
 
     channel_exposures = {}
     channel_intensities = {}
@@ -8914,7 +8951,33 @@ def _collect_channel_backgrounds(
         import json
         import time as _time
 
-        from microscope_command_server.modality.lcpolscope import BACKGROUND_PROVENANCE_FILE
+        from microscope_command_server.modality.lcpolscope import (
+            BACKGROUND_PROVENANCE_FILE,
+            EXTINCTION_CHANNEL_ID,
+        )
+
+        # A calibration matches the swing states' intensities on a clear field, so on
+        # one their background means agree to a few percent. A specimen in the field
+        # breaks that (one demo background taken on tissue spread 782..1285 counts) and
+        # turns every corrected tile into nonsense, with nothing else to show for it.
+        swing_spread = None
+        black = float(recon.get("black_level") or 0.0)
+        swing_means = [
+            v["mean"] - black for k, v in lcps_state_stats.items() if k != EXTINCTION_CHANNEL_ID
+        ]
+        if len(swing_means) >= 2 and np.mean(swing_means) > 0:
+            swing_spread = round(
+                float((max(swing_means) - min(swing_means)) / np.mean(swing_means)), 4
+            )
+            if swing_spread > LC_BACKGROUND_MAX_SWING_SPREAD:
+                logger.warning(
+                    "LC-PolScope background: the swing states differ by %.0f%% (means %s). On a "
+                    "clear, specimen-free field after a calibration they agree to a few percent, "
+                    "so this was probably taken on specimen or debris. Move to an empty area and "
+                    "collect it again.",
+                    swing_spread * 100,
+                    {k: v["mean"] for k, v in lcps_state_stats.items()},
+                )
 
         provenance = {
             "modality": modality_name,
@@ -8924,6 +8987,7 @@ def _collect_channel_backgrounds(
             "states": list(channel_exposures),
             "exposure_ms": channel_exposures,
             "state_stats": lcps_state_stats,
+            "swing_state_spread": swing_spread,
             "lc_calibrated_at": recon.get("lc_calibrated_at"),
             "lc_calibration_file": recon.get("lc_calibration_file"),
             "lc_extinction_ratio": recon.get("lc_extinction_ratio"),
@@ -9019,7 +9083,12 @@ def simple_background_collection(
             "resolved_profile": str or None (acquisition profile key used),
         }
     """
-    # Resolve wb_mode: require explicit choice, never silently pick a mode
+    # Resolve wb_mode: require explicit choice, never silently pick a mode.
+    # A per-channel collection (fluorescence, LC-PolScope) has no white balance
+    # and the client sends none; it returns from the channel branch below
+    # before any WB code runs, so it must not be refused here.
+    if wb_mode is None and channels:
+        wb_mode = "off"
     if wb_mode is None:
         if use_per_angle_wb:
             wb_mode = "per_angle"

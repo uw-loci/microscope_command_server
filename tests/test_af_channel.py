@@ -69,6 +69,7 @@ class Ctx:
         self.af_channel = kw.get("af_channel")
         self.af_channel_exposure = kw.get("af_channel_exposure")
         self.af_channel_intensity = kw.get("af_channel_intensity")
+        self.af_focus_channel = kw.get("af_focus_channel")
         self.hardware = kw.get("hardware") or FakeHardware()
         self.logger = kw.get("logger") or FakeLogger()
         self.params = {"scan_type": "IF"}
@@ -154,6 +155,24 @@ def test_zero_intensity_is_still_forwarded():
     fn, calls = build({"DAPI": DAPI})
     fn(Ctx(af_channel="DAPI", af_channel_intensity=0.0))
     assert calls["resolve"][0][2] == {"DAPI": 0.0}
+
+
+def test_the_focus_channel_is_applied_when_there_is_no_dedicated_one():
+    # --focus-channel (the dialog's autofocus reference channel) without
+    # --af-channel: focus on that channel's own state and exposure. It used to be
+    # parsed and ignored, so the first tile focused in the dark after a profile switch.
+    fn, calls = build({"DAPI": DAPI})
+    ctx = Ctx(af_focus_channel="DAPI", af_channel_exposure=20.0, af_channel_intensity=5.0)
+    assert fn(ctx) is True
+    assert calls["apply"] == ["DAPI"]
+    assert ctx.hardware.exposures == [100.0], "the channel's own exposure, not the dedicated one"
+    assert calls["resolve"][0][1:] == ([], None), "dedicated overrides are not borrowed"
+
+
+def test_a_dedicated_focus_channel_wins_over_the_reference_channel():
+    fn, calls = build({"DAPI": DAPI, "FITC": {"id": "FITC", "exposure_ms": 80.0}})
+    assert fn(Ctx(af_channel="FITC", af_focus_channel="DAPI")) is True
+    assert calls["apply"] == ["FITC"]
 
 
 def test_unknown_channel_warns_and_leaves_hardware_alone():
