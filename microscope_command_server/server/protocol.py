@@ -84,6 +84,11 @@ class ExtendedCommand:
     # fraction of full scale (<= 0: default 0.75). Reply as LCREADY.
     LCSIGNAL = b"lcsignal"
 
+    # Read or apply one Micro-Manager ConfigGroup preset (QPSC keeps MM's objective
+    # preset in step with the objective chosen in QPSC). Request and reply are a
+    # 4-byte big-endian length + UTF-8 JSON; see server/handlers/presets.py.
+    MMPRESET = b"mmpreset"
+
     # ---- JAI-Specific: White Balance Calibration Commands ----
     # These commands require a JAI trilinear color camera with per-channel
     # exposure and gain control. They use the JAIWhiteBalanceCalibrator from

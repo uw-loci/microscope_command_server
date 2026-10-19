@@ -961,6 +961,22 @@ class DemoCore:
     def wait_for_config(self, group: str, preset: str) -> None:
         self.wait_for_system()
 
+    def get_available_config_groups(self) -> StrVector:
+        with self._lock:
+            return StrVector(self._config_groups.keys())
+
+    def get_available_configs(self, group: str) -> StrVector:
+        with self._lock:
+            return StrVector(self._config_groups.get(group, {}).keys())
+
+    def get_current_config(self, group: str) -> str:
+        """The preset whose settings all match the current state, or "" (as MMCore)."""
+        with self._lock:
+            for preset, settings in self._config_groups.get(group, {}).items():
+                if all(self.get_property(d, p) == v for d, p, v in settings):
+                    return preset
+            return ""
+
     # ----- stages -------------------------------------------------------- #
 
     def set_position(self, *args) -> None:

@@ -633,6 +633,20 @@ exposure that puts the brightest swing state's 99.9th percentile at the target, 
 Viewer Camera tab uses it to choose the one exposure all states share. Implementation:
 `calibration/lc_state_signal.py`.
 
+## Micro-Manager preset (MMPRESET)
+
+Request and reply are a 4-byte big-endian length plus UTF-8 JSON. `{"action": "get", "group",
+"preset"}` reports the group's `current` preset, whether the group and preset exist, and the
+names that do (`presets`, or `groups` when the group is missing); `"set"` applies the preset and
+adds `applied`, `previous` and the resulting `pixel_size_um`. A set is refused (an `error`
+field) while an acquisition thread runs or before CONFIG, because a preset can turn a motorized
+turret. QPSC uses it to keep Micro-Manager's objective preset in step with the objective chosen
+in QPSC (`mm_preset` in the microscope YAML). Implementation: `server/handlers/presets.py`.
+
+When Micro-Manager reports pixel size 0, GETPXSZ also logs (once per state) every pixel-size
+preset with the properties it needs and their current values, e.g.
+`'20x 0.4 ORYX' needs DObjective.Label=20x (now 4x) <- differs`.
+
 ## LC-PolScope Calibration (LCCALIB)
 
 The `LCCALIB` command calibrates the liquid crystals on an LC-PolScope system,
