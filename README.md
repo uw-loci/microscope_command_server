@@ -590,6 +590,18 @@ No payload. Replies with a 4-byte big-endian length and UTF-8 JSON: `camera` (th
 Read-only. QPSC shows it in the LC-PolScope acquisition panel before a run; the same camera
 checks also run at the start of the calibration and on the first state of every acquisition.
 
+## LC-PolScope state signal (LCSIGNAL)
+
+Payload: 32-byte profile name, then two big-endian doubles, `exposure_ms` (0 or less: the
+camera's current exposure) and the target fraction of full scale (0 or less: 0.75). Applies
+every state of the profile's channel library, each at that ONE exposure, snaps it, and replies
+like LCREADY with `states[]` (`id`, `mean`, `p999`, `max`, `saturated_fraction`, `extinction`),
+`full_scale`, `brightest_state`, `brightest_fraction`, `clipped`, `suggested_exposure_ms` (the
+exposure that puts the brightest swing state's 99.9th percentile at the target, above
+`reconstruction.black_level`; null when clipped or dark) and the camera problems. QPSC's Live
+Viewer Camera tab uses it to choose the one exposure all states share. Implementation:
+`calibration/lc_state_signal.py`.
+
 ## LC-PolScope Calibration (LCCALIB)
 
 The `LCCALIB` command calibrates the liquid crystals on an LC-PolScope system,

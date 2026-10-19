@@ -77,6 +77,12 @@ class ExtendedCommand:
     # adapter's wavelength against the reconstruction's. No payload. Reply:
     # 4-byte big-endian length + that many UTF-8 bytes of JSON.
     LCREADY = b"lcready_"
+    # LC-PolScope state signal: apply every state at ONE exposure, snap each, and
+    # report per-state brightness against full scale plus a suggested exposure.
+    # Payload: 32-byte profile name (null-padded UTF-8) + 8-byte big-endian
+    # double exposure_ms (<= 0: camera's current) + 8-byte double target
+    # fraction of full scale (<= 0: default 0.75). Reply as LCREADY.
+    LCSIGNAL = b"lcsignal"
 
     # ---- JAI-Specific: White Balance Calibration Commands ----
     # These commands require a JAI trilinear color camera with per-channel

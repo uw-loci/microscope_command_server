@@ -2132,3 +2132,46 @@ def handle_lcready(conn, client, hardware, settings, **kwargs):
     data = json.dumps(report).encode("utf-8")
     conn.sendall(struct.pack("!I", len(data)))
     conn.sendall(data)
+
+
+def handle_lcsignal(conn, client, hardware, settings, **kwargs):
+    """Per-state brightness of the LC-PolScope states at one exposure, for the Live
+    Viewer Camera tab (see calibration.lc_state_signal.measure_lc_states).
+
+    Payload: 32-byte profile name + 8-byte double exposure_ms + 8-byte double target
+    fraction. Reply: 4-byte big-endian length + UTF-8 JSON; an error is a field in it.
+    """
+    import json
+
+    from microscope_command_server.calibration.lc_state_signal import (
+        DEFAULT_TARGET_FRACTION,
+        measure_lc_states,
+    )
+
+    report: dict
+    try:
+        data = b""
+        while len(data) < 48:
+            chunk = conn.recv(48 - len(data))
+            if not chunk:
+                break
+            data += chunk
+        if len(data) < 48:
+            report = {"error": f"short LCSIGNAL payload ({len(data)} bytes, want 48)"}
+        else:
+            profile = data[:32].rstrip(b"\x00").decode("utf-8").strip()
+            exposure_ms, target = struct.unpack("!dd", data[32:48])
+            active = getattr(hardware, "settings", None) or settings
+            report = measure_lc_states(
+                hardware,
+                active,
+                profile,
+                exposure_ms=exposure_ms if exposure_ms > 0 else None,
+                target_fraction=target if target > 0 else DEFAULT_TARGET_FRACTION,
+            )
+    except Exception as exc:  # report, never take the socket down
+        logger.error("LCSIGNAL failed: %s", exc)
+        report = {"error": str(exc)}
+    payload = json.dumps(report).encode("utf-8")
+    conn.sendall(struct.pack("!I", len(payload)))
+    conn.sendall(payload)

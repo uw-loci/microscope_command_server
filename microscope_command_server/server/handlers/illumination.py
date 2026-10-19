@@ -13,6 +13,49 @@ import logging
 logger = logging.getLogger(__name__)
 
 
+def resolve_profile_modality(settings, profile_name):
+    """``(modality_name, modality_cfg, profile_cfg)`` for an acquisition profile, or None
+    (logged) when the profile or its modality cannot be found. A trailing ``_<counter>``
+    on the profile name is tolerated, as apply_mode_setup does."""
+    profiles = (settings or {}).get("acquisition_profiles", {}) or {}
+    profile_cfg = profiles.get(profile_name)
+    if profile_cfg is None and "_" in profile_name:
+        stem = "_".join(profile_name.split("_")[:-1])
+        profile_cfg = profiles.get(stem)
+    if not isinstance(profile_cfg, dict):
+        logger.error("Unknown acquisition profile '%s'", profile_name)
+        return None
+    modality_name = profile_cfg.get("modality")
+    modalities = (settings or {}).get("modalities", {}) or {}
+    modality_cfg = modalities.get(modality_name) if modality_name else None
+    if not isinstance(modality_cfg, dict):
+        logger.error("Profile '%s' has no resolvable modality", profile_name)
+        return None
+    return modality_name, modality_cfg, profile_cfg
+
+
+def profile_channel_entry(modality_cfg, profile_cfg, channel_id):
+    """The channel library entry ``channel_id`` with the profile's ``channel_overrides``
+    merged in (device_properties appended, other keys replaced), or None."""
+    ch_entry = None
+    for entry in modality_cfg.get("channels", []) or []:
+        if isinstance(entry, dict) and entry.get("id") == channel_id:
+            ch_entry = dict(entry)  # shallow copy for override merge
+            break
+    if ch_entry is None:
+        return None
+    overrides = profile_cfg.get("channel_overrides") or {}
+    if isinstance(overrides, dict) and isinstance(overrides.get(channel_id), dict):
+        for k, v in overrides[channel_id].items():
+            if k == "device_properties" and isinstance(v, list):
+                base_props = list(ch_entry.get("device_properties") or [])
+                base_props.extend(v)
+                ch_entry["device_properties"] = base_props
+            else:
+                ch_entry[k] = v
+    return ch_entry
+
+
 def handle_getillm(conn, client, hardware, settings, **kwargs):
     """Return current illumination state (power, range, on/off).
 
@@ -264,28 +307,11 @@ def handle_applych(conn, client, hardware, settings, **kwargs):
         profile_name = data[:32].rstrip(b"\x00").decode("utf-8").strip()
         channel_id = data[32:].rstrip(b"\x00").decode("utf-8").strip()
 
-        # Resolve profile -> modality -> channel library
-        profiles = (settings or {}).get("acquisition_profiles", {}) or {}
-        profile_cfg = profiles.get(profile_name)
-        if profile_cfg is None and "_" in profile_name:
-            # Strip a trailing "_<counter>" the way apply_mode_setup does.
-            stem = "_".join(profile_name.split("_")[:-1])
-            profile_cfg = profiles.get(stem)
-        if not isinstance(profile_cfg, dict):
-            logger.error("APPLYCH: unknown profile '%s'", profile_name)
+        resolved = resolve_profile_modality(settings, profile_name)
+        if resolved is None:
             conn.sendall(b"ERR_CHAN")
             return
-
-        modality_name = profile_cfg.get("modality")
-        modalities = (settings or {}).get("modalities", {}) or {}
-        modality_cfg = modalities.get(modality_name) if modality_name else None
-        if not isinstance(modality_cfg, dict):
-            logger.error(
-                "APPLYCH: profile '%s' has no resolvable modality",
-                profile_name,
-            )
-            conn.sendall(b"ERR_CHAN")
-            return
+        modality_name, modality_cfg, profile_cfg = resolved
 
         # "None" / empty channel id: deactivate every illumination source
         # the modality declares. Same helper apply_mode_setup uses for
@@ -304,13 +330,8 @@ def handle_applych(conn, client, hardware, settings, **kwargs):
                 conn.sendall(b"ERR_CHAN")
             return
 
-        # Find the channel entry by id in the modality's channel library.
         library = modality_cfg.get("channels", []) or []
-        ch_entry = None
-        for entry in library:
-            if isinstance(entry, dict) and entry.get("id") == channel_id:
-                ch_entry = dict(entry)  # shallow copy for override merge
-                break
+        ch_entry = profile_channel_entry(modality_cfg, profile_cfg, channel_id)
         if ch_entry is None:
             logger.error(
                 "APPLYCH: channel '%s' not found in modality '%s' library",
@@ -319,18 +340,6 @@ def handle_applych(conn, client, hardware, settings, **kwargs):
             )
             conn.sendall(b"ERR_CHAN")
             return
-
-        # Merge profile-level channel_overrides (per-objective tuning).
-        overrides = profile_cfg.get("channel_overrides") or {}
-        if isinstance(overrides, dict) and isinstance(overrides.get(channel_id), dict):
-            ch_override = overrides[channel_id]
-            for k, v in ch_override.items():
-                if k == "device_properties" and isinstance(v, list):
-                    base_props = list(ch_entry.get("device_properties") or [])
-                    base_props.extend(v)
-                    ch_entry["device_properties"] = base_props
-                else:
-                    ch_entry[k] = v
 
         # Cross-channel cleanup: zero every other channel's intensity
         # property so the previously-active wavelength does not stay lit
