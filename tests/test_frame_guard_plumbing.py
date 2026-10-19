@@ -34,8 +34,9 @@ fg = _load("frame_guard")
 
 
 class FakeStage:
-    def __init__(self, suspect=None, setter_raises=False):
+    def __init__(self, suspect=None, setter_raises=False, since=None):
         self.xy_frame_suspect = suspect
+        self.xy_frame_suspect_since = since
         self.armed = None
         self._setter_raises = setter_raises
 
@@ -101,6 +102,25 @@ def test_a_suspect_frame_stops_the_run_and_says_why():
     # The operator has to be able to act on this without reading the source.
     assert "no longer trustworthy" in message
     assert "last commanded position" in message
+    assert "restart the microscope server" in message
+
+
+def test_an_old_detection_says_when_it_happened():
+    # 2026-10-19: a 10:37 run failed with the 09:59 detection's numbers and read as new.
+    import time
+
+    since = time.time() - 38 * 60
+    stage = FakeStage(suspect="Stage reports (3628.0, 1636.0) um", since=since)
+    with pytest.raises(RuntimeError) as excinfo:
+        fg.raise_if_frame_suspect(SimpleNamespace(stage=stage))
+    stamp = time.strftime("%H:%M:%S", time.localtime(since))
+    assert f"first detected at {stamp}, 38 min ago" in str(excinfo.value)
+
+
+def test_a_stage_without_the_time_still_stops_the_run():
+    with pytest.raises(RuntimeError) as excinfo:
+        fg.raise_if_frame_suspect(SimpleNamespace(stage=FakeStage(suspect="drift")))
+    assert "detected" not in str(excinfo.value)
 
 
 # --------------------------------------------------------------------------

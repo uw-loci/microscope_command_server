@@ -22,6 +22,7 @@ Kept free of hardware imports so it can be tested without Micro-Manager.
 
 import functools
 import logging
+import time
 from typing import Any, Callable, Optional
 
 logger = logging.getLogger(__name__)
@@ -90,4 +91,26 @@ def raise_if_frame_suspect(hardware: Any) -> None:
     """
     reason = frame_suspect_reason(hardware)
     if reason:
-        raise RuntimeError(f"Stage coordinate frame is no longer trustworthy. {reason}")
+        raise RuntimeError(
+            "Stage coordinate frame is no longer trustworthy"
+            f"{_detected_note(hardware)}. {reason} "
+            "Re-establish the frame at the calibration slide fiducial, then restart the "
+            "microscope server: until it restarts, every acquisition stops here."
+        )
+
+
+def _detected_note(hardware: Any, now: Optional[float] = None) -> str:
+    """' (first detected at 09:59:41, 38 min ago)', or '' when the stage does not say.
+
+    The flag is sticky, so a run started long after the fault fails with the very same
+    numbers. 2026-10-19: a 10:37 failure was the 09:59 detection, and read as a new one.
+    """
+    since = getattr(getattr(hardware, "stage", None), "xy_frame_suspect_since", None)
+    if not isinstance(since, (int, float)):
+        return ""
+    now = time.time() if now is None else now
+    minutes = max(0, int((now - since) // 60))
+    stamp = time.strftime("%H:%M:%S", time.localtime(since))
+    if minutes < 1:
+        return f" (detected at {stamp})"
+    return f" (first detected at {stamp}, {minutes} min ago)"
