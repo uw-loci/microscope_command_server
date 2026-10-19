@@ -7,6 +7,7 @@ properties, and a focus sweep that has to peak where the virtual slide says
 focus is.
 """
 
+import logging
 import time
 
 import numpy as np
@@ -521,3 +522,422 @@ def hardware_logger():
     import logging
 
     return logging.getLogger("test_far_from_focus")
+
+
+# --------------------------------------------------------------------------- #
+# The monochrome camera: fluorescence and LC-PolScope
+# --------------------------------------------------------------------------- #
+
+#: The demo compensator's calibrated palette, as shipped in config_Demo.yml.
+DEMO_PALETTE = [
+    ("State0", 0.2475, 0.5137),
+    ("State1", 0.2175, 0.5137),
+    ("State2", 0.2475, 0.5437),
+    ("State3", 0.2775, 0.5137),
+    ("State4", 0.2475, 0.4837),
+]
+
+FLUORESCENCE_CHANNELS = [
+    ("DAPI", "385nm", 100, 25),
+    ("FITC", "475nm", 200, 50),
+    ("TRITC", "550nm", 80, 30),
+    ("Cy5", "621nm", 100, 25),
+]
+
+
+def _lc_channel(state, a, b):
+    return {
+        "id": state,
+        "exposure_ms": 50,
+        "device_properties": [
+            {"device": "MeadowlarkLC", "property": "Retardance LC-A [in waves]", "value": a},
+            {"device": "MeadowlarkLC", "property": "Retardance LC-B [in waves]", "value": b},
+            {"device": "DLED", "property": "State", "value": 0},
+            {"device": "DLamp", "property": "State", "value": 1},
+            {"device": "DLamp", "property": "Intensity", "value": 100},
+        ],
+    }
+
+
+def _fl_channel(cid, line, exposure, power):
+    props = [
+        {"device": "DLamp", "property": "State", "value": 0},
+        {"device": "DLED", "property": "State", "value": 1},
+    ]
+    for other in ("385nm", "475nm", "550nm", "621nm"):
+        props.append(
+            {
+                "device": "DLED",
+                "property": f"Enable-{other}",
+                "value": "On" if other == line else "Off",
+            }
+        )
+    props.append({"device": "DLED", "property": f"Intensity-{line}", "value": power})
+    return {
+        "id": cid,
+        "exposure_ms": exposure,
+        "intensity_property": {"device": "DLED", "property": f"Intensity-{line}"},
+        "device_properties": props,
+    }
+
+
+def multimodal_settings():
+    """config_Demo.yml's three modalities on two cameras, in the server's shape."""
+    s = demo_settings()
+    s["modalities"]["Fluorescence"] = {
+        "type": "widefield",
+        "illumination": {
+            "device": "DLED",
+            "type": "device_property",
+            "state_property": "State",
+            "intensity_property": "State",
+            "max_intensity": 1.0,
+            "label": "Demo epi LED",
+        },
+        "channels": [_fl_channel(*c) for c in FLUORESCENCE_CHANNELS],
+    }
+    s["modalities"]["lcpolscope"] = {
+        "type": "polarized",
+        "reconstruction": {
+            "wavelength_nm": 549,
+            "swing_waves": 0.03,
+            "scheme": "5-State",
+            "state_order": [p[0] for p in DEMO_PALETTE],
+            "method": "openpolscope",
+            "black_level": 100,
+        },
+        "channels": [_lc_channel(*p) for p in DEMO_PALETTE],
+    }
+    s["hardware"]["objectives"][0]["pixel_size_xy_um"]["DEMO_MONO_CAMERA"] = 0.586
+    s["hardware"]["detectors"].append("DEMO_MONO_CAMERA")
+    s["id_detector"]["DEMO_MONO_CAMERA"] = {
+        "name": "Demo Mono Camera",
+        "camera_type": "generic",
+        "device": "DMonoCam",
+        "width_px": 640,
+        "height_px": 512,
+        "flip_x": False,
+        "flip_y": False,
+    }
+    s["acquisition_profiles"]["Fluorescence_10x"] = {
+        "modality": "Fluorescence",
+        "detector": "DEMO_MONO_CAMERA",
+        "channels": [c[0] for c in FLUORESCENCE_CHANNELS],
+    }
+    s["acquisition_profiles"]["lcpolscope_10x"] = {
+        "modality": "lcpolscope",
+        "detector": "DEMO_MONO_CAMERA",
+        "objective": "DEMO_OBJECTIVE_10X",
+        "channels": [p[0] for p in DEMO_PALETTE],
+    }
+    return s
+
+
+@pytest.fixture
+def mm_hardware(core):
+    return PycromanagerHardware(core, DemoStudio(core), multimodal_settings())
+
+
+def _goto(core, x, y):
+    core.set_xy_position(x, y)
+    core.set_position(core.slide.focus_z(x, y))
+    core.wait_for_system()
+
+
+def _apply(hardware, modality, channel_id):
+    from microscope_command_server.acquisition.workflow import apply_channel_hardware_state
+
+    channels = hardware.settings["modalities"][modality]["channels"]
+    entry = next(c for c in channels if c["id"] == channel_id)
+    apply_channel_hardware_state(hardware, entry, logging.getLogger("test"))
+    hardware.set_exposure(entry["exposure_ms"])
+
+
+def _snap(hardware):
+    frame, _ = hardware.snap_image()
+    return frame.astype(np.float64)
+
+
+class TestMonoCamera:
+    def test_the_profile_switches_the_camera(self, mm_hardware, core):
+        mm_hardware.apply_mode_setup("Fluorescence_10x")
+        assert core.get_camera_device() == "DMonoCam"
+        frame, _ = mm_hardware.snap_image()
+        assert frame.shape == (512, 640) and frame.dtype == np.uint16
+        assert core.get_image_bit_depth() == 12
+        assert core.get_bytes_per_pixel() == 2
+        assert core.get_pixel_size_um() == pytest.approx(0.586), "MM reports the active camera's"
+        mm_hardware.apply_mode_setup("Brightfield_10x")
+        assert core.get_camera_device() == "DCam"
+        assert mm_hardware.snap_image()[0].shape == (512, 512, 3)
+
+    def test_each_camera_keeps_its_own_exposure_and_roi(self, core):
+        core.set_exposure(12.0)
+        core.set_roi(0, 0, 256, 256)
+        core.set_property("Core", "Camera", "DMonoCam")
+        assert core.get_exposure() == 50.0
+        assert core.get_roi() == (0, 0, 640, 512)
+        core.set_property("Core", "Camera", "DCam")
+        assert core.get_exposure() == 12.0
+        assert core.get_roi() == (0, 0, 256, 256)
+
+    def test_the_camera_checks_find_nothing_wrong_by_default_and_auto_gain_when_on(
+        self, mm_hardware, core
+    ):
+        from microscope_command_server.calibration.camera_checks import (
+            camera_setting_problems,
+            camera_snapshot,
+        )
+
+        core.set_property("Core", "Camera", "DMonoCam")
+        summary, props = camera_snapshot(mm_hardware)
+        assert summary["significant_bits"] == 12
+        assert camera_setting_problems(props, 12) == ([], [])
+        core.set_property("DMonoCam", "Gain Auto", "Continuous")
+        _, props = camera_snapshot(mm_hardware)
+        fatal, _ = camera_setting_problems(props, 12)
+        assert fatal and "Gain Auto" in fatal[0]
+
+    def test_dark_frame_sits_at_the_offset(self, core):
+        core.set_property("Core", "Camera", "DMonoCam")
+        core.set_property("DLamp", "State", "0")
+        core.snap_image()
+        frame = core.get_image().astype(np.float64)
+        assert abs(frame.mean() - 100.0) < 1.0
+
+
+class TestFluorescence:
+    def test_dapi_lights_the_nuclei(self, mm_hardware, core):
+        mm_hardware.apply_mode_setup("Fluorescence_10x")
+        _goto(core, 0.0, 0.0)
+        _apply(mm_hardware, "Fluorescence", "DAPI")
+        frame = _snap(mm_hardware)
+        nuclei = core.slide.specimen_maps(0.0, 0.0, 640, 512, 0.586)["fl385"] > 0.9
+        assert nuclei.mean() > 0.01
+        assert frame[nuclei].mean() > 2000 > frame[~nuclei].mean() + 1000
+
+    def test_channels_show_different_structures_without_saturating(self, mm_hardware, core):
+        mm_hardware.apply_mode_setup("Fluorescence_10x")
+        _goto(core, 0.0, 0.0)
+        frames = {}
+        for cid, *_ in FLUORESCENCE_CHANNELS:
+            _apply(mm_hardware, "Fluorescence", cid)
+            frames[cid] = _snap(mm_hardware)
+            assert (frames[cid] >= 4095).mean() < 0.001, cid
+            assert np.percentile(frames[cid], 99.9) > 500, cid
+        corr = np.corrcoef(frames["DAPI"].ravel(), frames["TRITC"].ravel())[0, 1]
+        assert corr < 0.5, "nuclei and eosin are different structures"
+
+    def test_the_colour_camera_does_not_see_the_leds(self, mm_hardware, core):
+        mm_hardware.apply_mode_setup("Fluorescence_10x")
+        _apply(mm_hardware, "Fluorescence", "DAPI")
+        core.set_property("Core", "Camera", "DCam")
+        frame = _snap(mm_hardware)
+        assert (
+            frame.mean() < 5.0
+        ), "the lamp is off; DAPI excitation never reaches the colour camera"
+
+
+class TestLcPolScope:
+    def _states(self, hardware, core, x, y):
+        _goto(core, x, y)
+        out = []
+        for state, *_ in DEMO_PALETTE:
+            _apply(hardware, "lcpolscope", state)
+            out.append(_snap(hardware))
+        return np.stack(out)
+
+    def test_the_shipped_palette_is_the_extinction_minimum(self, mm_hardware, core):
+        mm_hardware.apply_mode_setup("lcpolscope_10x")
+        _goto(core, 22000.0, 0.0)  # bare glass
+        _apply(mm_hardware, "lcpolscope", "State0")
+
+        def mean_at(a, b):
+            core.set_property("MeadowlarkLC", core.LC_A, f"{a:.4f}")
+            core.set_property("MeadowlarkLC", core.LC_B, f"{b:.4f}")
+            return _snap(mm_hardware).mean()
+
+        at = mean_at(0.2475, 0.5137)
+        for da, db in ((0.005, 0), (-0.005, 0), (0, 0.005), (0, -0.005)):
+            assert mean_at(0.2475 + da, 0.5137 + db) > at
+
+    def test_states_reconstruct_to_the_planted_birefringence(self, mm_hardware, core):
+        polscope = pytest.importorskip("polscope_library")
+        mm_hardware.apply_mode_setup("lcpolscope_10x")
+        background = np.mean(
+            [self._states(mm_hardware, core, 22000.0, 0.0) for _ in range(4)], axis=0
+        )
+        states = self._states(mm_hardware, core, 0.0, 0.0)
+        truth = core.slide.specimen_maps(0.0, 0.0, 640, 512, 0.586)
+        for method in ("qlipp", "openpolscope"):
+            result = polscope.reconstruct(
+                states,
+                0.03,
+                549.0,
+                method=method,
+                black_level=100,
+                background_intensities=background,
+            )
+            error = result.retardance_nm - truth["retardance_nm"]
+            assert abs(np.median(error)) < 0.1, method
+            assert np.percentile(np.abs(error), 95) < 1.0, method
+            fibres = truth["retardance_nm"] > 8
+            d = np.degrees(result.orientation_rad - truth["orientation_rad"])
+            d = (d + 90.0) % 180.0 - 90.0
+            assert np.median(np.abs(d[fibres])) < 1.0, method
+
+    def test_without_a_background_the_residual_shows_on_glass(self, mm_hardware, core):
+        polscope = pytest.importorskip("polscope_library")
+        mm_hardware.apply_mode_setup("lcpolscope_10x")
+        states = self._states(mm_hardware, core, 22000.0, 0.0)
+        result = polscope.reconstruct(states, 0.03, 549.0, method="openpolscope", black_level=100)
+        # Retardance and orientation together, as the vector a seam compares.
+        r, two_theta = result.retardance_nm, 2.0 * result.orientation_rad
+        vec = np.stack([r * np.cos(two_theta), r * np.sin(two_theta)])
+        left = np.median(vec[:, :, :100], axis=(1, 2))
+        right = np.median(vec[:, :, -100:], axis=(1, 2))
+        assert np.hypot(*(right - left)) > 1.0, "the field-fixed residual differs across the field"
+        assert np.median(r[:, -100:]) - np.median(r[:, :100]) > 0.3
+
+    def test_the_adapter_wavelength_scales_what_the_crystals_make(self, core):
+        core.set_property("MeadowlarkLC", core.LC_A, "0.25")
+        a549, _ = core.lc_delivered_waves()
+        core.set_property("MeadowlarkLC", "Wavelength", "546")
+        a546, _ = core.lc_delivered_waves()
+        assert a546 < a549
+        assert core.get_property("MeadowlarkLC", "Retardance LC-A [in nm]") == "136.50"
+        with pytest.raises(RuntimeError, match="read-only"):
+            core.set_property("MeadowlarkLC", "Retardance LC-A [in nm]", "100")
+
+    def test_lcsignal_measures_all_five_states(self, mm_hardware, core):
+        from microscope_command_server.calibration.lc_state_signal import measure_lc_states
+
+        mm_hardware.apply_mode_setup("lcpolscope_10x")
+        _goto(core, 22000.0, 0.0)
+        report = measure_lc_states(mm_hardware, mm_hardware.settings, "lcpolscope_10x", 50.0)
+        assert "error" not in report, report
+        assert [s["id"] for s in report["states"]] == [p[0] for p in DEMO_PALETTE]
+        assert report["full_scale"] == 4095.0
+        assert not report["clipped"]
+        assert 0.25 < report["brightest_fraction"] < 0.5
+        assert report["camera_fatal"] == [] and report["camera_advisory"] == []
+        assert report["suggested_exposure_ms"] > 50.0, "glass alone would take a longer exposure"
+
+    def test_the_shipped_exposure_does_not_clip_tissue(self, mm_hardware, core):
+        from microscope_command_server.calibration.lc_state_signal import measure_lc_states
+
+        mm_hardware.apply_mode_setup("lcpolscope_10x")
+        for x, y in ((0.0, 0.0), (-3000.0, 2500.0), (1500.0, -800.0)):
+            _goto(core, x, y)
+            report = measure_lc_states(mm_hardware, mm_hardware.settings, "lcpolscope_10x", 50.0)
+            assert not report["clipped"], (x, y, report["brightest_fraction"])
+            assert 0.5 < report["brightest_fraction"] < 0.9, (x, y)
+
+
+class TestLcCalibrationOnTheDemo:
+    def test_calibration_after_a_fluorescence_profile_finds_the_shipped_palette(
+        self, mm_hardware, core, tmp_path
+    ):
+        """A profile switch leaves the lamp off (and, from brightfield, the colour camera on);
+        the calibration applies State0's hardware state first, so it still sees the field."""
+        pytest.importorskip("polscope_library")
+        from microscope_command_server.calibration.lc_calibration_workflow import (
+            run_lc_calibration,
+        )
+
+        mm_hardware.apply_mode_setup("Brightfield_10x")
+        mm_hardware.apply_mode_setup("Fluorescence_10x")
+        mm_hardware.apply_mode_setup("Brightfield_10x")
+        assert core.get_camera_device() == "DCam"
+        _goto(core, 22000.0, 0.0)
+        settings = multimodal_settings()
+        settings["modalities"]["lcpolscope"]["reconstruction"]["lc_settle_ms"] = 0
+        result = run_lc_calibration(
+            mm_hardware, settings, output_folder=str(tmp_path), exposure_ms=50.0
+        )
+        assert result["success"], result.get("error")
+        assert core.get_camera_device() == "DMonoCam"
+        assert 200 < result["extinction_ratio"] < 330
+        lca, lcb = result["palette_waves"]["State0"]
+        assert lca == pytest.approx(0.2475, abs=0.002)
+        assert lcb == pytest.approx(0.5137, abs=0.002)
+
+
+class TestChannelBackgroundsOnTheDemo:
+    def test_lc_backgrounds_are_collected_without_a_wb_mode(self, mm_hardware, core, tmp_path):
+        """The client sends no --wb-mode for a per-channel collection; it was refused
+        before the channel branch ran, so no LC-PolScope or fluorescence background was
+        ever collected through BGACQUIRE."""
+        import yaml
+
+        from microscope_command_server.acquisition.workflow import simple_background_collection
+        from microscope_control.config import ConfigManager
+
+        settings = multimodal_settings()
+        config = tmp_path / "config_Demo.yml"
+        config.write_text(yaml.safe_dump(settings))
+        (tmp_path / "resources").mkdir()
+        (tmp_path / "resources" / "resources_LOCI.yml").write_text(
+            yaml.safe_dump({"id_detector": settings["id_detector"]})
+        )
+        mm_hardware.apply_mode_setup("Brightfield_10x")  # the colour camera is active
+        _goto(core, 22000.0, 0.0)
+        out = tmp_path / "bg"
+        result = simple_background_collection(
+            yaml_file_path=str(config),
+            output_folder_path=str(out),
+            modality="lcpolscope",
+            angles_str="()",
+            exposures_str="()",
+            hardware=mm_hardware,
+            config_manager=ConfigManager(),
+            logger=logging.getLogger("test"),
+            update_progress=lambda *a: None,
+            profile="lcpolscope_10x",
+            channels=[p[0] for p in DEMO_PALETTE],
+        )
+        assert core.get_camera_device() == "DMonoCam", "the profile's camera, not the last one"
+        assert sorted(f.name for f in out.glob("*.tif")) == sorted(
+            f"{p[0]}.tif" for p in DEMO_PALETTE
+        )
+        assert result is not None
+
+    def test_a_background_taken_on_tissue_is_called_out(self, mm_hardware, core, tmp_path, caplog):
+        import json
+
+        import yaml
+
+        from microscope_command_server.acquisition.workflow import simple_background_collection
+        from microscope_control.config import ConfigManager
+
+        settings = multimodal_settings()
+        config = tmp_path / "config_Demo.yml"
+        config.write_text(yaml.safe_dump(settings))
+        (tmp_path / "resources").mkdir()
+        (tmp_path / "resources" / "resources_LOCI.yml").write_text(
+            yaml.safe_dump({"id_detector": settings["id_detector"]})
+        )
+        spreads = {}
+        for where, (x, y) in {"glass": (22000.0, 0.0), "tissue": (0.0, 0.0)}.items():
+            _goto(core, x, y)
+            out = tmp_path / where
+            with caplog.at_level(logging.WARNING):
+                simple_background_collection(
+                    yaml_file_path=str(config),
+                    output_folder_path=str(out),
+                    modality="lcpolscope",
+                    angles_str="()",
+                    exposures_str="()",
+                    hardware=mm_hardware,
+                    config_manager=ConfigManager(),
+                    logger=logging.getLogger("test"),
+                    update_progress=lambda *a: None,
+                    profile="lcpolscope_10x",
+                    channels=[p[0] for p in DEMO_PALETTE],
+                )
+            spreads[where] = json.loads((out / "background_provenance.json").read_text())[
+                "swing_state_spread"
+            ]
+        assert spreads["glass"] < 0.02, spreads
+        assert spreads["tissue"] > 0.10, spreads
+        assert "probably taken on specimen" in caplog.text

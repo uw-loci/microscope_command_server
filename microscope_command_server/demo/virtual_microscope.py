@@ -3,22 +3,43 @@
 :class:`DemoCore` is what the server hands to ``PycromanagerHardware`` when it is
 started with ``--demo``. It implements the subset of MMCore that
 ``microscope_control`` and this server call -- device properties, an XY stage and
-a focus stage with simulated travel time, a camera that snaps and streams, a
+a focus stage with simulated travel time, two cameras that snap and stream, a
 circular buffer, ROI, config groups -- and nothing more. Unknown devices and
 properties raise, the way MMCore does, so a typo in a config fails here too.
 
-The camera looks at a :class:`VirtualSlide`: a procedurally generated H&E-like
-section with tissue islands, texture and nuclei, lying on a tilted, gently
-undulating focal surface within about +/-22 um of Z = 0. Moving the stage pans
-across it; moving Z defocuses it, so autofocus sweeps produce a real focus curve
-with a single peak. The slide pattern is seeded, so the same stage position
-always shows the same field, up to per-frame Gaussian read noise (sigma 2 gray
-levels).
+Both cameras look at one :class:`VirtualSlide`: a procedurally generated
+H&E-like section with tissue islands, texture and nuclei, lying on a tilted,
+gently undulating focal surface within about +/-22 um of Z = 0. Moving the stage
+pans across it; moving Z defocuses it, so autofocus sweeps produce a real focus
+curve with a single peak. The slide pattern is seeded, so the same stage
+position always shows the same field, up to per-frame noise.
+
+Three ways of looking at it:
+
+* ``DCam``, an 8-bit colour camera on the transmitted lamp ``DLamp``: brightfield.
+* ``DMonoCam``, a 12-bit monochrome camera, behind a liquid-crystal universal
+  compensator (``MeadowlarkLC``) and a circular analyser on the transmitted
+  path -- an LC-PolScope -- and on an epi port lit by a four-line LED
+  (``DLED``, 385/475/550/621 nm) for fluorescence. The specimen carries a
+  birefringence map (fibrous stroma, isotropic nuclei) and four fluorophore
+  maps (nuclei, weak autofluorescence, eosin, sparse puncta) laid over the
+  same tissue, so every modality shows the same place.
+
+The polarization optics follow ``polscope_library.calibration``'s forward model
+(polarizer at 0 deg, LC-A at 45 deg, LC-B at 0 deg, specimen, circular analyser),
+so the five states reconstruct to the planted retardance and orientation with
+either of that library's methods. The instrument adds what a real one has: a
+small field-fixed residual retardance (about 0.6 to 2.7 nm), a liquid crystal
+that lands a few hundredths of a wave from what it is told, depolarization that
+limits the extinction ratio to about 265, and an adapter wavelength that scales
+every retardance when it differs from the 549 nm the lamp delivers. A measured
+background removes the first; calibration finds the second.
 
 Device labels follow Micro-Manager's Demo adapter where it has an obvious
-counterpart (``DCam``, ``DStage``); ``XYStage`` and ``DLamp`` are this core's own
-labels. Running the demo config against a real Micro-Manager Demo configuration
-has not been tried.
+counterpart (``DCam``, ``DStage``); ``MeadowlarkLC`` and its property names are
+the Meadowlark adapter's; ``XYStage``, ``DLamp``, ``DMonoCam`` and ``DLED`` are
+this core's own labels. Running the demo config against a real Micro-Manager
+Demo configuration has not been tried.
 """
 
 from __future__ import annotations
@@ -154,6 +175,57 @@ class VirtualSlide:
         on_slide = (np.abs(x) < self.half_x_um) & (np.abs(y) < self.half_y_um)
         return mask * on_slide
 
+    def _grid(
+        self, x_um: float, y_um: float, width_px: int, height_px: int, pixel_size_um: float
+    ) -> Tuple[np.ndarray, np.ndarray]:
+        """Stage coordinates of every pixel of a field centred on (x, y)."""
+        cols = (np.arange(width_px, dtype=np.float64) - width_px / 2.0 + 0.5) * pixel_size_um
+        rows = (np.arange(height_px, dtype=np.float64) - height_px / 2.0 + 0.5) * pixel_size_um
+        return np.meshgrid(x_um + cols, y_um + rows)
+
+    def _structure(self, wx: np.ndarray, wy: np.ndarray) -> Dict[str, np.ndarray]:
+        """Tissue, stroma texture and nuclei: what every rendering is made of."""
+        tissue = self._tissue_mask(wx, wy)
+        stroma = _fractal_noise(wx, wy, 60.0, self.seed + 101.0, 3)
+        nuclei_field = _fractal_noise(wx, wy, 9.0, self.seed + 202.0, 2)
+        nuclei = _smoothstep(0.70, 0.76, nuclei_field) * _smoothstep(0.2, 0.5, tissue)
+        return {"tissue": tissue, "stroma": stroma, "nuclei": nuclei}
+
+    @staticmethod
+    def _colour(parts: Dict[str, np.ndarray]) -> np.ndarray:
+        """The H&E colour of a field, glass at about 243 of 255, as float RGB."""
+        tissue, stroma, nuclei = parts["tissue"], parts["stroma"], parts["nuclei"]
+        glass = np.array([243.0, 241.0, 246.0])
+        eosin = np.array([226.0, 150.0, 182.0])
+        eosin_dark = np.array([196.0, 110.0, 150.0])
+        hematoxylin = np.array([88.0, 52.0, 128.0])
+        pink = (
+            eosin[None, None, :] * (1.0 - stroma[..., None])
+            + eosin_dark[None, None, :] * stroma[..., None]
+        )
+        img = glass[None, None, :] * (1.0 - tissue[..., None]) + pink * tissue[..., None]
+        return img * (1.0 - nuclei[..., None]) + hematoxylin[None, None, :] * nuclei[..., None]
+
+    def defocus_sigma_px(
+        self, x_um: float, y_um: float, z_um: float, pixel_size_um: float
+    ) -> float:
+        """Gaussian blur, in pixels, of a field at (x, y) seen from focus z."""
+        dz = abs(z_um - self.focus_z(x_um, y_um))
+        return min(dz * self.blur_px_per_um / pixel_size_um * 0.65, 30.0)
+
+    @staticmethod
+    def _blur(img: np.ndarray, sigma_px: float) -> np.ndarray:
+        if sigma_px <= 0.3:
+            return img
+        from scipy.ndimage import gaussian_filter
+
+        if img.ndim == 3:
+            out = np.empty_like(img)
+            for c in range(img.shape[2]):
+                out[..., c] = gaussian_filter(img[..., c], sigma_px, mode="nearest")
+            return out
+        return gaussian_filter(img, sigma_px, mode="nearest")
+
     def render(
         self,
         x_um: float,
@@ -168,35 +240,9 @@ class VirtualSlide:
         rng: np.random.Generator,
     ) -> np.ndarray:
         """Render the field centred on (x, y) at focus z as an RGB uint8 image."""
-        cols = (np.arange(width_px, dtype=np.float64) - width_px / 2.0 + 0.5) * pixel_size_um
-        rows = (np.arange(height_px, dtype=np.float64) - height_px / 2.0 + 0.5) * pixel_size_um
-        wx, wy = np.meshgrid(x_um + cols, y_um + rows)
-
-        tissue = self._tissue_mask(wx, wy)
-        stroma = _fractal_noise(wx, wy, 60.0, self.seed + 101.0, 3)
-        nuclei_field = _fractal_noise(wx, wy, 9.0, self.seed + 202.0, 2)
-        nuclei = _smoothstep(0.70, 0.76, nuclei_field) * _smoothstep(0.2, 0.5, tissue)
-
-        glass = np.array([243.0, 241.0, 246.0])
-        eosin = np.array([226.0, 150.0, 182.0])
-        eosin_dark = np.array([196.0, 110.0, 150.0])
-        hematoxylin = np.array([88.0, 52.0, 128.0])
-
-        img = np.empty((height_px, width_px, 3), dtype=np.float64)
-        pink = (
-            eosin[None, None, :] * (1.0 - stroma[..., None])
-            + eosin_dark[None, None, :] * stroma[..., None]
-        )
-        img[:] = glass[None, None, :] * (1.0 - tissue[..., None]) + pink * tissue[..., None]
-        img = img * (1.0 - nuclei[..., None]) + hematoxylin[None, None, :] * nuclei[..., None]
-
-        dz = abs(z_um - self.focus_z(x_um, y_um))
-        sigma_px = min(dz * self.blur_px_per_um / pixel_size_um * 0.65, 30.0)
-        if sigma_px > 0.3:
-            from scipy.ndimage import gaussian_filter
-
-            for c in range(3):
-                img[..., c] = gaussian_filter(img[..., c], sigma_px, mode="nearest")
+        wx, wy = self._grid(x_um, y_um, width_px, height_px, pixel_size_um)
+        img = self._colour(self._structure(wx, wy))
+        img = self._blur(img, self.defocus_sigma_px(x_um, y_um, z_um, pixel_size_um))
 
         if lamp_on:
             scale = (exposure_ms / self.reference_exposure_ms) * (
@@ -207,6 +253,74 @@ class VirtualSlide:
         img *= scale
         img += rng.normal(0.0, 2.0, img.shape)
         return np.clip(img, 0.0, 255.0).astype(np.uint8)
+
+    def specimen_maps(
+        self, x_um: float, y_um: float, width_px: int, height_px: int, pixel_size_um: float
+    ) -> Dict[str, np.ndarray]:
+        """What the monochrome camera's modalities see, in focus, for a field.
+
+        ``transmittance`` is the H&E section's transmission at 549 nm (the green
+        channel, glass = 1). ``retardance_nm`` and ``orientation_rad`` are the
+        birefringence: fibrous stroma at 3 to 18 nm with a slow-axis orientation
+        that wanders over a few hundred micrometres, isotropic nuclei and glass.
+        ``fl385`` ... ``fl621`` are fluorophore densities (0 to 1) excited by
+        each LED line: nuclei (a DAPI stand-in), weak autofluorescence, eosin
+        (which really does fluoresce in a TRITC set) and sparse puncta in a
+        subset of the tissue (a Cy5 marker stand-in).
+        """
+        wx, wy = self._grid(x_um, y_um, width_px, height_px, pixel_size_um)
+        parts = self._structure(wx, wy)
+        tissue, stroma, nuclei = parts["tissue"], parts["stroma"], parts["nuclei"]
+
+        transmittance = self._colour(parts)[..., 1] / 241.0
+
+        fibres = _fractal_noise(wx, wy, 25.0, self.seed + 303.0, 3)
+        retardance_nm = tissue * (1.0 - nuclei) * (3.0 + 15.0 * _smoothstep(0.40, 0.70, fibres))
+        orientation_rad = (
+            2.0 * np.pi * _fractal_noise(wx, wy, 400.0, self.seed + 404.0, 2)
+        ) % np.pi
+
+        puncta = _smoothstep(0.68, 0.76, _fractal_noise(wx, wy, 12.0, self.seed + 505.0, 2))
+        positive_region = _smoothstep(
+            0.40, 0.55, _fractal_noise(wx, wy, 900.0, self.seed + 1111.0, 2)
+        )
+        return {
+            "transmittance": transmittance,
+            "retardance_nm": retardance_nm,
+            "orientation_rad": orientation_rad,
+            "fl385": nuclei,
+            "fl475": 0.12 * tissue * (0.6 + 0.4 * stroma),
+            "fl550": tissue * (1.0 - nuclei) * (0.35 + 0.65 * stroma),
+            "fl621": tissue * puncta * positive_region,
+        }
+
+
+def linear_retarder_output(
+    v1, v2, v3, orientation_rad: np.ndarray, retardance_rad: np.ndarray
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """``(S1, S2, S3)`` after a linear retarder with its slow axis at ``orientation_rad``.
+
+    A rotation of the Poincare sphere by the retardance about the slow axis's
+    point on the equator. The sign convention is the one under which
+    ``polscope_library.reconstruct`` returns the planted orientation (checked in
+    the tests), so the demo's orientation map reads back as itself.
+    """
+    c, s = np.cos(2.0 * orientation_rad), np.sin(2.0 * orientation_rad)
+    cd, sd = np.cos(retardance_rad), np.sin(retardance_rad)
+    o1 = (c * c + s * s * cd) * v1 + c * s * (1.0 - cd) * v2 - s * sd * v3
+    o2 = c * s * (1.0 - cd) * v1 + (s * s + c * c * cd) * v2 + c * sd * v3
+    o3 = s * sd * v1 - c * sd * v2 + cd * v3
+    return o1, o2, o3
+
+
+def compensator_polarization(lca_waves: float, lcb_waves: float) -> Tuple[float, float, float]:
+    """``(S1, S2, S3)`` leaving the universal compensator (polscope_library's model)."""
+    da, db = 2.0 * np.pi * lca_waves, 2.0 * np.pi * lcb_waves
+    return (
+        float(np.cos(da)),
+        float(-np.sin(da) * np.sin(db)),
+        float(np.sin(da) * np.cos(db)),
+    )
 
 
 # --------------------------------------------------------------------------- #
@@ -268,6 +382,31 @@ class _Axis:
         self.arrives_at = now
 
 
+@dataclass
+class _CameraSpec:
+    """A camera's fixed geometry and how it turns light into counts."""
+
+    label: str
+    colour: bool
+    sensor_w: int
+    sensor_h: int
+    #: Micrometres per pixel at the sample (10x), unbinned. Micro-Manager reports
+    #: the active camera's, so QPSC can tell the two cameras apart by it.
+    pixel_size_um: float = 0.65
+    #: Significant bits of the monochrome camera's 16-bit format.
+    bit_depth: int = 8
+    #: Offset added to every monochrome frame, in counts of the deep format.
+    black_level: float = 0.0
+    roi: Optional[Tuple[int, int, int, int]] = None
+
+
+#: Wavelength the transmitted lamp delivers through its interference filter, nm.
+LAMP_WAVELENGTH_NM = 549.0
+
+#: LED lines of ``DLED`` and the fluorophore map each one excites.
+LED_LINES = ("385nm", "475nm", "550nm", "621nm")
+
+
 class DemoCore:
     """A Pycro-Manager ``Core`` look-alike driving a :class:`VirtualSlide`.
 
@@ -277,23 +416,63 @@ class DemoCore:
     """
 
     CAMERA = "DCam"
+    MONO_CAMERA = "DMonoCam"
     FOCUS = "DStage"
     XY = "XYStage"
     LAMP = "DLamp"
+    LED = "DLED"
+    LC = "MeadowlarkLC"
+
+    LC_A = "Retardance LC-A [in waves]"
+    LC_B = "Retardance LC-B [in waves]"
+
+    #: Monochrome counts per millisecond through clear glass with the lamp at
+    #: full intensity and nothing in the way. The compensator and analyser pass
+    #: about 1% of it at the swing states, so at 50 ms the swing states read
+    #: about 37% of the 12-bit range on glass and the brightest birefringent
+    #: stroma (whose retardance adds to the swing) about 70%.
+    TRANSMITTED_COUNTS_PER_MS = 2300.0
+    #: Monochrome counts per millisecond from a fluorophore density of 1 under
+    #: an LED line at full intensity.
+    FLUORESCENCE_COUNTS_PER_MS = 96.0
+    #: Fraction of the light that stays polarized; sets the extinction ratio
+    #: (about 265, polscope_library's simulator default, tuned to the rig).
+    POLARIZATION = 0.9925
+    #: What each crystal adds to the retardance it is told to make, in waves.
+    #: A calibration finds the palette that cancels it (and the residual).
+    LC_OFFSET_WAVES = (0.004, -0.012)
 
     def __init__(
         self,
         slide: Optional[VirtualSlide] = None,
         pixel_size_um: float = 0.65,
         sensor_px: Tuple[int, int] = (512, 512),
-        xy_speed_um_per_s: float = 4000.0,
+        mono_sensor_px: Tuple[int, int] = (640, 512),
+        mono_pixel_size_um: float = 0.586,
+        xy_speed_um_per_s: float = 12000.0,
         z_speed_um_per_s: float = 800.0,
         seed: int = 1,
     ):
         self._lock = threading.RLock()
         self._slide = slide or VirtualSlide()
-        self._pixel_size_um = float(pixel_size_um)
-        self._sensor_w, self._sensor_h = int(sensor_px[0]), int(sensor_px[1])
+        self._cameras: Dict[str, _CameraSpec] = {
+            self.CAMERA: _CameraSpec(
+                self.CAMERA,
+                True,
+                int(sensor_px[0]),
+                int(sensor_px[1]),
+                pixel_size_um=float(pixel_size_um),
+            ),
+            self.MONO_CAMERA: _CameraSpec(
+                self.MONO_CAMERA,
+                False,
+                int(mono_sensor_px[0]),
+                int(mono_sensor_px[1]),
+                pixel_size_um=float(mono_pixel_size_um),
+                bit_depth=12,
+                black_level=100.0,
+            ),
+        }
         self._rng = np.random.default_rng(seed)
         self._timeout_ms = 5000
 
@@ -301,9 +480,12 @@ class DemoCore:
         self._y = _Axis(speed_um_per_s=xy_speed_um_per_s)
         self._z = _Axis(speed_um_per_s=z_speed_um_per_s)
 
-        self._roi: Optional[Tuple[int, int, int, int]] = None
         self._snapped: Optional[np.ndarray] = None
         self._snapped_tags: Dict[str, object] = {}
+        # The specimen maps of the last monochrome field, so the five LC states
+        # (and a live stream at a fixed position) compute them once.
+        self._maps_key: Optional[tuple] = None
+        self._maps: Dict[str, np.ndarray] = {}
 
         # Streaming: frames are produced on a clock at the exposure period and
         # consumed by pop_*; get_last_* reads the newest without consuming.
@@ -319,13 +501,12 @@ class DemoCore:
     # ----- construction -------------------------------------------------- #
 
     def _build_devices(self) -> None:
-        sensor_w, sensor_h = str(self._sensor_w), str(self._sensor_h)
         self._devices["Core"] = _Device(
             "Core",
             "Core",
             "Core controller",
             {
-                "Camera": _Property(self.CAMERA),
+                "Camera": _Property(self.CAMERA, allowed=[self.CAMERA, self.MONO_CAMERA]),
                 "Focus": _Property(self.FOCUS),
                 "XYStage": _Property(self.XY),
                 "Shutter": _Property(""),
@@ -334,18 +515,42 @@ class DemoCore:
                 "TimeoutMs": _Property("5000"),
             },
         )
+        colour = self._cameras[self.CAMERA]
         self._devices[self.CAMERA] = _Device(
             "DemoCamera",
             "DCam",
-            "Demo camera (QPSC virtual slide)",
+            "Demo colour camera (QPSC virtual slide)",
             {
                 "Exposure": _Property("10.0000", lower=0.1, upper=10000.0),
                 "Binning": _Property("1", allowed=["1", "2", "4"]),
                 "PixelType": _Property("32bitRGB", allowed=["8bit", "32bitRGB"]),
                 "Gain": _Property("0", lower=-5.0, upper=8.0),
-                "OnCameraCCDXSize": _Property(sensor_w, read_only=True),
-                "OnCameraCCDYSize": _Property(sensor_h, read_only=True),
+                "OnCameraCCDXSize": _Property(str(colour.sensor_w), read_only=True),
+                "OnCameraCCDYSize": _Property(str(colour.sensor_h), read_only=True),
                 "CameraName": _Property("QPSC demo camera", read_only=True),
+                "TransposeMirrorX": _Property("0", allowed=["0", "1"]),
+                "TransposeMirrorY": _Property("0", allowed=["0", "1"]),
+            },
+        )
+        mono = self._cameras[self.MONO_CAMERA]
+        self._devices[self.MONO_CAMERA] = _Device(
+            "DemoCamera",
+            "DCam",
+            "Demo 12-bit monochrome camera, 5.86 um pixels (QPSC polarization and epi ports)",
+            {
+                "Exposure": _Property("50.0000", lower=0.1, upper=10000.0),
+                "Binning": _Property("1", allowed=["1", "2", "4"]),
+                "PixelType": _Property("16bit", allowed=["8bit", "16bit"]),
+                "BitDepth": _Property(str(mono.bit_depth), read_only=True),
+                # GenICam-style names, so the LC-PolScope camera checks have
+                # something to read: set Gain Auto to Continuous or Gamma away
+                # from 1 to see them fire (and the frames change accordingly).
+                "Gain": _Property("0", lower=0.0, upper=24.0),
+                "Gain Auto": _Property("Off", allowed=["Off", "Continuous"]),
+                "Gamma": _Property("1.0", lower=0.25, upper=4.0),
+                "OnCameraCCDXSize": _Property(str(mono.sensor_w), read_only=True),
+                "OnCameraCCDYSize": _Property(str(mono.sensor_h), read_only=True),
+                "CameraName": _Property("QPSC demo monochrome camera", read_only=True),
                 "TransposeMirrorX": _Property("0", allowed=["0", "1"]),
                 "TransposeMirrorY": _Property("0", allowed=["0", "1"]),
             },
@@ -371,10 +576,31 @@ class DemoCore:
         self._devices[self.LAMP] = _Device(
             "DemoCamera",
             "DLightPath",
-            "Demo transmitted lamp (QPSC)",
+            "Demo transmitted lamp, 549/15 filter (QPSC)",
             {
                 "State": _Property("1", allowed=["0", "1"]),
                 "Intensity": _Property("25", lower=0.0, upper=100.0),
+            },
+        )
+        led = {"State": _Property("0", allowed=["0", "1"])}
+        for line in LED_LINES:
+            led[f"Enable-{line}"] = _Property("Off", allowed=["On", "Off"])
+            led[f"Intensity-{line}"] = _Property("0", lower=0.0, upper=100.0)
+        self._devices[self.LED] = _Device(
+            "DemoCamera", "DLED", "Demo four-line epi LED (QPSC)", led
+        )
+        self._devices[self.LC] = _Device(
+            "MeadowlarkLC",
+            "MeadowlarkLC",
+            "Demo liquid-crystal universal compensator (QPSC)",
+            {
+                self.LC_A: _Property("0.2500", lower=0.0, upper=1.0),
+                self.LC_B: _Property("0.5000", lower=0.0, upper=1.0),
+                # Read-only and computed, as on the real adapter.
+                "Retardance LC-A [in nm]": _Property("", read_only=True),
+                "Retardance LC-B [in nm]": _Property("", read_only=True),
+                "Wavelength": _Property(f"{LAMP_WAVELENGTH_NM:g}", lower=400.0, upper=800.0),
+                "Total Number of LCs": _Property("2", read_only=True),
             },
         )
         self._config_groups["Channel"] = {
@@ -401,37 +627,75 @@ class DemoCore:
             return self._z
         raise RuntimeError(f"Device '{device}' is not a single-axis stage")
 
+    def _camera(self) -> _CameraSpec:
+        return self._cameras[self._prop("Core", "Camera").value]
+
+    def _camera_value(self, name: str) -> str:
+        return self._prop(self._camera().label, name).value
+
     def _binning(self) -> int:
-        return int(self._prop(self.CAMERA, "Binning").value)
+        return int(self._camera_value("Binning"))
 
     def _exposure_ms(self) -> float:
-        return float(self._prop(self.CAMERA, "Exposure").value)
+        return float(self._camera_value("Exposure"))
 
     def _components(self) -> int:
-        return 4 if self._prop(self.CAMERA, "PixelType").value == "32bitRGB" else 1
+        cam = self._camera()
+        if cam.colour:
+            return 4 if self._camera_value("PixelType") == "32bitRGB" else 1
+        return 1
+
+    def _bytes_per_pixel(self) -> int:
+        cam = self._camera()
+        if cam.colour:
+            return self._components()
+        return 2 if self._camera_value("PixelType") == "16bit" else 1
+
+    def _bit_depth(self) -> int:
+        cam = self._camera()
+        if cam.colour or self._camera_value("PixelType") == "8bit":
+            return 8
+        return cam.bit_depth
 
     def _frame_size(self) -> Tuple[int, int]:
+        cam = self._camera()
         b = self._binning()
-        if self._roi is not None:
-            _, _, w, h = self._roi
+        if cam.roi is not None:
+            _, _, w, h = cam.roi
             return max(1, w // b), max(1, h // b)
-        return self._sensor_w // b, self._sensor_h // b
+        return cam.sensor_w // b, cam.sensor_h // b
+
+    def _field_centre(self, now: float) -> Tuple[float, float, float]:
+        cam = self._camera()
+        x, y, z = self._x.at(now), self._y.at(now), self._z.at(now)
+        if cam.roi is not None:
+            rx, ry, rw, rh = cam.roi
+            # Offset the field centre by the ROI's displacement from the sensor centre.
+            x += (rx + rw / 2.0 - cam.sensor_w / 2.0) * cam.pixel_size_um
+            y += (ry + rh / 2.0 - cam.sensor_h / 2.0) * cam.pixel_size_um
+        return x, y, z
 
     def _render_frame(self) -> np.ndarray:
-        """The current field as the flat byte buffer MMCore would hand back."""
+        """The current field as the flat buffer MMCore would hand back."""
+        if not self._camera().colour:
+            return self._render_mono()
         now = time.monotonic()
         w, h = self._frame_size()
         b = self._binning()
-        x, y, z = self._x.at(now), self._y.at(now), self._z.at(now)
-        if self._roi is not None:
-            rx, ry, rw, rh = self._roi
-            # Offset the field centre by the ROI's displacement from the sensor centre.
-            x += (rx + rw / 2.0 - self._sensor_w / 2.0) * self._pixel_size_um
-            y += (ry + rh / 2.0 - self._sensor_h / 2.0) * self._pixel_size_um
+        x, y, z = self._field_centre(now)
         lamp = self._prop(self.LAMP, "State").value == "1"
         intensity = float(self._prop(self.LAMP, "Intensity").value)
         rgb = self._slide.render(
-            x, y, z, w, h, self._pixel_size_um * b, self._exposure_ms(), intensity, lamp, self._rng
+            x,
+            y,
+            z,
+            w,
+            h,
+            self._camera().pixel_size_um * b,
+            self._exposure_ms(),
+            intensity,
+            lamp,
+            self._rng,
         )
         if self._components() == 1:
             gray = (0.299 * rgb[..., 0] + 0.587 * rgb[..., 1] + 0.114 * rgb[..., 2]).astype(
@@ -445,14 +709,129 @@ class DemoCore:
         bgra[..., 3] = 255
         return bgra.reshape(-1)
 
+    # ----- the monochrome camera's optics ---------------------------------- #
+
+    def lc_delivered_waves(self) -> Tuple[float, float]:
+        """Retardance each crystal actually makes at the lamp's wavelength, in waves.
+
+        The adapter converts the commanded waves to a retardance in nm at its own
+        Wavelength setting; at 549 nm that is ``commanded * adapter / 549``
+        waves. Each crystal then adds its own offset (:attr:`LC_OFFSET_WAVES`).
+        """
+        adapter = float(self._prop(self.LC, "Wavelength").value)
+        scale = adapter / LAMP_WAVELENGTH_NM
+        a = float(self._prop(self.LC, self.LC_A).value) * scale + self.LC_OFFSET_WAVES[0]
+        b = float(self._prop(self.LC, self.LC_B).value) * scale + self.LC_OFFSET_WAVES[1]
+        return a, b
+
+    def instrument_residual(self, width_px: int, height_px: int) -> Tuple[np.ndarray, np.ndarray]:
+        """``(retardance_nm, orientation_rad)`` of the optics' own birefringence.
+
+        Fixed to the camera, not the stage: about 0.6 to 2.7 nm, rising left to
+        right and top to bottom, with a slow-axis orientation that turns from top
+        to bottom. A calibration cancels its mean, not its shape, so the edges of
+        every tile still disagree -- what makes neighbouring tiles differ at their
+        seams until a measured background removes it.
+        """
+        cam = self._camera()
+        b = self._binning()
+        ox, oy = (cam.roi[0], cam.roi[1]) if cam.roi is not None else (0, 0)
+        cols = (ox + (np.arange(width_px) + 0.5) * b) / cam.sensor_w * 2.0 - 1.0
+        rows = (oy + (np.arange(height_px) + 0.5) * b) / cam.sensor_h * 2.0 - 1.0
+        u, v = np.meshgrid(cols, rows)
+        retardance_nm = 0.6 + 1.6 * ((u + 1.0) / 2.0) ** 2 + 0.5 * ((v + 1.0) / 2.0) ** 2
+        orientation_rad = np.radians(20.0 + 15.0 * v)
+        return retardance_nm, orientation_rad
+
+    def _specimen(self, x: float, y: float, w: int, h: int, px: float) -> Dict[str, np.ndarray]:
+        key = (round(x, 3), round(y, 3), w, h, px)
+        if key != self._maps_key:
+            self._maps = self._slide.specimen_maps(x, y, w, h, px)
+            self._maps_key = key
+        return self._maps
+
+    def _render_mono(self) -> np.ndarray:
+        """Light on the monochrome camera, then the camera itself.
+
+        Transmitted light passes the compensator, the specimen, the optics'
+        residual and the circular analyser; epi fluorescence adds the enabled LED
+        lines' fluorophores. The camera applies gain (or its own auto gain),
+        gamma, an offset, shot and read noise, and its bit depth.
+        """
+        now = time.monotonic()
+        cam = self._camera()
+        w, h = self._frame_size()
+        px = cam.pixel_size_um * self._binning()
+        x, y, z = self._field_centre(now)
+        exposure = self._exposure_ms()
+        maps = self._specimen(x, y, w, h, px)
+        signal = np.zeros((h, w), dtype=np.float64)
+
+        if self._prop(self.LAMP, "State").value == "1":
+            lamp = float(self._prop(self.LAMP, "Intensity").value) / 100.0
+            a, b = self.lc_delivered_waves()
+            v = compensator_polarization(a, b)
+            s1, s2, s3 = linear_retarder_output(
+                v[0],
+                v[1],
+                v[2],
+                maps["orientation_rad"],
+                2.0 * np.pi * maps["retardance_nm"] / LAMP_WAVELENGTH_NM,
+            )
+            res_nm, res_theta = self.instrument_residual(w, h)
+            _, _, s3 = linear_retarder_output(
+                s1, s2, s3, res_theta, 2.0 * np.pi * res_nm / LAMP_WAVELENGTH_NM
+            )
+            fraction = 0.5 * (1.0 + self.POLARIZATION * s3)
+            signal += (
+                self.TRANSMITTED_COUNTS_PER_MS * exposure * lamp * maps["transmittance"] * fraction
+            )
+
+        if self._prop(self.LED, "State").value == "1":
+            for line in LED_LINES:
+                if self._prop(self.LED, f"Enable-{line}").value != "On":
+                    continue
+                power = float(self._prop(self.LED, f"Intensity-{line}").value) / 100.0
+                if power > 0:
+                    signal += (
+                        self.FLUORESCENCE_COUNTS_PER_MS
+                        * exposure
+                        * power
+                        * maps["fl" + line.replace("nm", "")]
+                    )
+
+        signal = self._slide._blur(signal, self._slide.defocus_sigma_px(x, y, z, px))
+
+        full = float(2**cam.bit_depth - 1)
+        if self._camera_value("Gain Auto") == "Continuous":
+            # Steer the frame mean to 45% of full scale, as an auto-gain loop would.
+            mean = float(signal.mean())
+            gain = min(max(0.45 * full / mean, 1.0), 16.0) if mean > 0 else 16.0
+        else:
+            gain = 10.0 ** (float(self._camera_value("Gain")) / 20.0)
+        signal *= gain
+        gamma = float(self._camera_value("Gamma"))
+        if abs(gamma - 1.0) > 1e-6:
+            signal = full * np.power(np.clip(signal / full, 0.0, None), 1.0 / gamma)
+        noise_sigma = np.sqrt(9.0 + 0.25 * signal)
+        counts = cam.black_level + signal + self._rng.normal(0.0, 1.0, signal.shape) * noise_sigma
+        counts = np.clip(np.rint(counts), 0.0, full)
+        if self._camera_value("PixelType") == "8bit":
+            return (counts / (full + 1.0) * 256.0).astype(np.uint8).reshape(-1)
+        return counts.astype(np.uint16).reshape(-1)
+
     def _tags(self) -> Dict[str, object]:
         w, h = self._frame_size()
         now = time.monotonic()
+        if self._camera().colour:
+            pixel_type = "RGB32" if self._components() == 4 else "GRAY8"
+        else:
+            pixel_type = "GRAY16" if self._bytes_per_pixel() == 2 else "GRAY8"
         return {
             "Width": w,
             "Height": h,
-            "PixelType": "RGB32" if self._components() == 4 else "GRAY8",
-            "Camera": self.CAMERA,
+            "PixelType": pixel_type,
+            "Camera": self._camera().label,
             "Exposure-ms": self._exposure_ms(),
             "Binning": self._binning(),
             "XPositionUm": self._x.at(now),
@@ -517,6 +896,10 @@ class DemoCore:
         with self._lock:
             if device == self.FOCUS and name == "Position":
                 return f"{self._z.at(time.monotonic()):.4f}"
+            if device == self.LC and name.endswith("[in nm]"):
+                waves = self._prop(self.LC, name.replace("[in nm]", "[in waves]")).value
+                wavelength = float(self._prop(self.LC, "Wavelength").value)
+                return f"{float(waves) * wavelength:.2f}"
             return self._prop(device, name).value
 
     def set_property(self, device: str, name: str, value) -> None:
@@ -538,7 +921,7 @@ class DemoCore:
             if device == self.FOCUS and name == "Position":
                 self._z.start(float(text), time.monotonic())
                 return
-            if device == self.CAMERA and name == "Exposure":
+            if device in self._cameras and name == "Exposure":
                 text = f"{float(text):.4f}"
             prop.value = text
 
@@ -676,50 +1059,46 @@ class DemoCore:
 
     def get_bytes_per_pixel(self) -> int:
         with self._lock:
-            return self._components()
+            return self._bytes_per_pixel()
 
     def get_image_bit_depth(self) -> int:
-        return 8
+        with self._lock:
+            return self._bit_depth()
 
     def get_image_buffer_size(self) -> int:
         with self._lock:
             w, h = self._frame_size()
-            return w * h * self._components()
+            return w * h * self._bytes_per_pixel()
 
     def get_pixel_size_um(self) -> float:
         with self._lock:
-            return self._pixel_size_um * self._binning()
+            return self._camera().pixel_size_um * self._binning()
 
     def set_roi(self, x: int, y: int, w: int, h: int) -> None:
         with self._lock:
-            if (
-                w <= 0
-                or h <= 0
-                or x < 0
-                or y < 0
-                or x + w > self._sensor_w
-                or y + h > self._sensor_h
-            ):
+            cam = self._camera()
+            if w <= 0 or h <= 0 or x < 0 or y < 0 or x + w > cam.sensor_w or y + h > cam.sensor_h:
                 raise RuntimeError(
-                    f"ROI ({x}, {y}, {w}, {h}) does not fit the {self._sensor_w}x{self._sensor_h} sensor"
+                    f"ROI ({x}, {y}, {w}, {h}) does not fit the {cam.sensor_w}x{cam.sensor_h} sensor"
                 )
-            self._roi = (int(x), int(y), int(w), int(h))
+            cam.roi = (int(x), int(y), int(w), int(h))
 
     def clear_roi(self) -> None:
         with self._lock:
-            self._roi = None
+            self._camera().roi = None
 
     def get_roi(self) -> Tuple[int, int, int, int]:
         with self._lock:
-            return self._roi if self._roi is not None else (0, 0, self._sensor_w, self._sensor_h)
+            cam = self._camera()
+            return cam.roi if cam.roi is not None else (0, 0, cam.sensor_w, cam.sensor_h)
 
     # ----- camera: exposure ---------------------------------------------- #
 
     def set_exposure(self, exposure_ms: float) -> None:
-        self.set_property(self.CAMERA, "Exposure", exposure_ms)
+        self.set_property(self.get_camera_device(), "Exposure", exposure_ms)
 
     def get_exposure(self) -> float:
-        return float(self.get_property(self.CAMERA, "Exposure"))
+        return float(self.get_property(self.get_camera_device(), "Exposure"))
 
     # ----- camera: snap -------------------------------------------------- #
 

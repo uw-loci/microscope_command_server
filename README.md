@@ -30,7 +30,8 @@ second or two the console prints `DEMO MODE: no Micro-Manager, driving a simulat
 microscope` and `Micro-Manager core: SIMULATED (demo mode, no hardware)`, then the server
 listens on port 5000 on all interfaces. Stop it with Ctrl+C. `ERROR: Another server
 instance is already running on port 5000!` means a server is already up. QPSC's demo
-connect reuses it only if it reports the demo camera `DCam`, and refuses one with a real camera.
+connect reuses it only if it reports one of the demo cameras (`DCam` or `DMonoCam`), and
+refuses one with a real camera.
 
 Use `--demo` to develop or test a handler, an acquisition workflow or autofocus logic on
 any machine: every handler runs unchanged, and the slide pattern is seeded, so a stage
@@ -41,8 +42,9 @@ replaced by `microscope_command_server.demo.virtual_microscope.DemoCore` and
 the production code. The core answers the subset of the MMCore API this code base
 calls: device properties with allowed values and limits, an XY stage and a focus
 stage with simulated travel time (`device_busy` is true while a move is under way),
-a camera that snaps and streams through a circular buffer, ROI and binning, config
-groups. Unknown devices and properties raise, as MMCore does.
+two cameras that snap and stream through a circular buffer (switched with `Core-Camera`,
+as a profile switch does), ROI and binning per camera, config groups. Unknown devices and
+properties raise, as MMCore does.
 
 The camera looks at a procedurally generated H&E-like slide (bilinearly interpolated
 lattice value noise summed over two to three octaves), 40 x 20 mm centered on the stage
@@ -53,6 +55,29 @@ scores one clear peak. The slide pattern is deterministic (`VirtualSlide.seed`);
 frame adds Gaussian read noise of sigma 2 gray levels from a generator seeded once per
 server start, so runs repeat in content, not bit for bit. Bare glass renders near-white
 (about 243 of 255) at 10 ms exposure and lamp intensity 25, just under clipping.
+
+The same slide carries two more layers, seen through a second, monochrome camera
+`DMonoCam`, so the bundled config offers three modalities that switch camera the way a
+two-camera scope does:
+
+- **Fluorescence**: a four-line epi LED `DLED` (385, 475, 550, 621 nm) excites four
+  fluorophore maps laid over the same tissue: nuclei (a DAPI stand-in), weak
+  autofluorescence, eosin (which does fluoresce in a TRITC set) and sparse puncta in part
+  of the tissue (a Cy5 stand-in).
+- **LC-PolScope**: on the transmitted path the camera sits behind a liquid-crystal
+  universal compensator `MeadowlarkLC` and a circular analyser, modelled as
+  `polscope_library.calibration` models them (polarizer at 0 deg, LC-A at 45 deg, LC-B at
+  0 deg). The specimen has a birefringence map: fibrous stroma at 3 to 18 nm with a slowly
+  wandering slow axis, isotropic nuclei and glass. Five states reconstruct to that map with
+  either `polscope_library` method (tested: median error under 0.1 nm, orientation under
+  1 deg, with a background). The instrument is deliberately imperfect in the ways a real
+  one is: each crystal lands 0.004 / -0.012 waves from what it is told, the optics add a
+  field-fixed residual retardance of about 0.6 to 2.7 nm (so uncorrected tiles disagree at
+  their seams and a background collected on glass fixes it), 99.25% of the light stays
+  polarized (extinction ratio about 265), and the adapter's `Wavelength` scales every
+  retardance by `Wavelength / 549` -- set it to 546 to watch the readiness check and the
+  acquisition log complain. The bundled palette is the demo compensator's calibrated one;
+  Calibrate Liquid Crystals finds it again.
 
 All of these are `DemoCore` and `VirtualSlide` constructor defaults; no command-line flag
 or YAML key changes them.
@@ -66,15 +91,21 @@ or YAML key changes them.
 | Lamp `DLamp` | `State` 0/1, `Intensity` 0 to 100 |
 | Gain | accepted, -5 to 8, no effect on the image |
 | Defocus blur | Gaussian, sigma 0.35 px per um from the focal surface, capped at 30 px (about 86 um out) |
-| Stage speeds | XY 4000 um/s, Z 800 um/s, minimum move 20 ms; `device_busy` is true while moving |
+| Stage speeds | XY 12000 um/s (any move on the 50 mm stage finishes inside the 5 s wait timeout), Z 800 um/s, minimum move 20 ms; `device_busy` is true while moving |
 | Live frames | one per max(exposure, 10 ms); 32-frame circular buffer |
+| Mono camera `DMonoCam` | 640 x 512 px at 0.65 um/px, 12-bit in `16bit` (or `8bit`), offset 100 counts, read noise 3 counts plus shot noise; `Gain` 0 to 24 dB; `Gain Auto` Off/Continuous and `Gamma` behave as their names say, so the LC-PolScope camera checks have something to catch |
+| Epi LED `DLED` | `State` 0/1; `Enable-<line>` On/Off and `Intensity-<line>` 0 to 100 for 385nm, 475nm, 550nm, 621nm; 96 counts per ms at full intensity for a fluorophore density of 1 |
+| LC `MeadowlarkLC` | `Retardance LC-A [in waves]`, `Retardance LC-B [in waves]` 0 to 1; read-only `... [in nm]`; `Wavelength` 400 to 800 nm (549 by default, the lamp's filter) |
+| Transmitted, mono | 2300 counts per ms at lamp intensity 100 through clear glass before the analyser; at the shipped palette and 50 ms the swing states read about 1530 of 4095 on glass (extinction about 530) and the brightest birefringent stroma about 70% of full scale |
 
-Not simulated: a shutter device, a rotation stage, Z sequencing, 16-bit output,
-vignetting or illumination non-uniformity, stage backlash or drift. `wait_for_device`
+Not simulated: a shutter device, a rotation stage, Z sequencing, a second objective,
+vignetting or illumination non-uniformity, liquid-crystal settling time, stage backlash or
+drift. `wait_for_device`
 times out after `TimeoutMs` (5000 ms by default).
 
 Device labels follow Micro-Manager's Demo adapter where it has an obvious counterpart
-(`DCam`, `DStage`); `XYStage` and `DLamp` (`State`, `Intensity`) are this core's own
+(`DCam`, `DStage`) and the Meadowlark adapter for `MeadowlarkLC` and its property names;
+`XYStage`, `DLamp` (`State`, `Intensity`), `DMonoCam` and `DLED` are this core's own
 labels. Running `config_Demo.yml` against a real Micro-Manager Demo configuration has not
 been tried. That config (with its autofocus, imageprocessing and resources sidecars)
 ships inside the QPSC extension, which extracts it and starts this server when you choose
