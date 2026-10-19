@@ -10,12 +10,19 @@ an acquisition rather than to a stage:
   the Live Viewer, and a disagreement with the last commanded position is then
   not evidence of anything.
 * **what a suspect frame costs** -- the run, immediately.
+* **when the operator has the stage** -- every pause that waits on a person
+  (manual focus, hardware-error recovery, the saturation decision). The manual
+  focus dialog invites them to find tissue with the joystick, and the move back
+  afterwards then disagreed with our last position: on 2026-10-19 a liver run
+  stopped 3.4 mm "off" for exactly that. The stage re-measures from where it
+  stands when the check is re-armed.
 
 Kept free of hardware imports so it can be tested without Micro-Manager.
 """
 
+import functools
 import logging
-from typing import Any, Optional
+from typing import Any, Callable, Optional
 
 logger = logging.getLogger(__name__)
 
@@ -33,6 +40,32 @@ def set_frame_check_armed(hardware: Any, armed: bool) -> None:
         setter(armed)
     except Exception as e:
         logger.debug("Could not %s the stage frame check: %s", "arm" if armed else "disarm", e)
+
+
+def operator_pause(hardware: Any, callback: Optional[Callable]) -> Optional[Callable]:
+    """Wrap a callback that waits on the operator so the frame check is off meanwhile.
+
+    The check is disarmed for the call and re-armed afterwards, only if it was
+    armed to begin with. Re-arming re-measures from the stage's current position
+    and reads the motion profile back, so a controller restart during the pause
+    is still caught. Returns None for None, so optional callbacks stay optional.
+    """
+    if callback is None:
+        return None
+
+    @functools.wraps(callback)
+    def paused(*args, **kwargs):
+        stage = getattr(hardware, "stage", None)
+        was_armed = bool(getattr(stage, "frame_check_armed", False))
+        if was_armed:
+            set_frame_check_armed(hardware, False)
+        try:
+            return callback(*args, **kwargs)
+        finally:
+            if was_armed:
+                set_frame_check_armed(hardware, True)
+
+    return paused
 
 
 def frame_suspect_reason(hardware: Any) -> Optional[str]:

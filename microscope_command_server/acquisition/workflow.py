@@ -21,6 +21,7 @@ from scipy.spatial.distance import cdist as _cdist_scipy
 from microscope_control.hardware import Position
 
 from microscope_command_server.acquisition.frame_guard import (
+    operator_pause,
     raise_if_frame_suspect,
     set_frame_check_armed,
 )
@@ -2838,6 +2839,12 @@ def _acquisition_workflow(
         # so the stage may hold us to it: a reported position that disagrees
         # with the last one we commanded now means the frame itself moved.
         set_frame_check_armed(hardware, True)
+        # ...except while a dialog waits on the operator, who may then move it.
+        ctx.request_manual_focus = operator_pause(hardware, ctx.request_manual_focus)
+        ctx.request_hardware_error_recovery = operator_pause(
+            hardware, ctx.request_hardware_error_recovery
+        )
+        ctx.request_saturation_decision = operator_pause(hardware, ctx.request_saturation_decision)
 
         # Phase 7: Load AF settings, resolve strategy, compute positions
         _configure_autofocus(ctx)

@@ -135,3 +135,68 @@ def test_the_check_is_armed_before_autofocus_and_disarmed_on_cleanup():
     assert source.index("set_frame_check_armed(ctx.hardware, False)") > source.index(
         "def _cleanup_acquisition("
     )
+
+
+# --------------------------------------------------------------------------
+# operator pauses
+# --------------------------------------------------------------------------
+
+
+class ArmableStage:
+    def __init__(self, armed):
+        self.frame_check_armed = armed
+        self.history = []
+
+    def set_frame_check_armed(self, armed):
+        self.frame_check_armed = armed
+        self.history.append(armed)
+
+
+def test_an_operator_pause_disarms_and_re_arms():
+    # 2026-10-19: the operator found tissue with the joystick during manual
+    # focus, and the move back stopped the run as a frame change.
+    stage = ArmableStage(armed=True)
+    hardware = SimpleNamespace(stage=stage)
+    seen = []
+
+    def ask(retries):
+        seen.append(stage.frame_check_armed)
+        return "skip"
+
+    assert fg.operator_pause(hardware, ask)(2) == "skip"
+    assert seen == [False]
+    assert stage.history == [False, True]
+
+
+def test_an_operator_pause_re_arms_when_the_callback_raises():
+    stage = ArmableStage(armed=True)
+
+    def ask():
+        raise RuntimeError("socket closed")
+
+    with pytest.raises(RuntimeError):
+        fg.operator_pause(SimpleNamespace(stage=stage), ask)()
+    assert stage.frame_check_armed is True
+
+
+def test_an_operator_pause_leaves_a_disarmed_check_alone():
+    stage = ArmableStage(armed=False)
+    fg.operator_pause(SimpleNamespace(stage=stage), lambda: "retry")()
+    assert stage.history == []
+
+
+def test_an_absent_callback_stays_absent():
+    assert fg.operator_pause(SimpleNamespace(stage=ArmableStage(True)), None) is None
+
+
+def test_every_operator_callback_is_wrapped_once_armed():
+    src = WORKFLOW_SRC.read_text(encoding="utf-8").replace("\r\n", "\n")
+    armed_at = src.index("set_frame_check_armed(hardware, True)")
+    phase7 = src.index("# Phase 7", armed_at)
+    window = src[armed_at:phase7]
+    for name in (
+        "request_manual_focus",
+        "request_hardware_error_recovery",
+        "request_saturation_decision",
+    ):
+        assert f"ctx.{name} = operator_pause(" in window, name
