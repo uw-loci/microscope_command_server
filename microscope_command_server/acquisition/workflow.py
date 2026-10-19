@@ -2909,16 +2909,11 @@ def _acquisition_workflow(
                 if af_type == "skipped":
                     continue
 
-                # Collect stage position for this tile
-                current_stage_pos = hardware.get_current_position()
-                ctx.stage_positions_collected.append(
-                    (
-                        filename,
-                        current_stage_pos.x,
-                        current_stage_pos.y,
-                        current_stage_pos.z,
-                    )
-                )
+                # The tile's recorded stage position is read only once XY has
+                # settled (_record_settled_tile_position). A non-AF tile's XY move
+                # is issued no-wait, so a read here would be a point along the way:
+                # an LC-PolScope tile 3 was recorded at X=9973.4 for a commanded
+                # 9697.0, 276 um short, partway through a 378 um move.
 
                 # Dispatch by modality
                 tile_worst_sat = {"R": 0.0, "G": 0.0, "B": 0.0}
@@ -2929,6 +2924,12 @@ def _acquisition_workflow(
                 }
                 tile_stats: dict = {}
                 if ctx.params["angles"]:
+                    # The angle path overlaps the first rotation with the XY move and
+                    # waits for XY inside, before its first snap. Z has already
+                    # settled (a non-AF tile's Z correction is a blocking move), so
+                    # the Z read here is real; XY is the commanded position until
+                    # the settled read after the snaps.
+                    current_stage_pos = Position(pos.x, pos.y, hardware.get_current_position().z)
                     # PPM high-bit-depth capture is scoped to the angle snaps: enter
                     # the camera's high-bit PixelFormat here (autofocus above already
                     # ran in 8-bit) and always restore, even on cancel/error, so live
@@ -2950,10 +2951,19 @@ def _acquisition_workflow(
                     finally:
                         if high_bit_active:
                             hardware.camera.set_high_bit_mode(False)
+                    # XY waited for inside; Z is back at the stack center if a
+                    # Z-stack ran, so this read is where the tile was imaged.
+                    current_stage_pos = _record_settled_tile_position(
+                        ctx, pos, filename, xy_move_pending
+                    )
+                    xy_move_pending = False
                 else:
-                    # Wait for non-blocking XY move before single-image/channel snap
-                    if xy_move_pending:
-                        ctx.hardware.wait_for_xy()
+                    # Wait for the non-blocking XY move before the single-image /
+                    # channel snaps, and record the settled position.
+                    current_stage_pos = _record_settled_tile_position(
+                        ctx, pos, filename, xy_move_pending
+                    )
+                    xy_move_pending = False
 
                     # Try channel-based acquisition first
                     channel_plan = resolve_channel_plan(
@@ -7392,6 +7402,85 @@ def _acquire_tile_single(
 
     tile_stats.pop("__counts__", None)
     return tile_worst_sat, tile_role_sat, tile_stats
+
+
+#: A settled stage readback further than this from the commanded XY is reported.
+#: A Prior step is 1 um and readbacks of settled tiles land within ~0.2 um, so
+#: 5 um is well clear of granularity while still a small fraction of any tile
+#: overlap -- an offset this size would show as a seam.
+TILE_POSITION_TOLERANCE_UM = 5.0
+
+#: Pause before the one re-read made when a settled readback disagrees with the
+#: commanded XY, in case the controller's position report lags its Busy flag.
+_TILE_POSITION_REREAD_DELAY_S = 0.1
+
+
+def _xy_offset_um(actual, commanded) -> Optional[float]:
+    """Euclidean XY distance between two positions, or None if either is incomplete."""
+    try:
+        dx = float(actual.x) - float(commanded.x)
+        dy = float(actual.y) - float(commanded.y)
+    except (TypeError, ValueError, AttributeError):
+        return None
+    return (dx * dx + dy * dy) ** 0.5
+
+
+def _record_settled_tile_position(
+    ctx: AcquisitionContext, pos, filename: str, xy_move_pending: bool
+):
+    """Read the tile's stage position once XY has settled and record it.
+
+    The reading feeds tile_manifest.csv, TileConfiguration_Stage.txt and the
+    tile's z_um measurement, so it must be where the images were taken. A
+    non-AF tile's XY move is issued no-wait; reading before ``wait_for_xy()``
+    caught a Prior stage partway through a move (2026-10-19, LC-PolScope
+    2x2: tile 3 recorded at X=9973.4 for a commanded 9697.0, while image
+    registration showed the tile was taken at 9697).
+
+    When the settled reading still disagrees with the commanded XY by more than
+    ``TILE_POSITION_TOLERANCE_UM``, the stage is waited on and read once more;
+    a disagreement that survives that is logged as a WARNING naming the tile
+    and both positions, since it may be a real positioning failure. The
+    reading is recorded either way -- it is what the stage reports.
+
+    Returns the recorded Position.
+    """
+    logger = ctx.logger
+    hardware = ctx.hardware
+    if xy_move_pending:
+        hardware.wait_for_xy()
+    actual = hardware.get_current_position()
+    offset = _xy_offset_um(actual, pos)
+    if offset is not None and offset > TILE_POSITION_TOLERANCE_UM:
+        logger.debug(
+            "Tile %s: settled readback (%.2f, %.2f) is %.2f um from the commanded "
+            "(%.2f, %.2f); waiting on the XY stage and reading again",
+            filename,
+            actual.x,
+            actual.y,
+            offset,
+            pos.x,
+            pos.y,
+        )
+        time.sleep(_TILE_POSITION_REREAD_DELAY_S)
+        hardware.wait_for_xy()
+        actual = hardware.get_current_position()
+        offset = _xy_offset_um(actual, pos)
+        if offset is not None and offset > TILE_POSITION_TOLERANCE_UM:
+            logger.warning(
+                "Tile %s: stage reports (%.2f, %.2f) um after settling but the commanded "
+                "position was (%.2f, %.2f) um -- %.2f um apart (tolerance %.1f um). The "
+                "stage may not have reached this tile; recording the reported position.",
+                filename,
+                actual.x,
+                actual.y,
+                pos.x,
+                pos.y,
+                offset,
+                TILE_POSITION_TOLERANCE_UM,
+            )
+    ctx.stage_positions_collected.append((filename, actual.x, actual.y, actual.z))
+    return actual
 
 
 def _record_tile_measurement(
