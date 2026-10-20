@@ -1064,6 +1064,7 @@ def test_the_colour_image_is_written_beside_retardance_and_orientation(tmp_path)
     assert data.shape == (4, 4, 3) and data.dtype == np.uint8
     assert meta["polscope.display_only"].startswith("true")
     assert "5 nm" in meta["polscope.brightness"]
+    assert meta["qpsc.background"] == "black"
     assert (tmp_path / ORIENTATION_COLOR_DIR).is_dir()
 
 

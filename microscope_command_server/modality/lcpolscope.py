@@ -517,6 +517,9 @@ def _reconstruct_and_write(
             "polscope.display_only": "true -- for viewing; measure on the retardance and orientation images",
             "polscope.hue": "slow-axis orientation, one colour cycle over 0..180 deg",
             "polscope.brightness": f"retardance, full brightness at {ceiling:g} nm",
+            # RGB but not brightfield: no signal is black. Tells the stitcher to fill
+            # the area no tile reaches with black, not the white it assumes for RGB.
+            "qpsc.background": "black",
         },
     )
     if log is not None:
