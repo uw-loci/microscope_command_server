@@ -131,26 +131,22 @@ def handle_getframe(conn, client, hardware, settings, **kwargs):
 
 
 def handle_correctframe(conn, client, hardware, settings, **kwargs):
-    """Get latest frame with server-side flat-field correction applied.
+    """Return the current live frame with flat-field correction applied (Live Viewer Snap).
 
-    Same wire format as GETFRAME on success: 20-byte header
-    (5 big-endian ints: w, h, channels, bpp, data_len) followed by raw
-    pixel bytes. On any configuration failure (no background folder,
-    missing per-angle file, shape mismatch) the server replies with a
-    textual ``FAILED:<reason>`` payload instead so the Java client can
-    fall back to an uncorrected snap with a clear status message.
+    Payload (variable length, terminated by END_MARKER, like SNAP):
+    ``--bg-folder <folder> [--bg-method divide|subtract] [--modality <name>]``.
+    The folder is the leaf QPSC resolved under the active background profile for the
+    current detector, modality, magnification and white balance mode: the same folder an
+    ACQUIRE would be sent. The server never derives a background folder itself, so
+    the Snap correction is the correction an acquisition would get. ``--modality`` is
+    only for the log.
 
-    The Java side is expected to have already validated settings-match
-    (modality / objective / detector / WB mode / current angle) before
-    issuing this command -- those are the same checks ACQUIRE runs in
-    AcquisitionConfigurationBuilder. This handler is the second line of
-    defense for racy YAML edits during a session.
-
-    Args (via kwargs):
-        active_connection_config_path: Path to the active config_<scope>.yml
-            from which the imageprocessing_<scope>.yml peer file is derived.
+    Response: same wire format as GETFRAME (5 big-endian int32 header + pixels), or a
+    textual ``FAILED:<reason>`` so the Java client falls back to an uncorrected snap.
     """
     from pathlib import Path
+
+    from microscope_command_server.server.protocol import END_MARKER
 
     addr = client.addr
     logger.info("Client %s requested corrected frame", addr)
@@ -162,6 +158,17 @@ def handle_correctframe(conn, client, hardware, settings, **kwargs):
             logger.error("CORRECTFRAME: could not send FAILED response: %s", send_err)
 
     try:
+        params = _read_flag_message(conn, ("--bg-folder", "--bg-method", "--modality"))
+        if params is None:
+            _fail("Connection closed while reading the CORRECTFRAME message")
+            return
+        bg_folder = params.get("--bg-folder")
+        if not bg_folder:
+            _fail("No --bg-folder in the CORRECTFRAME message (choose a background profile)")
+            return
+        method = params.get("--bg-method") or "divide"
+        modality = params.get("--modality") or "?"
+
         # Step 1: pull current frame (identical to GETFRAME).
         image, _ = hardware.get_live_frame()
         if image is None:
@@ -170,62 +177,13 @@ def handle_correctframe(conn, client, hardware, settings, **kwargs):
             conn.sendall(struct.pack(">5i", 0, 0, 0, 0, 0))
             return
 
-        # Step 2: resolve modality, objective, detector from the cached
-        # CONFIG settings.
-        if not hasattr(hardware, "settings") or not hardware.settings:
-            _fail("Server has no CONFIG settings loaded")
-            return
-        mscope = hardware.settings.get("microscope", {}) or {}
-        modality = mscope.get("modality_in_use") or mscope.get("default_modality")
-        objective = mscope.get("objective_in_use") or mscope.get("objective")
-        detector = mscope.get("detector_in_use") or mscope.get("detector")
-        if not modality:
-            _fail("No active modality (microscope.modality_in_use)")
-            return
-        if not objective:
-            _fail("No active objective (microscope.objective_in_use)")
-            return
-        if not detector:
-            _fail("No active detector (microscope.detector_in_use)")
-            return
-
-        # Step 3: locate the background folder via the imageprocessing config.
-        config_path_str = kwargs.get("active_connection_config_path")
-        if not config_path_str:
-            _fail("No active CONFIG path on the server")
-            return
-        config_path = Path(config_path_str)
-        ip_path = (
-            config_path.parent / f"imageprocessing_{config_path.stem.replace('config_', '')}.yml"
-        )
-        if not ip_path.exists():
-            _fail(f"No imageprocessing config at {ip_path}")
-            return
-        try:
-            from microscope_command_server.utils import config_manager
-
-            ip_config = config_manager.load_config_file(str(ip_path))
-        except Exception as e:
-            _fail(f"Could not load imageprocessing config: {e}")
-            return
-        bc_root = (ip_config or {}).get("background_correction", {})
-        bc_settings = bc_root.get(modality) or bc_root.get(_strip_mag_suffix(modality)) or {}
-        if not bc_settings.get("enabled"):
-            _fail(f"Background correction not enabled for modality '{modality}'")
-            return
-        bg_base = bc_settings.get("base_folder")
-        if not bg_base:
-            _fail(f"No base_folder configured for modality '{modality}'")
-            return
-
-        # Step 4: determine current rotation angle (0 for non-rotation modalities).
+        # Step 2: determine current rotation angle (0 for non-rotation modalities).
         try:
             angle = float(hardware.get_rotation_position())
         except Exception:
             angle = 0.0
-        method = bc_settings.get("method", "divide")
 
-        # Step 5: load the matching background image.
+        # Step 3: load the matching background image.
         try:
             from microscope_imageprocessing.correction.background import (
                 BackgroundCorrectionUtils,
@@ -233,7 +191,10 @@ def handle_correctframe(conn, client, hardware, settings, **kwargs):
         except Exception as e:
             _fail(f"BackgroundCorrectionUtils unavailable: {e}")
             return
-        bg_root = Path(bg_base)
+        bg_root = Path(bg_folder)
+        if not bg_root.is_dir():
+            _fail(f"Background folder not found: {bg_root}")
+            return
         backgrounds, scaling_factors, _ = BackgroundCorrectionUtils.load_background_images(
             bg_root, [angle], logger
         )
@@ -241,7 +202,7 @@ def handle_correctframe(conn, client, hardware, settings, **kwargs):
             _fail(f"No background image for angle {angle} in {bg_root} " f"(modality={modality})")
             return
 
-        # Step 6: apply correction.
+        # Step 4: apply correction.
         try:
             corrected = BackgroundCorrectionUtils.apply_flat_field_correction(
                 image,
@@ -253,7 +214,7 @@ def handle_correctframe(conn, client, hardware, settings, **kwargs):
             _fail(f"apply_flat_field_correction failed: {e}")
             return
 
-        # Step 7: send back same wire format as GETFRAME.
+        # Step 5: send back same wire format as GETFRAME.
         h, w = corrected.shape[:2]
         channels = 1 if corrected.ndim == 2 else corrected.shape[2]
         bpp = corrected.dtype.itemsize
@@ -264,13 +225,14 @@ def handle_correctframe(conn, client, hardware, settings, **kwargs):
         header = struct.pack(">5i", w, h, channels, bpp, len(raw_bytes))
         conn.sendall(header + raw_bytes)
         logger.info(
-            "CORRECTFRAME OK: %dx%d, %d ch, %d-bit (modality=%s, angle=%s)",
+            "CORRECTFRAME OK: %dx%d, %d ch, %d-bit (modality=%s, angle=%s, folder=%s)",
             w,
             h,
             channels,
             bpp * 8,
             modality,
             angle,
+            bg_root,
         )
     except Exception as e:
         logger.exception("CORRECTFRAME failed: %s", e)
@@ -278,6 +240,52 @@ def handle_correctframe(conn, client, hardware, settings, **kwargs):
             _fail(f"Internal error: {e}")
         except Exception:
             pass
+
+
+def _read_flag_message(conn, flags, timeout=5.0, max_bytes=65536):
+    """Read an END_MARKER-terminated ``--flag value`` message and return {flag: value}.
+
+    Values run to the next known flag, so a path with spaces survives. Returns None when
+    the connection closes first. The socket timeout is restored afterwards.
+    """
+    from microscope_command_server.server.protocol import END_MARKER
+
+    previous_timeout = conn.gettimeout() if hasattr(conn, "gettimeout") else None
+    if hasattr(conn, "settimeout"):
+        conn.settimeout(timeout)
+    parts = []
+    total = 0
+    try:
+        while True:
+            chunk = conn.recv(1024)
+            if not chunk:
+                return None
+            parts.append(chunk.decode("utf-8", errors="replace"))
+            total += len(chunk)
+            full = "".join(parts)
+            if END_MARKER in full:
+                message = full.replace(END_MARKER, "").strip()
+                break
+            if total > max_bytes:
+                return None
+    finally:
+        if hasattr(conn, "settimeout"):
+            conn.settimeout(previous_timeout)
+    out = {}
+    tokens = message.split()
+    i = 0
+    while i < len(tokens):
+        if tokens[i] in flags:
+            j = i + 1
+            value = []
+            while j < len(tokens) and tokens[j] not in flags:
+                value.append(tokens[j])
+                j += 1
+            out[tokens[i]] = " ".join(value)
+            i = j
+        else:
+            i += 1
+    return out
 
 
 def _strip_mag_suffix(modality):

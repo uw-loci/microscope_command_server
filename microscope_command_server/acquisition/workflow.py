@@ -1458,9 +1458,16 @@ def write_acquisition_metadata(
         acq_params["wb_enabled"] = params.get("white_balance_enabled", False)
         acq_params["wb_per_angle"] = params.get("white_balance_per_angle", False)
 
-        # Background correction
+        # Background correction: what was asked for, and what was done. bg_correction_applied is
+        # False when the folder or every file was missing and the run went uncorrected.
         acq_params["bg_correction_enabled"] = params.get("background_correction_enabled", False)
         acq_params["bg_correction_method"] = params.get("background_correction_method")
+        acq_params["bg_profile"] = params.get("background_profile")
+        acq_params["bg_folder"] = params.get("background_folder")
+        acq_params["bg_disabled_angles"] = params.get("background_disabled_angles", [])
+        acq_params["bg_correction_applied"] = params.get("background_correction_applied", False)
+        acq_params["bg_angles_loaded"] = params.get("background_angles_loaded", [])
+        acq_params["bg_channels_loaded"] = params.get("background_channels_loaded", [])
 
         # Z-stack
         if params.get("z_stack"):
@@ -2281,6 +2288,10 @@ def parse_acquisition_message(message: str) -> dict:
                 i += 2
             elif parts[i] == "--bg-folder" and i + 1 < len(parts):
                 params["background_folder"] = parts[i + 1]
+                i += 2
+            elif parts[i] == "--bg-profile" and i + 1 < len(parts):
+                # The background profile QPSC resolved --bg-folder under; recorded, never resolved here.
+                params["background_profile"] = parts[i + 1]
                 i += 2
             elif parts[i] == "--bg-disabled-angles" and i + 1 < len(parts):
                 params["background_disabled_angles_str"] = parts[i + 1]
@@ -3532,39 +3543,21 @@ def _prepare_acquisition(
     lcps_background_provenance: Dict[str, Any] = {}
 
     if background_correction_enabled:
+        # The client resolves the folder (background profile, detector, modality, magnification,
+        # white balance mode) and sends it; the server never derives one. Without --bg-folder
+        # there is nothing to load, and the run is uncorrected.
         background_dir = None
-
-        # Priority 1: Message parameter
-        if "background_folder" in params:
+        if params.get("background_folder"):
             background_dir = Path(params["background_folder"])
-            logger.info(f"Using background folder from message: {background_dir}")
-        else:
-            # Priority 2: YAML configuration from imageprocessing config file
-            config_path = Path(params["yaml_file_path"])
-            imageprocessing_path = (
-                config_path.parent
-                / f"imageprocessing_{config_path.stem.replace('config_', '')}.yml"
+            logger.info(
+                "Using background folder from message: %s (background profile: %s)",
+                background_dir,
+                params.get("background_profile") or "not given",
             )
-
-            bc_settings = None
-            if imageprocessing_path.exists():
-                try:
-                    imageprocessing_config = config_manager.load_config_file(
-                        str(imageprocessing_path)
-                    )
-                    bc_config = imageprocessing_config.get("background_correction", {})
-                    bc_settings = bc_config.get(modality, {})
-                    logger.info(
-                        f"Loaded background correction settings from: {imageprocessing_path}"
-                    )
-                except Exception as e:
-                    logger.warning(f"Failed to load imageprocessing config: {e}")
-            else:
-                logger.warning(f"Imageprocessing config not found at: {imageprocessing_path}")
-
-            if bc_settings and bc_settings.get("enabled") and bc_settings.get("base_folder"):
-                background_dir = Path(bc_settings["base_folder"]) / modality
-                logger.info(f"Using background folder from YAML config: {background_dir}")
+        else:
+            logger.warning(
+                "Background correction requested without --bg-folder; acquiring uncorrected"
+            )
 
         # Load background images if directory is valid
         if background_dir and background_dir.exists():
@@ -3635,10 +3628,24 @@ def _prepare_acquisition(
                     channel_background_images,
                     logger,
                 )
-        else:
+        elif background_dir is not None:
             logger.warning(f"Background directory not found: {background_dir}")
             logger.warning("Disabling background correction")
             background_correction_enabled = False
+        else:
+            background_correction_enabled = False
+
+    # What actually happened, for acquisition_metadata.json: the request said "correct", but
+    # a missing folder or file turns correction off here, and that used to be recorded nowhere.
+    # Per-channel correction is gated only on the channel backgrounds that loaded (the angle
+    # flag above goes False for a channel modality, which has no angle files), so "applied"
+    # means: correction was requested and something loaded for it.
+    params["background_correction_applied"] = bool(
+        params.get("background_correction_enabled")
+        and (background_images or channel_background_images)
+    )
+    params["background_angles_loaded"] = sorted(float(a) for a in background_images)
+    params["background_channels_loaded"] = sorted(channel_background_images)
 
     # ======= WHITE BALANCE SETUP =======
     angles_wb = {}
