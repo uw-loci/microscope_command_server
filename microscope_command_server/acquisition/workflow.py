@@ -2428,6 +2428,11 @@ def parse_acquisition_message(message: str) -> dict:
             elif parts[i] == "--averaging" and i + 1 < len(parts):
                 params["averaging"] = int(parts[i + 1])
                 i += 2
+            elif parts[i] == "--display-colormap" and i + 1 < len(parts):
+                # LC-PolScope: the orientation colour image's map for this run, chosen in the
+                # acquisition dialog; overrides reconstruction.display_colormap.
+                params["display_colormap"] = parts[i + 1]
+                i += 2
             elif parts[i] == "--biref-min-intensity" and i + 1 < len(parts):
                 params["biref_min_intensity"] = int(parts[i + 1])
                 i += 2
@@ -7040,6 +7045,8 @@ def _maybe_reconstruct_lcpolscope_tile(ctx, channel_plan, channel_images, filena
 
     modalities = (ctx.ppm_settings or {}).get("modalities", {}) or {}
     recon_cfg = (modalities.get("lcpolscope") or {}).get("reconstruction") or {}
+    if ctx.params.get("display_colormap"):
+        recon_cfg = {**recon_cfg, "display_colormap": ctx.params["display_colormap"]}
 
     try:
         submit_tile_reconstruction(

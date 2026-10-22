@@ -896,7 +896,9 @@ state folders, each with its own `TileConfiguration.txt` so it stitches on the s
   `display_orientation_sign` (+1/-1) and `display_orientation_offset_deg` register this
   instrument's angles to the borrowed frame before colouring (default identity). Each colour
   tile records the map in `polscope.colormap`. An unknown map, a bad sign, or `ppm` without a
-  usable calibration is refused at acquisition start.
+  usable calibration is refused at acquisition start. `--display-colormap <name>` on the
+  acquisition command (QPSC's **Orientation colour image** dropdown) overrides
+  `display_colormap` for one run.
 
 ### LC-PolScope background correction
 

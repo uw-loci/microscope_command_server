@@ -107,3 +107,37 @@ def test_undefined_and_zero_pixels_are_black():
         np.array([[np.nan, 0.0, 1.0]]), np.radians(np.array([[10.0, 10.0, np.nan]])), 1.0
     )
     assert not rgb.any()
+
+
+def test_the_dialog_choice_reaches_the_reconstruction(monkeypatch):
+    # --display-colormap (the acquisition dialog's Colour map) overrides the YAML for one run.
+    from types import SimpleNamespace
+
+    from microscope_command_server.acquisition import workflow
+    from microscope_command_server.modality import lcpolscope
+
+    params = workflow.parse_acquisition_message(
+        "--yaml c.yml --projects p --sample s --scan-type lcpolscope_20x --region r "
+        "--angles () --exposures (300.0) --display-colormap hsv"
+    )
+    assert params["display_colormap"] == "hsv"
+
+    seen = {}
+    monkeypatch.setattr(
+        lcpolscope, "submit_tile_reconstruction", lambda **kw: seen.update(kw["reconstruction_cfg"])
+    )
+    ctx = SimpleNamespace(
+        modality="lcpolscope",
+        params=params,
+        ppm_settings={
+            "modalities": {"lcpolscope": {"reconstruction": {"display_colormap": "ppm"}}}
+        },
+        output_path=None,
+        hardware=SimpleNamespace(get_pixel_size_um=lambda: 0.27),
+        write_pool=None,
+        channel_background_images=None,
+        lcps_background_provenance=None,
+        logger=None,
+    )
+    workflow._maybe_reconstruct_lcpolscope_tile(ctx, [{"id": "State0"}], {}, "0.tif")
+    assert seen["display_colormap"] == "hsv"
