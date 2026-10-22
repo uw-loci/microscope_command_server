@@ -1017,11 +1017,14 @@ def test_metadata_carries_the_adapter_wavelength(tmp_path):
 def test_orientation_colour_is_cyclic_and_scaled_by_retardance():
     import numpy as np
 
-    from microscope_command_server.modality.lcpolscope import orientation_color_rgb
+    from microscope_command_server.modality.orientation_colormap import (
+        ColormapSettings,
+        orientation_rgb,
+    )
 
     ret = np.array([[20.0, 20.0, 10.0, 0.0, np.nan]])
     ori = np.radians(np.array([[0.0, 179.999, 90.0, 45.0, 30.0]]))
-    rgb = orientation_color_rgb(ret, ori, 20.0).astype(int)
+    rgb = orientation_rgb(ret, ori, 20.0, ColormapSettings(name="hsv")).astype(int)
     assert rgb.shape == (1, 5, 3)
     # 0 and ~180 deg are the same colour: the map is cyclic like the data.
     assert np.abs(rgb[0, 0] - rgb[0, 1]).max() <= 2
@@ -1065,7 +1068,21 @@ def test_the_colour_image_is_written_beside_retardance_and_orientation(tmp_path)
     assert meta["polscope.display_only"].startswith("true")
     assert "5 nm" in meta["polscope.brightness"]
     assert meta["qpsc.background"] == "black"
+    assert meta["polscope.colormap"].startswith("uniform: OKLCH")
     assert (tmp_path / ORIENTATION_COLOR_DIR).is_dir()
+
+
+def test_a_bad_colormap_is_refused_up_front():
+    from microscope_command_server.modality.lcpolscope import ReconstructionRefused
+
+    with pytest.raises(ReconstructionRefused, match="display_colormap"):
+        _submit(
+            reconstruction_cfg={
+                "swing_waves": 0.03,
+                "wavelength_nm": 549,
+                "display_colormap": "rainbow",
+            },
+        )
 
 
 # ---------------------------------------------------------------------------

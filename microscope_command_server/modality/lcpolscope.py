@@ -40,6 +40,8 @@ from microscope_imageprocessing.io import (
 from .config import ModalityConfig
 from .registry import register
 
+from .orientation_colormap import ColormapSettings, colormap_settings, orientation_rgb
+
 logger = logging.getLogger(__name__)
 
 
@@ -83,42 +85,16 @@ def register_lcpolscope():
 
 RETARDANCE_DIR = "retardance"
 ORIENTATION_DIR = "orientation"
-#: Display-only colour map: hue = slow-axis orientation over [0, 180) (cyclic,
+#: Display-only colour image: hue = slow-axis orientation over [0, 180) (cyclic,
 #: so 0 and 180 deg are the same colour), brightness = retardance up to the
 #: display ceiling. The image OpenPolScope and recOrder show; QuPath cannot
-#: put a cyclic colour map on an image channel, so it is written as RGB.
+#: put a cyclic colour map on an image channel, so it is written as RGB. The
+#: colour map (reconstruction.display_colormap) is in orientation_colormap.
 ORIENTATION_COLOR_DIR = "orientation_color"
 #: Retardance at full brightness in the colour image, unless the YAML sets
 #: reconstruction.display_retardance_ceiling_nm. OpenPolScope's own ceiling on
 #: this instrument (its 2026-10-16 metadata).
 DEFAULT_DISPLAY_CEILING_NM = 20.0
-
-
-def orientation_color_rgb(retardance_nm, orientation_rad, ceiling_nm):
-    """``(Y, X, 3)`` uint8: hue from the axial orientation, value from retardance.
-
-    Hue runs once round the colour circle over 0..180 deg, so the map is cyclic
-    the way the data is. Undefined pixels (NaN) are black.
-    """
-    ret = np.asarray(retardance_nm, dtype=np.float64)
-    ori = np.asarray(orientation_rad, dtype=np.float64)
-    hue = np.mod(ori, np.pi) / np.pi  # 0..1, one cycle per 180 deg
-    value = np.clip(ret / float(ceiling_nm), 0.0, 1.0)
-    bad = ~np.isfinite(ret) | ~np.isfinite(ori)
-    hue = np.where(bad, 0.0, hue)
-    value = np.where(bad, 0.0, value)
-    # HSV -> RGB with saturation 1.
-    h6 = hue * 6.0
-    sector = np.floor(h6).astype(int) % 6
-    f = h6 - np.floor(h6)
-    p = np.zeros_like(value)
-    q = value * (1.0 - f)
-    t = value * f
-    r = np.choose(sector, [value, q, p, p, t, value])
-    g = np.choose(sector, [t, value, value, q, p, p])
-    b = np.choose(sector, [p, p, t, value, value, q])
-    rgb = np.stack([r, g, b], axis=-1)
-    return np.rint(rgb * 255.0).astype(np.uint8)
 
 
 # Derived tiles are written as uint16, not float, because the stitcher cannot
@@ -323,6 +299,7 @@ def _reconstruct_and_write(
     lc_adapter_wavelength_nm=None,
     background_provenance=None,
     estimated_background=None,
+    display_colormap=None,
 ):
     """Reconstruct one tile and write retardance + orientation. Runs in the write pool."""
     from polscope_library import reconstruct
@@ -509,13 +486,16 @@ def _reconstruct_and_write(
     ome_writer(
         filename=str(color_dir / filename),
         pixel_size_um=pixel_size_um,
-        data=orientation_color_rgb(result.retardance_nm, result.orientation_rad, ceiling),
+        data=orientation_rgb(
+            result.retardance_nm, result.orientation_rad, ceiling, display_colormap
+        ),
         channel_name="Orientation colour (hue = orientation, brightness = retardance)",
         map_annotations={
             **shared,
             "polscope.quantity": "orientation_colour_display",
             "polscope.display_only": "true -- for viewing; measure on the retardance and orientation images",
             "polscope.hue": "slow-axis orientation, one colour cycle over 0..180 deg",
+            "polscope.colormap": (display_colormap or ColormapSettings()).describe(),
             "polscope.brightness": f"retardance, full brightness at {ceiling:g} nm",
             # RGB but not brightfield: no signal is black. Tells the stitcher to fill
             # the area no tile reaches with black, not the white it assumes for RGB.
@@ -930,6 +910,10 @@ def submit_tile_reconstruction(
         estimated_background = estimated_background_settings(reconstruction_cfg)
     except (TypeError, ValueError) as exc:
         raise ReconstructionRefused(f"reconstruction.estimated_background: {exc}") from exc
+    try:
+        display_colormap = colormap_settings(reconstruction_cfg)
+    except (TypeError, ValueError) as exc:
+        raise ReconstructionRefused(f"reconstruction.{exc}") from exc
 
     recon_order = resolve_state_order(channel_order, reconstruction_cfg.get("state_order"))
     ordered = [channel_images[cid] for cid in recon_order]
@@ -955,6 +939,7 @@ def submit_tile_reconstruction(
         lc_adapter_wavelength_nm=lc_adapter_wavelength_nm,
         background_provenance=background_provenance,
         estimated_background=estimated_background,
+        display_colormap=display_colormap,
         output_path=output_path,
         filename=filename,
         pixel_size_um=pixel_size_um,

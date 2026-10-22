@@ -885,6 +885,18 @@ state folders, each with its own `TileConfiguration.txt` so it stitches on the s
   over 0..180 deg, so 0 and 180 are the same colour; brightness is the retardance, full at
   `reconstruction.display_retardance_ceiling_nm` (default 20 nm). QuPath cannot put a cyclic
   colour map on an image channel, so the server renders it. Measure on the other two.
+  `reconstruction.display_colormap` picks the colours (`modality/orientation_colormap.py`):
+  - `uniform` (default): a constant-lightness OKLCH wheel (L 0.75, C 0.125), so every
+    orientation looks equally light at equal retardance and brightness means retardance only.
+  - `hsv`: OpenPolScope's look; its yellows and cyans look much lighter than its blues.
+  - `ppm`: the hue a PPM camera image shows for the angle, from
+    `display_hue_calibration: {source, slope, intercept, hue_offset}` copied from a PPM
+    sunburst `.npz` (slope forced to one cycle per 180 deg so the map stays cyclic).
+
+  `display_orientation_sign` (+1/-1) and `display_orientation_offset_deg` register this
+  instrument's angles to the borrowed frame before colouring (default identity). Each colour
+  tile records the map in `polscope.colormap`. An unknown map, a bad sign, or `ppm` without a
+  usable calibration is refused at acquisition start.
 
 ### LC-PolScope background correction
 
