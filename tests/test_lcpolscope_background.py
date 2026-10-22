@@ -239,3 +239,54 @@ class TestStatePlan:
 
         problems = state_plan_problems(self.LIB, [33, 33, 40, 33, 33], self.LIB)
         assert problems and "State2=40 ms" in problems[0]
+
+
+# --- swing-state spread: calibration imbalance vs specimen ---------------------------------
+
+
+def _state_field(level, shape=(256, 256), patch=None):
+    img = np.full(shape, float(level))
+    if patch is not None:
+        (r0, r1, c0, c1), factor = patch
+        img[r0:r1, c0:c1] *= factor
+    return img
+
+
+def test_uniform_imbalance_has_a_flat_field_map():
+    # 10-21 Hamamatsu means, uncalibrated palette: 28% apart, but every block alike.
+    from microscope_command_server.acquisition.workflow import (
+        _block_means,
+        _swing_field_variation,
+    )
+
+    maps = [_block_means(_state_field(m)) for m in (28761, 33398, 25324, 29185)]
+    assert _swing_field_variation(maps, black=103) < 0.001
+
+
+def test_specimen_changes_the_balance_where_it_sits():
+    from microscope_command_server.acquisition.workflow import (
+        _block_means,
+        _swing_field_variation,
+    )
+
+    patch = ((0, 128, 0, 128), 0.6)  # a birefringent particle dims one state in a quarter
+    maps = [
+        _block_means(_state_field(29000, patch=patch)),
+        _block_means(_state_field(29000)),
+        _block_means(_state_field(29000)),
+        _block_means(_state_field(29000)),
+    ]
+    assert _swing_field_variation(maps, black=103) > 0.2
+
+
+def test_spread_message_names_the_calibration_when_none_is_applied():
+    from microscope_command_server.acquisition.workflow import _swing_spread_message
+
+    msg = _swing_spread_message(0.28, {"State1": 1.0}, False, 0.004)
+    assert "No QPSC LC calibration" in msg and "specimen" not in msg
+    assert "0.4%" in msg
+    calibrated = _swing_spread_message(0.28, {"State1": 1.0}, True, None)
+    assert "specimen" in calibrated
+    # Uncalibrated, but the balance changes across the field: something is in it.
+    patchy = _swing_spread_message(0.28, {"State1": 1.0}, False, 2.0)
+    assert "specimen" in patchy and "No QPSC LC calibration" not in patchy

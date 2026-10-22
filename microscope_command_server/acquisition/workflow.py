@@ -3562,18 +3562,25 @@ def _prepare_acquisition(
         # Load background images if directory is valid
         if background_dir and background_dir.exists():
             logger.info(f"Loading background images from: {background_dir}")
-            bg_load_angles = params["angles"] if params["angles"] else [0.0]
-            background_images, background_scaling_factors, background_wb_coeffs = (
-                BackgroundCorrectionUtils.load_background_images(
-                    background_dir, bg_load_angles, logger
-                )
-            )
-
-            if background_images:
-                logger.info(f"Loaded {len(background_images)} background images")
-            else:
-                logger.warning("No background images found - disabling background correction")
+            if params.get("channels") and not params["angles"]:
+                # A channel acquisition (fluorescence, LC-PolScope) has per-channel files only,
+                # loaded below. The angle loader would look for 0.0.tif and log "not found ...
+                # disabling background correction" for a folder that is fine. The angle flag
+                # still goes False, as it always did for a channel modality.
                 background_correction_enabled = False
+            else:
+                bg_load_angles = params["angles"] if params["angles"] else [0.0]
+                background_images, background_scaling_factors, background_wb_coeffs = (
+                    BackgroundCorrectionUtils.load_background_images(
+                        background_dir, bg_load_angles, logger
+                    )
+                )
+
+                if background_images:
+                    logger.info(f"Loaded {len(background_images)} background images")
+                else:
+                    logger.warning("No background images found - disabling background correction")
+                    background_correction_enabled = False
 
             # Opt-in per-channel background loading for multi-channel widefield IF
             if params.get("channels"):
@@ -8758,6 +8765,73 @@ def _channel_intensity_value(ch_entry):
 #: on glass agree to well under 1%; a specimen spreads them by tens of percent.
 LC_BACKGROUND_MAX_SWING_SPREAD = 0.10
 
+#: Block size, in pixels, for the swing states' field map (see _swing_field_variation).
+LC_BACKGROUND_FIELD_BLOCK = 64
+
+#: Above this, the swing states' balance changes enough across the field to mean something
+#: is in it, calibrated or not. The demo microscope reads 0.13 on clear glass and 2.0 on
+#: tissue; no rig value has been measured yet.
+LC_BACKGROUND_MAX_FIELD_VARIATION = 0.25
+
+
+def _block_means(arr, block=LC_BACKGROUND_FIELD_BLOCK):
+    """Mean of each ``block`` x ``block`` square of a 2-D image (edges that do not fill one dropped)."""
+    a = np.asarray(arr, dtype=np.float64)
+    if a.ndim > 2:
+        a = a.mean(axis=-1)
+    h = (a.shape[0] // block) * block
+    w = (a.shape[1] // block) * block
+    if h == 0 or w == 0:
+        return a.reshape(1, 1, -1).mean(axis=-1)
+    return a[:h, :w].reshape(h // block, block, w // block, block).mean(axis=(1, 3))
+
+
+def _swing_field_variation(block_maps, black=0.0):
+    """How much the swing states' balance changes across the field, as a fraction.
+
+    For each swing state, its share of the swing states' mean is mapped block by block;
+    the result is the largest (p95 - p5) / median of those maps. A uniform imbalance
+    (states not calibrated for this light path) leaves every map flat, so this stays
+    small however far apart the means are. Specimen or debris changes the balance
+    where it sits, so this grows with it. None with fewer than two swing states.
+    """
+    maps = [np.maximum(np.asarray(m, dtype=np.float64) - black, 1e-9) for m in block_maps]
+    if len(maps) < 2:
+        return None
+    mean_map = np.mean(maps, axis=0)
+    worst = 0.0
+    for m in maps:
+        share = m / mean_map
+        med = float(np.median(share))
+        if med > 0:
+            p5, p95 = np.percentile(share, [5, 95])
+            worst = max(worst, float((p95 - p5) / med))
+    return round(worst, 4)
+
+
+def _swing_spread_message(spread, means, calibrated, field_variation):
+    """The warning for a background whose swing states disagree, naming the likely cause."""
+    field = (
+        ""
+        if field_variation is None
+        else " Their balance varies by %.1f%% across the field." % (field_variation * 100)
+    )
+    patchy = field_variation is not None and field_variation > LC_BACKGROUND_MAX_FIELD_VARIATION
+    if not calibrated and not patchy:
+        return (
+            "LC-PolScope background: the swing states differ by %.0f%% (means %s).%s No QPSC "
+            "LC calibration is applied, so the states are not balanced for this light path and "
+            "a spread like this is expected; the background correction removes a uniform one. "
+            "Calibrate Liquid Crystals + Apply, then collect the background again."
+            % (spread * 100, means, field)
+        )
+    return (
+        "LC-PolScope background: the swing states differ by %.0f%% (means %s).%s On a clear "
+        "field their balance is the same everywhere, and after a calibration they agree to a few "
+        "percent, so this was probably taken on specimen or debris. Move to an empty area and "
+        "collect it again." % (spread * 100, means, field)
+    )
+
 
 def _collect_channel_backgrounds(
     channels,
@@ -8827,6 +8901,7 @@ def _collect_channel_backgrounds(
     recon = (modality_cfg.get("reconstruction") or {}) if is_lcps else {}
     frames = 1
     lcps_state_stats: Dict[str, Any] = {}
+    lcps_block_maps: Dict[str, Any] = {}
     camera_summary: Dict[str, Any] = {}
     full_scale = None
     adapter_wavelength_nm = None
@@ -8921,6 +8996,7 @@ def _collect_channel_backgrounds(
                     logger.debug("Could not read the LC adapter wavelength: %s", exc)
             arr = np.asarray(image, dtype=np.float64)
             saturated = float(np.mean(arr >= full_scale)) if full_scale is not None else None
+            lcps_block_maps[channel_id] = _block_means(arr)
             lcps_state_stats[channel_id] = {
                 "mean": round(float(arr.mean()), 3),
                 "max": float(arr.max()),
@@ -8972,18 +9048,27 @@ def _collect_channel_backgrounds(
         swing_means = [
             v["mean"] - black for k, v in lcps_state_stats.items() if k != EXTINCTION_CHANNEL_ID
         ]
+        field_variation = _swing_field_variation(
+            [m for k, m in lcps_block_maps.items() if k != EXTINCTION_CHANNEL_ID], black
+        )
         if len(swing_means) >= 2 and np.mean(swing_means) > 0:
             swing_spread = round(
                 float((max(swing_means) - min(swing_means)) / np.mean(swing_means)), 4
             )
+            logger.info(
+                "LC-PolScope background: swing states differ by %.1f%%; their balance varies by "
+                "%s across the field",
+                swing_spread * 100,
+                "?" if field_variation is None else "%.1f%%" % (field_variation * 100),
+            )
             if swing_spread > LC_BACKGROUND_MAX_SWING_SPREAD:
                 logger.warning(
-                    "LC-PolScope background: the swing states differ by %.0f%% (means %s). On a "
-                    "clear, specimen-free field after a calibration they agree to a few percent, "
-                    "so this was probably taken on specimen or debris. Move to an empty area and "
-                    "collect it again.",
-                    swing_spread * 100,
-                    {k: v["mean"] for k, v in lcps_state_stats.items()},
+                    _swing_spread_message(
+                        swing_spread,
+                        {k: v["mean"] for k, v in lcps_state_stats.items()},
+                        bool(recon.get("lc_calibrated_at")),
+                        field_variation,
+                    )
                 )
 
         provenance = {
@@ -8995,6 +9080,7 @@ def _collect_channel_backgrounds(
             "exposure_ms": channel_exposures,
             "state_stats": lcps_state_stats,
             "swing_state_spread": swing_spread,
+            "swing_field_variation": field_variation,
             "lc_calibrated_at": recon.get("lc_calibrated_at"),
             "lc_calibration_file": recon.get("lc_calibration_file"),
             "lc_extinction_ratio": recon.get("lc_extinction_ratio"),

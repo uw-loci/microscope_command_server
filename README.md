@@ -900,10 +900,16 @@ acquisition paths skip for this modality.
   (default 10; a single frame's noise would be copied into every tile), refuses a camera on
   auto gain or auto exposure, warns on clipped pixels, and writes `<State>.tif` (float32) plus
   `background_provenance.json`: the LC calibration time and file, exposures, frames, adapter
-  wavelength, black level, camera summary, per-state means and `swing_state_spread` (how far
-  apart the swing states' background means lie, as a fraction of their mean). Above 10% the
-  collector logs a WARNING that the field probably had specimen or debris in it; move to an
-  empty area and collect again.
+  wavelength, black level, camera summary, per-state means, `swing_state_spread` (how far
+  apart the swing states' background means lie, as a fraction of their mean) and
+  `swing_field_variation` (how much their balance changes across the field, from 64 px blocks;
+  a uniform imbalance from an uncalibrated palette stays low, specimen or debris pushes it up;
+  the demo reads 0.13 on glass and 2.0 on tissue).
+  Above 10% the collector logs a WARNING. If the balance also varies across the field (above
+  25%), or a calibration was applied, the warning says the field probably had specimen or debris
+  in it: move to an empty area and collect again. With no calibration applied and a flat field,
+  the warning says the spread is expected, since the states are not balanced for this light path,
+  and asks you to calibrate and collect again.
 - **At acquisition** the five states are loaded from the profile's background folder and checked
   against the current calibration. A background with no provenance, or one collected under a
   different LC calibration, is **not used**: an ERROR says why and the run reconstructs without
