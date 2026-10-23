@@ -3924,10 +3924,10 @@ def _approach_from_safe_z(
         logger.warning(
             "STREAM_AF:approach: cancelled; retracting to the safe Z %.2f before returning", safe_z
         )
-        _retract(core, focus_device, safe_z, "aborted")
+        _retract(core, focus_device, safe_z, "aborted", speed_prop, normal_value)
         return scan
     if not scan.samples_trace:
-        _retract(core, focus_device, safe_z, "no samples")
+        _retract(core, focus_device, safe_z, "no samples", speed_prop, normal_value)
         return _ScanAttemptResult(
             "insufficient_samples",
             None,
@@ -3950,7 +3950,7 @@ def _approach_from_safe_z(
     # bottom", with SIFT matching against the resulting blur.
     samples = [(float(s[1]), float(s[2])) for s in scan.samples_trace if len(s) >= 3]
     if not samples:
-        _retract(core, focus_device, safe_z, "no usable samples")
+        _retract(core, focus_device, safe_z, "no usable samples", speed_prop, normal_value)
         return _ScanAttemptResult(
             "metric_flat",
             None,
@@ -3960,7 +3960,7 @@ def _approach_from_safe_z(
         )
     peaks = first_prominent_peaks_in_scan_order(samples)
     if not peaks:
-        _retract(core, focus_device, safe_z, "no prominent peak")
+        _retract(core, focus_device, safe_z, "no prominent peak", speed_prop, normal_value)
         return _ScanAttemptResult(
             "metric_flat",
             None,
@@ -4068,7 +4068,7 @@ def _approach_from_safe_z(
             why,
         )
 
-    _retract(core, focus_device, safe_z, "no peak passed the tissue gate")
+    _retract(core, focus_device, safe_z, "no peak passed the tissue gate", speed_prop, normal_value)
     return _ScanAttemptResult(
         "metric_flat",
         None,
@@ -4078,13 +4078,33 @@ def _approach_from_safe_z(
     )
 
 
-def _retract(core, focus_device: str, safe_z: float, why: str) -> None:
+def _retract(
+    core,
+    focus_device: str,
+    safe_z: float,
+    why: str,
+    speed_prop: Optional[str] = None,
+    normal_value: Optional[str] = None,
+) -> None:
     """Return the stage to the safe Z after a failed approach.
 
     A failed autofocus must finish clear of the sample rather than parked
     wherever the scan stopped, which may be closer to it than where the run
     started.
+
+    The stage is stopped and the normal speed restored first. A cancelled scan
+    leaves the slow continuous move still running, and a speed change does not
+    reach a move already under way (Prior), so the retract inherited the scan
+    speed: 30 s from 330 um out on PPM (2026-10-22), long enough that the cancel
+    looked ignored. The top-level abort handler stops the stage the same way.
     """
+    try:
+        core.stop(focus_device)
+    except Exception:
+        # Not every adapter implements Stop; the absolute move below redirects it anyway.
+        pass
+    if speed_prop is not None and normal_value is not None:
+        _try_set(core, focus_device, speed_prop, normal_value)
     try:
         core.set_position(focus_device, float(safe_z))
         _wait_via_busy(core, focus_device)

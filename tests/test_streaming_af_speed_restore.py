@@ -236,5 +236,42 @@ def test_the_cancel_is_logged_before_the_retract_moves_the_stage():
     assert source.count(marker) == 1
     after = source.split(marker, 1)[1][:600]
     log_at = after.index("cancelled; retracting")
-    retract_at = after.index('_retract(core, focus_device, safe_z, "aborted")')
+    retract_at = after.index('_retract(core, focus_device, safe_z, "aborted"')
     assert log_at < retract_at
+
+
+def test_the_approach_retract_stops_the_stage_and_restores_speed_before_moving():
+    """PPM, 2026-10-22: a cancelled approach retracted 330 um at 11.5 um/s.
+
+    The scan's own restore runs while its slow continuous move is still under
+    way, and a Prior stage does not apply a speed change to a move in progress.
+    The retract must stop the stage, then restore speed, then move.
+    """
+    sf = _load_streaming_focus()
+    calls = []
+
+    class Core:
+        def stop(self, device):
+            calls.append(("stop", device))
+
+        def set_property(self, device, prop, value):
+            calls.append(("set", prop, value))
+
+        def get_property(self, device, prop):
+            return calls[-1][2] if calls and calls[-1][0] == "set" else "1"
+
+        def set_position(self, device, z):
+            calls.append(("move", z))
+
+        def device_busy(self, device):
+            return False
+
+        def get_position(self, device):
+            return 0.0
+
+    sf._retract(Core(), "ZStage", 0.0, "aborted", "MaxSpeed", "100")
+    kinds = [c[0] for c in calls]
+    assert kinds.index("stop") < kinds.index("move"), calls
+    sets = [c for c in calls if c[0] == "set"]
+    assert sets and sets[0][2] == "100", calls
+    assert calls.index(sets[0]) < kinds.index("move"), calls
