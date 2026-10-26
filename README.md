@@ -898,7 +898,9 @@ state folders, each with its own `TileConfiguration.txt` so it stitches on the s
   tile records the map in `polscope.colormap`. An unknown map, a bad sign, or `ppm` without a
   usable calibration is refused at acquisition start. `--display-colormap <name>` on the
   acquisition command (QPSC's **Orientation colour image** dropdown) overrides
-  `display_colormap` for one run.
+  `display_colormap` for one run, and `--display-ceiling-nm <nm>` (QPSC's **Full brightness
+  at** field) overrides `display_retardance_ceiling_nm` the same way; a mounting medium or a
+  thick section can need a higher ceiling than the default.
 
 ### LC-PolScope background correction
 

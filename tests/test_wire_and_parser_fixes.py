@@ -125,6 +125,16 @@ def test_flags_after_af_disabled_are_still_read():
     assert params.get("z_step") == 1.5
 
 
+def test_display_ceiling_is_read_and_a_bad_one_ignored():
+    params = _parse_with_deadline(f"{REQUIRED} --display-ceiling-nm 35.5 --display-colormap hsv")
+    assert params["display_ceiling_nm"] == 35.5
+    assert params["display_colormap"] == "hsv"
+    for bad in ("0", "-3", "abc", "inf"):
+        params = _parse_with_deadline(f"{REQUIRED} --display-ceiling-nm {bad} --af-disabled")
+        assert "display_ceiling_nm" not in params, bad
+        assert params["af_disabled"] is True, bad
+
+
 def test_end_marker_is_removed_by_its_value():
     params = _parse_with_deadline(f"{REQUIRED} ENDOFSTR")
     assert params["region_name"] == "r"

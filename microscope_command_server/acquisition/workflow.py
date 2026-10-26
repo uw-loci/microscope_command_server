@@ -2433,6 +2433,22 @@ def parse_acquisition_message(message: str) -> dict:
                 # acquisition dialog; overrides reconstruction.display_colormap.
                 params["display_colormap"] = parts[i + 1]
                 i += 2
+            elif parts[i] == "--display-ceiling-nm" and i + 1 < len(parts):
+                # LC-PolScope: the retardance shown at full brightness in the orientation
+                # colour image for this run (the dialog's "Full brightness at"); overrides
+                # reconstruction.display_retardance_ceiling_nm. Display only.
+                try:
+                    ceiling = float(parts[i + 1])
+                except ValueError:
+                    ceiling = float("nan")
+                if 0 < ceiling < float("inf"):
+                    params["display_ceiling_nm"] = ceiling
+                else:
+                    logger.warning(
+                        "Ignoring --display-ceiling-nm %r; it must be a number above 0",
+                        parts[i + 1],
+                    )
+                i += 2
             elif parts[i] == "--biref-min-intensity" and i + 1 < len(parts):
                 params["biref_min_intensity"] = int(parts[i + 1])
                 i += 2
@@ -7047,6 +7063,11 @@ def _maybe_reconstruct_lcpolscope_tile(ctx, channel_plan, channel_images, filena
     recon_cfg = (modalities.get("lcpolscope") or {}).get("reconstruction") or {}
     if ctx.params.get("display_colormap"):
         recon_cfg = {**recon_cfg, "display_colormap": ctx.params["display_colormap"]}
+    if ctx.params.get("display_ceiling_nm"):
+        recon_cfg = {
+            **recon_cfg,
+            "display_retardance_ceiling_nm": ctx.params["display_ceiling_nm"],
+        }
 
     try:
         submit_tile_reconstruction(
