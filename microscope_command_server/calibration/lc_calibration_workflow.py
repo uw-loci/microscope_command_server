@@ -281,6 +281,7 @@ def run_lc_calibration(
     black_level: Optional[float] = None,
     exposure_ms: Optional[float] = None,
     strategy: str = "single_pass",
+    roi_fraction: Optional[float] = None,
     lc_control_mode: Optional[str] = None,
     progress_callback: Optional[Callable[[int, int, str, str], None]] = None,
     should_abort: Optional[Callable[[], bool]] = None,
@@ -294,7 +295,10 @@ def run_lc_calibration(
     exception: ``None`` means "whatever Micro-Manager is set to", and either
     way the exposure used is recorded in the result, with the camera's bit
     depth and pixel format, because a frame mean in counts is unreadable
-    without them.
+    without them. ``roi_fraction`` (0 to 1, exclusive) measures through the
+    central fraction of the field, a camera ROI where the core allows one and
+    a software crop otherwise, so junk at the sensor's edges stays out of the
+    means; the whole field is used when it is ``None``.
 
     Returns
     -------
@@ -388,6 +392,14 @@ def run_lc_calibration(
         )
     except Exception as exc:
         return fail(f"could not reach the liquid crystals: {exc}")
+
+    roi = instrument.apply_roi(roi_fraction)
+    if roi.get("mode") == "software":
+        warnings.append(
+            f"The camera ROI could not be set ({roi.get('reason')}); every frame was cropped to "
+            f"the central {roi['fraction'] * 100:.0f}% in software instead, which keeps the edges "
+            "out of the means but does not shorten the readout."
+        )
 
     # The adapter converts the palette's waves to volts at ITS wavelength. If
     # that is not the reconstruction wavelength, the swing the crystals apply
@@ -485,6 +497,8 @@ def run_lc_calibration(
         )
 
     def restore_exposure() -> None:
+        # The camera is left as the acquisition expects it: whole field, its exposure.
+        instrument.restore_roi()
         if restore_exposure_ms is None:
             return
         try:
@@ -774,6 +788,7 @@ def run_lc_calibration(
         # frame mean in counts means nothing without the first, and the
         # second is the one-line answer to "was the field bright enough".
         "camera": camera,
+        "roi": roi,
         "signal": signal,
         # The camera offset measured from an exposure series at extinction, and
         # how straight the line was. QPSC offers to write it on Apply.

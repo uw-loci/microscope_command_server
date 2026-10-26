@@ -672,7 +672,8 @@ measures the LC-PolScope field, not a dark one.
 ```
 LCCALIB --yaml config.yml --output /path/to/output [--modality lcpolscope] \
         [--swing 0.03] [--scheme "5-State"] [--wavelength 546.0] \
-        [--black-level 100.0] [--exposure-ms 50] [--strategy single_pass] ENDOFSTR
+        [--black-level 100.0] [--exposure-ms 50] [--strategy single_pass] \
+        [--roi-fraction 0.5] ENDOFSTR
 ```
 
 ### Parameters
@@ -710,6 +711,13 @@ LCCALIB --yaml config.yml --output /path/to/output [--modality lcpolscope] \
   (default) makes one pass per state; `iterative` repeats, re-centring on the
   crystals, until the residual is small enough. The second costs roughly three
   times the exposures, so it is a trade rather than an upgrade.
+- **`--roi-fraction 0.5`** (optional) -- Measure through the central fraction of the
+  field (each axis), so dust and other junk at the sensor's edges stay out of the
+  intensity means. The camera's own ROI is set through the core where it allows one,
+  which also reads out faster; otherwise every frame is cropped in software (reply
+  warning, `roi.mode` = `software`). Cleared afterwards on every exit path. Omitted
+  or not strictly between 0 and 1 means the whole field. The reply's `roi` says what
+  was used.
 
 **The black level is also measured on every run.** After the search, the crystals are held at
 extinction and four frames-averaged snaps are taken at 25, 50, 75 and 100% of the calibration
@@ -769,6 +777,8 @@ The command sends multiple responses as it progresses:
      "camera": {"device": "Oryx ORX-10G-51S5M", "exposure_ms": 50.0, "exposure_source": "request|micro-manager",
                 "bit_depth": 12, "significant_bits": 12, "bytes_per_pixel": 2, "width": 2448, "height": 2048,
                 "binning": "1", "pixel_type": "Mono12", "gain": "0"},
+     "roi": {"fraction": 0.5, "mode": "camera|software|full", "x": 612, "y": 512, "width": 1224, "height": 1024,
+             "full_width": 2448, "full_height": 2048},
      "signal": {"extinction": 410.2, "brightest_state": 1890.5, "grid_peak": 3950.0,
                 "full_scale": 4095.0, "grid_peak_fraction": 0.9646,
                 "extinction_above_black": 307.2, "swing_contrast": 1480.3, "swing_contrast_fraction": 0.3615,

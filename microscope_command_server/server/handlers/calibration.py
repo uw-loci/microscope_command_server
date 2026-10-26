@@ -1979,7 +1979,8 @@ def handle_lccalib(conn, client, hardware, settings, **kwargs):
 
     Finds the extinction point and the swing states, then writes the palette
     and a metadata file. Reads --yaml, --output, --modality, --swing,
-    --scheme, --wavelength, --black-level, --exposure-ms, --strategy.
+    --scheme, --wavelength, --black-level, --exposure-ms, --strategy,
+    --roi-fraction.
 
     Response: STARTED:<output_folder>, then PROGRESS:<current>:<total>:<msg>
     while it runs, then SUCCESS:<json> or FAILED:<reason>.
@@ -2010,6 +2011,7 @@ def handle_lccalib(conn, client, hardware, settings, **kwargs):
         "--black-level",
         "--exposure-ms",
         "--strategy",
+        "--roi-fraction",
     ]
     raw = {}
     for i, flag in enumerate(flags):
@@ -2061,6 +2063,7 @@ def handle_lccalib(conn, client, hardware, settings, **kwargs):
             black_level=optional_float("--black-level"),
             exposure_ms=optional_float("--exposure-ms"),
             strategy=raw.get("--strategy") or "single_pass",
+            roi_fraction=optional_float("--roi-fraction"),
             progress_callback=send_progress,
             logger_=logger,
         )

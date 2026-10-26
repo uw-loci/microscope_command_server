@@ -194,6 +194,80 @@ class TestInstrument:
             MicroManagerLC(NoCore(), settle_ms=0).set_retardance("LCA", 0.25)
 
 
+class RoiCore(FakeCore):
+    """A core whose camera accepts an ROI, like MMCore does."""
+
+    def __init__(self, *a, **kw):
+        super().__init__(*a, **kw)
+        self.roi = None
+        self.cleared = 0
+
+    def get_image_width(self):
+        return 4
+
+    def get_image_height(self):
+        return 4
+
+    def set_roi(self, x, y, w, h):
+        self.roi = (x, y, w, h)
+
+    def clear_roi(self):
+        self.roi = None
+        self.cleared += 1
+
+
+class TestMeasurementField:
+    def test_camera_roi_is_centred_and_cleared_afterwards(self):
+        hw = FakeHardware(core=RoiCore())
+        instrument = MicroManagerLC(hw, settle_ms=0)
+        record = instrument.apply_roi(0.5)
+        assert record["mode"] == "camera"
+        assert hw.core.roi == (1, 1, 2, 2)
+        instrument.restore_roi()
+        assert hw.core.roi is None and hw.core.cleared == 1
+
+    def test_software_crop_when_the_core_has_no_roi(self):
+        hw = FakeHardware()  # FakeCore: no set_roi
+        instrument = MicroManagerLC(hw, settle_ms=0)
+        record = instrument.apply_roi(0.5)
+        assert record["mode"] == "software"
+        instrument.measure_intensity()
+        assert instrument.frame_shape == (2, 2), "the 4x4 fake frame is cropped to its centre"
+        instrument.restore_roi()
+        instrument.measure_intensity()
+        assert instrument.frame_shape == (4, 4)
+
+    def test_whole_field_for_none_or_a_bad_fraction(self):
+        instrument = MicroManagerLC(FakeHardware(), settle_ms=0)
+        for value in (None, 0.0, 1.0, 1.5, -0.2):
+            assert instrument.apply_roi(value)["mode"] == "full", value
+            assert instrument.roi is None
+
+    def test_the_workflow_records_the_field_and_restores_it(self, tmp_path):
+        hw = FakeHardware(core=RoiCore())
+        hw.core.properties[("MeadowlarkLC", "Wavelength")] = "546.0"
+        result = run_lc_calibration(
+            hw,
+            TestWorkflow()._yaml(),
+            output_folder=str(tmp_path),
+            black_level=102.0,
+            roi_fraction=0.5,
+        )
+        assert result["success"] is True
+        assert result["roi"]["mode"] == "camera"
+        assert result["roi"]["width"] == 2
+        assert hw.core.roi is None, "cleared when the run ended"
+        plain = run_lc_calibration(
+            FakeHardware(),
+            TestWorkflow()._yaml(),
+            output_folder=str(tmp_path / "sw"),
+            black_level=102.0,
+            roi_fraction=0.5,
+        )
+        assert plain["roi"]["mode"] == "software"
+        assert any("cropped" in w for w in plain["warnings"])
+
+
 class TestWorkflow:
     def _yaml(self, channel_exposures=None, **recon):
         base = {

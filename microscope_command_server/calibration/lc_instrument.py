@@ -18,6 +18,18 @@ from typing import Optional
 
 import numpy as np
 
+
+def central_crop(frame: np.ndarray, fraction: float) -> np.ndarray:
+    """The central ``fraction`` of ``frame`` along each of its first two axes."""
+    if frame.ndim < 2 or not (0.0 < fraction < 1.0):
+        return frame
+    height, width = frame.shape[0], frame.shape[1]
+    crop_h = max(1, int(round(height * fraction)))
+    crop_w = max(1, int(round(width * fraction)))
+    y, x = (height - crop_h) // 2, (width - crop_w) // 2
+    return frame[y : y + crop_h, x : x + crop_w]
+
+
 logger = logging.getLogger(__name__)
 
 LC_DEVICE = "MeadowlarkLC"
@@ -99,6 +111,11 @@ class MicroManagerLC:
         #: histogram of a subsample. The library's trace has one point per
         #: call too, so index i here is trace point i.
         self.frames: list = []
+        #: What the camera measures through, from :meth:`apply_roi`: the whole
+        #: field (``None``), a camera ROI, or a software crop of every frame.
+        self.roi: Optional[dict] = None
+        self._camera_roi_set = False
+        self._software_crop: Optional[float] = None
         self.limits = limits if limits is not None else self._device_limits()
 
     def _device_limits(self):
@@ -204,8 +221,74 @@ class MicroManagerLC:
         self.exposures += 1
         image, _ = self.hardware.snap_image()
         frame = np.asarray(image)
+        if self._software_crop is not None:
+            frame = central_crop(frame, self._software_crop)
         self._note_frame(frame)
         return float(frame.astype(np.float64).mean())
+
+    def apply_roi(self, fraction: Optional[float]) -> dict:
+        """Measure through the central ``fraction`` of the field (each axis).
+
+        Dust and other junk at the edges of the sensor would otherwise be
+        averaged into every intensity, and a smaller frame reads out faster.
+        The camera's own ROI is tried first, through the core; when the core
+        cannot set one, every frame is cropped in software instead, which
+        keeps the junk out but not the readout time. ``None`` or anything not
+        strictly between 0 and 1 measures the whole field. The record returned
+        (also kept as :attr:`roi`) says which happened.
+        """
+        self.restore_roi()
+        if fraction is None or not (0.0 < float(fraction) < 1.0):
+            self.roi = None
+            return {"fraction": 1.0, "mode": "full"}
+        fraction = float(fraction)
+        record: dict = {"fraction": fraction}
+        try:
+            core = self._core()
+            width, height = int(core.get_image_width()), int(core.get_image_height())
+            roi_w = max(1, int(round(width * fraction)))
+            roi_h = max(1, int(round(height * fraction)))
+            x, y = (width - roi_w) // 2, (height - roi_h) // 2
+            core.set_roi(x, y, roi_w, roi_h)
+            self._camera_roi_set = True
+            record.update(
+                mode="camera",
+                x=x,
+                y=y,
+                width=roi_w,
+                height=roi_h,
+                full_width=width,
+                full_height=height,
+            )
+            logger.info(
+                "LC calibration measures through a camera ROI of %dx%d at (%d, %d) of %dx%d",
+                roi_w,
+                roi_h,
+                x,
+                y,
+                width,
+                height,
+            )
+        except Exception as exc:
+            self._software_crop = fraction
+            record.update(mode="software", reason=str(exc))
+            logger.info(
+                "Camera ROI not available (%s); cropping every frame to the central %.0f%% instead",
+                exc,
+                fraction * 100,
+            )
+        self.roi = record
+        return record
+
+    def restore_roi(self) -> None:
+        """Back to the whole field: the camera ROI cleared, the software crop dropped."""
+        if self._camera_roi_set:
+            try:
+                self._core().clear_roi()
+            except Exception as exc:
+                logger.error("Could not clear the camera ROI after the calibration: %s", exc)
+            self._camera_roi_set = False
+        self._software_crop = None
 
     def _note_frame(self, frame: np.ndarray) -> None:
         self.frame_dtype = str(frame.dtype)
