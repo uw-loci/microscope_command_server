@@ -1627,6 +1627,57 @@ def _get_z_limits(settings: Dict[str, Any]) -> Tuple[Optional[float], Optional[f
         return (None, None)
 
 
+def _narrow_z_limits_to_insert(
+    z_low: Optional[float],
+    z_high: Optional[float],
+    insert_z_limit: Optional[float],
+    retract_sign: Optional[float],
+    current_z: float,
+) -> Tuple[Optional[float], Optional[float], Optional[str]]:
+    """Pull one stage Z limit in to the insert's sample-side limit.
+
+    ``stage.limits.z_um`` is the hardware's travel envelope; on PPM it is about seven
+    times wider than any focus range, so it stops nothing short of the end stop. The
+    insert's ``z_limit_um`` is the bound on the SAMPLE side, measured by the operator
+    with the thickest sample the insert carries in focus. It replaces whichever of
+    ``z_low``/``z_high`` lies toward the sample:
+
+    * ``retract_sign`` positive (increasing Z retracts): the sample is toward lower Z,
+      so the limit is a floor and narrows ``z_low``.
+    * ``retract_sign`` negative: a ceiling, narrowing ``z_high``.
+    * ``retract_sign`` unknown: the limit is by definition on the sample side of where
+      the stage is now, so the side is read off its position relative to ``current_z``.
+      A limit equal to the current Z cannot be oriented and is ignored.
+
+    Returns ``(z_low, z_high, side)`` with ``side`` one of ``"low"``, ``"high"`` or
+    ``None`` when nothing was narrowed. Narrowing only ever moves a limit toward the
+    sample side's opposite -- it never widens.
+    """
+    if insert_z_limit is None:
+        return z_low, z_high, None
+    if retract_sign is not None and retract_sign > 0:
+        side = "low"
+    elif retract_sign is not None and retract_sign < 0:
+        side = "high"
+    elif insert_z_limit < current_z:
+        side = "low"
+    elif insert_z_limit > current_z:
+        side = "high"
+    else:
+        return z_low, z_high, None
+    if side == "low":
+        return (
+            insert_z_limit if z_low is None else max(z_low, insert_z_limit),
+            z_high,
+            side,
+        )
+    return (
+        z_low,
+        insert_z_limit if z_high is None else min(z_high, insert_z_limit),
+        side,
+    )
+
+
 def _scan_window_within_limits(
     z_center: float,
     range_um: float,
@@ -4361,6 +4412,17 @@ def handle_streaming_focus(conn, client, hardware, settings, **kwargs):
     safe_z_str = params.get("safe_z")
     approach_max_str = params.get("approach_max")
     tissue_gate_str = params.get("tissue_gate")
+    # The sample-side Z limit of the insert mounted now. The server does not know which
+    # insert is fitted, so QPSC resolves stage.inserts.configurations.<id>.z_limit_um and
+    # sends it with every scan; it narrows the stage limits for this request only, in
+    # whichever direction stage.focus.retract_sign says is toward the sample.
+    insert_z_limit: Optional[float] = None
+    z_limit_str = params.get("z_limit")
+    if z_limit_str:
+        try:
+            insert_z_limit = float(z_limit_str)
+        except ValueError:
+            logger.warning("STREAM_AF:ignoring non-numeric --z-limit: %r", z_limit_str)
     approach_safe_z: Optional[float] = None
     approach_max_um: Optional[float] = None
     try:
@@ -4952,6 +5014,29 @@ def handle_streaming_focus(conn, client, hardware, settings, **kwargs):
         f"{z_low:.3f}" if z_low is not None else "None",
         f"{z_high:.3f}" if z_high is not None else "None",
     )
+    if insert_z_limit is not None:
+        # Imported here, not at module level: the acquisition package pulls in the
+        # project and tile stack on import, which this handler otherwise never needs.
+        from microscope_command_server.acquisition.retract import resolve_retract_sign
+
+        z_low, z_high, narrowed_side = _narrow_z_limits_to_insert(
+            z_low, z_high, insert_z_limit, resolve_retract_sign(settings), initial_z
+        )
+        if narrowed_side is None:
+            logger.warning(
+                "STREAM_AF:insert Z limit %.3f equals the current Z and retract_sign is not "
+                "declared; cannot tell which side is the sample, so it is not applied",
+                insert_z_limit,
+            )
+        else:
+            logger.info(
+                "STREAM_AF:insert Z limit %.3f (from the client) narrows the %s limit: scans "
+                "now stay within low=%s high=%s",
+                insert_z_limit,
+                narrowed_side,
+                f"{z_low:.3f}" if z_low is not None else "None",
+                f"{z_high:.3f}" if z_high is not None else "None",
+            )
 
     # Check whether the Live Viewer already has a sequence running.
     # Computed once -- attempts share this state since we don't stop

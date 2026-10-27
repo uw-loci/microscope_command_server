@@ -1532,7 +1532,19 @@ when both are given.
 --safe-z <micrometers>         # Retraction Z (where the sample is definitely not)
 --approach-max <micrometers>   # Distance to scan from safe Z toward the sample
 --tissue-gate 1                # Require tissue validation before committing (omit to disable)
+--z-limit <micrometers>        # The mounted insert's sample-side Z limit (every scan mode)
 ```
+
+**`--z-limit <um>`** narrows `stage.limits.z_um` for one request to the sample-side
+limit of the insert that is mounted (`stage.inserts.configurations.<id>.z_limit_um`).
+The server does not know which insert is fitted, so QPSC resolves the value and sends
+it with every `STRMAFZ`, whatever the mode. The side it narrows comes from
+`stage.focus.retract_sign` (increasing Z retracts: a floor; decreasing: a ceiling); with
+no sign declared, the side the limit lies on relative to the current Z. It only ever
+narrows, never widens, and the standard walk, the approach and the profiling traverse all
+clamp to the result. Added after a 2026-10-26 approach on PPM drove 450 um past the focus
+plane toward the objective with nothing to stop it but the hardware's -720 end stop and
+the operator.
 
 ### Approach-from-safe-Z parameters
 
