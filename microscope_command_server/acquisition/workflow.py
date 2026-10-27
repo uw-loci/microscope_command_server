@@ -1536,6 +1536,9 @@ def write_acquisition_metadata(
                 "af_failures": len(af_failed),
                 "af_type_counts": af_types,
             }
+            glass_skipped = af_types.get("skipped-glass", 0)
+            if glass_skipped:
+                af_summary["glass_tiles_skipped_by_wsi"] = glass_skipped
             # Drift statistics from sweep drift checks
             drifts = [
                 m.get("af_drift_um") for m in tile_measurements if m.get("af_drift_um") is not None
@@ -2396,6 +2399,19 @@ def parse_acquisition_message(message: str) -> dict:
             elif parts[i] == "--preferred-af-tile" and i + 1 < len(parts):
                 params["preferred_af_tile"] = int(parts[i + 1])
                 i += 2
+            elif parts[i] == "--af-tissue-tiles" and i + 1 < len(parts):
+                # The autofocus allow-list: every tile the client's macro image shows
+                # holding tissue (TileConfiguration order). No focus search ever starts
+                # outside it. "none" means the client scored the region and nothing
+                # qualified; absent means unscored, which keeps distance-only planning.
+                raw = parts[i + 1].strip()
+                params["af_tissue_scored"] = True
+                params["af_tissue_tiles"] = (
+                    []
+                    if raw.lower() == "none"
+                    else [int(tok) for tok in raw.split(",") if tok.strip()]
+                )
+                i += 2
             elif parts[i] == "--z-stack":
                 params["z_stack"] = True
                 i += 1
@@ -2728,6 +2744,9 @@ class AcquisitionContext:
     af_channel_intensity: Optional[float] = None
     af_positions: list = field(default_factory=list)
     af_min_distance: float = 0.0
+    # The autofocus allow-list from the client's macro image, or None when unscored. No
+    # focus search ever starts on a tile outside it: see _apply_tissue_allow_list.
+    af_tissue_tiles: Optional[set] = None
     exposure_90: float = 0.0  # mutable: doubled during brightness checks
     # AF saturation guard (set once per run): scale applied to the AF exposure
     # (or illumination power) to keep the focus frame below the strategy's
@@ -2765,6 +2784,8 @@ class AcquisitionContext:
     # the very value that keeps failing (slide 4, 2026-10-04: -285.8 um, 98 failures).
     last_accepted_af_z: Optional[float] = None
     last_af_pos_idx: int = -1
+    # A focus search the safety nets wanted on a glass tile, owed to the next tissue tile.
+    af_wanted_since_glass: bool = False
     tile_measurements: list = field(default_factory=list)
     tile_measurements_stream: Any = None  # file handle
     stage_positions_collected: list = field(default_factory=list)
@@ -3103,6 +3124,15 @@ def _acquisition_workflow(
 def _finalize_acquisition(ctx: AcquisitionContext) -> None:
     """Post-acquisition: close streams, write metadata files, set COMPLETED state."""
     logger = ctx.logger
+    if ctx.af_tissue_tiles is not None:
+        glass_skipped = sum(1 for m in ctx.tile_measurements if m.get("af_type") == "skipped-glass")
+        logger.info(
+            "Autofocus skipped on %d glass tile(s) by the client's macro image (WSI); %d of "
+            "%d tiles were on the allow-list",
+            glass_skipped,
+            len(ctx.af_tissue_tiles),
+            len(ctx.positions),
+        )
 
     # Close NDJSON stream now that the loop has finished normally
     if ctx.tile_measurements_stream is not None:
@@ -4047,6 +4077,194 @@ def _prepare_acquisition(
     )
 
 
+def _restrict_af_plan_to_tissue(
+    af_positions: List[int],
+    allow: set,
+    xy_positions: List[Tuple[float, float]],
+    af_min_distance: float,
+    preferred_af_tile: Optional[int],
+    logger,
+) -> List[int]:
+    """Keep the planned autofocus lattice, but only on tiles the client's macro image
+    shows holding tissue.
+
+    Each planned index off the allow-list is replaced by the nearest allow-listed tile
+    (by XY distance) not already planned, so the spread of the lattice survives; a
+    planned point with no allow-listed tile within ``af_min_distance`` is dropped. The
+    preferred tile, when it is on the list, stays first: it is where the
+    pre-acquisition search starts.
+
+    An EMPTY allow-list means the client scored the region and found no tissue: the plan
+    becomes the preferred tile alone (or the first planned tile), with a warning, so one
+    search still runs rather than a lattice of searches on glass.
+
+    Why this is done here and not in microscope_control: the lattice planner is shared
+    hardware code with no notion of tissue, and the allow-list is a client-side fact.
+    On 2026-10-27 a sparse LC-PolScope region drew 28 searches, most on bare glass,
+    because the plan, the safety nets and the deferral all chose by distance alone
+    while the camera-side texture gate read glass and tissue alike (0.014 either way).
+    """
+    n = len(xy_positions)
+    allow_in_range = sorted(i for i in allow if 0 <= i < n)
+    if not allow_in_range:
+        if preferred_af_tile is not None and 0 <= preferred_af_tile < n:
+            keep = [preferred_af_tile]
+        else:
+            keep = list(af_positions[:1])
+        logger.warning(
+            "No tile in this region holds tissue by the client's macro image; autofocus "
+            "plan reduced to %s (the preferred tile) -- one search, no lattice",
+            keep,
+        )
+        return keep
+
+    xy = np.asarray(xy_positions, dtype=float)
+    allow_xy = xy[allow_in_range]
+    planned: List[int] = []
+    moved = 0
+    dropped = 0
+    for idx in af_positions:
+        if idx in allow:
+            if idx not in planned:
+                planned.append(idx)
+            continue
+        if idx < 0 or idx >= n:
+            dropped += 1
+            continue
+        dist = np.hypot(allow_xy[:, 0] - xy[idx, 0], allow_xy[:, 1] - xy[idx, 1])
+        chosen = None
+        for k in np.argsort(dist):
+            cand = allow_in_range[int(k)]
+            if cand in planned:
+                continue
+            if af_min_distance > 0 and dist[k] > af_min_distance:
+                break
+            chosen = cand
+            break
+        if chosen is None:
+            dropped += 1
+        else:
+            planned.append(chosen)
+            moved += 1
+    if not planned:
+        # Every planned point was dropped: keep one search on tissue rather than none.
+        planned = [preferred_af_tile if preferred_af_tile in allow else allow_in_range[0]]
+    if preferred_af_tile in planned and planned[0] != preferred_af_tile:
+        planned.remove(preferred_af_tile)
+        planned.insert(0, preferred_af_tile)
+    logger.info(
+        "Autofocus positions after tissue filter (%d/%d tiles): %s (%d moved off glass, "
+        "%d dropped; %d tiles hold tissue by WSI)",
+        len(planned),
+        n,
+        planned,
+        moved,
+        dropped,
+        len(allow_in_range),
+    )
+    return planned
+
+
+def _apply_tissue_allow_list(
+    pos_idx: int,
+    needs_af: bool,
+    allow: Optional[set],
+    wanted_since_glass: bool,
+    af_benchmark: bool = False,
+) -> Tuple[bool, Optional[str], bool, Optional[str]]:
+    """The one rule the allow-list adds to the per-tile decision: no focus search starts
+    on a tile outside it, whatever the plan or the safety nets asked for.
+
+    Returns ``(needs_af, af_type, wanted_since_glass, log_line)``. ``af_type`` is
+    ``"skipped-glass"`` for a tile the search was withheld from and None otherwise
+    (the caller keeps its own). A search that was due on a glass tile -- planned, or
+    forced by the index/spatial safety nets -- is remembered in ``wanted_since_glass``
+    and runs on the next allow-listed tile instead, so a long run of glass still ends
+    in a fresh measurement at the first tissue after it. ``af_benchmark`` is a
+    diagnostic that times every tile and is left alone.
+    """
+    if allow is None or af_benchmark:
+        return needs_af, None, wanted_since_glass, None
+    if pos_idx not in allow:
+        line = f"  No tissue in tile {pos_idx} by WSI -- no focus search"
+        if needs_af:
+            line += " (a search was due here; owed to the next tissue tile)"
+        return False, "skipped-glass", wanted_since_glass or needs_af, line
+    if needs_af:
+        return True, None, False, None
+    if wanted_since_glass:
+        return (
+            True,
+            None,
+            False,
+            f"  Forcing AF: deferred from glass tile(s) to tissue tile {pos_idx}",
+        )
+    return False, None, False, None
+
+
+def _next_tissue_tile_for_deferral(
+    pos_idx: int,
+    proposed: Optional[int],
+    allow: Optional[set],
+    xy_positions: List[Tuple[float, float]],
+    af_min_distance: float,
+    logger,
+) -> Optional[int]:
+    """Keep a deferred autofocus on the allow-list.
+
+    ``defer_autofocus_to_next_tile`` picks the next tile in scan order at least
+    ``0.7 * af_min_distance`` away, by distance alone. With an allow-list, the first
+    such tile that is ALSO on the list is taken instead; with none, the search is not
+    queued, and the log says so.
+    """
+    if allow is None or proposed is None or proposed in allow:
+        return proposed
+    if not allow or pos_idx >= len(xy_positions):
+        logger.info(
+            "Deferred autofocus from tile %d not queued: no tissue tile by WSI to defer to",
+            pos_idx,
+        )
+        return None
+    cx, cy = xy_positions[pos_idx]
+    for cand in range(pos_idx + 1, len(xy_positions)):
+        if cand not in allow:
+            continue
+        x, y = xy_positions[cand]
+        if np.hypot(x - cx, y - cy) >= af_min_distance * 0.7:
+            logger.info(
+                "Deferring autofocus from tile %d to tissue tile %d (tile %d is glass by WSI)",
+                pos_idx,
+                cand,
+                proposed,
+            )
+            return cand
+    logger.info(
+        "Deferred autofocus from tile %d not queued: no tissue tile by WSI far enough ahead",
+        pos_idx,
+    )
+    return None
+
+
+def _nearest_tissue_tile_to_centre(
+    allow: Optional[set], tried: set, xy_positions: List[Tuple[float, float]]
+) -> Optional[int]:
+    """The allow-listed tile nearest the region centre that has not been searched yet,
+    for the pre-acquisition tissue search; None when there is none (or no list)."""
+    if not allow or not xy_positions:
+        return None
+    centre = np.mean(np.asarray(xy_positions, dtype=float), axis=0)
+    best = None
+    best_d = float("inf")
+    for idx in sorted(allow):
+        if idx in tried or idx < 0 or idx >= len(xy_positions):
+            continue
+        d = float(np.hypot(xy_positions[idx][0] - centre[0], xy_positions[idx][1] - centre[1]))
+        if d < best_d:
+            best_d = d
+            best = idx
+    return best
+
+
 def _configure_autofocus(ctx: AcquisitionContext) -> None:
     """Load AF settings from YAML, resolve strategy, compute AF positions.
 
@@ -4335,6 +4553,18 @@ def _configure_autofocus(ctx: AcquisitionContext) -> None:
         n_tiles=af_n_tiles,
         preferred_first_af=preferred_af_tile,
     )
+    af_tissue_tiles: Optional[set] = (
+        set(params.get("af_tissue_tiles") or []) if params.get("af_tissue_scored") else None
+    )
+    if af_tissue_tiles is not None:
+        af_positions = _restrict_af_plan_to_tissue(
+            af_positions,
+            af_tissue_tiles,
+            ctx.xy_positions,
+            af_min_distance,
+            preferred_af_tile,
+            logger,
+        )
 
     small_grid_override = len(ctx.xy_positions) <= 9
     if small_grid_override:
@@ -4396,6 +4626,7 @@ def _configure_autofocus(ctx: AcquisitionContext) -> None:
         )
     ctx.af_positions = af_positions
     ctx.af_min_distance = af_min_distance
+    ctx.af_tissue_tiles = af_tissue_tiles
     ctx.dynamic_af_positions = set(af_positions)
     ctx.deferred_af_positions = set()
     ctx.first_tissue_autofocus_done = False
@@ -4760,6 +4991,15 @@ def _run_pre_acquisition_autofocus(ctx: AcquisitionContext) -> None:
     fov = hardware.get_fov()
     fov_diagonal = np.sqrt(fov[0] ** 2 + fov[1] ** 2)
 
+    # With an allow-list the search visits tissue tiles only (nearest the centre first);
+    # with "none" it stays on the preferred tile for a single attempt.
+    searched_tiles = {first_af_idx}
+    if ctx.af_tissue_tiles is not None and not ctx.af_tissue_tiles:
+        logger.warning(
+            "No tile in this region holds tissue by the client's macro image; one tissue "
+            "search on the preferred tile %d, no walk",
+            first_af_idx,
+        )
     for attempt in range(max_tissue_search_attempts):
         hardware.move_to_position(search_pos)
         logger.info(
@@ -4825,11 +5065,29 @@ def _run_pre_acquisition_autofocus(ctx: AcquisitionContext) -> None:
             logger.info("Strategy failure_mode=MANUAL: breaking search loop to pop manual dialog")
             break
 
-        # DEFER: move toward center for next attempt
+        # DEFER: next attempt on the next tissue tile (allow-list) or one FOV toward
+        # the centre (unscored region).
         if attempt < max_tissue_search_attempts - 1:
-            new_xy = np.array([search_pos.x, search_pos.y]) + direction * fov_diagonal
-            search_pos = Position(new_xy[0], new_xy[1], search_pos.z)
-            logger.info("Moving 1 FOV diagonal toward center for next attempt")
+            if ctx.af_tissue_tiles is not None:
+                next_tile = _nearest_tissue_tile_to_centre(
+                    ctx.af_tissue_tiles, searched_tiles, ctx.xy_positions
+                )
+                if next_tile is None:
+                    logger.info(
+                        "No further tissue tile by WSI to search; stopping the tissue search"
+                    )
+                    break
+                searched_tiles.add(next_tile)
+                tile_pos = ctx.positions[next_tile][0]
+                search_pos = Position(tile_pos.x, tile_pos.y, search_pos.z)
+                logger.info(
+                    "Moving to tissue tile %d (nearest the region centre by WSI) for next attempt",
+                    next_tile,
+                )
+            else:
+                new_xy = np.array([search_pos.x, search_pos.y]) + direction * fov_diagonal
+                search_pos = Position(new_xy[0], new_xy[1], search_pos.z)
+                logger.info("Moving 1 FOV diagonal toward center for next attempt")
 
     # Reduce AF exposure/illumination if the focus frame is over-saturated
     # (determined once here, remembered for the run). A saturated metric
@@ -5351,6 +5609,17 @@ def _handle_tile_autofocus(
                 ctx.af_gap_spatial_multiplier,
             )
 
+    # The client's allow-list has the last word: no search on a tile its macro image
+    # shows as glass, whatever the plan or the nets above asked for. A search due here
+    # is owed to the next tissue tile instead.
+    needs_af, glass_af_type, ctx.af_wanted_since_glass, allow_note = _apply_tissue_allow_list(
+        pos_idx, needs_af, ctx.af_tissue_tiles, ctx.af_wanted_since_glass, af_benchmark
+    )
+    if glass_af_type is not None:
+        af_type_for_this_tile = glass_af_type
+    if allow_note:
+        logger.info(allow_note)
+
     # Seed Z from the spatially NEAREST already-focused tile -- for EVERY tile
     # that has one, including tiles that will themselves run AF. A per-tile
     # drift sweep is a narrow (+/-15 um) search that only corrects drift from
@@ -5686,6 +5955,14 @@ def _handle_tile_autofocus(
             af_min_distance=ctx.af_min_distance,
             positions=ctx.xy_positions,
             logger=logger,
+        )
+        next_af_pos = _next_tissue_tile_for_deferral(
+            pos_idx,
+            next_af_pos,
+            ctx.af_tissue_tiles,
+            ctx.xy_positions,
+            ctx.af_min_distance,
+            logger,
         )
         if next_af_pos is not None and next_af_pos < len(ctx.positions):
             ctx.dynamic_af_positions.add(next_af_pos)
@@ -7688,6 +7965,9 @@ def _record_tile_measurement(
         "af_strategy": ctx.af_strategy_name,
         "af_drift_um": round(drift, 2),
         "af_failed": af_failed,
+        # None when the client did not score the macro image; else whether this tile is
+        # on the autofocus allow-list.
+        "af_tissue": (None if ctx.af_tissue_tiles is None else (pos_idx in ctx.af_tissue_tiles)),
         "tile_time_ms": round(tile_elapsed_ms, 0),
         "saturation_R_pct": round(tile_worst_sat.get("R", tile_worst_sat.get("Gray", 0)), 1),
         "saturation_G_pct": round(tile_worst_sat.get("G", tile_worst_sat.get("Gray", 0)), 1),

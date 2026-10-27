@@ -1290,6 +1290,40 @@ FAILED:busy: an acquisition is running for <addr>; refusing to move the focus st
 and nothing moves. Wait for the acquisition to finish, or send a cancel and wait for it to
 complete, then re-issue the autofocus command.
 
+## Autofocus allow-list (--af-tissue-tiles)
+
+```
+--af-tissue-tiles <indices>    # Comma-separated tile indices (TileConfiguration order) the
+                               # client's macro image shows holding tissue; or "none"
+```
+
+**The server never starts a focus search on a tile outside this list.** QPSC builds it by
+scoring every tile of an existing-image acquisition against the overview image
+(`wsi_tissue_threshold`), and sends the preferred first tile (`--preferred-af-tile`) on the
+list beside it. With the list present:
+
+- the planned autofocus lattice is re-fitted to it: each planned index off the list moves to
+  the nearest listed tile not already planned, or is dropped when none lies within
+  `af_min_distance` (log: `Autofocus positions after tissue filter (k/N tiles): [...]`);
+- the index-gap and spatial-gap safety nets do not fire on an unlisted tile; a search they
+  wanted there runs on the next listed tile (`Forcing AF: deferred from glass tile(s)`);
+- a tile the strategy rejects defers only to a listed tile far enough ahead, or not at all;
+- the pre-acquisition tissue search walks listed tiles nearest the region centre instead of
+  one field toward the centre;
+- each unlisted tile logs `No tissue in tile N by WSI -- no focus search`, takes its Z from
+  the nearest focused tile, and is recorded with `af_type: skipped-glass` and
+  `af_tissue: false` in `tile_measurements`; the acquisition metadata carries
+  `autofocus_quality.glass_tiles_skipped_by_wsi`.
+
+`--af-tissue-tiles none` means the client scored the region and no tile qualified: the plan
+collapses to one search on the preferred tile, with a warning, and the tissue search does not
+walk. Absent means unscored, and the server plans by distance exactly as before.
+
+Why: on 2026-10-27 a sparse LC-PolScope region drew 28 focus searches, most on bare glass,
+because every choice was made by distance alone and the camera-side `dense_texture` gate
+read glass and tissue alike on the Flash4 (0.014 either way). Each search on glass found a
+noise peak 44-63 um away and the nearest-seed logic spread those Zs across the mosaic.
+
 ## Focus Surface Fitting (--focus-surface, --focus-survey, --focus-survey-tiles)
 
 The BGACQUIRE (and ACQUIRE) acquisition message parser accepts optional flags
