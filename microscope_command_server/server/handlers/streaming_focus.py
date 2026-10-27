@@ -4129,6 +4129,94 @@ def _approach_from_safe_z(
     )
 
 
+# How long to wait for the focus stage to report not-busy after a halt before
+# giving up and letting the move run to its end (logged either way).
+HALT_SETTLE_TIMEOUT_S = 2.0
+
+
+def _halt_focus_stage(core, focus_device: str) -> str:
+    """Stop a focus move that is already under way, and say how it went.
+
+    ``core.stop(label)`` reaches the adapter's ``Stop()``. The Prior ProScan Z stage
+    has none: in the Micro-Manager Prior adapter ``XYStage::Stop`` sends the
+    controller-wide halt (``K``) but ``ZStage`` does not implement ``Stop`` at all,
+    so on PPM the call raised, the ``except`` swallowed it, and the slow scan ran to
+    its far end before the retract began. On 2026-10-26 the retract "started" 11 ms
+    after ABORTAF both times and finished 10 s and 19 s later: the remaining traverse
+    at scan speed plus one fast move, which to the operator is a cancel that went all
+    the way to the bottom and then jumped back. The ProScan halt stops every axis, so
+    when the focus device has no Stop and the XY stage shares its adapter library and
+    serial port, the XY stage's Stop is the same halt and stops Z too.
+
+    Afterwards the adapter's cached position is refreshed with a position read. The
+    Prior ZStage moves RELATIVE to the target it last sent (``U,delta`` / ``D,delta``
+    from ``curSteps_``), and a halted move leaves that target unreached, so the next
+    absolute move would be off by the distance not travelled; ``GetPositionSteps``
+    resets the cache.
+
+    Returns a short description for the caller's log line.
+    """
+    how = None
+    try:
+        core.stop(focus_device)
+        how = "focus device Stop"
+    except Exception as e:
+        logger.info("STREAM_AF:halt: '%s' has no usable Stop (%s)", focus_device, e)
+        xy = None
+        try:
+            xy = core.get_xy_stage_device()
+        except Exception:
+            xy = None
+        if xy and _shares_controller(core, focus_device, xy):
+            try:
+                core.stop(xy)
+                how = f"XY stage '{xy}' Stop (shared controller halt)"
+            except Exception as e2:
+                logger.warning("STREAM_AF:halt: XY stage '%s' Stop failed too: %s", xy, e2)
+        if how is None:
+            how = "no halt available; the move runs to its end"
+            logger.warning("STREAM_AF:halt: %s", how)
+    deadline = time.perf_counter() + HALT_SETTLE_TIMEOUT_S
+    settled = False
+    while time.perf_counter() < deadline:
+        try:
+            if not core.device_busy(focus_device):
+                settled = True
+                break
+        except Exception:
+            settled = True
+            break
+        time.sleep(0.02)
+    if not settled:
+        logger.warning(
+            "STREAM_AF:halt: '%s' still busy %.1f s after %s",
+            focus_device,
+            HALT_SETTLE_TIMEOUT_S,
+            how,
+        )
+    try:
+        z_now = float(core.get_position(focus_device))
+        logger.info("STREAM_AF:halt via %s; stage at Z=%.2f", how, z_now)
+    except Exception as e:
+        logger.warning("STREAM_AF:halt via %s; position read failed: %s", how, e)
+    return how
+
+
+def _shares_controller(core, focus_device: str, xy_device: str) -> bool:
+    """Whether two stage devices are the same adapter on the same serial port."""
+    try:
+        if core.get_device_library(focus_device) != core.get_device_library(xy_device):
+            return False
+    except Exception:
+        return False
+    try:
+        if not (core.has_property(focus_device, "Port") and core.has_property(xy_device, "Port")):
+            return False
+        return core.get_property(focus_device, "Port") == core.get_property(xy_device, "Port")
+    except Exception:
+        return False
+
+
 def _retract(
     core,
     focus_device: str,
@@ -4143,17 +4231,13 @@ def _retract(
     wherever the scan stopped, which may be closer to it than where the run
     started.
 
-    The stage is stopped and the normal speed restored first. A cancelled scan
-    leaves the slow continuous move still running, and a speed change does not
-    reach a move already under way (Prior), so the retract inherited the scan
-    speed: 30 s from 330 um out on PPM (2026-10-22), long enough that the cancel
-    looked ignored. The top-level abort handler stops the stage the same way.
+    The stage is halted (``_halt_focus_stage``) and the normal speed restored first.
+    A cancelled scan leaves the slow continuous move still running, and a speed
+    change does not reach a move already under way (Prior), so the retract inherited
+    the scan speed: 30 s from 330 um out on PPM (2026-10-22), long enough that the
+    cancel looked ignored. The top-level abort handler halts the stage the same way.
     """
-    try:
-        core.stop(focus_device)
-    except Exception:
-        # Not every adapter implements Stop; the absolute move below redirects it anyway.
-        pass
+    _halt_focus_stage(core, focus_device)
     if speed_prop is not None and normal_value is not None:
         _try_set(core, focus_device, speed_prop, normal_value)
     try:
@@ -6003,12 +6087,7 @@ def handle_streaming_focus(conn, client, hardware, settings, **kwargs):
             # restore normal speed so the recovery move is not crawling,
             # and return Z to where autofocus started so the stage ends
             # settled at a known position -- as if AF was never run.
-            try:
-                core.stop(focus_device)
-            except Exception:
-                # Not every stage adapter implements Stop; the absolute
-                # set_position below redirects the move regardless.
-                pass
+            _halt_focus_stage(core, focus_device)
             if speed_prop is not None:
                 _try_set(core, focus_device, speed_prop, eff_normal_value)
             try:
