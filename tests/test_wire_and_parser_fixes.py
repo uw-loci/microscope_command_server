@@ -135,6 +135,58 @@ def test_display_ceiling_is_read_and_a_bad_one_ignored():
         assert params["af_disabled"] is True, bad
 
 
+class _FailingAfHardware:
+    """A camera whose autofocus never finds a peak, as on an empty glass tile."""
+
+    def __init__(self):
+        self.moves = []
+
+    def get_current_position(self):
+        return workflow_mod.Position(10.0, 20.0, 5.0)
+
+    def autofocus(self, **kw):
+        return {
+            "success": False,
+            "message": "focus never bracketed",
+            "quality_score": 0.5,
+            "peak_prominence": 0.6,
+            "attempted_z": -48.9,
+        }
+
+    def move_to_position(self, pos):
+        self.moves.append(pos)
+
+
+def test_a_failed_search_asks_the_operator_only_under_on_failure_manual():
+    import logging
+
+    asked = []
+    hw = _FailingAfHardware()
+    outcome = {}
+    z = workflow_mod.autofocus_with_manual_fallback(
+        hw,
+        logging.getLogger("t"),
+        request_manual_focus=lambda n: asked.append(n) or "skip",
+        fallback_z=7.5,
+        outcome=outcome,
+        prompt_operator=False,
+    )
+    assert asked == [], "on_failure=defer must not stop for the operator"
+    assert z == 7.5 and outcome["skipped"] is True
+    assert hw.moves and hw.moves[-1].z == 7.5
+
+    asked.clear()
+    z = workflow_mod.autofocus_with_manual_fallback(
+        hw,
+        logging.getLogger("t"),
+        request_manual_focus=lambda n: asked.append(n) or "skip",
+        fallback_z=7.5,
+        prompt_operator=True,
+    )
+    assert asked == [2], "on_failure=manual asks, with the retries left"
+    assert z == 7.5
+
+
 def test_end_marker_is_removed_by_its_value():
     params = _parse_with_deadline(f"{REQUIRED} ENDOFSTR")
     assert params["region_name"] == "r"

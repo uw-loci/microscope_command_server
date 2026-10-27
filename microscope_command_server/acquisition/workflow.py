@@ -1689,6 +1689,14 @@ def apply_af_channel_state(ctx) -> bool:
         return False
 
 
+def _prompts_operator(ctx) -> bool:
+    """Whether a failed autofocus search may stop for the operator: only on_failure=manual."""
+    from microscope_control.autofocus.strategies import StrategyFailureMode
+
+    strategy = getattr(ctx, "af_strategy", None)
+    return strategy is None or getattr(strategy, "on_failure", None) is StrategyFailureMode.MANUAL
+
+
 def autofocus_with_manual_fallback(
     hardware: PycromanagerHardware,
     logger,
@@ -1696,10 +1704,19 @@ def autofocus_with_manual_fallback(
     max_retries: int = 3,
     fallback_z: Optional[float] = None,
     outcome: Optional[dict] = None,
+    prompt_operator: bool = True,
     **autofocus_kwargs,
 ):
     """
     Perform autofocus with manual focus fallback on failure.
+
+    ``prompt_operator`` is the strategy's ``on_failure`` policy applied to a
+    failed search: only ``manual`` asks the operator. With ``defer`` (the
+    LC-PolScope default) a tile whose search finds no focus keeps the hint Z
+    and is not recorded as focused, the same as a tile the tissue gate
+    rejected. On 2026-10-26 an empty glass tile passed the gate, the search
+    ran off the low edge, and the run stopped for three hours waiting at a
+    dialog nobody had asked for.
 
     If autofocus fails (returns failure dict), prompts user for manual focus
     and retries. Shows dialog even on last attempt with retry button disabled.
@@ -1765,6 +1782,18 @@ def autofocus_with_manual_fallback(
             # Note: p98_p2 fallback and (optionally) peak-at-edge widen-shift
             # retries are handled inside hardware.autofocus() itself.
 
+            if request_manual_focus is not None and not prompt_operator:
+                skip_z = fallback_z if fallback_z is not None else result["attempted_z"]
+                logger.warning(
+                    "Autofocus found no focus here and the strategy's on_failure is not "
+                    "'manual': keeping Z %.2f um (%s) and moving on without asking the operator",
+                    skip_z,
+                    "hint" if fallback_z is not None else "the failed search's best guess",
+                )
+                hardware.move_to_position(Position(z=skip_z))
+                if outcome is not None:
+                    outcome["skipped"] = True
+                return skip_z
             if request_manual_focus is not None:
                 # Always show dialog, even on last attempt
                 retries_remaining = max(0, max_retries - attempt - 1)
@@ -4816,6 +4845,7 @@ def _run_pre_acquisition_autofocus(ctx: AcquisitionContext) -> None:
                 outcome=initial_outcome,
                 hardware=hardware,
                 request_manual_focus=ctx.request_manual_focus,
+                prompt_operator=_prompts_operator(ctx),
                 max_retries=3,
                 fallback_z=ctx.hint_z,
                 n_steps=ctx.af_n_steps,
@@ -4833,6 +4863,7 @@ def _run_pre_acquisition_autofocus(ctx: AcquisitionContext) -> None:
                 outcome=initial_outcome,
                 hardware=hardware,
                 request_manual_focus=ctx.request_manual_focus,
+                prompt_operator=_prompts_operator(ctx),
                 max_retries=0,
                 fallback_z=ctx.hint_z,
                 n_steps=ctx.af_n_steps,
@@ -5558,6 +5589,7 @@ def _handle_tile_autofocus(
                 hardware=hardware,
                 logger=logger,
                 request_manual_focus=ctx.request_manual_focus,
+                prompt_operator=_prompts_operator(ctx),
                 max_retries=3,
                 fallback_z=_skip_fallback_z(ctx),
                 outcome=tile_outcome,
