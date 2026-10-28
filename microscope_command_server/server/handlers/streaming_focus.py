@@ -4262,6 +4262,7 @@ def _brent_fallback_scan(
     max_evals: int = 8,
     abs_tolerance_um: float = 0.5,
     normal_value: str = NORMAL_SPEED_VALUE,
+    abort_event: Optional[threading.Event] = None,
 ) -> _ScanAttemptResult:
     """Stop-and-snap Brent's method search over [z_lo, z_hi].
 
@@ -4334,17 +4335,23 @@ def _brent_fallback_scan(
     evals: List[Tuple[float, float]] = []  # (z, metric)
 
     def neg_metric(z: float) -> float:
+        # A cancel (ABORTAF) is honoured before every evaluation. The fallback runs when the
+        # streaming passes found nothing -- a jump onto bare glass is the usual reason -- and
+        # each evaluation is a stop-and-snap over a wide bracket, so on a slow focus stage it
+        # used to run for a long time with Cancel ignored.
+        if abort_event is not None and abort_event.is_set():
+            raise _AbortRequested("user cancelled")
         try:
             core.set_position(focus_device, float(z))
             _wait_via_busy(core, focus_device, target_z=float(z))
-            core.snap_image()
-            img = _snap_image_as_numpy(core)
+            img = _snap_image_as_numpy(core)  # snaps; a snap before it was thrown away
             z_actual = float(core.get_position(focus_device))
         except Exception as e:
             logger.warning("STREAM_AF:%s eval at z=%.3f failed: %s", tag, z, e)
             return 0.0
         m = _focus_metric(img, metric_name)
         evals.append((z_actual, m))
+        AF_EVENTS.af_sample(z_actual, m)
         logger.info("STREAM_AF:%s eval %2d  z=%.3f  metric=%.4f", tag, len(evals), z_actual, m)
         # minimize_scalar expects a MINIMIZATION objective, so flip
         # the sign: better focus -> lower (more negative) value.
@@ -4356,6 +4363,12 @@ def _brent_fallback_scan(
             bracket=(z_lo, z_mid, z_hi),
             method="brent",
             options={"xtol": abs_tolerance_um, "maxiter": max_evals},
+        )
+    except _AbortRequested:
+        # Caught before the generic handler below, which would commit the best eval so far.
+        logger.warning("STREAM_AF:%s cancelled after %d evals", tag, len(evals))
+        return _ScanAttemptResult(
+            "aborted", None, len(evals), 0.0, "user cancelled", samples_trace=list(evals)
         )
     except Exception as e:
         logger.warning("STREAM_AF:%s minimize_scalar raised: %s", tag, e)
@@ -5934,6 +5947,7 @@ def _handle_streaming_focus(conn, client, hardware, settings, **kwargs):
                         brent_hi,
                         metric_name,
                         normal_value=eff_normal_value,
+                        abort_event=abort_event,
                     )
                     # Restart the sequence if the Live Viewer was
                     # depending on it when we arrived.
@@ -5971,7 +5985,11 @@ def _handle_streaming_focus(conn, client, hardware, settings, **kwargs):
                         key=lambda zm: zm[1],
                         default=None,
                     )
-                    if brent_result.status == "success" and brent_result.best_z is not None:
+                    if brent_result.status == "aborted":
+                        # Cancelled mid-fallback: no focus is committed, and the
+                        # aborted branch below returns Z to where autofocus started.
+                        final_result = brent_result
+                    elif brent_result.status == "success" and brent_result.best_z is not None:
                         # Brent converged. Trust it unless our
                         # global pool has something dramatically
                         # better at a Z that Brent never visited
