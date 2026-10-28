@@ -239,3 +239,11 @@ def test_the_socket_handler_needs_an_output_folder():
     )
     handle_lcsweep(conn, SimpleNamespace(addr="t"), SweepHardware(), _yaml())
     assert sent == [b"FAILED:--output is required"]
+
+
+def test_an_exact_table_shows_no_gap_and_rail_clamps_are_dropped(swept):
+    _, result, record = swept
+    # LC-A's fake table is the truth: judged around the palette, there is no gap to report.
+    assert result["axes"]["LCA"]["table_minus_measured_waves"]["max_abs"] < 0.01
+    # Retardances below the crystal's reach clamp to 20 V in the adapter; none of those are kept.
+    assert max(record["axes"]["LCA"]["adapter_table"]["volts"]) < 19.95

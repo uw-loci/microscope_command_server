@@ -47,6 +47,11 @@ TARGET_PEAK_FRACTION = 0.7
 PRESWEEP_POINTS = 41
 #: Retardances written to sample the adapter's table, in waves.
 TABLE_SAMPLE_WAVES = np.round(np.arange(0.05, 1.70, 0.01), 4)
+#: Table samples within this many volts of a voltage limit are clamped there, not real.
+RAIL_MARGIN_V = 0.05
+#: Half-width, in volts, around the palette over which the table is judged; the curve is flat
+#: and poorly measured near the rails, which are not where the palette works.
+PALETTE_WINDOW_V = 0.75
 #: Saturated-pixel fraction above which a sweep frame counts as clipped.
 CLIPPED_FRACTION = 0.001
 
@@ -232,10 +237,15 @@ def run_lc_voltage_sweep(
             for w in TABLE_SAMPLE_WAVES:
                 try:
                     set_waves(axis, float(w), settle=False)
-                    table_v.append(float(core.get_property(LC_DEVICE, VOLTAGE_PROPERTY[axis])))
-                    table_w.append(float(w))
+                    volts_read = float(core.get_property(LC_DEVICE, VOLTAGE_PROPERTY[axis]))
                 except Exception:
                     continue
+                # A retardance the crystal cannot reach is clamped to a voltage rail by the
+                # adapter: that pair says nothing about the table, so it is dropped.
+                if volts_read <= lo + RAIL_MARGIN_V or volts_read >= hi - RAIL_MARGIN_V:
+                    continue
+                table_v.append(volts_read)
+                table_w.append(float(w))
             entry["adapter_table"] = {"waves": table_w, "volts": table_v}
 
             set_waves(g.partner, g.partner_waves)
@@ -405,11 +415,26 @@ def _summarise(record: Dict[str, Any]) -> Dict[str, Any]:
             a["fringe_contrast"] = entry.get("fringe_contrast")
         tvm = entry.get("table_vs_measured")
         if tvm and tvm["volts"]:
+            v = np.asarray(tvm["volts"])
             d = np.asarray(tvm["table_waves"]) - np.asarray(tvm["measured_waves"])
-            a["table_minus_measured_waves"] = {
-                "max_abs": float(np.max(np.abs(d))),
-                "at_volts": float(tvm["volts"][int(np.argmax(np.abs(d)))]),
-            }
+            key = "lca_volts" if axis == "LCA" else "lcb_volts"
+            used = [
+                row[key]
+                for row in (record.get("palette") or {}).values()
+                if row.get(key) is not None
+            ]
+            if used:
+                window = [min(used) - PALETTE_WINDOW_V, max(used) + PALETTE_WINDOW_V]
+            else:
+                window = [float(v.min()) + 1.0, float(v.max()) - 1.0]
+            inside = (v >= window[0]) & (v <= window[1])
+            if inside.any():
+                worst = int(np.argmax(np.abs(np.where(inside, d, 0.0))))
+                a["table_minus_measured_waves"] = {
+                    "max_abs": float(abs(d[worst])),
+                    "at_volts": float(v[worst]),
+                    "window_volts": [float(window[0]), float(window[1])],
+                }
         axes[axis] = a
     lines = []
     for state, row in (record.get("palette") or {}).items():
