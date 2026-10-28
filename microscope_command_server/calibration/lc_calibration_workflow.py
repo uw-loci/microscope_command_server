@@ -8,6 +8,7 @@ search -- that is the library's job.
 
 from __future__ import annotations
 
+import contextlib
 import json
 import logging
 import time
@@ -212,6 +213,56 @@ def _describe_camera(camera: Dict[str, Any]) -> str:
     from .camera_checks import describe_camera
 
     return describe_camera(camera)
+
+
+def _palette_readback(instrument, palette_waves, log) -> Dict[str, Dict[str, Any]]:
+    """Set each palette state and read back what the adapter reports for it.
+
+    Per state: the commanded waves, the adapter's ``[in waves]`` readback, its
+    read-only ``[in nm]`` readback and the drive volts, for both crystals. The
+    volts are the point: the palette is in the adapter's waves, which pass
+    through its waves-to-volts table, and on the LC-PolScope that table's LC-B
+    column is suspected of not fitting the crystal (2026-10-28). Each reading
+    that fails is null, never guessed; the whole block is best effort and
+    never fails a calibration.
+    """
+    from .lc_instrument import LC_DEVICE
+
+    nm_property = {"LCA": "Retardance LC-A [in nm]", "LCB": "Retardance LC-B [in nm]"}
+    out: Dict[str, Dict[str, Any]] = {}
+    for state, values in palette_waves.items():
+        lca, lcb = float(values[0]), float(values[1])
+        entry: Dict[str, Any] = {"lca_waves_commanded": lca, "lcb_waves_commanded": lcb}
+        try:
+            instrument.set_retardance("LCA", lca)
+            instrument.set_retardance("LCB", lcb)
+        except Exception as exc:
+            log.warning("Palette readback: could not set %s: %s", state, exc)
+            out[state] = entry
+            continue
+        core = None
+        with contextlib.suppress(Exception):
+            core = instrument._core()
+        for axis, key in (("LCA", "lca"), ("LCB", "lcb")):
+            for field, read in (
+                ("waves", lambda a=axis: instrument.get_retardance(a)),
+                ("volts", lambda a=axis: instrument.get_voltage(a)),
+                (
+                    "nm",
+                    lambda a=axis: float(core.get_property(LC_DEVICE, nm_property[a])),
+                ),
+            ):
+                try:
+                    entry[f"{key}_{field}"] = float(read())
+                except Exception:
+                    entry[f"{key}_{field}"] = None
+        out[state] = entry
+    if out:
+        log.info(
+            "LC palette readback (volts): %s",
+            ", ".join(f"{s} A={e.get('lca_volts')} B={e.get('lcb_volts')}" for s, e in out.items()),
+        )
+    return out
 
 
 def prepare_extinction_hardware(
@@ -575,6 +626,11 @@ def run_lc_calibration(
         restore_exposure()
         return fail(str(exc))
 
+    # Each final state as the crystals really sit in it: the volts the adapter
+    # drove them at and both of its retardance readbacks. Before the black
+    # level, which then puts the crystals back at extinction itself.
+    palette_readback = _palette_readback(instrument, result.palette_waves, log)
+
     # Black level from an exposure series at extinction (see
     # black_level_from_exposure_series): the offset without blocking the lamp.
     black_level_estimate = _estimate_black_level(instrument, hardware, result, camera, log)
@@ -817,11 +873,16 @@ def run_lc_calibration(
         # is a dozen strings the socket reply does not need.
         on_disk["lc_device_properties"] = lc_device_properties
         on_disk["camera_properties"] = camera_properties
+        on_disk["palette_readback"] = palette_readback
+        # Volts are present when polscope_library records them (TracePoint
+        # lca_volts / lcb_volts) and the adapter answered; null otherwise.
         on_disk["trace"] = [
             {
                 "state": p.state,
                 "lca_waves": p.lca_waves,
                 "lcb_waves": p.lcb_waves,
+                "lca_volts": getattr(p, "lca_volts", None),
+                "lcb_volts": getattr(p, "lcb_volts", None),
                 "intensity": p.intensity,
             }
             for p in result.trace

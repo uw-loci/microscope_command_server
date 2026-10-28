@@ -2079,6 +2079,98 @@ def handle_lccalib(conn, client, hardware, settings, **kwargs):
         conn.sendall(f"FAILED:{str(e)}".encode())
 
 
+def handle_lcsweep(conn, client, hardware, settings, **kwargs):
+    """LC-PolScope voltage sweep: each crystal's own voltage-to-retardance curve.
+
+    Reads --output (required), --modality, --axes (LCA, LCB or LCA,LCB),
+    --start-v, --stop-v, --step-v, --exposure-ms, --roi-fraction. Same replies
+    as LCCALIB: STARTED:<output_folder>, PROGRESS:<current>:<total>:<msg>,
+    then SUCCESS:<json> or FAILED:<reason>. The JSON is the summary; the raw
+    sweeps are in the file it names.
+    """
+    import json
+
+    addr = client if isinstance(client, tuple) else getattr(client, "addr", client)
+    logger.info("Client %s requested an LC-PolScope voltage sweep", addr)
+    try:
+        message = read_message_string(conn)
+    except (socket.timeout, ConnectionError, ValueError) as e:
+        logger.error("Failed to read LCSWEEP message from %s: %s", addr, e)
+        conn.sendall(f"FAILED:{str(e)}".encode())
+        return
+    if message is None:
+        conn.sendall(b"FAILED:could not read the LCSWEEP arguments")
+        return
+
+    flags = [
+        "--output",
+        "--modality",
+        "--axes",
+        "--start-v",
+        "--stop-v",
+        "--step-v",
+        "--exposure-ms",
+        "--roi-fraction",
+    ]
+    raw = {}
+    for flag in flags:
+        if flag in message:
+            start = message.index(flag) + len(flag)
+            end = len(message)
+            for other in flags:
+                pos = message.find(other, start)
+                if other != flag and 0 <= pos < end:
+                    end = pos
+            raw[flag] = message[start:end].strip()
+
+    output_folder = raw.get("--output")
+    if not output_folder:
+        conn.sendall(b"FAILED:--output is required")
+        return
+
+    def optional_float(flag):
+        value = raw.get(flag)
+        return float(value) if value else None
+
+    try:
+        conn.sendall(f"STARTED:{output_folder}".encode())
+    except Exception as e:
+        logger.error("Could not acknowledge LCSWEEP: %s", e)
+        return
+
+    def send_progress(current, total, stage, msg):
+        try:
+            conn.sendall(f"PROGRESS:{current}:{total}:{msg}".encode())
+        except Exception as e:
+            logger.debug("Could not send LCSWEEP progress: %s", e)
+
+    try:
+        from microscope_command_server.calibration.lc_voltage_sweep import run_lc_voltage_sweep
+
+        axes = [a.strip().upper() for a in (raw.get("--axes") or "LCA,LCB").split(",") if a.strip()]
+        result = run_lc_voltage_sweep(
+            hardware,
+            settings,
+            output_folder=output_folder,
+            modality=raw.get("--modality") or "lcpolscope",
+            axes=axes,
+            start_v=optional_float("--start-v"),
+            stop_v=optional_float("--stop-v"),
+            step_v=optional_float("--step-v") or 0.02,
+            exposure_ms=optional_float("--exposure-ms"),
+            roi_fraction=optional_float("--roi-fraction"),
+            progress_callback=send_progress,
+            logger_=logger,
+        )
+        conn.sendall(f"SUCCESS:{json.dumps(result)}".encode())
+        logger.info(
+            "LCSWEEP finished: success=%s; %s", result.get("success"), result.get("headline")
+        )
+    except Exception as e:
+        logger.exception("LCSWEEP raised")
+        conn.sendall(f"FAILED:{str(e)}".encode())
+
+
 def lcpolscope_readiness(hardware, settings) -> dict:
     """What the LC-PolScope acquisition panel shows before a run: the camera as it is
     set, what is wrong with it, and whether the LC adapter converts at the

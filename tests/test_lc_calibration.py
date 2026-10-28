@@ -801,3 +801,65 @@ class TestRetardanceLimitsComeFromTheDevice:
         lc = MicroManagerLC(FakeHardware(Unhelpful()), settle_ms=0)
 
         assert lc.limits.max_waves == pytest.approx(1.600)
+
+
+class VoltCore(FakeCore):
+    """A core whose adapter also reports drive volts and nm, as the MeadowlarkLC adapter does."""
+
+    @staticmethod
+    def volts_for(waves):
+        return round(9.0 - 10.0 * float(waves), 4)
+
+    def get_property(self, device, prop):
+        if device == "MeadowlarkLC" and prop.startswith("Voltage (V) LC-"):
+            axis = prop[-1]
+            return str(
+                self.volts_for(
+                    self.properties[("MeadowlarkLC", f"Retardance LC-{axis} [in waves]")]
+                )
+            )
+        if device == "MeadowlarkLC" and prop.endswith("[in nm]"):
+            axis = prop.split("LC-")[1][0]
+            return str(
+                552.2 * float(self.properties[("MeadowlarkLC", f"Retardance LC-{axis} [in waves]")])
+            )
+        return super().get_property(device, prop)
+
+
+class TestDriveVolts:
+    """2026-10-28: the palette is in the adapter's waves; the volts are what the crystals got."""
+
+    def _yaml(self):
+        return TestWorkflow()._yaml()
+
+    def test_trace_and_palette_carry_volts(self, tmp_path):
+        result = run_lc_calibration(
+            FakeHardware(core=VoltCore()),
+            self._yaml(),
+            output_folder=str(tmp_path),
+            black_level=102.0,
+        )
+        assert result["success"] is True
+        written = json.loads((tmp_path / result["metadata_path"].split("/")[-1]).read_text())
+        traced = [p for p in written["trace"] if p["lca_volts"] is not None]
+        if not traced:
+            pytest.skip("the installed polscope_library predates TracePoint volts")
+        for p in written["trace"]:
+            assert p["lca_volts"] == pytest.approx(VoltCore.volts_for(p["lca_waves"]))
+            assert p["lcb_volts"] == pytest.approx(VoltCore.volts_for(p["lcb_waves"]))
+        readback = written["palette_readback"]
+        assert set(readback) == set(result["palette_waves"])
+        for state, (lca, lcb) in result["palette_waves"].items():
+            entry = readback[state]
+            assert entry["lca_waves_commanded"] == pytest.approx(lca)
+            assert entry["lcb_volts"] == pytest.approx(VoltCore.volts_for(entry["lcb_waves"]))
+            assert entry["lca_nm"] == pytest.approx(552.2 * entry["lca_waves"])
+
+    def test_an_adapter_without_volts_records_nulls(self, tmp_path):
+        result = run_lc_calibration(
+            FakeHardware(), self._yaml(), output_folder=str(tmp_path), black_level=102.0
+        )
+        assert result["success"] is True
+        written = json.loads((tmp_path / result["metadata_path"].split("/")[-1]).read_text())
+        assert all(p["lca_volts"] is None and p["lcb_volts"] is None for p in written["trace"])
+        assert all(e["lcb_volts"] is None for e in written["palette_readback"].values())

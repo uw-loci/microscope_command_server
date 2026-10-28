@@ -810,7 +810,14 @@ The command sends multiple responses as it progresses:
      - `acquisition_exposure_ms` is the one exposure the YAML's `channels` share (channels that disagree are reported and nothing is projected). `projected_swing_contrast` and `projected_brightest_pixel` scale the measured counts to it, and `usable_exposure_ms` is the range at this illumination that keeps the contrast over 1% and the brightest pixel under 90% of range. **A warning names the exposure to set when the acquisition would be dark or would clip.** The palette does not depend on exposure; the acquisition does, so a calibration taken at 500 ms that leaves a 50 ms acquisition dark is reported here, not discovered later.
      - `histogram_path`: a PNG beside the metadata file, one log-scale pixel histogram per state (final frame), with the mean and the black level marked. For the human check a frame mean cannot make: a dim lamp, a closed diaphragm and a slide left in the beam all give a low mean and different histograms
    - `warnings` lists any issues that don't prevent use (e.g., a poor extinction ratio, or a missing wavelength configuration)
-   - `metadata_path` points to a JSON file with the full trace (per-exposure details)
+   - `metadata_path` points to a JSON file with the full trace (per-exposure details). Each
+     trace point is `{state, lca_waves, lcb_waves, lca_volts, lcb_volts, intensity}`; the volts
+     are what the adapter drove each crystal at (`Voltage (V) LC-A/B`), and null when the
+     adapter or an older `polscope_library` does not supply them. The file also carries
+     `palette_readback`: per final state, the commanded waves and the adapter's `[in waves]`,
+     `[in nm]` and volts readbacks for both crystals. The palette is in the adapter's waves,
+     which go through its waves-to-volts table; the volts show whether that table fits the
+     crystal (see LCSWEEP below)
 
    **Camera settings are checked before the first frame** (`camera_properties`, matched loosely by
    name). Auto gain or auto exposure on (any `*Auto*` gain/exposure property not `Off`) is
@@ -989,6 +996,54 @@ The server currently supports **`MM-Retardance`** mode: commands the liquid
 crystals in retardance (wave) units, and the Micro-Manager device adapter
 converts to voltage. Voltage mode (`MM-Voltage`) is not yet wired up and is
 refused with an error message directing the operator to use retardance mode.
+
+## LC-PolScope Voltage Sweep (LCSWEEP)
+
+`LCSWEEP` measures each liquid crystal's own voltage-to-retardance curve and compares it
+with the conversion the Meadowlark adapter uses. The palette is set in the adapter's waves,
+which it turns into volts through `mmgr_dal_MeadowlarkLC.csv`; that table is not a
+measurement of these crystals. On the LC-PolScope its LC-B column has a hand-edited kink
+across 4.1-4.6 V, LC-B's working range, the leading explanation (2026-10-28) for an LC-B
+palette that is lopsided in waves (+0.014 / -0.025) but near-symmetric in volts.
+
+Run it on a clear, specimen-free field, like a calibration:
+
+```
+LCSWEEP --output /path/to/output [--modality lcpolscope] [--axes LCA,LCB] \
+        [--start-v 0] [--stop-v 20] [--step-v 0.02] [--exposure-ms 5] \
+        [--roi-fraction 0.5] ENDOFSTR
+```
+
+Per crystal it parks the partner as `polscope_library.calibration.SWEEP_GEOMETRY` says
+(LC-B at a half wave to sweep LC-A; LC-A at a **quarter** wave to sweep LC-B, whose sweep is
+flat at a half wave), writes the swept crystal's `Voltage (V) LC-x` directly so the table is
+out of the loop, snaps at every step, and hands the fringes to
+`polscope_library.calibration.curve_from_sweep`. Defaults: the adapter's voltage limits
+(0-20 V on the D5020) in 20 mV steps, about 1000 frames per crystal. The labelling needs the
+sweep to reach below the last fringe, so keep `--stop-v` at the top of the range.
+
+- **Exposure is chosen for the sweep** unless `--exposure-ms` is given: a coarse 41-point
+  pre-sweep, quartering the exposure while anything clips, then scaling so the brightest point
+  sits near 70% of range above the black level. A sweep passes maximum transmission, which at
+  a calibration exposure is several times full scale. A sweep with clipped frames is reported
+  as an error for that crystal, not analysed.
+- **The adapter's own table** is sampled by writing retardances (0.05-1.69 waves) and reading
+  back the volts it chooses: exactly the conversion the rig uses, with no file path.
+- **The palette** in the YAML's `channels` is replayed state by state: commanded waves, the
+  volts the adapter drives, and the waves the crystal really has at those volts, with each
+  swing state's offset from extinction commanded, measured and in volts.
+- The crystals (their retardances before the sweep), the exposure and the camera ROI are
+  restored on every exit path.
+
+Replies as LCCALIB (`STARTED`, `PROGRESS`, then `SUCCESS:<json>` or `FAILED:<reason>`). The
+JSON summary has `axes` (per crystal: partner, exposure, landmarks, fringe contrast,
+`table_minus_measured_waves` = the largest disagreement and the voltage it is at, or an
+`error`), `palette`, `palette_lines` / `headline` (the shape is `State2: LC-B +0.0140
+commanded = +0.0xxx measured (-179 mV)`), `metadata_path` (`lc_sweep_<stamp>.json`: the raw
+sweeps, the adapter table, the measured curves and the comparison) and `curve_csv_path`: the
+measured curves as millivolts against nm at the reconstruction wavelength. That CSV is **not**
+in the adapter's multi-wavelength format and is never installed; replacing the adapter's table
+is a decision for a person.
 
 ## PPM Acquisition Options (--ppm-high-bit-depth)
 

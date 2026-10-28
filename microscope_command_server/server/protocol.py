@@ -73,6 +73,10 @@ class ExtendedCommand:
     PPMBIREF = b"ppmbiref"  # PPM Birefringence Maximization Test
     SBCALIB = b"sbcalib_"  # Sunburst Calibration for hue-to-angle mapping
     LCCALIB = b"lccalib_"  # LC-PolScope liquid-crystal voltage/retardance calibration
+    # LC-PolScope voltage sweep: measure each crystal's own voltage-to-retardance
+    # curve from fringes, bypassing the adapter's waves-to-volts table. Same
+    # framing as LCCALIB (flags, STARTED / PROGRESS / SUCCESS:<json> / FAILED).
+    LCSWEEP = b"lcsweep_"
     # LC-PolScope readiness: camera settings and their problems, and the LC
     # adapter's wavelength against the reconstruction's. No payload. Reply:
     # 4-byte big-endian length + that many UTF-8 bytes of JSON.

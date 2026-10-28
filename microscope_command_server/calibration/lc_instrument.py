@@ -217,6 +217,16 @@ class MicroManagerLC:
         volts = float(core.get_property(LC_DEVICE, VOLTAGE_PROPERTY[axis]))
         return float(self.curve.retardance_for(axis, volts))
 
+    def get_voltage(self, axis: str) -> float:
+        """The volts the controller is driving one crystal at, as the adapter reports them.
+
+        The palette is set in the adapter's waves, which it turns into volts
+        through its own table (``mmgr_dal_MeadowlarkLC.csv``); the volts are
+        what the crystal actually received. Recorded on every calibration
+        trace point so a table that does not fit the crystal shows up.
+        """
+        return float(self._core().get_property(LC_DEVICE, VOLTAGE_PROPERTY[axis]))
+
     def measure_intensity(self) -> float:
         self.exposures += 1
         image, _ = self.hardware.snap_image()
