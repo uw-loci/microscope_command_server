@@ -266,7 +266,11 @@ def _palette_readback(instrument, palette_waves, log) -> Dict[str, Dict[str, Any
 
 
 def prepare_extinction_hardware(
-    hardware, settings_yaml: Optional[Dict[str, Any]], modality: str, log: logging.Logger
+    hardware,
+    settings_yaml: Optional[Dict[str, Any]],
+    modality: str,
+    log: logging.Logger,
+    label: str = "LC calibration",
 ) -> list:
     """Put the microscope in the extinction state's hardware state before searching.
 
@@ -297,7 +301,7 @@ def prepare_extinction_hardware(
         if active is not None and detector != active and hasattr(hardware, "set_active_camera"):
             try:
                 hardware.set_active_camera(detector)
-                log.info("LC calibration: switched to the %s camera, %s", modality, detector)
+                log.info("%s: switched to the %s camera, %s", label, modality, detector)
             except Exception as exc:
                 notes.append(f"Could not switch to the {modality} camera {detector}: {exc}")
 
@@ -314,9 +318,9 @@ def prepare_extinction_hardware(
         from microscope_command_server.acquisition.workflow import apply_channel_hardware_state
 
         apply_channel_hardware_state(hardware, extinction, log)
-        log.info("LC calibration: applied %s's hardware state before the search", order[0])
+        log.info("%s: applied %s's hardware state first", label, order[0])
     except Exception as exc:
-        notes.append(f"Could not apply {order[0]}'s hardware state before calibrating: {exc}")
+        notes.append(f"{label}: could not apply {order[0]}'s hardware state first: {exc}")
     return notes
 
 

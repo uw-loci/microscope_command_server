@@ -148,7 +148,11 @@ def run_lc_voltage_sweep(
             except Exception as exc:
                 log.debug("progress callback raised: %s", exc)
 
-    warnings.extend(prepare_extinction_hardware(hardware, settings_yaml, modality, log))
+    warnings.extend(
+        prepare_extinction_hardware(
+            hardware, settings_yaml, modality, log, label="LC voltage sweep"
+        )
+    )
     try:
         instrument = MicroManagerLC(hardware, settle_ms=0.0)
         core = instrument._core()
