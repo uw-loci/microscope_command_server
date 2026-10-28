@@ -1028,7 +1028,9 @@ sweep to reach below the last fringe, so keep `--stop-v` at the top of the range
   a calibration exposure is several times full scale. A sweep with clipped frames is reported
   as an error for that crystal, not analysed.
 - **The adapter's own table** is sampled by writing retardances (0.05-1.69 waves) and reading
-  back the volts it chooses: exactly the conversion the rig uses, with no file path.
+  back the volts it chooses: exactly the conversion the rig uses, with no file path. A
+  retardance the crystal cannot reach is clamped by the adapter to a voltage rail; those
+  samples (within 50 mV of either limit) are dropped, not kept as table points.
 - **The palette** in the YAML's `channels` is replayed state by state: commanded waves, the
   volts the adapter drives, and the waves the crystal really has at those volts, with each
   swing state's offset from extinction commanded, measured and in volts.
@@ -1037,9 +1039,12 @@ sweep to reach below the last fringe, so keep `--stop-v` at the top of the range
 
 Replies as LCCALIB (`STARTED`, `PROGRESS`, then `SUCCESS:<json>` or `FAILED:<reason>`). The
 JSON summary has `axes` (per crystal: partner, exposure, landmarks, fringe contrast,
-`table_minus_measured_waves` = the largest disagreement and the voltage it is at, or an
-`error`), `palette`, `palette_lines` / `headline` (the shape is `State2: LC-B +0.0140
-commanded = +0.0xxx measured (-179 mV)`), `metadata_path` (`lc_sweep_<stamp>.json`: the raw
+`table_minus_measured_waves` = the largest disagreement and the voltage it is at, judged only
+within `window_volts` (the palette's volts +/- 0.75 V, or the table's own range less 1 V at each
+end when the palette does not use the crystal; the curve is flat and poorly measured near the
+rails) and absent when no table point falls in that window; or an `error`), `palette`,
+`palette_lines` / `headline` (the shape is `State2: LC-B +0.0140 commanded = +0.0xxx measured
+(-179 mV)`), `metadata_path` (`lc_sweep_<stamp>.json`: the raw
 sweeps, the adapter table, the measured curves and the comparison) and `curve_csv_path`: the
 measured curves as millivolts against nm at the reconstruction wavelength. That CSV is **not**
 in the adapter's multi-wavelength format and is never installed; replacing the adapter's table
