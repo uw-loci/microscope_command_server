@@ -119,6 +119,7 @@ from typing import Dict, Any, List, Optional, Tuple
 
 import numpy as np
 
+from microscope_command_server.server.af_events import AF_EVENTS
 from microscope_command_server.server.focus_geometry import build_z_from_poll
 from microscope_command_server.server.handlers.busy import acquisition_in_progress, busy_reply
 from microscope_command_server.server.focus_peaks import (
@@ -2572,6 +2573,9 @@ def _run_streaming_scan(
                 max_model_divergence_um = _d
 
         samples.append((wall_ms, float(z_interp), metric, secondary))
+        AF_EVENTS.af_sample(
+            float(z_interp), metric, secondary if secondary_metric_name == "p98_p2" else None
+        )
         if dump_records is not None:
             dump_records.append((wall_ms, img, float(z_model), metric))
 
@@ -4417,7 +4421,7 @@ def handle_abort_af(conn, client, hardware, settings, **kwargs):
         pass
 
 
-def handle_streaming_focus(conn, client, hardware, settings, **kwargs):
+def _handle_streaming_focus(conn, client, hardware, settings, **kwargs):
     """Entry point for the STRMAFZ (streaming autofocus) command."""
     addr = getattr(client, "addr", client)
 
@@ -6257,6 +6261,57 @@ def handle_streaming_focus(conn, client, hardware, settings, **kwargs):
 
 
 # ----- In-process invoker (for the acquisition --af-benchmark mode) -----
+
+
+class _ReplyRecorder:
+    """A connection that also keeps what the handler sends, to read its outcome."""
+
+    def __init__(self, conn):
+        self._conn = conn
+        self._sent: List[bytes] = []
+
+    def sendall(self, data):
+        self._sent.append(data)
+        return self._conn.sendall(data)
+
+    def __getattr__(self, name):
+        return getattr(self._conn, name)
+
+    @property
+    def reply(self) -> str:
+        return b"".join(self._sent).decode("utf-8", errors="replace")
+
+
+_STREAMING_STATUS = {
+    "success": "ok",
+    "failed": "failed",
+    "aborted": "aborted",
+    "unavailable": "unavailable",
+}
+
+
+def handle_streaming_focus(conn, client, hardware, settings, **kwargs):
+    """STRMAFZ, reported to the operator's autofocus display (server/af_events.py).
+
+    Every streaming autofocus comes through here, the in-process ones from the
+    acquisition included, so this is where its start and outcome are published;
+    the scan publishes each pass's samples itself.
+    """
+    # A request the busy guard refuses (an acquisition owns the stage) is not a
+    # search; and nothing here may touch the hardware before that guard has run.
+    if acquisition_in_progress(kwargs.get("acquisition_states")):
+        return _handle_streaming_focus(conn, client, hardware, settings, **kwargs)
+    AF_EVENTS.af_started("streaming", {})
+    recorder = _ReplyRecorder(conn)
+    try:
+        _handle_streaming_focus(recorder, client, hardware, settings, **kwargs)
+    except BaseException as e:
+        AF_EVENTS.af_finished("error", None, {"reason": str(e)})
+        raise
+    outcome = _parse_streaming_response(recorder.reply)
+    status = _STREAMING_STATUS.get(outcome["status"], "error")
+    details = {"reason": outcome["reason"]} if outcome.get("reason") else {}
+    AF_EVENTS.af_finished(status, outcome.get("final_z"), details)
 
 
 class _InProcessConn:

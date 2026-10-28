@@ -68,7 +68,7 @@ def test_the_reply_is_a_failed_the_client_already_understands():
 def test_streaming_focus_asks_before_it_touches_the_stage():
     """The guard has to precede the first hardware access, or it is decoration."""
     src = HANDLER_SRC.read_text()
-    handler_at = src.index("def handle_streaming_focus(")
+    handler_at = src.index("def _handle_streaming_focus(")
     body = src[handler_at:]
     guard_at = body.index('acquisition_in_progress(kwargs.get("acquisition_states"))')
     first_hardware = body.index("STREAM_AF:focus device =")

@@ -116,6 +116,7 @@ from microscope_command_server.server.handlers.streaming_focus import (
     handle_abort_af,
 )
 from microscope_command_server.server.handlers.rapid_scan import handle_rapid_scan
+from microscope_command_server.server.handlers.af_trace import handle_aftrace
 
 # Map 8-byte command bytes -> handler function
 COMMAND_HANDLERS = {
@@ -213,6 +214,7 @@ COMMAND_HANDLERS = {
     # Streaming autofocus
     ExtendedCommand.STRMAFZ: handle_streaming_focus,
     ExtendedCommand.ABORTAF: handle_abort_af,
+    ExtendedCommand.AFTRACE: handle_aftrace,
     ExtendedCommand.FINDTISS: handle_findtissue,
     # Rapid scan
     ExtendedCommand.RPDSCAN: handle_rapid_scan,

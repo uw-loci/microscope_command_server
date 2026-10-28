@@ -790,6 +790,10 @@ def initialize_server(demo: bool = False):
         logger.info("Initializing Micro-Manager connection...")
         core, studio = init_pycromanager_with_logger()
     hardware = PycromanagerHardware(core, studio, startup_settings)
+    # Every stop-and-snap autofocus reports its progress to the operator's display.
+    from microscope_command_server.server.af_events import AF_EVENTS
+
+    hardware.autofocus_listener = AF_EVENTS
     logger.info("Hardware initialized with generic config")
     logger.info(
         "Server ready - microscope-specific config will be loaded from ACQUIRE --yaml parameter"

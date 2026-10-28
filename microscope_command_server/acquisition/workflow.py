@@ -30,6 +30,7 @@ from microscope_control.hardware.pycromanager import PycromanagerHardware
 from microscope_control.autofocus.core import AutofocusUtils
 from microscope_command_server.acquisition.tiles import TileConfigUtils
 from microscope_command_server.modality import get_config as get_modality_config
+from microscope_command_server.server.af_events import AF_EVENTS
 from microscope_command_server.server.protocol import END_MARKER
 from microscope_imageprocessing.io.writer import ome_tiff_writer
 from microscope_imageprocessing.correction.background import BackgroundCorrectionUtils
@@ -2940,16 +2941,22 @@ def _acquisition_workflow(
         )
         ctx.request_saturation_decision = operator_pause(hardware, ctx.request_saturation_decision)
 
+        # Every autofocus from here on is also written to af_trace.ndjson beside
+        # the tiles (the operator's display reads it live over AFTRACE).
+        AF_EVENTS.attach_file(ctx.output_path / "af_trace.ndjson")
+
         # Phase 7: Load AF settings, resolve strategy, compute positions
         _configure_autofocus(ctx)
 
         # Phase 8: Initial autofocus at first tissue position
-        _run_pre_acquisition_autofocus(ctx)
+        with AF_EVENTS.context("Initial focus"):
+            _run_pre_acquisition_autofocus(ctx)
 
         # Phase 8b: Measure the rest of the focus surface up front, if asked. Runs
         # after Phase 8 on purpose -- that phase sets the AF rotation angle and
         # exposure and produces the first focus point, and the survey needs all three.
-        _run_focus_survey(ctx)
+        with AF_EVENTS.context("Focus survey"):
+            _run_focus_survey(ctx)
 
         # Phase 9: Create saturation monitor, write pool, NDJSON stream
         _initialize_loop_infrastructure(ctx)
@@ -3002,9 +3009,12 @@ def _acquisition_workflow(
                 tile_start = time.perf_counter()
 
                 # AF decision + stage move + autofocus execution
-                needs_af, af_type, drift, af_failed, xy_move_pending = _handle_tile_autofocus(
-                    ctx, pos_idx, pos, filename
-                )
+                with AF_EVENTS.context(
+                    f"Tile {pos_idx + 1} of {len(ctx.positions)}", tile=pos_idx, x=pos.x, y=pos.y
+                ):
+                    needs_af, af_type, drift, af_failed, xy_move_pending = _handle_tile_autofocus(
+                        ctx, pos_idx, pos, filename
+                    )
 
                 # User chose to skip this tile during hardware error recovery
                 if af_type == "skipped":
@@ -3271,6 +3281,7 @@ def _cleanup_acquisition(ctx: AcquisitionContext) -> None:
         except Exception:
             pass
         ctx.tile_measurements_stream = None
+    AF_EVENTS.detach_file()
 
     # Leave the light path dark for channel modalities. The tile loop ends with the
     # LAST acquired channel still applied and still exciting the sample, and the Live
@@ -5298,6 +5309,13 @@ def _run_focus_survey(ctx: "AcquisitionContext") -> None:
     failed = 0
 
     for tile_idx in candidates:
+        survey_pos = ctx.positions[tile_idx][0]
+        AF_EVENTS.set_context(
+            f"Focus survey point {measured + 1} of {requested}",
+            tile=tile_idx,
+            x=survey_pos.x,
+            y=survey_pos.y,
+        )
         if len(ctx.completed_af_positions) >= target_total:
             break
         if ctx.is_cancelled is not None and ctx.is_cancelled():

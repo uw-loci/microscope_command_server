@@ -1352,6 +1352,26 @@ FAILED:busy: an acquisition is running for <addr>; refusing to move the focus st
 and nothing moves. Wait for the acquisition to finish, or send a cancel and wait for it to
 complete, then re-issue the autofocus command.
 
+## Autofocus progress (AFTRACE, af_trace.ndjson)
+
+Every autofocus the server runs reports its progress to one in-memory event log
+(`server/af_events.py`): the stop-and-snap searches through `hardware.autofocus_listener`
+(microscope_control 6ad87dd or later), streaming autofocus from its own handler. Each search
+is a `start` event (method `sweep`, `drift_check` or `streaming`, a label such as
+`Tile 12 of 80`, start Z, range, steps, metric), one `sample` per scored Z (`z`, `score`, and
+`spread` = P98 - P2 when it was measured), and an `end` (`status` `ok`, `failed`, `aborted`,
+`error` or `unavailable`, the focus `z`, `elapsed_s`, and a `reason` when one is known).
+
+- **`AFTRACE` (`aftrace_`)**, on either socket: 8-byte big-endian last-seen sequence number
+  (0 for none); reply 4-byte big-endian length + UTF-8 JSON
+  `{"seq", "first", "more", "active", "events"}`. `active` is the running search's start
+  event or null; `first` is the oldest event still held (4000 kept); `more` means the reply was
+  cut at 1000 events. It reads only the log, never the hardware, so it answers while a search
+  or an acquisition runs. An older server ignores the command and sends nothing.
+- **`af_trace.ndjson`** in an acquisition's output folder: the same events, one JSON object per
+  line, from the initial focus to the end of the run, so every focus curve can be looked at
+  afterwards.
+
 ## Autofocus allow-list (--af-tissue-tiles)
 
 ```

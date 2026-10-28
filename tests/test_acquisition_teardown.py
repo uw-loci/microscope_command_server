@@ -82,6 +82,7 @@ def cleanup(ctx):
     # Teardown also hands the stage back by disarming the frame check, so that name
     # has to be in the namespace too; the stub records the call for the test below.
     ctx.frame_check_calls = []
+    ctx.af_trace_detached = []
     # The retraction records into the SAME list as the stage moves, so the tests below
     # assert its ORDER relative to the return move, not merely that it happened. That
     # order is the point: the return move is itself a long move at focus height.
@@ -89,12 +90,22 @@ def cleanup(ctx):
         "Position": lambda **kw: dict(kw),
         "AcquisitionContext": object,
         "set_frame_check_armed": lambda hw, armed: ctx.frame_check_calls.append(armed),
+        "AF_EVENTS": type(
+            "AfEvents",
+            (),
+            {"detach_file": staticmethod(lambda: ctx.af_trace_detached.append(True))},
+        ),
         "retract_to_safe_z": lambda settings, read_z, move_z, log=None: bool(
             ctx.hardware.moves.append("RETRACT")
         ),
     }
     load_function("_cleanup_acquisition", ns)(ctx)
     return ctx
+
+
+def test_teardown_closes_the_autofocus_record():
+    ctx = cleanup(Ctx(channels=[]))
+    assert ctx.af_trace_detached == [True]
 
 
 def test_teardown_hands_the_stage_back():

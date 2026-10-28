@@ -178,6 +178,10 @@ class ExtendedCommand:
     # Cancel an in-progress STRMAFZ scan. Sent on the client's AUXILIARY
     # socket (the primary is blocked running STRMAFZ). Response: 'ACK'.
     ABORTAF = b"abortaf_"  # Abort streaming autofocus scan
+    # Autofocus events (start, each scored Z, result) after a sequence number, for
+    # the operator's display. Payload: 8-byte big-endian last-seen sequence number.
+    # Reply: 4-byte big-endian length + UTF-8 JSON. Either socket. See af_events.py.
+    AFTRACE = b"aftrace_"
     # Move the stage until the camera is looking at tissue, so a focus scan has
     # something to find. Pure XY -- it never touches Z or the exposure, and the
     # caller orders it itself: MOVE -> FINDTISS -> STRMAFZ. Exists because a
