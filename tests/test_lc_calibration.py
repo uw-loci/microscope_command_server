@@ -863,3 +863,51 @@ class TestDriveVolts:
         written = json.loads((tmp_path / result["metadata_path"].split("/")[-1]).read_text())
         assert all(p["lca_volts"] is None and p["lcb_volts"] is None for p in written["trace"])
         assert all(e["lcb_volts"] is None for e in written["palette_readback"].values())
+
+
+class PhantomReadbackCore(FakeCore):
+    """The 2026-10-28 rig: LC-B's waves readback sometimes reports its 20 V value."""
+
+    def __init__(self):
+        super().__init__()
+        self.phantom = False
+
+    def get_property(self, device, prop):
+        if self.phantom and prop == "Retardance LC-B [in waves]":
+            return "0.0719"
+        return super().get_property(device, prop)
+
+
+class TestReadbackIsNotBelieved:
+    def test_the_written_value_wins_over_a_wrong_echo(self):
+        core = PhantomReadbackCore()
+        lc = MicroManagerLC(FakeHardware(core=core), settle_ms=0)
+        lc.set_retardance("LCB", 0.4343)
+        core.phantom = True
+        assert lc.get_retardance("LCB") == pytest.approx(0.4343)
+        assert lc.readback_disagreements == 1
+
+    def test_before_any_write_the_readback_is_used(self):
+        lc = MicroManagerLC(FakeHardware(), settle_ms=0)
+        assert lc.get_retardance("LCB") == pytest.approx(0.50)
+
+    def test_a_calibration_survives_the_phantom(self, tmp_path):
+        class PhantomHardware(FakeHardware):
+            def snap_image(self):
+                # The crystals are where they were driven; only the readback lies.
+                self.core.phantom = False
+                try:
+                    return super().snap_image()
+                finally:
+                    self.core.phantom = True
+
+        core = PhantomReadbackCore()
+        core.phantom = True
+        result = run_lc_calibration(
+            PhantomHardware(core=core),
+            TestWorkflow()._yaml(),
+            output_folder=str(tmp_path),
+            black_level=102.0,
+        )
+        assert result["success"] is True
+        assert result["palette_waves"]["State0"][1] == pytest.approx(0.5, abs=0.01)

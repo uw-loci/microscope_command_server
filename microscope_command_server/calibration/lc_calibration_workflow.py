@@ -650,6 +650,13 @@ def run_lc_calibration(
         }
 
     warnings.extend(result.warnings)
+    if getattr(instrument, "readback_disagreements", 0):
+        warnings.append(
+            f"The LC adapter's waves readback disagreed with the value just written "
+            f"{instrument.readback_disagreements} times during the search; the written values "
+            "were used. On 2026-10-28 LC-B read 0.0719 waves (its 20 V value) while driven at "
+            "extinction, which sent the search to the rail."
+        )
 
     # What the camera saw, in one place: the counts the ratio was computed
     # from, against the camera's range. This is the line that says "dark" or

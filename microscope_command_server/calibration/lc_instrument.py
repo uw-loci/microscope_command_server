@@ -43,6 +43,8 @@ LC_DEVICE = "MeadowlarkLC"
 #: 2026-08-28 -- so it can be reported but never commanded.
 RETARDANCE_PROPERTY = {"LCA": "Retardance LC-A [in waves]", "LCB": "Retardance LC-B [in waves]"}
 VOLTAGE_PROPERTY = {"LCA": "Voltage (V) LC-A", "LCB": "Voltage (V) LC-B"}
+#: A waves readback further than this from the value just written is not believed.
+READBACK_TOLERANCE_WAVES = 0.002
 
 
 class MicroManagerLC:
@@ -117,6 +119,10 @@ class MicroManagerLC:
         self._camera_roi_set = False
         self._software_crop: Optional[float] = None
         self.limits = limits if limits is not None else self._device_limits()
+        #: Last value written to each crystal, after clamping (MM-Retardance mode).
+        self._commanded: dict = {}
+        #: Readbacks that disagreed with the command, kept for the record.
+        self.readback_disagreements = 0
 
     def _device_limits(self):
         """Ask the adapter what the crystals will actually accept.
@@ -193,6 +199,7 @@ class MicroManagerLC:
         core = self._core()
         if self.mode == "MM-Retardance":
             core.set_property(LC_DEVICE, RETARDANCE_PROPERTY[axis], str(value))
+            self._commanded[axis] = value
         else:
             core.set_property(
                 LC_DEVICE, VOLTAGE_PROPERTY[axis], str(self.curve.voltage_for(axis, value))
@@ -207,13 +214,37 @@ class MicroManagerLC:
     def get_retardance(self, axis: str) -> float:
         """Read back what the crystal is at, in waves.
 
-        Always read, never assume the commanded value: in voltage mode the
-        command round-trips through a curve and the hardware quantises, and
-        the palette we record has to be what the instrument reproduces.
+        In voltage mode the command round-trips through a curve and the hardware
+        quantises, so the readback is the truth. In retardance mode the adapter
+        rounds what was written, and the readback is used while it agrees with
+        the command to within ``READBACK_TOLERANCE_WAVES``; beyond that the
+        adapter has lost track (2026-10-28) and the written value is returned.
         """
         core = self._core()
         if self.mode == "MM-Retardance":
-            return float(core.get_property(LC_DEVICE, RETARDANCE_PROPERTY[axis]))
+            read = float(core.get_property(LC_DEVICE, RETARDANCE_PROPERTY[axis]))
+            commanded = self._commanded.get(axis)
+            if commanded is None or abs(read - commanded) <= READBACK_TOLERANCE_WAVES:
+                # Within tolerance the readback is the better number: it carries the
+                # adapter's own rounding of what was written.
+                return read
+            # In retardance mode the adapter's waves property can only echo the command,
+            # and on 2026-10-28 it did not: LC-B read 0.0719 waves (its 20 V value) while
+            # driven at 4.406 V, extinction. The search took that as the crystal's position
+            # and drove LC-B to the rail. The command is what the crystal was set to and
+            # what the palette replays, so it wins; the disagreement is logged.
+            self.readback_disagreements += 1
+            if self.readback_disagreements <= 5:
+                logger.warning(
+                    "%s readback %s = %.4f waves disagrees with the %.4f just written; using "
+                    "the written value (disagreement %d)",
+                    LC_DEVICE,
+                    RETARDANCE_PROPERTY[axis],
+                    read,
+                    commanded,
+                    self.readback_disagreements,
+                )
+            return commanded
         volts = float(core.get_property(LC_DEVICE, VOLTAGE_PROPERTY[axis]))
         return float(self.curve.retardance_for(axis, volts))
 
