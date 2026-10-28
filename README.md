@@ -815,8 +815,10 @@ The command sends multiple responses as it progresses:
      are what the adapter drove each crystal at (`Voltage (V) LC-A/B`), and null when the
      adapter or an older `polscope_library` does not supply them. The file also carries
      `palette_readback`: per final state, the commanded waves and the adapter's `[in waves]`,
-     `[in nm]` and volts readbacks for both crystals. The palette is in the adapter's waves,
-     which go through its waves-to-volts table; the volts show whether that table fits the
+     `[in nm]` and volts readbacks for both crystals. A `[in waves]` readback that disagrees with
+     the command by more than 0.002 waves is not believed: the written value is recorded in its
+     place, and the reply's `warnings` says how many times it happened. The palette is in the
+     adapter's waves, which go through its waves-to-volts table; the volts show whether that table fits the
      crystal (see LCSWEEP below)
 
    **Camera settings are checked before the first frame** (`camera_properties`, matched loosely by
