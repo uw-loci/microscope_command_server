@@ -109,6 +109,7 @@ class AutofocusEventLog:
                 "type": "end",
                 "run": start["run"],
                 "method": start["method"],
+                "context": start.get("context"),
                 "status": status,
                 "z": _clean(z),
                 "elapsed_s": round(time.time() - start["t"], 2),

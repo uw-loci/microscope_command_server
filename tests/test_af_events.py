@@ -35,6 +35,7 @@ def test_a_search_is_start_samples_end_with_one_run_id():
     assert start["context"] == "Tile 3 of 10" and start["tile"] == 2 and start["x"] == 100.0
     assert start["method"] == "sweep" and start["n_steps"] == 3
     assert end["status"] == "ok" and end["z"] == -301.2 and end["method"] == "sweep"
+    assert end["context"] == "Tile 3 of 10"  # a reader of the record need not find the start
     assert [e["seq"] for e in events] == [1, 2, 3, 4, 5]
     # The label is the caller's: it is gone once the block ends.
     log.af_started("sweep", {})
