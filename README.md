@@ -46,10 +46,16 @@ two cameras that snap and stream through a circular buffer (switched with `Core-
 as a profile switch does), ROI and binning per camera, config groups. Unknown devices and
 properties raise, as MMCore does.
 
-The camera looks at a procedurally generated H&E-like slide (bilinearly interpolated
-lattice value noise summed over two to three octaves), 40 x 20 mm centered on the stage
-origin, with tissue islands, texture and nuclei on a focal surface that tilts and
-undulates between about -22 and +20 um of Z = 0. Moving the stage pans across it; moving
+The camera looks at a procedurally generated H&E-like slide, 40 x 20 mm centered on the
+stage origin, on a focal surface that tilts and undulates between about -22 and +20 um of
+Z = 0. Tissue sits in islands a few millimeters across, each a patchwork of regions:
+fibrous stroma, glandular regions, fat lobules and round lymphoid follicles. Collagen
+fibres run in wavy bundles whose direction drifts across the section, with spindle-shaped
+nuclei lying along them; glands are ovals 50 to 110 um long with a lumen and a ring of
+columnar nuclei; vessels 6 to 22 um wide, packed with red cells, wind for millimeters. No
+two fields look alike, so the direction of a stage move shows in the image. Every feature
+is placed by a hash of its position (value noise, and one jittered point per grid cell for
+nuclei, red cells, fat cells and glands). Moving the stage pans across it; moving
 Z defocuses it in proportion to the distance from that surface, so an autofocus sweep
 scores one clear peak. The slide pattern is deterministic (`VirtualSlide.seed`); each
 frame adds Gaussian read noise of sigma 2 gray levels from a generator seeded once per
@@ -67,8 +73,10 @@ two-camera scope does:
 - **LC-PolScope**: on the transmitted path the camera sits behind a liquid-crystal
   universal compensator `MeadowlarkLC` and a circular analyser, modelled as
   `polscope_library.calibration` models them (polarizer at 0 deg, LC-A at 45 deg, LC-B at
-  0 deg). The specimen has a birefringence map: fibrous stroma at 3 to 18 nm with a slowly
-  wandering slow axis, isotropic nuclei and glass. Five states reconstruct to that map with
+  0 deg). The specimen has a birefringence map: collagen fibres at up to 18 nm with the
+  slow axis along each fibre (so it follows the fibres' curves), vessel walls at about
+  6 nm along the vessel, loose stroma and fat membranes at 1 to 2 nm, and isotropic
+  nuclei, lumens and glass. Five states reconstruct to that map with
   either `polscope_library` method (tested: median error under 0.1 nm, orientation under
   1 deg, with a background). The instrument is deliberately imperfect in the ways a real
   one is: each crystal lands 0.004 / -0.012 waves from what it is told, the optics add a

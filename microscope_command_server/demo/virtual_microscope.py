@@ -8,11 +8,15 @@ circular buffer, ROI, config groups -- and nothing more. Unknown devices and
 properties raise, the way MMCore does, so a typo in a config fails here too.
 
 Both cameras look at one :class:`VirtualSlide`: a procedurally generated
-H&E-like section with tissue islands, texture and nuclei, lying on a tilted,
-gently undulating focal surface within about +/-22 um of Z = 0. Moving the stage
-pans across it; moving Z defocuses it, so autofocus sweeps produce a real focus
-curve with a single peak. The slide pattern is seeded, so the same stage
-position always shows the same field, up to per-frame noise.
+H&E-like section built from what real tissue has -- islands of tissue holding
+fibrous stroma, glands, fat and lymphoid follicles, wavy collagen fibres with
+spindle nuclei along them, and winding vessels full of red cells -- so every
+field looks different and the direction of a move can be read from the image.
+It lies on a tilted, gently undulating focal surface within about +/-22 um of
+Z = 0. Moving the stage pans across it; moving Z defocuses it, so autofocus
+sweeps produce a real focus curve with a single peak. The slide pattern is
+seeded, so the same stage position always shows the same field, up to
+per-frame noise.
 
 Three ways of looking at it:
 
@@ -21,7 +25,8 @@ Three ways of looking at it:
   compensator (``MeadowlarkLC``) and a circular analyser on the transmitted
   path -- an LC-PolScope -- and on an epi port lit by a four-line LED
   (``DLED``, 385/475/550/621 nm) for fluorescence. The specimen carries a
-  birefringence map (fibrous stroma, isotropic nuclei) and four fluorophore
+  birefringence map (collagen with its slow axis along each fibre, vessel
+  walls, isotropic nuclei and lumens) and four fluorophore
   maps (nuclei, weak autofluorescence, eosin, sparse puncta) laid over the
   same tissue, so every modality shows the same place.
 
@@ -88,7 +93,7 @@ class TaggedImage:
 # --------------------------------------------------------------------------- #
 
 
-def _smoothstep(edge0: float, edge1: float, x: np.ndarray) -> np.ndarray:
+def _smoothstep(edge0: float, edge1, x: np.ndarray) -> np.ndarray:
     t = np.clip((x - edge0) / (edge1 - edge0), 0.0, 1.0)
     return t * t * (3.0 - 2.0 * t)
 
@@ -99,15 +104,26 @@ def _lattice_hash(ix: np.ndarray, iy: np.ndarray, seed: float) -> np.ndarray:
     return v - np.floor(v)
 
 
-def _value_noise(x: np.ndarray, y: np.ndarray, cell: float, seed: float) -> np.ndarray:
-    """Bilinearly interpolated lattice noise with ``cell`` spacing, in [0, 1)."""
+def _value_noise(
+    x: np.ndarray, y: np.ndarray, cell: float, seed: float, quintic: bool = False
+) -> np.ndarray:
+    """Bilinearly interpolated lattice noise with ``cell`` spacing, in [0, 1).
+
+    ``quintic`` smooths the interpolant to second order, so the noise's
+    gradient has no kinks along the lattice lines (needed where the gradient
+    itself is drawn, as the collagen fibres' direction is).
+    """
     gx = np.floor(x / cell)
     gy = np.floor(y / cell)
     fx = x / cell - gx
     fy = y / cell - gy
     # Smooth the interpolant so cell edges do not show.
-    ux = fx * fx * (3.0 - 2.0 * fx)
-    uy = fy * fy * (3.0 - 2.0 * fy)
+    if quintic:
+        ux = fx * fx * fx * (fx * (fx * 6.0 - 15.0) + 10.0)
+        uy = fy * fy * fy * (fy * (fy * 6.0 - 15.0) + 10.0)
+    else:
+        ux = fx * fx * (3.0 - 2.0 * fx)
+        uy = fy * fy * (3.0 - 2.0 * fy)
     a = _lattice_hash(gx, gy, seed)
     b = _lattice_hash(gx + 1.0, gy, seed)
     c = _lattice_hash(gx, gy + 1.0, seed)
@@ -118,18 +134,152 @@ def _value_noise(x: np.ndarray, y: np.ndarray, cell: float, seed: float) -> np.n
 
 
 def _fractal_noise(
-    x: np.ndarray, y: np.ndarray, cell: float, seed: float, octaves: int
+    x: np.ndarray, y: np.ndarray, cell: float, seed: float, octaves: int, quintic: bool = False
 ) -> np.ndarray:
     """Sum of ``octaves`` value-noise layers, each half the cell and half the weight."""
     total = np.zeros_like(x)
     weight = 1.0
     norm = 0.0
     for i in range(octaves):
-        total += weight * _value_noise(x, y, cell, seed + 17.0 * i)
+        total += weight * _value_noise(x, y, cell, seed + 17.0 * i, quintic)
         norm += weight
         cell *= 0.5
         weight *= 0.5
     return total / norm
+
+
+_M32 = 0xFFFFFFFF
+
+
+def _int_hash(ix: np.ndarray, iy: np.ndarray, seed: int) -> np.ndarray:
+    """Pseudo-random value in [0, 1) per integer lattice point (multiply-xorshift)."""
+    h = (
+        np.asarray(ix, dtype=np.int64) * 374761393
+        + np.asarray(iy, dtype=np.int64) * 668265263
+        + seed * 2246822519
+    ) & _M32
+    h = ((h ^ (h >> 15)) * 2246822519) & _M32
+    h = ((h ^ (h >> 13)) * 3266489917) & _M32
+    h ^= h >> 16
+    return h * (1.0 / 4294967296.0)
+
+
+def _coarse_axis(n: int, step: int) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Every ``step``-th index of ``n`` (and the last), and for each of the ``n``
+    indices the coarse sample to its left and the weight of the one to its right."""
+    idx = np.unique(np.r_[np.arange(0, n, step), n - 1])
+    if len(idx) == 1:
+        return idx, np.zeros(n, dtype=np.int64), np.zeros(n, dtype=np.float32)
+    i = np.arange(n)
+    j = np.clip(np.searchsorted(idx, i, side="right") - 1, 0, len(idx) - 2)
+    t = ((i - idx[j]) / (idx[j + 1] - idx[j])).astype(np.float32)
+    return idx, j, t
+
+
+def _upsample(coarse: np.ndarray, cols, rows) -> np.ndarray:
+    """Bilinear interpolation of ``coarse[..., r, c]`` back to the full grid."""
+    (cj, ct), (rj, rt) = cols, rows
+    if coarse.shape[-1] > 1:
+        coarse = (
+            coarse[..., cj] * (1.0 - ct)
+            + coarse[..., np.minimum(cj + 1, coarse.shape[-1] - 1)] * ct
+        )
+    else:
+        coarse = coarse[..., cj]
+    if coarse.shape[-2] > 1:
+        lo = coarse[..., rj, :]
+        hi = coarse[..., np.minimum(rj + 1, coarse.shape[-2] - 1), :]
+        return lo * (1.0 - rt[:, None]) + hi * rt[:, None]
+    return coarse[..., rj, :]
+
+
+class _Cells:
+    """The nearest of one jittered feature point per ``cell``-sized square, per pixel.
+
+    ``d1`` is the distance to the nearest point and, with ``second``, ``d2`` to
+    the second-nearest; with ``offsets``, ``dx``/``dy`` is the offset from the
+    nearest. :meth:`attr` gives each point's own random number for a seed, so a
+    feature keeps its size, shape and colour wherever it is seen from. With
+    ``stretch`` = (angle, ratio) (per pixel or scalar), distance is measured in a
+    frame turned by the angle and squeezed across it, which makes the features
+    ellipses elongated along the angle. The points are hashed once per cell into
+    a small table and looked up, not re-hashed per pixel. Works on any shape of
+    ``x``/``y``, including the 1-D pixel lists of a mask.
+    """
+
+    def __init__(self, x, y, cell, seed, jitter=0.9, stretch=None, second=False, offsets=False):
+        gx = np.floor(x / cell).astype(np.int64)
+        gy = np.floor(y / cell).astype(np.int64)
+        self._k = np.zeros(x.shape, dtype=np.int64)
+        self.d1 = np.full(x.shape, np.inf, dtype=np.float32)
+        self.d2 = np.full(x.shape, np.inf, dtype=np.float32) if second else None
+        self.dx = np.zeros(x.shape, dtype=np.float32) if offsets else None
+        self.dy = np.zeros(x.shape, dtype=np.float32) if offsets else None
+        if x.size == 0:
+            self._tx = self._ty = np.zeros((1, 1), dtype=np.int64)
+            return
+        gx0, gy0 = int(gx.min()) - 1, int(gy.min()) - 1
+        nx, ny = int(gx.max()) + 2 - gx0, int(gy.max()) + 2 - gy0
+        self._tx, self._ty = np.meshgrid(np.arange(gx0, gx0 + nx), np.arange(gy0, gy0 + ny))
+        # Positions relative to the table's corner, so float32 keeps sub-um precision.
+        ox0, oy0 = gx0 * cell, gy0 * cell
+        jx = _int_hash(self._tx, self._ty, seed) - 0.5
+        jy = _int_hash(self._tx, self._ty, seed + 1) - 0.5
+        px = ((self._tx - gx0 + 0.5 + jitter * jx) * cell).astype(np.float32).ravel()
+        py = ((self._ty - gy0 + 0.5 + jitter * jy) * cell).astype(np.float32).ravel()
+        lx = (x - ox0).astype(np.float32)
+        ly = (y - oy0).astype(np.float32)
+        if stretch is not None:
+            cos_a = np.cos(stretch[0]).astype(np.float32)
+            sin_a = np.sin(stretch[0]).astype(np.float32)
+            ratio = np.float32(stretch[1])
+        base = (gy - gy0) * nx + (gx - gx0)
+        d1sq = np.full(x.shape, np.inf, dtype=np.float32)
+        d2sq = np.full(x.shape, np.inf, dtype=np.float32) if second else None
+        for oy in (-1, 0, 1):
+            for ox in (-1, 0, 1):
+                k = base + (oy * nx + ox)
+                dx = lx - np.take(px, k)
+                dy = ly - np.take(py, k)
+                if stretch is None:
+                    dsq = dx * dx + dy * dy
+                else:
+                    u = (dx * cos_a + dy * sin_a) / ratio
+                    v = (dy * cos_a - dx * sin_a) * ratio
+                    dsq = u * u + v * v
+                closer = dsq < d1sq
+                if second:
+                    np.minimum(d2sq, np.where(closer, d1sq, dsq), out=d2sq)
+                np.copyto(d1sq, dsq, where=closer)
+                np.copyto(self._k, k, where=closer)
+                if offsets:
+                    np.copyto(self.dx, dx, where=closer)
+                    np.copyto(self.dy, dy, where=closer)
+        self.d1 = np.sqrt(d1sq)
+        if second:
+            self.d2 = np.sqrt(d2sq)
+
+    def attr(self, seed: int) -> np.ndarray:
+        return np.take(_int_hash(self._tx, self._ty, seed).ravel().astype(np.float32), self._k)
+
+
+def _disc(d: np.ndarray, radius, soft: float = 0.6) -> np.ndarray:
+    """1 inside ``radius``, 0 outside, with a ``soft`` um edge."""
+    return 1.0 - _smoothstep(radius - soft, radius + soft, d)
+
+
+#: H&E colours of what the section is made of, RGB 0-255 as the colour camera sees it.
+_GLASS = np.array([243.0, 241.0, 246.0])
+_LOOSE_STROMA = np.array([232.0, 180.0, 207.0])
+_COLLAGEN = np.array([214.0, 122.0, 168.0])
+_CYTOPLASM = np.array([206.0, 152.0, 198.0])
+_SECRETION = np.array([234.0, 178.0, 206.0])
+_PLASMA = np.array([238.0, 206.0, 220.0])
+_MUSCLE = np.array([216.0, 112.0, 156.0])
+_RED_CELL = np.array([204.0, 50.0, 66.0])
+_MEMBRANE = np.array([224.0, 156.0, 192.0])
+_NUCLEUS = np.array([82.0, 48.0, 126.0])
+_LYMPHOCYTE = np.array([60.0, 34.0, 104.0])
 
 
 @dataclass
@@ -138,6 +288,16 @@ class VirtualSlide:
 
     The slide covers ``[-half_x, half_x] x [-half_y, half_y]`` micrometres with
     the stage origin at its centre; beyond that the camera sees bare glass.
+
+    The section is built like real tissue, so that every field looks different
+    and a field's neighbours can be told apart: islands of tissue a few
+    millimetres across, each a patchwork of regions (fibrous stroma, glandular
+    epithelium, fat, round lymphoid follicles); wavy collagen fibres whose
+    direction drifts across the section, with spindle-shaped nuclei lying along
+    them; oval glands of different sizes with a lumen and a ring of columnar
+    nuclei; and winding blood vessels, packed with red cells, that run for
+    millimetres. Every feature is placed by a hash of where it is, so the same
+    stage position always shows the same thing.
     """
 
     seed: float = 7.0
@@ -171,40 +331,295 @@ class VirtualSlide:
 
     def _tissue_mask(self, x: np.ndarray, y: np.ndarray) -> np.ndarray:
         islands = _fractal_noise(x, y, 2500.0, self.seed, 3)
-        mask = _smoothstep(0.47, 0.56, islands)
+        # A crisp, slightly ragged edge, as a cut section has.
+        ragged = _fractal_noise(x, y, 120.0, self.seed + 9.0, 2) - 0.5
+        mask = _smoothstep(0.5095, 0.5125, islands + 0.012 * ragged)
         on_slide = (np.abs(x) < self.half_x_um) & (np.abs(y) < self.half_y_um)
         return mask * on_slide
 
-    def _grid(
+    def _axes(
         self, x_um: float, y_um: float, width_px: int, height_px: int, pixel_size_um: float
     ) -> Tuple[np.ndarray, np.ndarray]:
-        """Stage coordinates of every pixel of a field centred on (x, y)."""
+        """Stage X of every column and Y of every row of a field centred on (x, y)."""
         cols = (np.arange(width_px, dtype=np.float64) - width_px / 2.0 + 0.5) * pixel_size_um
         rows = (np.arange(height_px, dtype=np.float64) - height_px / 2.0 + 0.5) * pixel_size_um
-        return np.meshgrid(x_um + cols, y_um + rows)
+        return x_um + cols, y_um + rows
 
-    def _structure(self, wx: np.ndarray, wy: np.ndarray) -> Dict[str, np.ndarray]:
-        """Tissue, stroma texture and nuclei: what every rendering is made of."""
-        tissue = self._tissue_mask(wx, wy)
-        stroma = _fractal_noise(wx, wy, 60.0, self.seed + 101.0, 3)
-        nuclei_field = _fractal_noise(wx, wy, 9.0, self.seed + 202.0, 2)
-        nuclei = _smoothstep(0.70, 0.76, nuclei_field) * _smoothstep(0.2, 0.5, tissue)
-        return {"tissue": tissue, "stroma": stroma, "nuclei": nuclei}
+    def _layer_seed(self, k: int) -> int:
+        return int(self.seed * 1000.0) + 101 * k
+
+    def _slow_fields(self, x: np.ndarray, y: np.ndarray) -> Dict[str, np.ndarray]:
+        """Everything that varies over tens of micrometres or more.
+
+        ``psi`` is the collagen "stream function": fibres run along its contour
+        lines, so they curve, bunch and fan out without ever crossing, and the
+        fibre direction is known exactly (for the birefringence). Vessels run
+        along one contour of ``vessel``; ``psi_x`` etc. are gradients, in 1/um.
+        """
+        s = self._layer_seed
+        f: Dict[str, np.ndarray] = {}
+        f["tissue"] = self._tissue_mask(x, y)
+        f["zone_gland"] = _fractal_noise(x, y, 1600.0, s(1), 3)
+        f["zone_fat"] = _fractal_noise(x, y, 1300.0, s(2), 3)
+        follicles = _Cells(x, y, 1400.0, s(3), jitter=0.5)
+        radius = 140.0 + 200.0 * follicles.attr(s(4))
+        f["follicle"] = _disc(follicles.d1, radius, 25.0) * (follicles.attr(s(5)) < 0.2)
+        e = 0.5
+        for name, cell, k, octaves in (
+            ("psi", 700.0, 6, 3),
+            ("vessel", 1500.0, 7, 3),
+            ("capillary", 320.0, 8, 2),
+        ):
+            v = _fractal_noise(x, y, cell, s(k), octaves, quintic=True)
+            f[name] = v
+            f[name + "_x"] = (_fractal_noise(x + e, y, cell, s(k), octaves, True) - v) / e
+            f[name + "_y"] = (_fractal_noise(x, y + e, cell, s(k), octaves, True) - v) / e
+        f["bundles"] = _fractal_noise(x, y, 150.0, s(9), 2)
+        f["vessel_width"] = _value_noise(x, y, 900.0, s(10))
+        f["capillary_on"] = _value_noise(x, y, 260.0, s(11))
+        f["crimp"] = _value_noise(x, y, 120.0, s(12))
+        f["warp_x"] = _fractal_noise(x, y, 60.0, s(13), 2) - 0.5
+        f["warp_y"] = _fractal_noise(x, y, 60.0, s(14), 2) - 0.5
+        f["blood"] = _value_noise(x, y, 80.0, s(15))
+        f["grain"] = _fractal_noise(x, y, 14.0, s(16), 2)
+        return f
+
+    def _glands(self, xs: np.ndarray, ys: np.ndarray, zone_gland) -> Dict[str, np.ndarray]:
+        """Glands: an oval of epithelium around a lumen, columnar nuclei at its base.
+
+        One candidate per 210 um square, kept with a probability that rises with
+        the glandular region's strength at its centre (so a gland is never cut
+        by a region boundary), and drawn only inside its own bounding box.
+        Shape, size, turn, lobes, lumen and secretion come from the square's
+        hash, so each gland is recognisable when it comes back into view.
+        """
+        s = self._layer_seed
+        shape = (len(ys), len(xs))
+        out = {
+            k: np.zeros(shape, dtype=np.float32) for k in ("gland", "lumen", "nuclei", "secretion")
+        }
+        cell, reach = 210.0, 75.0
+        gx = np.arange(math.floor((xs[0] - reach) / cell), math.floor((xs[-1] + reach) / cell) + 1)
+        gy = np.arange(math.floor((ys[0] - reach) / cell), math.floor((ys[-1] + reach) / cell) + 1)
+        tx, ty = np.meshgrid(gx, gy)
+        tx, ty = tx.ravel(), ty.ravel()
+        cx = (tx + 0.5 + 0.3 * (_int_hash(tx, ty, s(23)) - 0.5)) * cell
+        cy = (ty + 0.5 + 0.3 * (_int_hash(tx, ty, s(23) + 1) - 0.5)) * cell
+        zone = _smoothstep(0.50, 0.56, zone_gland(cx, cy))
+        keep = _int_hash(tx, ty, s(24)) < 0.06 + 0.8 * zone
+        rand = [_int_hash(tx, ty, s(25 + i)) for i in range(7)]
+        for i in np.flatnonzero(keep):
+            a = 26.0 + 30.0 * rand[0][i]
+            b = a * (0.5 + 0.45 * rand[1][i])
+            turn = math.pi * rand[2][i]
+            c0 = np.searchsorted(xs, cx[i] - 1.25 * a)
+            c1 = np.searchsorted(xs, cx[i] + 1.25 * a)
+            r0 = np.searchsorted(ys, cy[i] - 1.25 * a)
+            r1 = np.searchsorted(ys, cy[i] + 1.25 * a)
+            if c0 >= c1 or r0 >= r1:
+                continue
+            dx, dy = np.meshgrid(xs[c0:c1] - cx[i], ys[r0:r1] - cy[i])
+            u = dx * math.cos(turn) + dy * math.sin(turn)
+            v = dy * math.cos(turn) - dx * math.sin(turn)
+            phi = np.arctan2(v / b, u / a)
+            wobble = (
+                1.0
+                + 0.11 * np.sin(3.0 * phi + 6.283 * rand[3][i])
+                + 0.07 * np.sin(5.0 * phi + 6.283 * rand[4][i])
+            )
+            rho = np.hypot(u / a, v / b) / wobble
+            lumen_r = 0.42 + 0.22 * rand[5][i]
+            gland = _disc(rho, 1.0, 0.03)
+            lumen = _disc(rho, lumen_r, 0.03)
+            n_cells = max(10.0, round(math.pi * (a + b) / 5.5))
+            columns = _smoothstep(0.45, 0.8, 0.5 + 0.5 * np.cos(n_cells * phi))
+            band = _smoothstep(lumen_r + 0.12, lumen_r + 0.2, rho) * _disc(rho, 0.9, 0.04)
+            win = (slice(r0, r1), slice(c0, c1))
+            np.maximum(out["gland"][win], gland, out=out["gland"][win])
+            np.maximum(out["lumen"][win], lumen, out=out["lumen"][win])
+            np.maximum(out["nuclei"][win], columns * band * gland, out=out["nuclei"][win])
+            if rand[6][i] < 0.3:
+                np.maximum(out["secretion"][win], lumen, out=out["secretion"][win])
+        return out
+
+    def _structure(self, xs: np.ndarray, ys: np.ndarray) -> Dict[str, np.ndarray]:
+        """What every rendering is made of, per pixel of the grid ``xs`` x ``ys``.
+
+        Each map is 0 to 1: ``tissue``; the H&E parts (``collagen``, ``loose``
+        stroma, gland ``cytoplasm``, ``lumen``, ``secretion``, vessel ``plasma``
+        and ``muscle``, ``red_cells``, fat ``membrane`` and cell interior ``fat``, ``nuclei`` and
+        ``lymphocytes``); ``eosin`` (stain density); ``fibre_angle`` (radians,
+        the direction of the collagen or muscle fibres at each pixel).
+        """
+        s = self._layer_seed
+        px = abs(xs[1] - xs[0]) if len(xs) > 1 else (abs(ys[1] - ys[0]) if len(ys) > 1 else 1.0)
+        # The slow fields on a coarse grid (no coarser than 4 um), interpolated.
+        step = int(min(8, max(1, 4.0 / px)))
+        ci, cj, ct = _coarse_axis(len(xs), step)
+        ri, rj, rt = _coarse_axis(len(ys), step)
+        cx, cy = np.meshgrid(xs[ci], ys[ri])
+        slow = self._slow_fields(cx, cy)
+        stacked = _upsample(np.stack(list(slow.values())).astype(np.float32), (cj, ct), (rj, rt))
+        f = dict(zip(slow.keys(), stacked))
+        x, y = np.meshgrid(xs, ys)
+        tissue = np.clip(f["tissue"], 0.0, 1.0)
+
+        # Regions: follicles sit in the stroma; fat and glands take turns.
+        follicle = np.clip(f["follicle"], 0.0, 1.0)
+        gland_zone = _smoothstep(0.50, 0.56, f["zone_gland"]) * (1.0 - follicle)
+        fat_edge = f["zone_fat"] + 0.02 * f["warp_x"]
+        # Fat lobules have a sharp edge; glandular regions win where both apply.
+        fat_zone = (
+            _smoothstep(0.619, 0.621, fat_edge)
+            * (1.0 - _smoothstep(0.525, 0.535, f["zone_gland"]))
+            * (1.0 - follicle)
+        )
+
+        # Collagen: dashes along the contours of psi, typically 5 to 13 um apart, gently
+        # crimped. Where psi is nearly flat the direction is undefined (a whorl's
+        # centre), so the fibres fade out there instead of fanning into a star.
+        g = np.hypot(f["psi_x"], f["psi_y"]) + np.float32(1e-9)
+        fibre_angle = np.arctan2(f["psi_y"], f["psi_x"]) + np.float32(0.5 * np.pi)
+        along = (x * np.cos(fibre_angle) + y * np.sin(fibre_angle)).astype(np.float32)
+        phase = f["psi"] * 195.0 + 0.08 * np.sin(along / 7.0 + 6.283 * f["crimp"])
+        fibre_id = np.floor(phase)
+        dash = _int_hash(fibre_id, np.floor(along / 30.0), s(20))
+        width = 0.16 + 0.12 * _int_hash(fibre_id, np.zeros_like(fibre_id), s(19))
+        profile = 1.0 - _smoothstep(width - 0.08, width + 0.06, np.abs(phase - fibre_id - 0.5))
+        spacing_px = 1.0 / (195.0 * g * px)
+        resolved = _smoothstep(2.5, 4.0, spacing_px)  # finer than that shows as its mean
+        bundle = _smoothstep(0.26, 0.46, f["bundles"]) * _smoothstep(2.5e-4, 5e-4, g)
+        collagen = bundle * (resolved * profile * (dash < 0.75) + (1.0 - resolved) * 0.3)
+
+        # Vessels: a contour of a slow field, 6 to 22 um across; capillaries.
+        vg = np.maximum(np.hypot(f["vessel_x"], f["vessel_y"]), 2e-4)
+        vdist = np.abs(f["vessel"] - 0.5) / vg
+        vradius = 3.0 + 8.0 * f["vessel_width"]
+        lumen_v = _disc(vdist, vradius)
+        wall_v = np.clip(_disc(vdist, vradius + 2.0 + 0.4 * vradius) - lumen_v, 0.0, 1.0)
+        cg = np.maximum(np.hypot(f["capillary_x"], f["capillary_y"]), 8e-4)
+        capillary = _disc(np.abs(f["capillary"] - 0.5) / cg, 2.5) * _smoothstep(
+            0.55, 0.62, f["capillary_on"]
+        )
+        vessel_lumen = np.maximum(lumen_v, capillary)
+        vessel_angle = np.arctan2(f["vessel_y"], f["vessel_x"]) + np.float32(0.5 * np.pi)
+        red_cells = np.zeros_like(tissue)
+        red_centre = np.zeros_like(tissue)
+        m = vessel_lumen > 0.01
+        if m.any():
+            red = _Cells(x[m], y[m], 6.0, s(21), jitter=0.8)
+            red_cells[m] = (
+                _disc(red.d1, 2.8, 0.5)
+                * (red.attr(s(22)) < 0.55 + 0.4 * f["blood"][m])
+                * vessel_lumen[m]
+            )
+            red_centre[m] = _disc(red.d1, 1.1, 0.6) * red_cells[m]
+
+        gl = self._glands(xs, ys, lambda gx, gy: _fractal_noise(gx, gy, 1600.0, s(1), 3))
+        gland, gland_lumen = gl["gland"], gl["lumen"]
+
+        # Fat: polygonal cells tens of um across, thin pink membranes.
+        membrane = np.zeros_like(tissue)
+        m = fat_zone > 0.01
+        if m.any():
+            fat = _Cells(
+                x[m] + 10.0 * f["warp_x"][m],
+                y[m] + 10.0 * f["warp_y"][m],
+                65.0,
+                s(32),
+                jitter=0.85,
+                second=True,
+            )
+            membrane[m] = (1.0 - _smoothstep(0.7, 1.8, fat.d2 - fat.d1)) * fat_zone[m]
+        fat_space = fat_zone - membrane
+
+        # Nuclei: spindles along the fibres in stroma (and along vessel walls).
+        in_wall = _smoothstep(0.2, 0.5, wall_v)
+        fibre_angle = np.where(in_wall > 0.5, vessel_angle, fibre_angle)
+        stroma_share = (1.0 - gland) * (1.0 - vessel_lumen) * (1.0 - fat_zone)
+        spindle_nuclei = np.zeros_like(tissue)
+        m = stroma_share * tissue > 0.01
+        if m.any():
+            sp = _Cells(x[m], y[m], 14.0, s(33), jitter=0.9, stretch=(fibre_angle[m], 2.0))
+            keep = 0.12 + 0.25 * gland_zone[m] + 0.12 * follicle[m] + 0.5 * in_wall[m]
+            spindle_nuclei[m] = _disc(sp.d1, 2.2, 0.4) * (sp.attr(s(34)) < keep) * stroma_share[m]
+        lymphocytes = np.zeros_like(tissue)
+        m = follicle * tissue > 0.01
+        if m.any():
+            ly = _Cells(x[m], y[m], 7.0, s(35), jitter=0.75)
+            lymphocytes[m] = (
+                _disc(ly.d1, 2.4, 0.4)
+                * (ly.attr(s(36)) < 0.9 * follicle[m])
+                * (1.0 - vessel_lumen[m])
+            )
+
+        parts = {
+            "tissue": tissue,
+            "collagen": collagen * stroma_share * tissue,
+            "loose": stroma_share * (1.0 - collagen) * tissue,
+            # Uneven, granular staining: some of the loose stroma takes up more eosin.
+            "mottle": stroma_share
+            * (1.0 - collagen)
+            * tissue
+            * np.clip(
+                0.7 * f["grain"] - 0.12 + 0.25 * _smoothstep(0.3, 0.8, f["bundles"]), 0.0, 0.6
+            ),
+            "cytoplasm": (gland - gland_lumen) * tissue,
+            "lumen": gland_lumen * tissue,
+            "secretion": gl["secretion"] * tissue,
+            "plasma": vessel_lumen * (1.0 - gland) * tissue,
+            "muscle": wall_v * (1.0 - gland) * (1.0 - fat_space) * tissue,
+            "red_cells": red_cells * (1.0 - gland) * tissue,
+            "red_centre": red_centre * (1.0 - gland) * tissue,
+            "membrane": membrane * tissue,
+            "fat": fat_space * tissue,
+            "nuclei": np.maximum(spindle_nuclei, gl["nuclei"]) * tissue,
+            "lymphocytes": lymphocytes * (1.0 - gland) * tissue,
+            "fibre_angle": fibre_angle % np.float32(np.pi),
+        }
+        parts["eosin"] = np.clip(
+            0.35 * parts["loose"]
+            + 1.0 * parts["collagen"]
+            + 0.5 * parts["cytoplasm"]
+            + 0.4 * parts["secretion"]
+            + 0.25 * parts["plasma"]
+            + 0.85 * parts["muscle"]
+            + 1.0 * parts["red_cells"]
+            + 0.6 * parts["membrane"],
+            0.0,
+            1.0,
+        )
+        return parts
 
     @staticmethod
     def _colour(parts: Dict[str, np.ndarray]) -> np.ndarray:
         """The H&E colour of a field, glass at about 243 of 255, as float RGB."""
-        tissue, stroma, nuclei = parts["tissue"], parts["stroma"], parts["nuclei"]
-        glass = np.array([243.0, 241.0, 246.0])
-        eosin = np.array([226.0, 150.0, 182.0])
-        eosin_dark = np.array([196.0, 110.0, 150.0])
-        hematoxylin = np.array([88.0, 52.0, 128.0])
-        pink = (
-            eosin[None, None, :] * (1.0 - stroma[..., None])
-            + eosin_dark[None, None, :] * stroma[..., None]
-        )
-        img = glass[None, None, :] * (1.0 - tissue[..., None]) + pink * tissue[..., None]
-        return img * (1.0 - nuclei[..., None]) + hematoxylin[None, None, :] * nuclei[..., None]
+        img = np.empty(parts["tissue"].shape + (3,), dtype=np.float32)
+        img[...] = _GLASS
+
+        def paint(weight: np.ndarray, colour: np.ndarray) -> None:
+            # img = img * (1 - w) + colour * w, one channel at a time, in place.
+            for c in range(3):
+                ch = img[..., c]
+                ch += (np.float32(colour[c]) - ch) * weight
+
+        for name, colour in (
+            ("loose", _LOOSE_STROMA),
+            ("mottle", _COLLAGEN),
+            ("collagen", _COLLAGEN),
+            ("cytoplasm", _CYTOPLASM),
+            ("secretion", _SECRETION),
+            ("plasma", _PLASMA),
+            ("muscle", _MUSCLE),
+            ("membrane", _MEMBRANE),
+            ("red_cells", _RED_CELL),
+        ):
+            paint(parts[name], colour)
+        # Red cells are biconcave: paler in the middle.
+        paint(0.35 * parts["red_centre"], _PLASMA)
+        paint(parts["nuclei"], _NUCLEUS)
+        paint(parts["lymphocytes"], _LYMPHOCYTE)
+        return img
 
     def defocus_sigma_px(
         self, x_um: float, y_um: float, z_um: float, pixel_size_um: float
@@ -240,8 +655,8 @@ class VirtualSlide:
         rng: np.random.Generator,
     ) -> np.ndarray:
         """Render the field centred on (x, y) at focus z as an RGB uint8 image."""
-        wx, wy = self._grid(x_um, y_um, width_px, height_px, pixel_size_um)
-        img = self._colour(self._structure(wx, wy))
+        xs, ys = self._axes(x_um, y_um, width_px, height_px, pixel_size_um)
+        img = self._colour(self._structure(xs, ys))
         img = self._blur(img, self.defocus_sigma_px(x_um, y_um, z_um, pixel_size_um))
 
         if lamp_on:
@@ -261,37 +676,42 @@ class VirtualSlide:
 
         ``transmittance`` is the H&E section's transmission at 549 nm (the green
         channel, glass = 1). ``retardance_nm`` and ``orientation_rad`` are the
-        birefringence: fibrous stroma at 3 to 18 nm with a slow-axis orientation
-        that wanders over a few hundred micrometres, isotropic nuclei and glass.
-        ``fl385`` ... ``fl621`` are fluorophore densities (0 to 1) excited by
-        each LED line: nuclei (a DAPI stand-in), weak autofluorescence, eosin
-        (which really does fluoresce in a TRITC set) and sparse puncta in a
-        subset of the tissue (a Cy5 marker stand-in).
+        birefringence: collagen fibres at up to 18 nm with the slow axis along
+        each fibre, vessel walls (smooth muscle) at about 6 nm along the vessel,
+        loose stroma and fat membranes at 1 to 2 nm, isotropic nuclei, lumens and
+        glass. ``fl385`` ... ``fl621`` are fluorophore densities (0 to 1) excited
+        by each LED line: nuclei (a DAPI stand-in), weak autofluorescence, eosin
+        (which really does fluoresce in a TRITC set, brightest in collagen and
+        red cells) and sparse puncta in a subset of the tissue (a Cy5 marker
+        stand-in).
         """
-        wx, wy = self._grid(x_um, y_um, width_px, height_px, pixel_size_um)
-        parts = self._structure(wx, wy)
-        tissue, stroma, nuclei = parts["tissue"], parts["stroma"], parts["nuclei"]
+        xs, ys = self._axes(x_um, y_um, width_px, height_px, pixel_size_um)
+        parts = self._structure(xs, ys)
+        tissue, eosin = parts["tissue"], parts["eosin"]
+        nuclei = np.maximum(parts["nuclei"], parts["lymphocytes"])
+        # Tissue that has cells in it: not a lumen, a vessel or a fat cell's interior.
+        cellular = np.clip(tissue - parts["lumen"] - parts["plasma"] - parts["fat"], 0.0, 1.0)
 
         transmittance = self._colour(parts)[..., 1] / 241.0
+        retardance_nm = (
+            2.0 * parts["loose"]
+            + 18.0 * parts["collagen"]
+            + 6.0 * parts["muscle"]
+            + 1.5 * parts["membrane"]
+        ) * (1.0 - nuclei)
 
-        fibres = _fractal_noise(wx, wy, 25.0, self.seed + 303.0, 3)
-        retardance_nm = tissue * (1.0 - nuclei) * (3.0 + 15.0 * _smoothstep(0.40, 0.70, fibres))
-        orientation_rad = (
-            2.0 * np.pi * _fractal_noise(wx, wy, 400.0, self.seed + 404.0, 2)
-        ) % np.pi
-
-        puncta = _smoothstep(0.68, 0.76, _fractal_noise(wx, wy, 12.0, self.seed + 505.0, 2))
-        positive_region = _smoothstep(
-            0.40, 0.55, _fractal_noise(wx, wy, 900.0, self.seed + 1111.0, 2)
-        )
+        x, y = np.meshgrid(xs, ys)
+        dots = _Cells(x, y, 9.0, self._layer_seed(40), jitter=0.9)
+        puncta = _disc(dots.d1, 1.3, 0.5) * (dots.attr(self._layer_seed(41)) < 0.5)
+        positive_region = _smoothstep(0.40, 0.55, _value_noise(x, y, 900.0, self.seed + 1111.0))
         return {
             "transmittance": transmittance,
             "retardance_nm": retardance_nm,
-            "orientation_rad": orientation_rad,
+            "orientation_rad": parts["fibre_angle"],
             "fl385": nuclei,
-            "fl475": 0.12 * tissue * (0.6 + 0.4 * stroma),
-            "fl550": tissue * (1.0 - nuclei) * (0.35 + 0.65 * stroma),
-            "fl621": tissue * puncta * positive_region,
+            "fl475": 0.12 * cellular * (0.6 + 0.4 * eosin),
+            "fl550": (1.0 - nuclei) * (0.1 * tissue + 0.9 * eosin),
+            "fl621": cellular * puncta * positive_region * (1.0 - nuclei),
         }
 
 
