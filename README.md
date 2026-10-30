@@ -641,6 +641,15 @@ exposure that puts the brightest swing state's 99.9th percentile at the target, 
 Viewer Camera tab uses it to choose the one exposure all states share. Implementation:
 `calibration/lc_state_signal.py`.
 
+## Flat-field fit (FLATFIT)
+
+Fits a BaSiC flat-field profile from a folder of tiles and saves it, for detectors with no background
+image such as a PMT. The payload is JSON, because a folder path can hold spaces:
+`{"tiles": <folder>, "profile": <folder>, "channel": <int|null>, "offset": <float|null>, "label": <text>}`.
+The reply is `SUCCESS:<json>` with `flatfield_min`, `flatfield_max`, `offset`, `images_used` and
+`images_read`, or `FAILED:<reason>`. It reads files only and needs no hardware. The fit is
+`microscope_imageprocessing.correction.flatfield`, so that package must be from 2026-10-30 or later.
+
 ## Micro-Manager preset (MMPRESET)
 
 Request and reply are a 4-byte big-endian length plus UTF-8 JSON. `{"action": "get", "group",
