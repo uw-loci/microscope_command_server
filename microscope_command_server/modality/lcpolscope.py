@@ -27,7 +27,10 @@ Two invariants this modality does NOT enforce alone
    with ``polscope-scheme-check`` before trusting any orientation output.
 """
 
+import json
 import logging
+import shutil
+from pathlib import Path
 
 import numpy as np
 
@@ -595,10 +598,54 @@ LC_DEVICE = "MeadowlarkLC"
 #: calibration -- so the acquisition reads this and refuses a mismatch.
 BACKGROUND_PROVENANCE_FILE = "background_provenance.json"
 
+#: Subfolder of an acquisition folder that tile cleanup and Make Project Portable leave alone.
+#: QPSC reads the same name: TileProcessingUtilities.PROTECTED_FOLDER.
+PROTECTED_FOLDER = "_protected"
+
 #: Frames averaged per state when collecting a background. A single frame's
 #: shot noise is copied into every tile the background corrects; averaging N
 #: frames cuts it by sqrt(N).
 DEFAULT_BACKGROUND_FRAMES = 10
+
+
+def preserve_run_record(output_path, recon, background_provenance, log):
+    """Copy the background and LC calibration a run used into its acquisition folder.
+
+    A background folder is overwritten by the next collection, so a path to it says nothing a
+    week later. Returns the block for acquisition_metadata.json. Never raises: a failed copy is
+    logged and listed under ``copy_failed``, because it must not stop an acquisition.
+    """
+    root = Path(output_path) / PROTECTED_FOLDER
+    sources = []
+    folder = (background_provenance or {}).get("folder")
+    if folder and Path(folder).is_dir():
+        sources += [("background", f) for f in sorted(Path(folder).iterdir()) if f.is_file()]
+    calibration = recon.get("lc_calibration_file")
+    if calibration and Path(calibration).is_file():
+        sources.append(("calibration", Path(calibration)))
+
+    copied, failed = [], []
+    for subfolder, source in sources:
+        target = root / subfolder / source.name
+        try:
+            target.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(source, target)
+            copied.append(target.relative_to(output_path).as_posix())
+        except OSError as exc:
+            log.warning("Could not keep a copy of %s with the run: %s", source, exc)
+            failed.append(str(source))
+    log.info("Kept %d background and calibration file(s) in %s", len(copied), root)
+
+    record = {
+        "reconstruction": json.loads(json.dumps(recon, default=str)),
+        "background": dict(background_provenance or {}),
+        "kept_copies": copied,
+    }
+    if calibration and not Path(calibration).is_file():
+        failed.append(str(calibration))
+    if failed:
+        record["copy_failed"] = failed
+    return record
 
 
 def state_plan_problems(channel_ids, channel_exposures, library_ids, tolerance_ms=0.01):

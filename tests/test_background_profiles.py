@@ -2,7 +2,9 @@
 derives a folder itself, and says in acquisition_metadata.json what was actually applied."""
 
 import json
+import logging
 import struct
+from pathlib import Path
 
 import numpy as np
 import tifffile
@@ -128,3 +130,73 @@ def test_a_path_with_spaces_survives_the_flag_reader():
     conn = FakeConn(("--bg-folder C:/My Data/bg --bg-method divide" + END_MARKER).encode())
     params = live._read_flag_message(conn, ("--bg-folder", "--bg-method"))
     assert params == {"--bg-folder": "C:/My Data/bg", "--bg-method": "divide"}
+
+
+def _bg_and_calibration(tmp_path):
+    bg = tmp_path / "bg"
+    bg.mkdir()
+    for name in ("State0.tif", "State1.tif", "background_provenance.json"):
+        (bg / name).write_text(name)
+    cal = tmp_path / "lc_calibration_20261029_172203.json"
+    cal.write_text("{}")
+    recon = {"method": "openpolscope", "swing_waves": 0.05, "lc_calibration_file": str(cal)}
+    return bg, recon
+
+
+def test_a_run_keeps_its_background_and_calibration_in_its_own_folder(tmp_path):
+    from microscope_command_server.modality.lcpolscope import preserve_run_record
+
+    bg, recon = _bg_and_calibration(tmp_path)
+    run = tmp_path / "run"
+    run.mkdir()
+    record = preserve_run_record(
+        run, recon, {"folder": str(bg), "collected_at": "2026-10-29T17:23:20"}, logging.getLogger()
+    )
+
+    (bg / "State0.tif").write_text("the next collection")
+    assert (run / "_protected/background/State0.tif").read_text() == "State0.tif"
+    assert (run / "_protected/calibration" / Path(recon["lc_calibration_file"]).name).is_file()
+    assert "_protected/background/State1.tif" in record["kept_copies"]
+    assert record["background"]["collected_at"] == "2026-10-29T17:23:20"
+    assert record["reconstruction"]["swing_waves"] == 0.05
+    assert "copy_failed" not in record
+
+
+def test_a_failed_copy_is_reported_and_does_not_raise(tmp_path, monkeypatch):
+    from microscope_command_server.modality import lcpolscope
+
+    bg, recon = _bg_and_calibration(tmp_path)
+    run = tmp_path / "run"
+    run.mkdir()
+
+    def disk_full(*_args, **_kwargs):
+        raise OSError("disk full")
+
+    monkeypatch.setattr(lcpolscope.shutil, "copy2", disk_full)
+    record = lcpolscope.preserve_run_record(run, recon, {"folder": str(bg)}, logging.getLogger())
+    assert record["kept_copies"] == []
+    assert len(record["copy_failed"]) == 4
+
+
+def test_a_calibration_that_is_gone_is_reported(tmp_path):
+    from microscope_command_server.modality.lcpolscope import preserve_run_record
+
+    recon = {"lc_calibration_file": str(tmp_path / "moved.json")}
+    record = preserve_run_record(tmp_path, recon, {}, logging.getLogger())
+    assert record["copy_failed"] == [recon["lc_calibration_file"]]
+
+
+def test_metadata_carries_the_polscope_record_only_when_there_is_one(tmp_path):
+    workflow_mod.write_acquisition_metadata(
+        output_path=tmp_path,
+        params={"polscope_record": {"kept_copies": ["_protected/background/State0.tif"]}},
+        tile_measurements=[],
+        sat_monitor=None,
+    )
+    meta = json.loads((tmp_path / "acquisition_metadata.json").read_text())
+    assert meta["polscope"]["kept_copies"] == ["_protected/background/State0.tif"]
+
+    workflow_mod.write_acquisition_metadata(
+        output_path=tmp_path, params={"polscope_record": {}}, tile_measurements=[], sat_monitor=None
+    )
+    assert "polscope" not in json.loads((tmp_path / "acquisition_metadata.json").read_text())

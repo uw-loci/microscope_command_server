@@ -1596,6 +1596,8 @@ def write_acquisition_metadata(
             "saturation": sat_section,
             "software_versions": versions,
         }
+        if params.get("polscope_record"):
+            metadata["polscope"] = params["polscope_record"]
 
         # Strip None values for cleaner output
         def strip_none(d):
@@ -3946,6 +3948,11 @@ def _prepare_acquisition(
     if not output_path.exists():
         output_path.mkdir(parents=True, exist_ok=True)
         logger.info(f"Created output directory: {output_path}")
+
+    # Before the first tile, so a canceled run keeps the record too.
+    params["polscope_record"] = _preserve_lcpolscope_record(
+        modality, output_path, ppm_settings, lcps_background_provenance, logger
+    )
 
     # Read tile positions
     tile_config_path = output_path / "TileConfiguration.txt"
@@ -7335,6 +7342,25 @@ def _check_lcpolscope_background(
         provenance.get("frames", "?"),
     )
     return provenance
+
+
+def _preserve_lcpolscope_record(modality, output_path, settings, provenance, logger):
+    """LC-PolScope only: keep the run's background and calibration with its tiles."""
+    from microscope_command_server.modality.lcpolscope import (
+        LCPOLSCOPE_CONFIG,
+        preserve_run_record,
+    )
+
+    try:
+        if get_modality_config(modality) is not LCPOLSCOPE_CONFIG:
+            return {}
+        recon = (((settings or {}).get("modalities", {}) or {}).get("lcpolscope", {}) or {}).get(
+            "reconstruction"
+        ) or {}
+        return preserve_run_record(output_path, recon, provenance, logger)
+    except Exception as exc:
+        logger.warning("LC-PolScope run record not kept (non-fatal): %s", exc)
+        return {}
 
 
 def _uses_stokes_background(ctx) -> bool:
