@@ -962,6 +962,14 @@ acquisition paths skip for this modality.
 - Derived tiles record `polscope.background_corrected` and, when corrected,
   `polscope.background_collected_at`, `polscope.background_lc_calibrated_at`,
   `polscope.background_frames` and `polscope.background_folder`.
+- **The run keeps its own copy** of the background and the LC calibration file it used, so the
+  acquisition folder stays reconstructable after the background folder is overwritten by the next
+  collection. The copies go to `_protected/background/` and `_protected/calibration/` inside the
+  acquisition folder (tile cleanup and Make Project Portable leave `_protected/` alone). The
+  `polscope` block of `acquisition_metadata.json` records the reconstruction settings, the
+  background provenance and the kept paths (`kept_copies`). A copy that fails is listed under
+  `copy_failed` and logged as a WARNING; it does not stop the acquisition. The record is written
+  before the first tile, so a canceled run keeps it too.
 
 #### Estimated background (opt-in, per tile)
 
