@@ -968,8 +968,10 @@ acquisition paths skip for this modality.
   acquisition folder (tile cleanup and Make Project Portable leave `_protected/` alone). The
   `polscope` block of `acquisition_metadata.json` records the reconstruction settings, the
   background provenance and the kept paths (`kept_copies`). A copy that fails is listed under
-  `copy_failed` and logged as a WARNING; it does not stop the acquisition. The record is written
-  before the first tile, so a canceled run keeps it too.
+  `copy_failed` and logged as a WARNING; it does not stop the acquisition. The copies are made
+  before the first tile, so a canceled run keeps them too. The `polscope` block is written with the
+  rest of `acquisition_metadata.json` at the end of a run, so a canceled run has the copies but no
+  metadata file.
 
 #### Estimated background (opt-in, per tile)
 
