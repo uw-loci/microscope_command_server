@@ -67,7 +67,8 @@ class ExtendedCommand:
     TLAPSE = b"tlapse__"  # Time-lapse acquisition at current position (repeat over time)
     SIFTAL = b"siftal__"  # SIFT auto-alignment: snap + match against WSI region file
     SIFTIM = b"siftim__"  # SIFT image-vs-image: match two on-disk image files (no camera snap)
-    FLATFIT = b"flatfit_"  # Fit a BaSiC flat-field profile from a folder of tiles
+    FLATFIT = b"flatfit_"  # Start fitting a BaSiC flat-field profile from a folder of tiles
+    FLATPOLL = b"flatpoll"  # How the flat-field fit is going
 
     # PPM Testing Commands (for QPSC menu integration)
     PPMSENS = b"ppmsens_"  # PPM Rotation Sensitivity Test

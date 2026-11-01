@@ -51,7 +51,11 @@ class FlatfieldCorrector:
     @property
     def loaded(self) -> List[str]:
         """What is covered: channel ids, or "all" for a profile covering every image."""
-        return sorted("all" if key is None else key for key in self._profiles)
+        return sorted(
+            "all" if key is None else key
+            for key, profile in self._profiles.items()
+            if profile is not None
+        )
 
     def apply(self, image, channel_id: Optional[str] = None):
         """Correct one raw plane, returning the image unchanged when no profile covers it."""
@@ -66,7 +70,8 @@ class FlatfieldCorrector:
                 profile.flatfield.shape,
                 image.shape,
             )
-            del self._profiles[key]
+            # Kept as None so this channel does not fall through to the profile for every image
+            self._profiles[key] = None
             return image
         corrected, clipped = profile.apply(image)
         self.clipped_pixels += clipped

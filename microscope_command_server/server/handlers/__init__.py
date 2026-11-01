@@ -108,7 +108,7 @@ from microscope_command_server.server.handlers.system import (
     handle_siftim,
     handle_get_log,
 )
-from microscope_command_server.server.handlers.flatfield import handle_flatfit
+from microscope_command_server.server.handlers.flatfield import handle_flatfit, handle_flatpoll
 from microscope_command_server.server.handlers.probez import handle_probez
 from microscope_command_server.server.handlers.probe_stage_af import handle_probe_stage_af
 from microscope_command_server.server.handlers.find_tissue import handle_findtissue
@@ -207,6 +207,7 @@ COMMAND_HANDLERS = {
     ExtendedCommand.SIFTAL: handle_siftal,
     ExtendedCommand.SIFTIM: handle_siftim,
     ExtendedCommand.FLATFIT: handle_flatfit,
+    ExtendedCommand.FLATPOLL: handle_flatpoll,
     # Diagnostics: session-log tail for the in-app bug reporter
     ExtendedCommand.GETLOG: handle_get_log,
     # Z-stage diagnostic probe

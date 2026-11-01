@@ -3146,7 +3146,7 @@ def _finalize_acquisition(ctx: AcquisitionContext) -> None:
     logger = ctx.logger
     if ctx.flatfield.clipped_pixels:
         logger.warning(
-            "Flat-field correction clipped %d pixels at the top of the range",
+            "Flat-field correction clipped %d pixels at the limits of the range",
             ctx.flatfield.clipped_pixels,
         )
     if ctx.af_tissue_tiles is not None:
@@ -3748,6 +3748,18 @@ def _prepare_acquisition(
         else:
             background_correction_enabled = False
 
+    # ======= FLAT-FIELD PROFILE SETUP =======
+    # The alternative to background images: QPSC sends one or the other, and a run never gets both.
+    # The keys are channel ids, so a profile set fitted per channel is applied per channel.
+    flatfield = FlatfieldCorrector.load(
+        params.get("flatfield_folder"), params.get("channels") or ()
+    )
+    params["flatfield_loaded"] = flatfield.loaded
+    if flatfield.loaded and (background_images or channel_background_images):
+        logger.warning("Flat-field profiles chosen: ignoring the background images also sent")
+        background_images, channel_background_images = {}, {}
+        background_correction_enabled = False
+
     # What actually happened, for acquisition_metadata.json: the request said "correct", but
     # a missing folder or file turns correction off here, and that used to be recorded nowhere.
     # Per-channel correction is gated only on the channel backgrounds that loaded (the angle
@@ -3759,14 +3771,6 @@ def _prepare_acquisition(
     )
     params["background_angles_loaded"] = sorted(float(a) for a in background_images)
     params["background_channels_loaded"] = sorted(channel_background_images)
-
-    # ======= FLAT-FIELD PROFILE SETUP =======
-    # The alternative to background images: QPSC sends one or the other. The saved channels are
-    # the keys, so a profile set fitted per channel is applied per channel.
-    flatfield = FlatfieldCorrector.load(
-        params.get("flatfield_folder"), params.get("channels") or ()
-    )
-    params["flatfield_loaded"] = flatfield.loaded
 
     # ======= WHITE BALANCE SETUP =======
     angles_wb = {}

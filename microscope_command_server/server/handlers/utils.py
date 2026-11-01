@@ -5,7 +5,7 @@ such as reading variable-length message strings from the socket.
 """
 
 import socket
-import shlex
+import re
 import time
 import logging
 
@@ -15,12 +15,11 @@ logger = logging.getLogger(__name__)
 
 
 def split_flag_message(message):
-    """Split a flag message on spaces, keeping quoted paths whole and Windows backslashes."""
-    try:
-        parts = shlex.split(message.replace("\\", "|||BACKSLASH|||"))
-    except ValueError:  # an unmatched quote, such as an apostrophe in a sample name
-        return message.split()
-    return [part.replace("|||BACKSLASH|||", "\\") for part in parts]
+    """Split a flag message on spaces, keeping double-quoted paths whole.
+
+    Only double quotes count: an apostrophe in a folder name is an ordinary character.
+    """
+    return [quoted or bare for quoted, bare in re.findall(r'"([^"]*)"|(\S+)', message)]
 
 
 def read_message_string(conn, timeout=5.0, max_bytes=10000, chunk_size=1024):

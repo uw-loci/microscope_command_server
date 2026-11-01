@@ -641,17 +641,22 @@ exposure that puts the brightest swing state's 99.9th percentile at the target, 
 Viewer Camera tab uses it to choose the one exposure all states share. Implementation:
 `calibration/lc_state_signal.py`.
 
-## Flat-field fit (FLATFIT)
+## Flat-field fit (FLATFIT, FLATPOLL)
 
 Fits a BaSiC flat-field profile from a folder of tiles and saves it, for detectors with no background
-image such as a PMT. The payload is JSON, because a folder path can hold spaces:
-`{"tiles": <folder>, "profile": <folder>, "channel": <int|null>, "offset": <float|null>, "label": <text>}`.
+image such as a PMT. The fit can take minutes and runs on its own thread, so a client's command socket
+stays free for cancel and status polls. `FLATFIT` takes JSON, because a folder path can hold spaces:
+`{"tiles": <folder>, "profile": <folder>, "channel": <int|null>, "offset": <float|null>, "label": <text>}`,
+and replies `STARTED` or `FAILED:<reason>`. Only one fit runs at a time.
+`FLATPOLL` replies `RUNNING`, `SUCCESS:{"profiles": [...]}` with `channel`, `flatfield_min`,
+`flatfield_max`, `offset`, `images_used` and `images_read` for each, or `FAILED:<reason>`. Every reply
+ends with a newline.
+
 With no channel given and channel folders under `tiles`, each holding a `TileConfiguration.txt` as a
-QPSC region does, every channel is fitted on its own and saved to `<profile>/<channel id>/`.
-The reply is `SUCCESS:{"profiles": [...]}` with `channel`, `flatfield_min`, `flatfield_max`, `offset`,
-`images_used` and `images_read` for each, or `FAILED:<reason>`. It reads files only and needs no
-hardware. The fit is `microscope_imageprocessing.correction.flatfield`, so that package must be from
-2026-11-01 or later.
+QPSC region does, every channel is fitted on its own and saved to `<profile>/<channel id>/`. A fit
+reaching below 0.1 of the mean is refused: the usual cause is an offset read from tissue. Reads files
+only and needs no hardware. The fit is `microscope_imageprocessing.correction.flatfield`, so that
+package must be from 2026-11-01 or later.
 
 ### Using a profile during acquisition (--flatfield-folder)
 
@@ -659,8 +664,10 @@ ACQUIRE, ZSTACK and TLAPSE take `--flatfield-folder <folder>`, the alternative t
 detectors with no background image. A profile directly in the folder covers every image;
 `<folder>/<channel id>/` covers one channel and takes precedence for it. Each raw plane is corrected
 as it is snapped, before any Z projection, so every projection is exact. A missing or wrong-sized
-profile warns and leaves those images uncorrected. `acquisition_metadata.json` records
-`flatfield_folder` and `flatfield_loaded`.
+profile warns and leaves those images uncorrected. If background images arrive too, the profile wins
+and a warning is logged: a run never gets both. ZSTACK and TLAPSE use the profile for every image, so
+they ignore channel subfolders. `acquisition_metadata.json` records `flatfield_folder` and
+`flatfield_loaded`.
 
 ## Micro-Manager preset (MMPRESET)
 

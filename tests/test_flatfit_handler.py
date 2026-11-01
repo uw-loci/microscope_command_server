@@ -2,24 +2,41 @@
 
 import json
 import socket
+import threading
+import time
 
 import numpy as np
 import tifffile as tf
 
-from microscope_command_server.server.handlers.flatfield import handle_flatfit
+from microscope_command_server.server.handlers import flatfield as flatfield_handler
+from microscope_command_server.server.handlers.flatfield import handle_flatfit, handle_flatpoll
 from microscope_command_server.server.protocol import END_MARKER
 
 
-def _call(payload):
+def _exchange(handler, payload=b""):
     server_side, client_side = socket.socketpair()
     try:
-        client_side.sendall(payload + END_MARKER.encode())
-        handle_flatfit(server_side, ("test", 0), None, None)
+        client_side.sendall(payload)
+        handler(server_side, ("test", 0), None, None)
         client_side.settimeout(5)
-        return client_side.recv(4096).decode("ascii")
+        return client_side.recv(65536).decode("ascii").rstrip("\n")
     finally:
         server_side.close()
         client_side.close()
+
+
+def _call(payload):
+    """Start a fit and poll until it ends, as the client does."""
+    reply = _exchange(handle_flatfit, payload + END_MARKER.encode())
+    if reply != "STARTED":
+        return reply
+    deadline = time.monotonic() + 30
+    while time.monotonic() < deadline:
+        reply = _exchange(handle_flatpoll)
+        if reply != "RUNNING":
+            return reply
+        time.sleep(0.02)
+    raise AssertionError("the fit never finished")
 
 
 def test_fits_a_folder_with_spaces_in_its_name(tmp_path):
@@ -81,6 +98,19 @@ def test_a_region_of_channel_folders_fits_each_channel(tmp_path):
 def test_a_missing_folder_is_reported_not_raised(tmp_path):
     reply = _call(json.dumps({"tiles": str(tmp_path), "profile": str(tmp_path / "p")}).encode())
     assert reply.startswith("FAILED:No TIFF files")
+
+
+def test_a_second_fit_is_refused_while_one_runs(tmp_path, monkeypatch):
+    release = threading.Event()
+    monkeypatch.setattr(flatfield_handler, "_fit", lambda request: release.wait(5) and "SUCCESS:{}")
+    payload = json.dumps({"tiles": str(tmp_path), "profile": str(tmp_path)}).encode()
+    assert _exchange(handle_flatfit, payload + END_MARKER.encode()) == "STARTED"
+    assert _exchange(handle_flatpoll) == "RUNNING"
+    second = _exchange(handle_flatfit, payload + END_MARKER.encode())
+    assert second == "FAILED:A flat-field fit is already running"
+    release.set()
+    flatfield_handler._job_thread.join(5)
+    assert _exchange(handle_flatpoll) == "SUCCESS:{}"
 
 
 def test_a_bad_message_is_reported():

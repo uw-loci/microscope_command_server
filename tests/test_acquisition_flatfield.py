@@ -64,19 +64,30 @@ def test_clipped_pixels_are_counted(tmp_path):
     assert corrector.clipped_pixels == 16
 
 
-def test_zstack_flags_keep_a_quoted_folder_and_survive_an_apostrophe():
+def test_zstack_flags_keep_a_quoted_folder_and_every_apostrophe():
     assert split_flag_message('--flatfield-folder "F:\\flat field\\a" --x 1') == [
         "--flatfield-folder",
         "F:\\flat field\\a",
         "--x",
         "1",
     ]
-    assert split_flag_message("--output C:\\Mike's\\run --x 1") == [
+    assert split_flag_message("--output C:\\Bob's\\Mike's\\run --x 1") == [
         "--output",
-        "C:\\Mike's\\run",
+        "C:\\Bob's\\Mike's\\run",
         "--x",
         "1",
     ]
+
+
+def test_a_wrong_sized_channel_does_not_fall_through_to_the_common_profile(tmp_path):
+    _save(tmp_path, 2.0)
+    profile = FlatfieldProfile(flatfield=np.full((8, 8), 2.0, dtype=np.float32), offset=100.0)
+    profile.save(tmp_path / "DAPI")
+    corrector = FlatfieldCorrector.load(str(tmp_path), ["DAPI"])
+    image = _plane()
+    assert corrector.apply(image, "DAPI") is image
+    assert corrector.apply(image, "DAPI") is image
+    assert corrector.loaded == ["all"]
 
 
 def test_the_acquire_message_carries_a_folder_with_spaces():
