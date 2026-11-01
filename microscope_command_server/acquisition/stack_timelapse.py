@@ -20,6 +20,8 @@ import numpy as np
 from pathlib import Path
 from typing import List, Dict, Optional, Tuple, Callable
 
+from microscope_command_server.acquisition.flatfield import FlatfieldCorrector
+
 logger = logging.getLogger(__name__)
 
 
@@ -41,6 +43,7 @@ def acquire_z_stack(
     background_correction_enabled: bool = False,
     background_folder: Optional[str] = None,
     background_correction_method: str = "divide",
+    flatfield_folder: Optional[str] = None,
     n_timepoints: int = 1,
     interval_seconds: float = 0.0,
     cancel_check: Optional[Callable[[], bool]] = None,
@@ -81,6 +84,7 @@ def acquire_z_stack(
             (BackgroundCorrectionUtils.load_background_images) -- typically
             {folder}/{angle}.tif or {folder}/{angle}/background.tif.
         background_correction_method: "divide" (flat-field) or "subtract".
+        flatfield_folder: Flat-field profile folder, the alternative to background images.
         n_timepoints: Number of timepoints (default 1 = pure Z-stack).
             Combined with z_step, supports Z+T output (SizeT, SizeZ both > 1).
         interval_seconds: Seconds between timepoint START times when
@@ -161,6 +165,7 @@ def acquire_z_stack(
         angles=angles,
     )
     bg_active = bool(background_images)
+    flatfield = FlatfieldCorrector.load(flatfield_folder)
 
     saved_files = []
     # Validate T params
@@ -270,6 +275,7 @@ def acquire_z_stack(
                     # the main workflow's _acquire_tile_angles BG path so PPM
                     # output from the single-point dialog matches what BoundedAcq
                     # would have produced for the same modality/folder.
+                    image = flatfield.apply(image)
                     if bg_active and angle in background_images:
                         image = _apply_bg_correction(
                             image=image,
@@ -478,6 +484,7 @@ def acquire_time_lapse(
     background_correction_enabled: bool = False,
     background_folder: Optional[str] = None,
     background_correction_method: str = "divide",
+    flatfield_folder: Optional[str] = None,
 ) -> Dict:
     """
     Acquire a time-lapse at the current position.
@@ -555,6 +562,7 @@ def acquire_time_lapse(
         angles=angles,
     )
     bg_active = bool(background_images)
+    flatfield = FlatfieldCorrector.load(flatfield_folder)
 
     saved_files = []
     # Buffer per-angle frames so we can emit a single multi-page OME-TIFF
@@ -593,6 +601,7 @@ def acquire_time_lapse(
                 continue
 
             # Per-angle flat-field correction (parity with main workflow).
+            image = flatfield.apply(image)
             if bg_active and angle in background_images:
                 image = _apply_bg_correction(
                     image=image,

@@ -17,7 +17,10 @@ import time
 import logging
 
 from microscope_command_server.server.protocol import END_MARKER
-from microscope_command_server.server.handlers.utils import read_message_string
+from microscope_command_server.server.handlers.utils import (
+    read_message_string,
+    split_flag_message,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -542,7 +545,7 @@ def handle_zstack(conn, client, hardware, settings, **kwargs):
     # Parse parameters: --output --z-start --z-end --z-step
     #   --modality --angles --wb-mode --yaml --objective --detector
     params = {}
-    parts = message.split()
+    parts = split_flag_message(message)
     i = 0
     while i < len(parts):
         if parts[i] == "--output" and i + 1 < len(parts):
@@ -587,6 +590,9 @@ def handle_zstack(conn, client, hardware, settings, **kwargs):
         elif parts[i] == "--bg-method" and i + 1 < len(parts):
             params["bg_method"] = parts[i + 1]
             i += 2
+        elif parts[i] == "--flatfield-folder" and i + 1 < len(parts):
+            params["flatfield_folder"] = parts[i + 1]
+            i += 2
         elif parts[i] == "--timepoints" and i + 1 < len(parts):
             params["timepoints"] = int(parts[i + 1])
             i += 2
@@ -623,6 +629,7 @@ def handle_zstack(conn, client, hardware, settings, **kwargs):
             background_correction_enabled=params.get("bg_correction", False),
             background_folder=params.get("bg_folder"),
             background_correction_method=params.get("bg_method", "divide"),
+            flatfield_folder=params.get("flatfield_folder"),
             n_timepoints=params.get("timepoints", 1),
             interval_seconds=params.get("interval", 0.0),
         )
@@ -671,7 +678,7 @@ def handle_tlapse(conn, client, hardware, settings, **kwargs):
     # Parse parameters: --output --timepoints --interval
     #   --modality --angles --wb-mode --yaml --objective --detector
     params = {}
-    parts = message.split()
+    parts = split_flag_message(message)
     i = 0
     while i < len(parts):
         if parts[i] == "--output" and i + 1 < len(parts):
@@ -710,6 +717,9 @@ def handle_tlapse(conn, client, hardware, settings, **kwargs):
         elif parts[i] == "--bg-method" and i + 1 < len(parts):
             params["bg_method"] = parts[i + 1]
             i += 2
+        elif parts[i] == "--flatfield-folder" and i + 1 < len(parts):
+            params["flatfield_folder"] = parts[i + 1]
+            i += 2
         else:
             i += 1
 
@@ -737,6 +747,7 @@ def handle_tlapse(conn, client, hardware, settings, **kwargs):
             background_correction_enabled=params.get("bg_correction", False),
             background_folder=params.get("bg_folder"),
             background_correction_method=params.get("bg_method", "divide"),
+            flatfield_folder=params.get("flatfield_folder"),
         )
         response = (
             f"SUCCESS:{params['output']}|"

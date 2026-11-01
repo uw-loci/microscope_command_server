@@ -7,10 +7,13 @@ no hardware, but the tiles must be visible from this machine.
 import json
 import logging
 import socket
+from pathlib import Path
 
 from microscope_command_server.server.handlers.utils import read_message_string
 
 logger = logging.getLogger(__name__)
+
+TILE_CONFIG = "TileConfiguration.txt"
 
 
 def handle_flatfit(conn, client, hardware, settings, **kwargs):
@@ -20,8 +23,12 @@ def handle_flatfit(conn, client, hardware, settings, **kwargs):
     ``{"tiles": <folder>, "profile": <folder>, "channel": <int|null>, "offset": <float|null>,
     "label": <text>}`` then END_MARKER.
 
-    Response: ``SUCCESS:<json>`` with offset, flatfield_min, flatfield_max, images_used and
-    images_read, or ``FAILED:<reason>``.
+    With no channel given and channel folders under ``tiles`` (each holding a
+    TileConfiguration.txt, as a QPSC region does), every channel is fitted on its own and saved to
+    ``<profile>/<channel id>/``, which is where an acquisition looks for it.
+
+    Response: ``SUCCESS:<json>``, ``{"profiles": [...]}`` with channel, offset, flatfield_min,
+    flatfield_max, images_used and images_read for each, or ``FAILED:<reason>``.
     """
     addr = kwargs.get(
         "addr", client if isinstance(client, tuple) else getattr(client, "addr", client)
@@ -48,25 +55,44 @@ def handle_flatfit(conn, client, hardware, settings, **kwargs):
         return
 
     channel = request.get("channel")
-    try:
-        planes = read_tile_planes(tiles, channel=channel)
-        logger.info("FLATFIT: read %d planes from %s", len(planes), tiles)
-        profile = fit_profile(
-            planes,
-            offset=request.get("offset"),
-            metadata={"source": tiles, "channel": channel, "label": request.get("label", "")},
+    tiles_path = Path(tiles)
+    channel_folders = []
+    if channel is None and tiles_path.is_dir():
+        channel_folders = sorted(
+            d for d in tiles_path.iterdir() if d.is_dir() and (d / TILE_CONFIG).is_file()
         )
-        profile.save(profile_folder)
+    targets = [(d.name, d, Path(profile_folder) / d.name) for d in channel_folders]
+    targets = targets or [(None, tiles_path, Path(profile_folder))]
+
+    summaries = []
+    try:
+        for name, source, destination in targets:
+            planes = read_tile_planes(source, channel=channel)
+            logger.info("FLATFIT: read %d planes from %s", len(planes), source)
+            profile = fit_profile(
+                planes,
+                offset=request.get("offset"),
+                metadata={
+                    "source": str(source),
+                    "channel": channel if name is None else name,
+                    "label": request.get("label", ""),
+                },
+            )
+            profile.save(destination)
+            summaries.append(
+                {
+                    "channel": name,
+                    "offset": profile.offset,
+                    "flatfield_min": profile.metadata["flatfield_min"],
+                    "flatfield_max": profile.metadata["flatfield_max"],
+                    "images_used": profile.metadata["images_used"],
+                    "images_read": profile.metadata["images_read"],
+                }
+            )
     except Exception as e:
         logger.error("FLATFIT failed", exc_info=True)
         fail(str(e))
         return
 
-    summary = {key: profile.metadata[key] for key in ("flatfield_min", "flatfield_max")}
-    summary.update(
-        offset=profile.offset,
-        images_used=profile.metadata["images_used"],
-        images_read=profile.metadata["images_read"],
-    )
-    logger.info("FLATFIT complete: %s, saved to %s", summary, profile_folder)
-    conn.sendall(f"SUCCESS:{json.dumps(summary)}".encode("ascii"))
+    logger.info("FLATFIT complete: %s, saved to %s", summaries, profile_folder)
+    conn.sendall(f"SUCCESS:{json.dumps({'profiles': summaries})}".encode("ascii"))

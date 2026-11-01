@@ -5,12 +5,22 @@ such as reading variable-length message strings from the socket.
 """
 
 import socket
+import shlex
 import time
 import logging
 
 from microscope_command_server.server.protocol import END_MARKER
 
 logger = logging.getLogger(__name__)
+
+
+def split_flag_message(message):
+    """Split a flag message on spaces, keeping quoted paths whole and Windows backslashes."""
+    try:
+        parts = shlex.split(message.replace("\\", "|||BACKSLASH|||"))
+    except ValueError:  # an unmatched quote, such as an apostrophe in a sample name
+        return message.split()
+    return [part.replace("|||BACKSLASH|||", "\\") for part in parts]
 
 
 def read_message_string(conn, timeout=5.0, max_bytes=10000, chunk_size=1024):

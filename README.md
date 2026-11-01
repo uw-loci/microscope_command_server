@@ -646,9 +646,21 @@ Viewer Camera tab uses it to choose the one exposure all states share. Implement
 Fits a BaSiC flat-field profile from a folder of tiles and saves it, for detectors with no background
 image such as a PMT. The payload is JSON, because a folder path can hold spaces:
 `{"tiles": <folder>, "profile": <folder>, "channel": <int|null>, "offset": <float|null>, "label": <text>}`.
-The reply is `SUCCESS:<json>` with `flatfield_min`, `flatfield_max`, `offset`, `images_used` and
-`images_read`, or `FAILED:<reason>`. It reads files only and needs no hardware. The fit is
-`microscope_imageprocessing.correction.flatfield`, so that package must be from 2026-10-30 or later.
+With no channel given and channel folders under `tiles`, each holding a `TileConfiguration.txt` as a
+QPSC region does, every channel is fitted on its own and saved to `<profile>/<channel id>/`.
+The reply is `SUCCESS:{"profiles": [...]}` with `channel`, `flatfield_min`, `flatfield_max`, `offset`,
+`images_used` and `images_read` for each, or `FAILED:<reason>`. It reads files only and needs no
+hardware. The fit is `microscope_imageprocessing.correction.flatfield`, so that package must be from
+2026-11-01 or later.
+
+### Using a profile during acquisition (--flatfield-folder)
+
+ACQUIRE, ZSTACK and TLAPSE take `--flatfield-folder <folder>`, the alternative to `--bg-folder` for
+detectors with no background image. A profile directly in the folder covers every image;
+`<folder>/<channel id>/` covers one channel and takes precedence for it. Each raw plane is corrected
+as it is snapped, before any Z projection, so every projection is exact. A missing or wrong-sized
+profile warns and leaves those images uncorrected. `acquisition_metadata.json` records
+`flatfield_folder` and `flatfield_loaded`.
 
 ## Micro-Manager preset (MMPRESET)
 

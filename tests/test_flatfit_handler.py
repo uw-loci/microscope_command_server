@@ -40,12 +40,42 @@ def test_fits_a_folder_with_spaces_in_its_name(tmp_path):
     )
 
     assert reply.startswith("SUCCESS:")
-    summary = json.loads(reply[len("SUCCESS:") :])
+    summaries = json.loads(reply[len("SUCCESS:") :])["profiles"]
+    assert len(summaries) == 1
+    summary = summaries[0]
+    assert summary["channel"] is None
     assert summary["offset"] == 6500.0
     assert summary["images_used"] == 10
     assert summary["flatfield_max"] > summary["flatfield_min"]
     assert (profile / "flatfield.tif").exists()
     assert "top PMT" in (profile / "profile.yml").read_text()
+
+
+def test_a_region_of_channel_folders_fits_each_channel(tmp_path):
+    rng = np.random.default_rng(1)
+    y, x = np.mgrid[0:64, 0:64] / 63.0
+    region = tmp_path / "region"
+    for name, slope in (("DAPI", 0.3), ("FITC", -0.3)):
+        (region / name).mkdir(parents=True)
+        (region / name / "TileConfiguration.txt").write_text("dim = 2\n")
+        for index in range(10):
+            signal = rng.uniform(500, 900) * (1 + slope * (x - 0.5))
+            tile = 6500 + signal + rng.normal(0, 20, (64, 64))
+            tf.imwrite(region / name / f"{index}.tif", tile.astype(np.uint16))
+    profile = tmp_path / "set"
+
+    reply = _call(
+        json.dumps({"tiles": str(region), "profile": str(profile), "offset": 6500.0}).encode()
+    )
+
+    summaries = json.loads(reply[len("SUCCESS:") :])["profiles"]
+    assert [s["channel"] for s in summaries] == ["DAPI", "FITC"]
+    assert (profile / "DAPI" / "flatfield.tif").exists()
+    assert (profile / "FITC" / "flatfield.tif").exists()
+    dapi = tf.imread(profile / "DAPI" / "flatfield.tif")
+    fitc = tf.imread(profile / "FITC" / "flatfield.tif")
+    assert dapi[:, -1].mean() > dapi[:, 0].mean()
+    assert fitc[:, -1].mean() < fitc[:, 0].mean()
 
 
 def test_a_missing_folder_is_reported_not_raised(tmp_path):

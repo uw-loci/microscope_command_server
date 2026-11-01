@@ -28,6 +28,7 @@ from microscope_command_server.acquisition.frame_guard import (
 from microscope_command_server.acquisition.retract import retract_to_safe_z
 from microscope_control.hardware.pycromanager import PycromanagerHardware
 from microscope_control.autofocus.core import AutofocusUtils
+from microscope_command_server.acquisition.flatfield import FlatfieldCorrector
 from microscope_command_server.acquisition.tiles import TileConfigUtils
 from microscope_command_server.modality import get_config as get_modality_config
 from microscope_command_server.server.af_events import AF_EVENTS
@@ -1469,6 +1470,8 @@ def write_acquisition_metadata(
         acq_params["bg_correction_applied"] = params.get("background_correction_applied", False)
         acq_params["bg_angles_loaded"] = params.get("background_angles_loaded", [])
         acq_params["bg_channels_loaded"] = params.get("background_channels_loaded", [])
+        acq_params["flatfield_folder"] = params.get("flatfield_folder")
+        acq_params["flatfield_loaded"] = params.get("flatfield_loaded", [])
 
         # Z-stack
         if params.get("z_stack"):
@@ -2328,6 +2331,9 @@ def parse_acquisition_message(message: str) -> dict:
                 # The background profile QPSC resolved --bg-folder under; recorded, never resolved here.
                 params["background_profile"] = parts[i + 1]
                 i += 2
+            elif parts[i] == "--flatfield-folder" and i + 1 < len(parts):
+                params["flatfield_folder"] = parts[i + 1]
+                i += 2
             elif parts[i] == "--bg-disabled-angles" and i + 1 < len(parts):
                 params["background_disabled_angles_str"] = parts[i + 1]
                 i += 2
@@ -2674,6 +2680,8 @@ class AcquisitionContext:
     channel_background_images: dict = field(default_factory=dict)
     #: LC-PolScope only: background_provenance.json of the background in use.
     lcps_background_provenance: dict = field(default_factory=dict)
+    #: Flat-field profiles, the alternative to background images.
+    flatfield: FlatfieldCorrector = field(default_factory=FlatfieldCorrector)
 
     # -- White balance --
     white_balance_enabled: bool = True
@@ -3136,6 +3144,11 @@ def _acquisition_workflow(
 def _finalize_acquisition(ctx: AcquisitionContext) -> None:
     """Post-acquisition: close streams, write metadata files, set COMPLETED state."""
     logger = ctx.logger
+    if ctx.flatfield.clipped_pixels:
+        logger.warning(
+            "Flat-field correction clipped %d pixels at the top of the range",
+            ctx.flatfield.clipped_pixels,
+        )
     if ctx.af_tissue_tiles is not None:
         glass_skipped = sum(1 for m in ctx.tile_measurements if m.get("af_type") == "skipped-glass")
         logger.info(
@@ -3747,6 +3760,14 @@ def _prepare_acquisition(
     params["background_angles_loaded"] = sorted(float(a) for a in background_images)
     params["background_channels_loaded"] = sorted(channel_background_images)
 
+    # ======= FLAT-FIELD PROFILE SETUP =======
+    # The alternative to background images: QPSC sends one or the other. The saved channels are
+    # the keys, so a profile set fitted per channel is applied per channel.
+    flatfield = FlatfieldCorrector.load(
+        params.get("flatfield_folder"), params.get("channels") or ()
+    )
+    params["flatfield_loaded"] = flatfield.loaded
+
     # ======= WHITE BALANCE SETUP =======
     angles_wb = {}
 
@@ -4053,6 +4074,7 @@ def _prepare_acquisition(
         total_images=total_images,
         background_correction_enabled=background_correction_enabled,
         background_correction_method=background_correction_method,
+        flatfield=flatfield,
         background_disabled_angles=background_disabled_angles,
         background_images=background_images,
         background_scaling_factors=background_scaling_factors,
@@ -6419,6 +6441,8 @@ def _acquire_tile_angles_angle_outer(
                 except Exception as e:
                     logger.warning(f"  Failed to queue raw image: {e}")
 
+            image = ctx.flatfield.apply(image)
+
             # Background correction (same as default body).
             if (
                 ctx.background_correction_enabled
@@ -6848,6 +6872,8 @@ def _acquire_tile_angles(
                 except Exception as e:
                     logger.warning(f"  Failed to queue raw image: {e}")
 
+            image = ctx.flatfield.apply(image)
+
             # Apply background correction
             if (
                 ctx.background_correction_enabled
@@ -7125,6 +7151,9 @@ def _acquire_tile_channels_z_outer(
                 _accumulate_tile_stats(tile_stats, _compute_tile_stats(image))
             except Exception as stats_err:
                 logger.debug(f"  Stats compute failed for {ch_id}: {stats_err}")
+
+            # After the checks above, which must see what the detector recorded
+            image = ctx.flatfield.apply(image, ch_id)
 
             if not ctx.z_stack_enabled:
                 # 2D mode: save directly. (Z-outer collapses to the same
@@ -7574,6 +7603,9 @@ def _acquire_tile_channels(
             except Exception as stats_err:
                 logger.debug(f"  Stats compute failed for {ch_id}: {stats_err}")
 
+            # After the checks above, which must see what the detector recorded
+            image = ctx.flatfield.apply(image, ch_id)
+
             if not ctx.z_stack_enabled:
                 # 2D mode: save directly
                 channel_images[ch_id] = image
@@ -7761,6 +7793,9 @@ def _acquire_tile_single(
             _accumulate_tile_stats(tile_stats, _compute_tile_stats(image))
         except Exception as stats_err:
             logger.debug(f"  Stats compute failed: {stats_err}")
+
+        # After the checks above, which must see what the detector recorded
+        image = ctx.flatfield.apply(image)
 
         if not ctx.z_stack_enabled:
             # 2D mode: save directly
