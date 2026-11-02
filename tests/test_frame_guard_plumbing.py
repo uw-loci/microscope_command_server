@@ -79,10 +79,11 @@ def test_arming_tolerates_a_stage_that_refuses():
 
 
 def test_a_healthy_frame_does_not_stop_the_run():
-    fg.raise_if_frame_suspect(SimpleNamespace(stage=FakeStage()))
-    fg.raise_if_frame_suspect(SimpleNamespace(stage=FakeStage(suspect=None)))
     # An empty reason is not a reason.
-    fg.raise_if_frame_suspect(SimpleNamespace(stage=FakeStage(suspect="")))
+    for stage in (FakeStage(), FakeStage(suspect=None), FakeStage(suspect="")):
+        hardware = SimpleNamespace(stage=stage)
+        assert fg.frame_suspect_reason(hardware) is None
+        fg.raise_if_frame_suspect(hardware)  # raises when the frame is suspect
 
 
 @pytest.mark.parametrize("hardware", [None, SimpleNamespace(), SimpleNamespace(stage=object())])

@@ -250,14 +250,20 @@ def test_missing_tile_configuration_does_not_break_reconstruction(tmp_path):
     pytest.importorskip("polscope_library")
     import numpy as np
 
+    from microscope_command_server.modality.lcpolscope import ORIENTATION_DIR, RETARDANCE_DIR
+
     states = [np.full((4, 4), v, dtype=float) for v in (10.0, 60.0, 55.0, 50.0, 45.0)]
+    written = []
     _, pool = _submit(
         channel_images=dict(zip([f"State{i}" for i in range(5)], states)),
         output_path=tmp_path,
-        ome_writer=lambda **kw: None,
+        ome_writer=lambda **kw: written.append(kw),
     )
     fn, kwargs = pool.submissions[0]
     fn(**kwargs)  # must not raise
+    assert written, "the tile was not reconstructed"
+    for subdir in (RETARDANCE_DIR, ORIENTATION_DIR):
+        assert not (tmp_path / subdir / "TileConfiguration.txt").exists()
 
 
 def test_partial_background_set_is_refused():

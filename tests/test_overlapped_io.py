@@ -7,9 +7,9 @@ ensure the invariants that make this safe:
 1. af_n_tiles >= 1 -- guarantees periodic drain points
 2. _TileWritePool correctly drains and reports errors
 
-Note: AutofocusUtils.get_autofocus_positions tests live in microscope_control's
-test suite (test_autofocus_metrics.py). This file tests the workflow-side invariants
-that don't require hardware imports.
+Note: no test calls AutofocusUtils.get_autofocus_positions directly (an earlier
+version of this note pointed at microscope_control's metric tests, which never did).
+This file tests the workflow-side invariants that don't require hardware imports.
 """
 
 import sys

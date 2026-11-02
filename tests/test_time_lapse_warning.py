@@ -120,8 +120,8 @@ class TestFormatting:
         sched = FakeScheduler(interval_seconds=12.0)
         sched.record_overrun(5.5)
         msg = _format_time_lapse_warning(sched)
-        # cp1252-safe: must encode cleanly as ASCII (no Unicode arrows/degrees).
-        msg.encode("ascii")
+        # cp1252-safe: no Unicode arrows or degree signs.
+        assert msg.isascii(), msg
 
 
 class TestLatch:
