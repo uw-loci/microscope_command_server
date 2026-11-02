@@ -2266,7 +2266,7 @@ Current automated tests achieve ~60-70% coverage for testable components:
 **Hardware Diagnostic Tools:**
 
 This package does not include standalone diagnostic tools. Hardware testing is performed via:
-- The `TESTAF` and `TESTADAF` server commands (call diagnostic functions from `microscope_control`)
+- The `TESTAF` and `TESTADAF` server commands (call diagnostic functions from `microscope_control`). `TESTADAF` runs a drift check by default; add `--wide-search` to run a full focus search instead, for a Z that may be far from focus (for example, on a new slide)
 - The `PPMSENS` and `PPMBIREF` server commands (call diagnostic functions from `ppm_library`)
 
 See the `microscope_control` and `ppm_library` documentation for details on these diagnostic tools.
