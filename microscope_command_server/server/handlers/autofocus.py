@@ -105,11 +105,18 @@ def handle_testaf(conn, client, hardware, settings, **kwargs):
 def handle_testadaf(conn, client, hardware, settings, **kwargs):
     """Test adaptive autofocus at the current position.
 
-    Reads a message with --yaml, --output, --objective flags,
-    then runs test_adaptive_autofocus_at_current_position.
+    Reads a message with --yaml, --output, --objective flags, then runs
+    test_adaptive_autofocus_at_current_position: a drift check, which only
+    corrects a small error around a Z that is already close.
+
+    With --wide-search it runs focus_search_at_current_position instead, for a
+    Z that may be far from focus, such as on a new slide. Both use the same
+    reply and the same cancel path.
 
     Response: SUCCESS:<message>|<initial_z>:<final_z>:<z_shift>
-              or FAILED:<reason>
+              CANCELLED:<message> after ABORTAF, with Z restored
+              or FAILED:<reason>, which includes finding no focus. Z is then
+              back at its starting value, and is not a measurement.
     """
     config_manager = kwargs.get("config_manager")
     addr = client if isinstance(client, tuple) else getattr(client, "addr", client)
@@ -124,7 +131,7 @@ def handle_testadaf(conn, client, hardware, settings, **kwargs):
 
     # Parse the message
     params = {}
-    flags = ["--yaml", "--output", "--objective"]
+    flags = ["--yaml", "--output", "--objective", "--wide-search"]
 
     for i, flag in enumerate(flags):
         if flag in message:
@@ -159,8 +166,8 @@ def handle_testadaf(conn, client, hardware, settings, **kwargs):
         conn.sendall(ack_response)
         logger.info("Sent STARTED acknowledgment for adaptive autofocus test")
 
-        # Execute ADAPTIVE autofocus test
         from microscope_control.autofocus.test import (
+            focus_search_at_current_position,
             test_adaptive_autofocus_at_current_position,
         )
 
@@ -179,15 +186,25 @@ def handle_testadaf(conn, client, hardware, settings, **kwargs):
             abort_event.clear()
         should_abort = (lambda: abort_event.is_set()) if abort_event is not None else None
 
-        result = test_adaptive_autofocus_at_current_position(
-            hardware=hardware,
-            config_manager=config_manager,
-            yaml_file_path=params["yaml_file_path"],
-            output_folder_path=params["output_folder_path"],
-            objective=params["objective"],
-            logger=logger,
-            should_abort=should_abort,
-        )
+        if "--wide-search" in message:
+            result = focus_search_at_current_position(
+                hardware=hardware,
+                yaml_file_path=params["yaml_file_path"],
+                output_folder_path=params["output_folder_path"],
+                objective=params["objective"],
+                logger=logger,
+                should_abort=should_abort,
+            )
+        else:
+            result = test_adaptive_autofocus_at_current_position(
+                hardware=hardware,
+                config_manager=config_manager,
+                yaml_file_path=params["yaml_file_path"],
+                output_folder_path=params["output_folder_path"],
+                objective=params["objective"],
+                logger=logger,
+                should_abort=should_abort,
+            )
 
         if result.get("cancelled"):
             response = f"CANCELLED:{result['message']}".encode()
