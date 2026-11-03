@@ -5,7 +5,10 @@ The 2026-10-16 rig run had Gain Auto: Continuous and Gamma Enabled: 1 on an
 camera's auto-gain target; the calibration reported "good".
 """
 
-from microscope_command_server.calibration.camera_checks import camera_setting_problems
+from microscope_command_server.calibration.camera_checks import (
+    camera_setting_problems,
+    describe_camera,
+)
 
 RIG_2026_10_16 = {
     "ADC Bit Depth": "Bit10",
@@ -118,3 +121,47 @@ def test_the_intercept_of_counts_against_exposure_is_the_offset():
     assert (
         black_level_from_exposure_series([10, 10, 10], [1, 2, 3]) is None
     ), "no spread in exposure"
+
+
+def test_describe_camera_says_data_bits_in_pixel_size():
+    demo = {
+        "device": "DCam",
+        "bit_depth": 12,
+        "significant_bits": 12,
+        "bytes_per_pixel": 2,
+        "pixel_type": "16bit",
+    }
+    assert describe_camera(demo) == "DCam, 12-bit in 16-bit pixels"
+
+    flash = {
+        "device": "Flash4",
+        "bit_depth": 16,
+        "significant_bits": 16,
+        "bytes_per_pixel": 2,
+        "pixel_type": "16bit",
+    }
+    assert describe_camera(flash) == "Flash4, 16-bit"
+
+    oryx = {
+        "device": "Oryx",
+        "bit_depth": 16,
+        "significant_bits": 12,
+        "bytes_per_pixel": 2,
+        "pixel_type": "Mono12p",
+    }
+    assert describe_camera(oryx) == "Oryx, 12-bit in 16-bit pixels (Mono12p)"
+
+    eight = {
+        "device": "Oryx",
+        "bit_depth": 8,
+        "significant_bits": 8,
+        "bytes_per_pixel": 1,
+        "pixel_type": "Mono8",
+    }
+    assert describe_camera(eight) == "Oryx, 8-bit (Mono8)"
+
+    no_size = {"device": "Cam", "significant_bits": 12, "pixel_type": "16bit"}
+    assert describe_camera(no_size) == "Cam, 12-bit in 16-bit pixels"
+
+    only_format = {"device": "Cam", "pixel_type": "Mono12"}
+    assert describe_camera(only_format) == "Cam, Mono12"

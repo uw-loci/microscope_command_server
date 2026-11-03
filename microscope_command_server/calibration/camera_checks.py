@@ -132,8 +132,27 @@ def significant_bits(bit_depth: Optional[int], pixel_type: Optional[str]) -> Opt
     return min(candidates) if candidates else None
 
 
+def _container_bits(camera: Dict[str, object]) -> Optional[int]:
+    """Bits per stored pixel: Micro-Manager's bytes per pixel, else a ``16bit``-style name."""
+    import re
+
+    per_pixel = camera.get("bytes_per_pixel")
+    if isinstance(per_pixel, int) and per_pixel in (1, 2):
+        return per_pixel * 8
+    match = re.fullmatch(r"\s*(\d+)\s*-?bit\s*", str(camera.get("pixel_type") or ""), re.I)
+    return int(match.group(1)) if match else None
+
+
 def describe_camera(camera: Dict[str, object]) -> str:
-    """One line: ``Oryx, 50 ms (request), 12-bit, Mono12, 2448x2048, binning 1``."""
+    """One line: ``Oryx, 50 ms (request), 12-bit in 16-bit pixels (Mono12p), 2448x2048, binning 1``.
+
+    The data bits come first and the stored pixel size only when it differs, so a
+    12-bit camera in Micro-Manager's 16-bit buffer does not read as two bit depths.
+    A pixel format with its own name (``Mono12p``) is kept in brackets; a plain
+    ``16bit`` adds nothing the size does not already say.
+    """
+    import re
+
     parts = []
     if camera.get("device"):
         parts.append(str(camera["device"]))
@@ -141,10 +160,18 @@ def describe_camera(camera: Dict[str, object]) -> str:
         source = camera.get("exposure_source")
         parts.append(f"{camera['exposure_ms']:g} ms" + (f" ({source})" if source else ""))
     bits = camera.get("significant_bits", camera.get("bit_depth"))
+    pixel_type = str(camera.get("pixel_type") or "").strip()
+    named_format = pixel_type and not re.fullmatch(r"\d+\s*-?bit", pixel_type, re.I)
     if bits is not None:
-        parts.append(f"{bits}-bit")
-    if camera.get("pixel_type"):
-        parts.append(str(camera["pixel_type"]))
+        container = _container_bits(camera)
+        text = f"{bits}-bit"
+        if container is not None and container != bits:
+            text += f" in {container}-bit pixels"
+        if named_format:
+            text += f" ({pixel_type})"
+        parts.append(text)
+    elif pixel_type:
+        parts.append(pixel_type)
     if camera.get("width") is not None and camera.get("height") is not None:
         parts.append(f"{camera['width']}x{camera['height']}")
     if camera.get("binning") is not None:
