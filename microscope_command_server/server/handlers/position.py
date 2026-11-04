@@ -11,6 +11,7 @@ import logging
 from contextlib import contextmanager
 
 from microscope_control.hardware import Position
+from microscope_control.hardware.stage_cache import StageUnavailableError
 
 logger = logging.getLogger(__name__)
 
@@ -129,6 +130,33 @@ def _read_position_cached_or_live(hardware) -> Position:
     return cache.get_cached_position(max_age_ms=_POSITION_CACHE_STALE_MS)
 
 
+# First lines of read errors already logged with a traceback. A stage that is
+# switched off fails every request the same way; its traceback is logged once.
+_traced_read_errors = set()
+_TRACED_READ_ERRORS_MAX = 50
+
+
+def _log_read_error(what, e):
+    """Log a failed position read without a stack trace on every request.
+
+    StageUnavailableError means the stage cache already reported the stage as
+    not responding, so each request is logged at DEBUG only. Any other error is
+    logged at ERROR with its first line (mmcorej errors carry the Java stack in
+    their text), and with the traceback the first time that line is seen.
+    """
+    if isinstance(e, StageUnavailableError):
+        logger.debug("Failed to get %s: %s", what, e)
+        return
+    text = str(e)
+    summary = text.splitlines()[0] if text else type(e).__name__
+    first_time = (
+        summary not in _traced_read_errors and len(_traced_read_errors) < _TRACED_READ_ERRORS_MAX
+    )
+    if first_time:
+        _traced_read_errors.add(summary)
+    logger.error("Failed to get %s: %s", what, summary, exc_info=first_time)
+
+
 def handle_getxy(conn, client, hardware, settings, **kwargs):
     """Return current XY stage position as two big-endian floats."""
     logger.debug("Client %s requested XY position", client.addr)
@@ -137,7 +165,7 @@ def handle_getxy(conn, client, hardware, settings, **kwargs):
         conn.sendall(struct.pack("!ff", pos.x, pos.y))
         logger.debug("Sent XY position: (%.1f, %.1f)", pos.x, pos.y)
     except Exception as e:
-        logger.error("Failed to get XY position: %s", e, exc_info=True)
+        _log_read_error("XY position", e)
         conn.sendall(b"HW_ERROR")
 
 
@@ -149,7 +177,7 @@ def handle_getz(conn, client, hardware, settings, **kwargs):
         conn.sendall(struct.pack("!f", pos.z))
         logger.debug("Sent Z position: %.2f", pos.z)
     except Exception as e:
-        logger.error("Failed to get Z position: %s", e, exc_info=True)
+        _log_read_error("Z position", e)
         # 5 bytes where the value is 4. The client reads 4, recognizes "HWER",
         # and reads the fifth; changing the length here would desynchronize it.
         conn.sendall(b"HWERR")
@@ -163,7 +191,7 @@ def handle_getxyz(conn, client, hardware, settings, **kwargs):
         conn.sendall(struct.pack("!fff", pos.x, pos.y, pos.z))
         logger.debug("Sent XYZ: (%.1f, %.1f, %.2f)", pos.x, pos.y, pos.z)
     except Exception as e:
-        logger.error("Failed to get XYZ position: %s", e, exc_info=True)
+        _log_read_error("XYZ position", e)
         # Same convention as GETXY: an ASCII marker the width of the reply.
         # Zeros used to go out here, and a client could not tell them from
         # the stage sitting at the origin.
@@ -306,7 +334,7 @@ def handle_getzf(conn, client, hardware, settings, **kwargs):
         pos = _read_position_cached_or_live(hardware)
         conn.sendall(struct.pack("!f", pos.z))
     except Exception as e:
-        logger.error("Failed fast Z read: %s", e, exc_info=True)
+        _log_read_error("Z position (fast read)", e)
         # Same 5-byte marker as GETZ; the client reads it the same way.
         conn.sendall(b"HWERR")
 
