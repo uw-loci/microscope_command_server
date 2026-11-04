@@ -440,8 +440,8 @@ def _reconstruct_and_write(
         },
     }
     channel_label = {
-        RETARDANCE_DIR: "Retardance (nm)",
-        ORIENTATION_DIR: "Slow Axis Orientation (deg x100, axial)",
+        RETARDANCE_DIR: "Retardance_nm_x_100",
+        ORIENTATION_DIR: "Orientation_deg_x_100",
     }
 
     retardance_counts, ret_clipped = _to_uint16(result.retardance_nm, RETARDANCE_COUNTS_PER_NM)
