@@ -17,12 +17,21 @@ import time
 import logging
 
 from microscope_command_server.server.protocol import END_MARKER
+
 from microscope_command_server.server.handlers.utils import (
     read_message_string,
     split_flag_message,
 )
 
 logger = logging.getLogger(__name__)
+
+#: Largest ACQUIRE message accepted. The autofocus allow-list (--af-tissue-tiles) names
+#: every tissue tile, so a large region's message runs to tens of kilobytes: 2,377 tiles
+#: overflowed the old 10 KB cap on the PPM rig on 2026-11-06. 1 MB holds ~150,000 tiles.
+MAX_ACQUIRE_MESSAGE_BYTES = 1_000_000
+
+#: Seconds allowed to read the whole ACQUIRE message.
+ACQUIRE_READ_TIMEOUT_S = 10.0
 
 
 def handle_acquire(conn, client, hardware, settings, **kwargs):
@@ -119,8 +128,8 @@ def handle_acquire(conn, client, hardware, settings, **kwargs):
         return None
 
     # Read the full message immediately
-    message_parts = []
-    total_bytes = 0
+    received = bytearray()
+    marker = END_MARKER.encode("utf-8")
     start_time = time.time()
 
     # Set a timeout for reading
@@ -131,7 +140,7 @@ def handle_acquire(conn, client, hardware, settings, **kwargs):
     try:
         while True:
             # Read in chunks
-            chunk = conn.recv(1024)
+            chunk = conn.recv(65536)
             if not chunk:
                 logger.error(
                     "Connection closed while reading acquisition message from %s",
@@ -141,12 +150,15 @@ def handle_acquire(conn, client, hardware, settings, **kwargs):
                     acquisition_states[addr] = AcquisitionState.FAILED
                 break
 
-            message_parts.append(chunk.decode("utf-8"))
-            total_bytes += len(chunk)
+            # Look for the end marker only in the new bytes (plus a marker's length before
+            # them, in case it straddles two chunks), so a long message is not rescanned.
+            search_from = max(0, len(received) - len(marker))
+            received += chunk
+            total_bytes = len(received)
 
             # Check if we have the end marker
-            full_message = "".join(message_parts)
-            if END_MARKER in full_message:
+            if received.find(marker, search_from) >= 0:
+                full_message = received.decode("utf-8")
                 # Remove the end marker
                 message = full_message.replace("," + END_MARKER, "").replace(END_MARKER, "")
                 logger.debug(
@@ -177,18 +189,25 @@ def handle_acquire(conn, client, hardware, settings, **kwargs):
                 break
 
             # Safety check for message size
-            if total_bytes > 10000:  # 10KB max
+            if total_bytes > MAX_ACQUIRE_MESSAGE_BYTES:
                 logger.error(
-                    "Acquisition message too large from %s: %d bytes",
+                    "Acquisition message too large from %s: %d bytes without its end marker "
+                    "(limit %d). Not starting; the rest of the message is discarded.",
                     addr,
                     total_bytes,
+                    MAX_ACQUIRE_MESSAGE_BYTES,
                 )
                 with acquisition_locks[addr]:
                     acquisition_states[addr] = AcquisitionState.FAILED
+                # Answer, then read the rest away: left in the socket, the dispatch loop
+                # took it 8 bytes at a time as commands (2026-11-06).
+                with contextlib.suppress(OSError):
+                    conn.sendall("FAILED:TOOLARGE".ljust(16)[:16].encode())
+                _drain_rejected_message(conn, addr, max_bytes=10 * MAX_ACQUIRE_MESSAGE_BYTES)
                 break
 
             # Timeout check
-            if time.time() - start_time > 10:
+            if time.time() - start_time > ACQUIRE_READ_TIMEOUT_S:
                 logger.error("Timeout reading acquisition message from %s", addr)
                 with acquisition_locks[addr]:
                     acquisition_states[addr] = AcquisitionState.FAILED

@@ -195,3 +195,73 @@ def test_an_admitted_acquire_does_not_touch_the_drain():
     conn = FakeConn(b"--sample Test ENDOFSTR")
     handle_acquire(conn, None, None, None, addr=ADDR_MAIN, **kwargs)
     assert conn.sent.startswith(b"STARTED:ACQUIRE")
+
+
+# --------------------------------------------------------------------------
+# message size: a large region's autofocus allow-list
+# --------------------------------------------------------------------------
+
+
+class ChunkedConn(FakeConn):
+    """Hands the message back a few kilobytes at a time, as a real socket does."""
+
+    def __init__(self, message, chunk=1024):
+        super().__init__(message)
+        self._chunk = chunk
+
+    def recv(self, size):
+        self.recv_calls += 1
+        n = min(size, self._chunk)
+        chunk, self._message = self._message[:n], self._message[n:]
+        return chunk
+
+
+def _message_with_tissue_tiles(n_tiles):
+    tiles = ",".join(str(i) for i in range(n_tiles))
+    return f"--yaml D:/x/config_PPM.yml --sample Test --af-tissue-tiles {tiles} ENDOFSTR".encode()
+
+
+def test_a_large_region_tissue_tile_list_is_accepted_whole():
+    # 2026-11-06, PPM: 2,377 tiles made a message over the old 10 KB cap, the
+    # acquisition never started and the rest of it was read as 'Unknown command's.
+    seen = {}
+    states = {ADDR_MAIN: AcquisitionState.IDLE}
+    kwargs = make_kwargs(states)
+    kwargs["acquisitionWorkflow"] = lambda message, addr: seen.setdefault("message", message)
+    body = _message_with_tissue_tiles(5000)
+    assert len(body) > 20_000
+    conn = ChunkedConn(body)
+    thread = handle_acquire(conn, None, None, None, addr=ADDR_MAIN, **kwargs)
+    thread.join(timeout=5)
+    assert conn.sent.startswith(b"STARTED:ACQUIRE")
+    assert conn.unread == b""
+    assert seen["message"].rstrip().endswith(",4999")
+    assert "ENDOFSTR" not in seen["message"]
+
+
+def test_an_end_marker_split_across_two_reads_is_found():
+    seen = {}
+    states = {ADDR_MAIN: AcquisitionState.IDLE}
+    kwargs = make_kwargs(states)
+    kwargs["acquisitionWorkflow"] = lambda message, addr: seen.setdefault("message", message)
+    body = b"--sample Test ENDOFSTR"
+    conn = ChunkedConn(body, chunk=len(body) - 4)  # "...ENDO" | "FSTR"
+    handle_acquire(conn, None, None, None, addr=ADDR_MAIN, **kwargs).join(timeout=5)
+    assert seen["message"].strip() == "--sample Test"
+
+
+def test_a_message_over_the_limit_is_answered_and_drained(monkeypatch):
+    from microscope_command_server.server.handlers import acquisition
+
+    monkeypatch.setattr(acquisition, "MAX_ACQUIRE_MESSAGE_BYTES", 4096)
+    states = {ADDR_MAIN: AcquisitionState.IDLE}
+    started = []
+    kwargs = make_kwargs(states)
+    kwargs["acquisitionWorkflow"] = lambda message, addr: started.append(message)
+    conn = ChunkedConn(_message_with_tissue_tiles(3000))
+    assert handle_acquire(conn, None, None, None, addr=ADDR_MAIN, **kwargs) is None
+    assert conn.sent.startswith(b"FAILED:TOOLARGE")
+    assert len(conn.sent) == 16
+    assert conn.unread == b"", "the rest would be parsed 8 bytes at a time as commands"
+    assert states[ADDR_MAIN] == AcquisitionState.FAILED
+    assert not started
