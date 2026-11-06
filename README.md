@@ -1610,10 +1610,13 @@ behavior to pre-feature acquisitions. The focus surface is off by default.
 
 **Edge-Retry Walk (default):**
 Starts from wherever the stage currently is and scans a window; if the peak
-appears to lie past an edge of that window, it shifts the window in that
-direction and scans again, up to `--max-attempts` times. Needs no operator
-measurement and works from any starting position, but each continuation is an
-inference that moving further -- possibly toward the sample -- is correct.
+appears to lie past an edge of that window, it scans again, up to
+`--max-attempts` times. A sloped profile shifts the window one full range toward
+the edge. A narrow, confident peak pinned at the edge is instead centered on, and
+if the retries run out on such a peak, one short follow-up sweep is run around
+it before the Brent fallback. Needs no operator measurement and works from any
+starting position, but each continuation is an inference that moving further --
+possibly toward the sample -- is correct.
 
 **Approach-from-Safe-Z (new):**
 A bounded single-pass scan that retracts to a known-safe position first, then
