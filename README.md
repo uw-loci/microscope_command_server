@@ -1452,6 +1452,11 @@ because every choice was made by distance alone and the camera-side `dense_textu
 read glass and tissue alike on the Flash4 (0.014 either way). Each search on glass found a
 noise peak 44-63 um away and the nearest-seed logic spread those Zs across the mosaic.
 
+**Message size.** An ACQUIRE message may be up to 1 MB, which holds a tissue-tile list for
+roughly 150,000 tiles, so a large region's allow-list fits in one message. A longer message is
+not started: the server replies `FAILED:TOOLARGE` and reads the rest of the message away, so it is
+not parsed as commands.
+
 ## Focus Surface Fitting (--focus-surface, --focus-survey, --focus-survey-tiles)
 
 The BGACQUIRE (and ACQUIRE) acquisition message parser accepts optional flags
