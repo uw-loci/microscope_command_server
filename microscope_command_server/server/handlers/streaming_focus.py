@@ -353,6 +353,77 @@ SLOPE_MIN_AMPLITUDE = 0.005
 # config.stage.limits.z_um.
 MAX_EDGE_RETRIES = 2
 
+# A narrow, confident peak pinned at a sweep's edge (gaussian mu on the sampled
+# boundary, sigma well under the window) is NOT a slope: the peak is right there,
+# at or just past the edge. Shifting the next window by a full range then puts it
+# at the new window's start, inside the head-discard stretch, and once retries run
+# out the Brent fallback searched best +/- range (160 um on PPM 20x 2026-11-06) for
+# a ~5 um wide peak and kept the edge sample. Instead: center the next sweep on
+# the peak, and, if retries are exhausted, run one short follow-up sweep there.
+#: Half-width of the follow-up sweep, in peak sigmas (the peak spans about +/-2 sigma).
+EDGE_PEAK_HALF_WIDTH_SIGMAS = 4.0
+#: Smallest follow-up sweep, um.
+EDGE_PEAK_MIN_RANGE_UM = 20.0
+#: Brent bracket half-width around a narrow edge peak, in sigmas, and its floor in um.
+EDGE_PEAK_BRENT_SIGMAS = 4.0
+EDGE_PEAK_BRENT_MIN_UM = 5.0
+
+
+def _next_center_after_edge(result, current_center: float, range_um: float):
+    """Where the next retry sweep goes after an edge result, and why.
+
+    A narrow peak pinned at the edge (``peak_sigma`` set) is centered on, so it sits
+    mid-window. A slope (no narrow peak) shifts by one full range, toward the edge, so
+    the windows tile without overlap.
+    """
+    if result.best_z is not None and result.peak_sigma is not None:
+        return float(result.best_z), "narrow peak at the window edge; centering on it"
+    step = -range_um if result.status == "edge_low" else range_um
+    return current_center + step, "slope toward the edge; shifting one full range"
+
+
+def _edge_followup_window(result, head_discard_um: float):
+    """(center, range) of the short sweep run after retries end on a narrow edge peak.
+
+    None when the last result is not a narrow, confident edge peak. The range covers
+    the peak (+/- EDGE_PEAK_HALF_WIDTH_SIGMAS sigma) plus the head-discard stretch on
+    each side, so the stretch a sweep throws away cannot be where the peak is.
+    """
+    if result.status not in ("edge_low", "edge_high"):
+        return None
+    if result.best_z is None or result.peak_sigma is None:
+        return None
+    rng = max(
+        EDGE_PEAK_MIN_RANGE_UM,
+        2.0 * EDGE_PEAK_HALF_WIDTH_SIGMAS * result.peak_sigma + 2.0 * max(head_discard_um, 0.0),
+    )
+    return float(result.best_z), rng
+
+
+def _brent_bracket(final_result, samples_zm, range_um, max_attempts, initial_z, z_low, z_high):
+    """The [lo, hi] the Brent fallback searches.
+
+    Around a narrow edge peak: +/- EDGE_PEAK_BRENT_SIGMAS sigma (at least
+    EDGE_PEAK_BRENT_MIN_UM). Otherwise one full range either side of the best sample,
+    or, with no samples, the span the retries would have covered. Clamped to the stage
+    limits.
+    """
+    if final_result.best_z is not None and final_result.peak_sigma is not None:
+        half = max(EDGE_PEAK_BRENT_SIGMAS * final_result.peak_sigma, EDGE_PEAK_BRENT_MIN_UM)
+        lo, hi = final_result.best_z - half, final_result.best_z + half
+    elif samples_zm:
+        best_z_so_far = max(samples_zm, key=lambda zm: zm[1])[0]
+        lo, hi = best_z_so_far - range_um, best_z_so_far + range_um
+    else:
+        total_span = range_um * max_attempts
+        lo, hi = initial_z - total_span / 2.0, initial_z + total_span / 2.0
+    if z_low is not None:
+        lo = max(lo, z_low)
+    if z_high is not None:
+        hi = min(hi, z_high)
+    return lo, hi
+
+
 # Default ROI crop factor (fraction of full sensor width/height
 # used during the scan). Smaller value = smaller per-frame transfer
 # = faster pop loop = denser sampling. 0.5 means the center 50%
@@ -2933,6 +3004,7 @@ class _ScanAttemptResult:
         z_span: float,
         reason: str,
         samples_trace: Optional[list] = None,
+        peak_sigma: Optional[float] = None,
     ):
         self.status = status
         self.best_z = best_z
@@ -2940,6 +3012,9 @@ class _ScanAttemptResult:
         self.z_span = z_span
         self.reason = reason
         self.samples_trace = samples_trace or []
+        # Set only on an edge result whose gaussian is narrow (non-degenerate) and
+        # pinned at the boundary: a real peak at or just past the edge, not a slope.
+        self.peak_sigma = peak_sigma
 
 
 def _attempt_one_scan(
@@ -3703,6 +3778,7 @@ def _attempt_one_scan(
                     f"{metric_range_frac:.2%}, R^2={r2:.2f}). True focus "
                     f"is likely at {direction}",
                     samples_trace=list(in_motion),
+                    peak_sigma=(sigma_fit if sigma_fit < 0.45 * max(z_span, 1e-6) else None),
                 )
 
         # 2026-07-13: degenerate-fit monotonic-slope escape on the
@@ -4319,10 +4395,9 @@ def _brent_fallback_scan(
             f"empty Brent bracket [{z_lo}, {z_hi}]",
         )
 
-    # Brent's method needs a 3-point bracket where the middle has a
-    # lower function value than both ends (we're MINIMIZING negative
-    # metric, i.e. maximizing metric). Start with a center at
-    # midpoint of the bracket.
+    # The bracket's midpoint is where the caller anchored it (the best Z the
+    # streaming passes found); it is evaluated first so the result can never be
+    # worse than that anchor.
     z_mid = (z_lo + z_hi) / 2.0
 
     # Use full stage speed for Brent evaluations -- each one is a
@@ -4358,11 +4433,17 @@ def _brent_fallback_scan(
         return -m
 
     try:
-        result = minimize_scalar(
+        neg_metric(z_mid)
+        # method="bounded" takes an ABSOLUTE tolerance (xatol, um). method="brent"
+        # with a 3-point bracket was used before; its xtol is RELATIVE to |z|, so
+        # 0.5 at z ~ -38 um meant "stop within ~19 um" and it returned after its
+        # three starting points every time -- "converged at -38.400 after 5 evals"
+        # on PPM 2026-11-06 was the bracket's middle, not a refined peak.
+        minimize_scalar(
             neg_metric,
-            bracket=(z_lo, z_mid, z_hi),
-            method="brent",
-            options={"xtol": abs_tolerance_um, "maxiter": max_evals},
+            bounds=(z_lo, z_hi),
+            method="bounded",
+            options={"xatol": abs_tolerance_um, "maxiter": max_evals},
         )
     except _AbortRequested:
         # Caught before the generic handler below, which would commit the best eval so far.
@@ -4392,12 +4473,27 @@ def _brent_fallback_scan(
             f"Brent failed with no evals: {e}",
         )
 
-    best_z = float(result.x)
-    # Clamp to bracket (scipy Brent can sometimes report just outside)
-    best_z = max(z_lo, min(z_hi, best_z))
-    z_span = (max(z for z, _ in evals) - min(z for z, _ in evals)) if evals else 0.0
+    if not evals:
+        return _ScanAttemptResult("error", None, 0, 0.0, "Brent made no evaluations")
+    # The best Z actually measured. Within xatol of the optimizer's answer when it
+    # converged, and never worse than the anchor evaluated first.
+    best_index = max(range(len(evals)), key=lambda i: evals[i][1])
+    best_z = float(evals[best_index][0])
+    z_span = max(z for z, _ in evals) - min(z for z, _ in evals)
 
     logger.info("STREAM_AF:%s converged at z=%.3f after %d evals", tag, best_z, len(evals))
+    if best_index == 0 and len(evals) > 1:
+        # Nothing the search tried beat the anchor it started from: on a bracket much
+        # wider than the peak, the probes can all land on baseline.
+        logger.warning(
+            "STREAM_AF:%s: no evaluation improved on the starting point z=%.3f; the "
+            "result is that point, not a refined peak. The bracket [%.3f, %.3f] may be "
+            "much wider than the peak.",
+            tag,
+            best_z,
+            z_lo,
+            z_hi,
+        )
     return _ScanAttemptResult(
         "success",
         best_z,
@@ -5510,20 +5606,16 @@ def _handle_streaming_focus(conn, client, hardware, settings, **kwargs):
             if result.status in ("edge_low", "edge_high"):
                 any_slope_attempt_seen = True
 
-            if result.status == "edge_low":
-                # Shift down by one full range so the next window's
-                # upper edge equals this one's lower edge -- we cover
-                # new ground without overlap.
-                current_center = current_center - range_um
+            if result.status in ("edge_low", "edge_high"):
+                # A slope shifts the window one full range (no overlap); a narrow
+                # peak pinned at the edge is centered on instead (see
+                # EDGE_PEAK_HALF_WIDTH_SIGMAS).
+                current_center, why = _next_center_after_edge(result, current_center, range_um)
                 logger.info(
-                    "STREAM_AF:edge_low -- next attempt center will be %.3f", current_center
-                )
-                continue
-
-            if result.status == "edge_high":
-                current_center = current_center + range_um
-                logger.info(
-                    "STREAM_AF:edge_high -- next attempt center will be %.3f", current_center
+                    "STREAM_AF:%s -- %s; next attempt center will be %.3f",
+                    result.status,
+                    why,
+                    current_center,
                 )
                 continue
 
@@ -5830,6 +5922,57 @@ def _handle_streaming_focus(conn, client, hardware, settings, **kwargs):
                 "unknown failure, no attempt completed",
             )
 
+        # --- Follow-up sweep on a narrow edge peak ---
+        # Retries ran out on a confident, narrow peak at a window's edge: the focus is
+        # right there. One short sweep centered on it is faster and far more reliable
+        # than Brent over a window many times the peak's width.
+        followup = _edge_followup_window(
+            final_result, (eff_head_discard_ms / 1000.0) * min_velocity_um_s
+        )
+        if (
+            followup is not None
+            and not (abort_event is not None and abort_event.is_set())
+            and _scan_window_within_limits(followup[0], followup[1], z_low, z_high)
+        ):
+            fu_center, fu_range = followup
+            logger.info(
+                "STREAM_AF:retries ended on a narrow peak at the window edge "
+                "(mu=%.3f, sigma=%.2f um); follow-up sweep centered on it, range %.1f um",
+                fu_center,
+                final_result.peak_sigma,
+                fu_range,
+            )
+            fu_result = _attempt_one_scan(
+                core,
+                focus_device,
+                speed_prop,
+                fu_center,
+                fu_range,
+                sequence_was_running,
+                attempt_label="edge follow-up",
+                velocity_um_s=min_velocity_um_s,
+                metric_name=metric_name,
+                slow_value=eff_slow_value,
+                normal_value=eff_normal_value,
+                dump_dir=(dump_root / "attempt_edge_followup" if dump_root is not None else None),
+                dump_frames=dump_frames,
+                secondary_metric_name=secondary_metric_name,
+                abort_event=abort_event,
+                head_discard_ms=eff_head_discard_ms,
+            )
+            attempts_log.append(
+                f"edge follow-up: center={fu_center:.3f} range={fu_range:.2f} "
+                f"status={fu_result.status} n={fu_result.n_samples} reason='{fu_result.reason}'"
+            )
+            for smp in fu_result.samples_trace:
+                if len(smp) >= 3:
+                    all_attempt_samples_zm.append((float(smp[1]), float(smp[2])))
+            if fu_result.status in ("success", "aborted", "rapid_jump"):
+                final_result = fu_result
+            elif fu_result.status in ("edge_low", "edge_high") and fu_result.best_z is not None:
+                # Still at an edge: keep the newer, closer estimate for the fallbacks.
+                final_result = fu_result
+
         # --- Union-fit pre-Brent escalation ---
         # Before going to Brent, give the union of all collected
         # samples one more chance. The retry loop may have exited
@@ -5907,20 +6050,15 @@ def _handle_streaming_focus(conn, client, hardware, settings, **kwargs):
             final_result = _ScanAttemptResult("aborted", None, 0, 0.0, "user cancelled")
 
         if final_result.status in ("edge_low", "edge_high", "no_slow_speed"):
-            if all_attempt_samples_zm:
-                # Anchor on the best sample we've already got, then
-                # widen to one full range either side.
-                best_z_so_far = max(all_attempt_samples_zm, key=lambda zm: zm[1])[0]
-                brent_lo = best_z_so_far - range_um
-                brent_hi = best_z_so_far + range_um
-            else:
-                total_span = range_um * max_attempts
-                brent_lo = initial_z - total_span / 2.0
-                brent_hi = initial_z + total_span / 2.0
-            if z_low is not None:
-                brent_lo = max(brent_lo, z_low)
-            if z_high is not None:
-                brent_hi = min(brent_hi, z_high)
+            brent_lo, brent_hi = _brent_bracket(
+                final_result,
+                all_attempt_samples_zm,
+                range_um,
+                max_attempts,
+                initial_z,
+                z_low,
+                z_high,
+            )
             if brent_hi - brent_lo >= 2.0:  # need at least 2 um bracket
                 logger.info(
                     "STREAM_AF:streaming retries exhausted with edge; "
