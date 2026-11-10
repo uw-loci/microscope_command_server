@@ -1460,8 +1460,9 @@ not parsed as commands.
 ## Focus Surface Fitting (--focus-surface, --focus-survey, --focus-survey-tiles)
 
 The BGACQUIRE (and ACQUIRE) acquisition message parser accepts optional flags
-to fit a robust plane through autofocus measurements and optionally validate or
-override per-tile autofocus results against that plane.
+to fit a robust surface (a plane, or a quadratic where the region supports one)
+through autofocus measurements and optionally validate or override per-tile
+autofocus results against that surface.
 
 ### Why a focus surface
 
@@ -1490,16 +1491,16 @@ drift sweeps defined to 0.27 um RMS. Full measurement and method:
 - **`off`** (default) -- No focus surface; behavior is identical to prior
   releases. The surface is not fitted or consulted.
 
-- **`observe`** -- Fit a robust plane and report what enforcement would do,
+- **`observe`** -- Fit a robust surface and report what enforcement would do,
   but change nothing. Every autofocus result is checked against the surface,
   and the log reports disagreements. This mode is a dry run: use it to
   measure what enforcement would have done over a real region before
   committing to automatic overrides.
 
-- **`enforce`** -- Fit a robust plane and replace autofocus results that
+- **`enforce`** -- Fit a robust surface and replace autofocus results that
   disagree with it beyond a gate. When an autofocus result lands far from the
-  fitted plane (residual > max of a 5 um floor or 4 sigma of the fit's RMS),
-  that result is rejected and the tile uses the plane's prediction instead,
+  fitted surface (residual > max of a 5 um floor or 4 sigma of the fit's RMS),
+  that result is rejected and the tile uses the surface's prediction instead,
   with the stage moved there.
 
 ### Focus surface licensing
@@ -1550,7 +1551,7 @@ once; the quadratic kept 1205 at 0.70 um RMS and would have replaced none.
 
 At the end of a region with the surface active, the server writes
 `focus_surface.json` beside the tiles: `model` (`plane` or `quadratic`),
-`licensed` and `unlicensed_reason`, `centre_x_um`/`centre_y_um`, `z0_um`,
+`licensed`, `unlicensed_reason`, `mode`, `centre_x_um`/`centre_y_um`, `z0_um`,
 `tilt_x_um_per_mm`/`tilt_y_um_per_mm`, the three `q*_um_per_mm2` terms (0 for a
 plane), `bounds_um` (`[xmin, xmax, ymin, ymax]`, null for a plane),
 `inlier_rms_um`, `inliers` and `points`. QPSC reads it and keeps a licensed
@@ -1610,7 +1611,7 @@ starts, instead of discovering the plane one tile at a time:
 --focus-surface observe --focus-survey 9
 ```
 
-Runs one survey with nine well-spread points, fits a plane, and logs every
+Runs one survey with nine well-spread points, fits a surface, and logs every
 time the surface would have overruled a tile's autofocus result. Nothing acts on
 it: no tile's Z changes and the stage is never moved on the surface's say-so, so
 the acquisition is the one it would have produced anyway. The output is the
@@ -1624,7 +1625,7 @@ many. Run this before `enforce`.
 --focus-surface enforce --focus-survey 6 --focus-survey-tiles "5,12,19,31,44,51"
 ```
 
-Measures the six client-specified tiles, fits a plane, and replaces autofocus
+Measures the six client-specified tiles, fits a surface, and replaces autofocus
 results that land far from it. The client (e.g., QuPath) scores tiles for
 tissue content and supplies the well-covered ones.
 
