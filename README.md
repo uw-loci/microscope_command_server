@@ -1529,6 +1529,33 @@ When any check fails, the mode is logged as "NOT licensed: ..." and the
 acquisition falls back to the nearest-neighbour seeding behavior from before
 this feature.
 
+### Plane or curved surface
+
+The surface is a plane unless the region supports a quadratic (three more terms:
+X^2, X*Y, Y^2). A quadratic is tried once there are at least 20 points spread
+at least 3 mm in both directions. It replaces the plane only if at least 85% of
+all points agree with it, and it either explains at least 2% more points (minimum
+2) or fits as many points with an RMS at most 75% of the plane's and at least
+0.2 um lower. Beyond the box its points span, a quadratic continues in a straight
+line along its slope at the box edge, so it never extrapolates a curve.
+
+Why: two PPM 20x regions (2026-11-06 and 2026-11-07, 19 mm across) were twisted
+(X*Y term -0.07 and -0.09 um/mm^2). The plane fitted all their autofocus results
+to 2.6 um RMS and left the row ends about 5 um off, which in enforce mode
+replaced correct results there. Replaying the 2026-11-07 region (1208 results):
+the plane kept 631 points as inliers, would have replaced 2 results and reset
+once; the quadratic kept 1205 at 0.70 um RMS and would have replaced none.
+
+### focus_surface.json
+
+At the end of a region with the surface active, the server writes
+`focus_surface.json` beside the tiles: `model` (`plane` or `quadratic`),
+`licensed` and `unlicensed_reason`, `centre_x_um`/`centre_y_um`, `z0_um`,
+`tilt_x_um_per_mm`/`tilt_y_um_per_mm`, the three `q*_um_per_mm2` terms (0 for a
+plane), `bounds_um` (`[xmin, xmax, ymin, ymax]`, null for a plane),
+`inlier_rms_um`, `inliers` and `points`. QPSC reads it and keeps a licensed
+surface as the slide's focus surface.
+
 ### Pre-acquisition focus survey
 
 `--focus-survey N` measures N additional focus points **before** the tile loop

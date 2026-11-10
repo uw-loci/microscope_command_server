@@ -11,8 +11,15 @@ Measured on ten regions across three PPM sessions (see
 ``claude-reports/design/autofocus-empirical/summaries/focus_surface.md``):
 
 * A single tilted plane describes measured focus to 0.27-1.11 um RMS over regions up
-  to 19 mm across, while focus itself travels 4-150 um over the same region. The
-  sample is tilted, not curved -- a quadratic term buys about 0.1 um.
+  to 19 mm across, while focus itself travels 4-150 um over the same region. On that
+  corpus a quadratic term bought about 0.1 um.
+* Not on every slide. Two PPM 20x regions of 2026-11-06 and 2026-11-07 (19 mm across,
+  700 and 1200 autofocus results) were twisted: an X*Y term of -0.07 and -0.09
+  um/mm^2. The plane fitted them to 2.6 um RMS on all points, about 5 um off at the
+  ends of every row; a quadratic fitted 0.7 um. The plane's robust fit called the row
+  ends outliers, and enforcement then replaced correct results there. So the surface
+  is a quadratic when enough well-spread points support one and it explains them
+  better, and a plane otherwise.
 * Narrow sweep drift checks land more than 5 um off that plane 1.2% of the time.
   Wide standard autofocus does so **25%** of the time, and more than 15 um off 21% of
   the time, worst case 73 um. One region had 12 of 12 standard results a median 43 um
@@ -108,6 +115,25 @@ RESURFACE_AFTER_REJECTIONS = 3
 _RANSAC_ITERATIONS = 100
 _RANSAC_SAMPLE = 4
 
+# A quadratic adds three curvature terms. It is tried only with this many points...
+QUAD_MIN_POINTS = 20
+# ...spread at least this far (mm) in BOTH principal directions: curvature over a strip
+# a few tiles wide is not measurable and would only be fitted noise.
+QUAD_MIN_SPREAD_MM = 3.0
+# It replaces the plane when it explains at least this many more points (absolute, or
+# as a fraction of all points, whichever is larger)...
+QUAD_EXTRA_INLIERS_MIN = 2
+QUAD_EXTRA_INLIERS_FRACTION = 0.02
+# ...or as many points with a residual at most this fraction of the plane's, and at
+# least this much (um) lower.
+QUAD_RMS_RATIO = 0.75
+QUAD_RMS_GAIN_UM = 0.2
+# Three extra terms fit noise too: on 36 points scattered 8 um about a plane, a quadratic
+# found 22 (61%) inside the band. Real regions agree at 91-100%, so a quadratic must
+# explain at least this fraction of all points before it can replace the plane.
+QUAD_MIN_INLIER_FRACTION = 0.85
+_RANSAC_SAMPLE_QUAD = 8
+
 
 @dataclass
 class Verdict:
@@ -125,7 +151,13 @@ class Verdict:
 
 @dataclass
 class _Fit:
-    """A plane z = z0 + ax * X_mm + ay * Y_mm about a centre, with its own quality."""
+    """z = z0 + ax*u + ay*v [+ qxx*u^2 + qxy*u*v + qyy*v^2], u and v in mm about a centre.
+
+    A plane leaves the three curvature terms at zero. A quadratic is only trusted inside
+    the box its inlier points span: outside it the surface continues in a straight line
+    along its slope at the box edge, because a curve extrapolated past its data runs
+    away (the next raster rows are exactly where a growing surface is asked about).
+    """
 
     centre: Tuple[float, float]
     z0: float
@@ -137,16 +169,46 @@ class _Fit:
     # Singular values (mm) of the centred inlier XY cloud. The smaller one is how well
     # the second tilt term is constrained; near zero means the points are a line.
     spread_mm: Tuple[float, float] = (0.0, 0.0)
+    qxx: float = 0.0
+    qxy: float = 0.0
+    qyy: float = 0.0
+    # (xmin, xmax, ymin, ymax) of the inlier points, um; None for a plane.
+    bounds: Optional[Tuple[float, float, float, float]] = None
+
+    @property
+    def quadratic(self) -> bool:
+        return self.bounds is not None
 
     def predict(self, x: float, y: float) -> float:
-        return (
+        if not self.quadratic:
+            return (
+                self.z0
+                + self.ax * (x - self.centre[0]) / 1000.0
+                + self.ay * (y - self.centre[1]) / 1000.0
+            )
+        xmin, xmax, ymin, ymax = self.bounds
+        xc = min(max(x, xmin), xmax)
+        yc = min(max(y, ymin), ymax)
+        u = (xc - self.centre[0]) / 1000.0
+        v = (yc - self.centre[1]) / 1000.0
+        z = (
             self.z0
-            + self.ax * (x - self.centre[0]) / 1000.0
-            + self.ay * (y - self.centre[1]) / 1000.0
+            + self.ax * u
+            + self.ay * v
+            + self.qxx * u * u
+            + self.qxy * u * v
+            + self.qyy * v * v
         )
+        gx = self.ax + 2.0 * self.qxx * u + self.qxy * v
+        gy = self.ay + self.qxy * u + 2.0 * self.qyy * v
+        return z + gx * (x - xc) / 1000.0 + gy * (y - yc) / 1000.0
 
     def tilt_um_per_mm(self) -> float:
+        """Slope magnitude at the centre."""
         return float(np.hypot(self.ax, self.ay))
+
+    def model(self) -> str:
+        return "quadratic" if self.quadratic else "plane"
 
 
 @dataclass
@@ -263,7 +325,15 @@ class FocusSurface:
             self._fit = None
             return
         pts = np.asarray(self._points, dtype=float)
-        self._fit = _ransac_plane(pts, self.inlier_band_um, self._rng, self.logger)
+        plane = _ransac_fit(pts, self.inlier_band_um, self._rng, self.logger, quadratic=False)
+        self._fit = plane
+        if plane is None or len(pts) < QUAD_MIN_POINTS:
+            return
+        if min(_spread_mm(pts[:, :2])) < QUAD_MIN_SPREAD_MM:
+            return
+        quad = _ransac_fit(pts, self.inlier_band_um, self._rng, self.logger, quadratic=True)
+        if quad is not None and _quadratic_is_better(plane, quad):
+            self._fit = quad
 
     # ---------- using ----------
 
@@ -347,16 +417,10 @@ class FocusSurface:
         # Distinct places, or this is one tile being retried rather than a moved slide.
         if len(np.unique(np.round(recent[:, :2], 1), axis=0)) < RESURFACE_AFTER_REJECTIONS:
             return False
-        # Keep this surface's tilt, re-fit the offset only, and see whether the rejected
+        # Keep this surface's shape, re-fit the offset only, and see whether the rejected
         # points actually lie on the result. A translated slide does; a stuck reading
         # does not, because it ignores the tilt.
-        tilted = np.array(
-            [
-                self._fit.ax * (x - self._fit.centre[0]) / 1000.0
-                + self._fit.ay * (y - self._fit.centre[1]) / 1000.0
-                for x, y, _ in recent
-            ]
-        )
+        tilted = np.array([self._fit.predict(x, y) - self._fit.z0 for x, y, _ in recent])
         offsets = recent[:, 2] - tilted
         if float(np.std(offsets)) > self.max_rms_um:
             # Not telling a coherent story -- these are failures, not a moved sample.
@@ -394,8 +458,13 @@ class FocusSurface:
         f = self._fit
         why = self._unlicensed_reason()
         verdict = "licensed" if why is None else f"NOT licensed: {why}"
+        curve = (
+            f" {f.qxx:+.3f}*X_mm^2 {f.qxy:+.3f}*X_mm*Y_mm {f.qyy:+.3f}*Y_mm^2"
+            if f.quadratic
+            else ""
+        )
         return (
-            f"focus surface: z = {f.z0:.2f} {f.ax:+.2f}*X_mm {f.ay:+.2f}*Y_mm about "
+            f"focus surface ({f.model()}): z = {f.z0:.2f} {f.ax:+.2f}*X_mm {f.ay:+.2f}*Y_mm{curve} about "
             f"({f.centre[0]:.0f}, {f.centre[1]:.0f}), tilt {f.tilt_um_per_mm():.2f} um/mm, "
             f"{f.n_inliers}/{f.n_points} inliers at {f.inlier_rms_um:.2f} um RMS, "
             f"spread {f.spread_mm[0]:.1f} x {f.spread_mm[1]:.1f} mm, "
@@ -429,20 +498,108 @@ class FocusSurface:
                     "spread_major_mm": round(self._fit.spread_mm[0], 3),
                     "spread_minor_mm": round(self._fit.spread_mm[1], 3),
                     "required_spread_mm": round(self.required_spread_mm(), 3),
+                    "model": self._fit.model(),
                 }
             )
+            if self._fit.quadratic:
+                out.update(
+                    {
+                        "qxx_um_per_mm2": round(self._fit.qxx, 5),
+                        "qxy_um_per_mm2": round(self._fit.qxy, 5),
+                        "qyy_um_per_mm2": round(self._fit.qyy, 5),
+                    }
+                )
         return out
 
+    def to_record(self) -> Optional[dict]:
+        """The fitted surface, for ``focus_surface.json`` beside the region's tiles.
 
-def _design(xy: np.ndarray, centre: Tuple[float, float]) -> np.ndarray:
-    """Plane design matrix in mm about ``centre``, which keeps it conditioned.
+        QPSC reads it after the region and stores it as the slide's focus surface, so the
+        next region on the slide starts from hundreds of points instead of the two or
+        three measured at alignment. None when there is no fit at all; a fit that is not
+        licensed is still written, with ``licensed: false`` and the reason.
+        """
+        f = self._fit
+        if not self.active or f is None:
+            return None
+        return {
+            "model": f.model(),
+            "licensed": self.licensed,
+            "unlicensed_reason": self._unlicensed_reason(),
+            "mode": self.mode,
+            "centre_x_um": f.centre[0],
+            "centre_y_um": f.centre[1],
+            "z0_um": f.z0,
+            "tilt_x_um_per_mm": f.ax,
+            "tilt_y_um_per_mm": f.ay,
+            "qxx_um_per_mm2": f.qxx,
+            "qxy_um_per_mm2": f.qxy,
+            "qyy_um_per_mm2": f.qyy,
+            "bounds_um": list(f.bounds) if f.bounds is not None else None,
+            "inlier_rms_um": f.inlier_rms_um,
+            "inliers": f.n_inliers,
+            "points": f.n_points,
+        }
+
+
+def _design(xy: np.ndarray, centre: Tuple[float, float], quadratic: bool = False) -> np.ndarray:
+    """Design matrix in mm about ``centre``, which keeps it conditioned.
 
     Stage coordinates run to tens of thousands of microns, so fitting in raw um makes
     the normal equations badly scaled and the tilt terms numerically mushy.
     """
     x = (xy[:, 0] - centre[0]) / 1000.0
     y = (xy[:, 1] - centre[1]) / 1000.0
+    if quadratic:
+        return np.column_stack([np.ones_like(x), x, y, x * x, x * y, y * y])
     return np.column_stack([np.ones_like(x), x, y])
+
+
+def _quadratic_is_better(plane: _Fit, quad: _Fit) -> bool:
+    """Whether the quadratic earns its three extra terms over the plane."""
+    if quad.n_points == 0 or quad.n_inliers / quad.n_points < QUAD_MIN_INLIER_FRACTION:
+        return False
+    extra = max(QUAD_EXTRA_INLIERS_MIN, QUAD_EXTRA_INLIERS_FRACTION * plane.n_points)
+    if quad.n_inliers >= plane.n_inliers + extra:
+        return True
+    return (
+        quad.n_inliers >= plane.n_inliers
+        and quad.inlier_rms_um <= QUAD_RMS_RATIO * plane.inlier_rms_um
+        and plane.inlier_rms_um - quad.inlier_rms_um >= QUAD_RMS_GAIN_UM
+    )
+
+
+def _make_fit(
+    centre: Tuple[float, float],
+    coef: np.ndarray,
+    rms: float,
+    n_inliers: int,
+    n_points: int,
+    spread: Tuple[float, float],
+    inlier_xy: Optional[np.ndarray],
+) -> _Fit:
+    if len(coef) == 3:
+        return _Fit(centre, *map(float, coef), rms, n_inliers, n_points, spread)
+    bounds = (
+        float(inlier_xy[:, 0].min()),
+        float(inlier_xy[:, 0].max()),
+        float(inlier_xy[:, 1].min()),
+        float(inlier_xy[:, 1].max()),
+    )
+    return _Fit(
+        centre,
+        float(coef[0]),
+        float(coef[1]),
+        float(coef[2]),
+        rms,
+        n_inliers,
+        n_points,
+        spread,
+        float(coef[3]),
+        float(coef[4]),
+        float(coef[5]),
+        bounds,
+    )
 
 
 def _spread_mm(xy: np.ndarray) -> Tuple[float, float]:
@@ -469,18 +626,19 @@ def _spread_mm(xy: np.ndarray) -> Tuple[float, float]:
     return (major, minor)
 
 
-def _ransac_plane(
+def _ransac_fit(
     pts: np.ndarray,
     band_um: float,
     rng: np.random.Generator,
     logger: logging.Logger,
+    quadratic: bool = False,
 ) -> Optional[_Fit]:
-    """Fit a plane that a minority of bad points cannot drag off."""
+    """Fit a plane (or quadratic) that a minority of bad points cannot drag off."""
     centre = (float(pts[:, 0].mean()), float(pts[:, 1].mean()))
-    A = _design(pts[:, :2], centre)
+    A = _design(pts[:, :2], centre, quadratic)
     z = pts[:, 2]
     n = len(pts)
-    sample_size = min(_RANSAC_SAMPLE, n)
+    sample_size = min(_RANSAC_SAMPLE_QUAD if quadratic else _RANSAC_SAMPLE, n)
 
     best_inliers = None
     for _ in range(_RANSAC_ITERATIONS):
@@ -495,7 +653,10 @@ def _ransac_plane(
         if best_inliers is None or inliers.sum() > best_inliers.sum():
             best_inliers = inliers
 
-    if best_inliers is None or best_inliers.sum() < 3:
+    if best_inliers is None or best_inliers.sum() < A.shape[1]:
+        if quadratic:
+            # The plane is the fallback for a quadratic; there is no point inventing one.
+            return None
         # Every hypothesis was degenerate (collinear sample, or fewer than three
         # distinct points). Fall back to plain least squares so the caller at least
         # gets a surface, and let the RMS gate decide whether it is usable.
@@ -505,31 +666,22 @@ def _ransac_plane(
             logger.debug("Focus surface: plane fit failed outright on %d points", n)
             return None
         resid = z - A @ coef
-        return _Fit(
-            centre,
-            float(coef[0]),
-            float(coef[1]),
-            float(coef[2]),
-            float(resid.std()),
-            int(n),
-            int(n),
-        )
+        return _make_fit(centre, coef, float(resid.std()), int(n), int(n), (0.0, 0.0), None)
 
     coef, *_ = np.linalg.lstsq(A[best_inliers], z[best_inliers], rcond=None)
     resid = z - A @ coef
     inliers = np.abs(resid) < band_um
-    if inliers.sum() < 3:
+    if inliers.sum() < A.shape[1]:
         inliers = best_inliers
     rms = float(np.sqrt(np.mean(resid[inliers] ** 2)))
-    return _Fit(
+    return _make_fit(
         centre,
-        float(coef[0]),
-        float(coef[1]),
-        float(coef[2]),
+        coef,
         rms,
         int(inliers.sum()),
         int(n),
         _spread_mm(pts[inliers, :2]),
+        pts[inliers, :2],
     )
 
 

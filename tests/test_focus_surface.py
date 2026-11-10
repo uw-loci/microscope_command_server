@@ -325,3 +325,96 @@ class TestPlumbing:
                 y = CENTRE[1] + j * 600.0
                 s.add(x, y, real_plane(x, y) + rng.normal(0, 0.4))
         assert s.licensed, s.describe()
+
+
+# A twisted slide, as measured on PPM 20x on 2026-11-07 (1208 autofocus results over
+# 19 x 17 mm): plane terms 5.67 / -2.65 um/mm and an X*Y term of -0.094 um/mm^2.
+TWIST = {"z0": -51.9, "ax": 5.67, "ay": -2.65, "qxx": -0.011, "qxy": -0.094, "qyy": -0.012}
+TWIST_CENTRE = (6835.0, -5443.0)
+
+
+def twisted(x, y):
+    u = (x - TWIST_CENTRE[0]) / 1000.0
+    v = (y - TWIST_CENTRE[1]) / 1000.0
+    t = TWIST
+    return (
+        t["z0"] + t["ax"] * u + t["ay"] * v + t["qxx"] * u * u + t["qxy"] * u * v + t["qyy"] * v * v
+    )
+
+
+def twisted_grid(n_side=12, extent_um=18000.0):
+    offs = (np.arange(n_side) / (n_side - 1) - 0.5) * extent_um
+    return [(TWIST_CENTRE[0] + dx, TWIST_CENTRE[1] + dy) for dx in offs for dy in offs]
+
+
+def feed_fn(s, points, fn, noise_um=0.5, seed=0):
+    rng = np.random.default_rng(seed)
+    for x, y in points:
+        s.add(x, y, fn(x, y) + rng.normal(0, noise_um))
+    return s
+
+
+class TestCurvedSurface:
+    def test_a_twisted_slide_gets_a_quadratic(self):
+        s = feed_fn(surface(), twisted_grid(), twisted)
+        assert s.summary()["model"] == "quadratic", s.describe()
+        assert s.licensed
+        # Every point agrees with it; the plane had dropped the row ends.
+        assert s.summary()["inliers"] >= 0.97 * len(twisted_grid())
+
+    def test_a_row_end_result_is_not_vetoed_on_a_twisted_slide(self):
+        # 2026-11-07: the plane was about 5 um off at the row ends and enforcement replaced
+        # correct results there. The true focus at a corner must agree with the surface.
+        s = feed_fn(surface(), twisted_grid(), twisted)
+        x, y = TWIST_CENTRE[0] + 9000.0, TWIST_CENTRE[1] + 9000.0
+        v = s.check(x, y, twisted(x, y))
+        assert not v.would_reject, v.reason
+
+    def test_a_flat_slide_keeps_its_plane(self):
+        grid = [
+            (CENTRE[0] + dx, CENTRE[1] + dy)
+            for dx in np.linspace(-7000, 7000, 8)
+            for dy in np.linspace(-7000, 7000, 8)
+        ]
+        s = feed_fn(surface(), grid, real_plane)
+        assert s.summary()["model"] == "plane", s.describe()
+
+    def test_too_few_points_never_curve(self):
+        pts = twisted_grid(n_side=4)  # 16 points, below QUAD_MIN_POINTS
+        s = feed_fn(surface(), pts, twisted)
+        assert s.summary()["model"] == "plane"
+
+    def test_a_narrow_strip_never_curves(self):
+        # 2 mm wide: curvature across it is not measurable.
+        pts = [
+            (TWIST_CENTRE[0] + dx, TWIST_CENTRE[1] + dy)
+            for dx in np.linspace(-9000, 9000, 15)
+            for dy in (-1000.0, 0.0, 1000.0)
+        ]
+        s = feed_fn(surface(), pts, twisted)
+        assert s.summary()["model"] == "plane"
+
+    def test_beyond_its_points_the_curve_continues_straight(self):
+        # Fit only the left half; ask 10 mm past its right edge. The prediction must follow
+        # the slope at the edge, not the parabola.
+        left = [p for p in twisted_grid() if p[0] <= TWIST_CENTRE[0]]
+        s = feed_fn(surface(), left, twisted, noise_um=0.2)
+        fit = s._fit
+        assert fit.quadratic
+        xmax = fit.bounds[1]
+        y = TWIST_CENTRE[1]
+        edge = fit.predict(xmax, y)
+        slope = (fit.predict(xmax, y) - fit.predict(xmax - 100.0, y)) / 0.1
+        far = fit.predict(xmax + 10000.0, y)
+        assert far == pytest.approx(edge + slope * 10.0, abs=0.05)
+
+    def test_the_record_carries_the_curve(self):
+        s = feed_fn(surface(), twisted_grid(), twisted)
+        r = s.to_record()
+        assert r["model"] == "quadratic" and r["licensed"]
+        assert r["qxy_um_per_mm2"] == pytest.approx(-0.094, abs=0.01)
+        assert len(r["bounds_um"]) == 4
+
+    def test_no_record_when_off_or_unfitted(self):
+        assert surface(MODE_OFF).to_record() is None
+        assert surface().to_record() is None

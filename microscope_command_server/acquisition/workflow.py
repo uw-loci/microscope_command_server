@@ -5471,6 +5471,26 @@ def _log_focus_surface_summary(ctx: "AcquisitionContext") -> None:
             summary["resurfaces"],
         )
     logger.info("  focus surface summary: %s", summary)
+    _write_focus_surface_record(ctx, surface)
+
+
+def _write_focus_surface_record(ctx: "AcquisitionContext", surface) -> None:
+    """Write the region's fitted surface to ``focus_surface.json`` beside its tiles.
+
+    QPSC reads it after the region and keeps a licensed one as the slide's focus surface.
+    Best effort: a failure here is logged and never fails the acquisition.
+    """
+    record = surface.to_record()
+    output_path = getattr(ctx, "output_path", None)
+    if record is None or not output_path:
+        return
+    try:
+        target = Path(str(output_path)) / "focus_surface.json"
+        with open(target, "w", encoding="utf-8") as fh:
+            json.dump(record, fh, indent=2)
+        ctx.logger.info("  focus surface written to %s", target)
+    except Exception as exc:  # noqa: BLE001 - reporting only
+        ctx.logger.warning("  could not write focus_surface.json: %s", exc)
 
 
 def _vet_autofocus_result(
