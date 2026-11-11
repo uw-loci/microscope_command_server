@@ -11,6 +11,7 @@ import time
 from dataclasses import dataclass, field
 from typing import Callable, List, Tuple, Optional, Dict, Any
 from pathlib import Path
+import re
 import shutil
 import logging
 import yaml
@@ -1483,6 +1484,12 @@ def write_acquisition_metadata(
                 "z_pixel_size_um": params.get("z_pixel_size_um"),
                 "projection": params.get("z_projection"),
             }
+        if int(params.get("n_timepoints", 1) or 1) > 1:
+            acq_params["time_lapse"] = {
+                "timepoints": int(params.get("n_timepoints", 1)),
+                "interval_s": params.get("interval_seconds"),
+                "projection": params.get("t_projection") or "none",
+            }
 
         # Processing pipeline
         acq_params["processing_pipeline"] = params.get("processing_pipeline")
@@ -2457,6 +2464,11 @@ def parse_acquisition_message(message: str) -> dict:
             elif parts[i] == "--z-projection" and i + 1 < len(parts):
                 params["z_projection"] = parts[i + 1]
                 i += 2
+            elif parts[i] == "--t-projection" and i + 1 < len(parts):
+                # Reduce a time-lapse's timepoints to one image per tile:
+                # mean, max, min, sum or std. Absent or "none": keep every timepoint.
+                params["t_projection"] = parts[i + 1].lower()
+                i += 2
             # EDF tuning. Only meaningful with --z-projection edf; ignored
             # otherwise, since the other projections have nothing to tune.
             elif parts[i] == "--edf-metric" and i + 1 < len(parts):
@@ -2743,6 +2755,9 @@ class AcquisitionContext:
     # makes the position loop behave identically to before the refactor.
     n_timepoints: int = 1
     interval_seconds: float = 0.0
+    # Reduce the timepoints to one image per tile after the last timepoint ("mean", "max",
+    # "min", "sum", "std"), or None to keep every timepoint for a time-series mosaic.
+    t_projection: Optional[str] = None
     output_format: str = "ome-per-t"
     t0: float = 0.0  # set at loop start (time.monotonic()); 0.0 means "not yet started"
 
@@ -3196,6 +3211,9 @@ def _finalize_acquisition(ctx: AcquisitionContext) -> None:
         logger.warning(
             f"Total background write failures during acquisition: {ctx.write_pool.total_failed}"
         )
+
+    # Every timepoint's tiles are on disk now; reduce them if a time projection was asked for.
+    _project_timepoints(ctx)
 
     # Save device properties
     current_props = ctx.hardware.get_device_properties()
@@ -4121,6 +4139,7 @@ def _prepare_acquisition(
         preserve_z_planes=preserve_z_planes,
         n_timepoints=n_timepoints,
         interval_seconds=float(params.get("interval_seconds", 0.0)),
+        t_projection=_resolve_time_projection(params.get("t_projection"), n_timepoints, logger),
         output_format=str(params.get("output_format", "ome-per-t")),
         hint_z=params.get("hint_z"),
         metadata_txt_for_positions=metadata_txt_for_positions,
@@ -6246,6 +6265,140 @@ def _run_af_benchmark(ctx: "AcquisitionContext", pos_idx: int, pos) -> str:
     return "af_benchmark"
 
 
+TIME_PROJECTIONS = ("mean", "max", "min", "sum", "std")
+
+# Folders whose pixels are axial angles (LC-PolScope slow-axis orientation, and the color
+# image drawn from it). An arithmetic mean of 179 and 1 deg is 90 deg, perpendicular to
+# both, so these keep their timepoints instead of being averaged.
+_AXIAL_FOLDERS = ("orientation", "orientation_color")
+
+_TIMEPOINT_DIR = re.compile(r"^t\d{3}$")
+
+
+def _resolve_time_projection(raw, n_timepoints: int, logger) -> Optional[str]:
+    """The time projection to apply, or None to keep every timepoint."""
+    if raw is None or n_timepoints <= 1:
+        return None
+    name = str(raw).strip().lower()
+    if name in ("", "none"):
+        return None
+    if name not in TIME_PROJECTIONS:
+        logger.warning(
+            "Unknown --t-projection '%s' (expected one of %s or none); keeping every timepoint",
+            raw,
+            ", ".join(TIME_PROJECTIONS),
+        )
+        return None
+    return name
+
+
+def _project_timepoints(ctx: AcquisitionContext) -> None:
+    """Reduce each tile's timepoints to one image, like a Z projection reduces planes.
+
+    Reads ``{group}/t{tt}/{tile}`` for every timepoint and writes the projection to
+    ``{group}/{tile}`` (``{group}/z{zz}/{tile}`` when Z planes are kept), which the stitcher
+    takes as a single-timepoint tile set. The timepoint folders are then moved under the
+    raw folder when raw tiles are kept, and removed otherwise, as Z planes are; a group
+    whose projection fails keeps them. Axial folders (LC-PolScope orientation) are not
+    averaged and keep their timepoints.
+    """
+    name = ctx.t_projection
+    if ctx.n_timepoints <= 1 or not name:
+        return
+    import tifffile
+
+    from microscope_command_server.acquisition.projections import get_projection
+
+    logger = ctx.logger
+    project = get_projection(name)
+    root = ctx.output_path
+    raw_root = ctx.output_path.parent / "Raw" / ctx.output_path.name
+    pixel_size = ctx.hardware.get_pixel_size_um()
+    groups = [root] + sorted(
+        d for d in root.iterdir() if d.is_dir() and not _TIMEPOINT_DIR.match(d.name)
+    )
+    for group_dir in groups:
+        t_dirs = sorted(
+            d for d in group_dir.iterdir() if d.is_dir() and _TIMEPOINT_DIR.match(d.name)
+        )
+        if not t_dirs:
+            continue
+        if group_dir.name in _AXIAL_FOLDERS:
+            logger.warning(
+                "Time projection: %s holds orientations, which cannot be averaged as numbers; "
+                "keeping its %d timepoints",
+                group_dir.name,
+                len(t_dirs),
+            )
+            continue
+        tiles = sorted(
+            {
+                p.relative_to(t)
+                for t in t_dirs
+                for p in t.rglob("*")
+                if p.is_file() and p.suffix.lower() in (".tif", ".tiff")
+            }
+        )
+        try:
+            for rel in tiles:
+                frames = [tifffile.imread(t / rel) for t in t_dirs if (t / rel).exists()]
+                out = group_dir / rel
+                out.parent.mkdir(parents=True, exist_ok=True)
+                ome_tiff_writer(filename=str(out), pixel_size_um=pixel_size, data=project(frames))
+        except Exception as e:
+            logger.error(
+                "Time projection (%s) failed in %s, keeping its timepoints: %s", name, group_dir, e
+            )
+            continue
+        for t in t_dirs:
+            if ctx.save_raw_tiles:
+                target = raw_root / t.relative_to(root)
+                target.parent.mkdir(parents=True, exist_ok=True)
+                shutil.move(str(t), str(target))
+            else:
+                shutil.rmtree(t)
+        logger.info(
+            "Time projection (%s) of %d timepoints: %d tile(s) in %s%s",
+            name,
+            len(t_dirs),
+            len(tiles),
+            group_dir,
+            "; timepoints moved to the raw folder" if ctx.save_raw_tiles else "",
+        )
+
+
+def _tile_dir(ctx: AcquisitionContext, group: Optional[str], base: Optional[Path] = None) -> Path:
+    """Folder one tile image is written to: ``{base}/[{group}/][t{tt}/]``.
+
+    ``base`` defaults to the acquisition's output folder. A time-lapse writes each
+    timepoint to its own ``t{tt}/`` folder, the layout the stitcher reads as a time series
+    (and the time projection reads back); without it every timepoint overwrote the same
+    tile and a 30-timepoint run left only the last (2026-11-11). Created when missing.
+    """
+    folder = ctx.output_path if base is None else base
+    if group is not None:
+        folder = folder / group
+    if getattr(ctx, "n_timepoints", 1) > 1:
+        folder = folder / f"t{ctx.current_timepoint:03d}"
+        folder.mkdir(parents=True, exist_ok=True)
+    return folder
+
+
+def _timepoint_filename(ctx: AcquisitionContext, filename: str) -> str:
+    """``t{tt}/{filename}`` in a time-lapse, else ``filename``, for writers that add their own folder."""
+    if getattr(ctx, "n_timepoints", 1) > 1:
+        return f"t{ctx.current_timepoint:03d}/{filename}"
+    return filename
+
+
+def _copy_tile_configuration_once(source: Optional[Path], group_dir: Path) -> None:
+    """Puts the TileConfiguration.txt at the top of a derived group, once."""
+    group_dir.mkdir(parents=True, exist_ok=True)
+    target = group_dir / "TileConfiguration.txt"
+    if source is not None and source.exists() and not target.exists():
+        shutil.copy2(source, target)
+
+
 def _plane_path(ctx: AcquisitionContext, group: Optional[str], z_idx: int, filename: str):
     """Output path for one individual Z-plane.
 
@@ -6533,7 +6686,7 @@ def _acquire_tile_angles_angle_outer(
             # Save raw image
             if ctx.save_raw_tiles:
                 raw_output_path = ctx.output_path.parent / "Raw" / ctx.output_path.name
-                raw_image_path = raw_output_path / str(angle) / filename
+                raw_image_path = _tile_dir(ctx, str(angle), base=raw_output_path) / filename
                 t_mkdir = time.perf_counter()
                 if not raw_image_path.parent.exists():
                     raw_image_path.parent.mkdir(parents=True, exist_ok=True)
@@ -6626,7 +6779,7 @@ def _acquire_tile_angles_angle_outer(
 
             # Save (2D) or accumulate (z-stack).
             if not ctx.z_stack_enabled:
-                image_path = ctx.output_path / str(angle) / filename
+                image_path = _tile_dir(ctx, str(angle)) / filename
                 if image_path.parent.exists():
                     proc_pixel_size = hardware.get_pixel_size_um()
                     ctx.write_pool.submit(
@@ -6665,7 +6818,7 @@ def _acquire_tile_angles_angle_outer(
             if angle in z_stack_images and len(z_stack_images[angle]) > 0:
                 projected = ctx.projection_fn(z_stack_images[angle])
                 angle_images[angle] = projected
-                image_path = ctx.output_path / str(angle) / filename
+                image_path = _tile_dir(ctx, str(angle)) / filename
                 if image_path.parent.exists():
                     ctx.write_pool.submit(
                         ome_tiff_writer,
@@ -6691,8 +6844,14 @@ def _acquire_tile_angles_angle_outer(
     if positive_angles and negative_angles:
         pos_angle = min(positive_angles)
         neg_angle = max(negative_angles)
-        biref_dir = ctx.output_path / f"{pos_angle}.biref"
+        biref_dir = _tile_dir(ctx, f"{pos_angle}.biref")
         tile_config_source = ctx.output_path / str(pos_angle) / "TileConfiguration.txt"
+        if ctx.n_timepoints > 1:
+            # The TileConfiguration belongs at the top of the group, not in t{tt}/.
+            _copy_tile_configuration_once(
+                tile_config_source, ctx.output_path / f"{pos_angle}.biref"
+            )
+            tile_config_source = None
 
         from ppm_library.imaging.writer import TifWriterUtils as PpmWriterUtils
 
@@ -6966,7 +7125,7 @@ def _acquire_tile_angles(
             # Save raw image
             if ctx.save_raw_tiles:
                 raw_output_path = ctx.output_path.parent / "Raw" / ctx.output_path.name
-                raw_image_path = raw_output_path / str(angle) / filename
+                raw_image_path = _tile_dir(ctx, str(angle), base=raw_output_path) / filename
                 t_mkdir = time.perf_counter()
                 if not raw_image_path.parent.exists():
                     raw_image_path.parent.mkdir(parents=True, exist_ok=True)
@@ -7056,7 +7215,7 @@ def _acquire_tile_angles(
 
             # Save or accumulate image depending on Z-stack mode
             if not ctx.z_stack_enabled:
-                image_path = ctx.output_path / str(angle) / filename
+                image_path = _tile_dir(ctx, str(angle)) / filename
                 if image_path.parent.exists():
                     proc_pixel_size = hardware.get_pixel_size_um()
                     ctx.write_pool.submit(
@@ -7092,7 +7251,7 @@ def _acquire_tile_angles(
             if angle in z_stack_images and len(z_stack_images[angle]) > 0:
                 projected = ctx.projection_fn(z_stack_images[angle])
                 angle_images[angle] = projected
-                image_path = ctx.output_path / str(angle) / filename
+                image_path = _tile_dir(ctx, str(angle)) / filename
                 if image_path.parent.exists():
                     ctx.write_pool.submit(
                         ome_tiff_writer,
@@ -7118,8 +7277,14 @@ def _acquire_tile_angles(
     if positive_angles and negative_angles:
         pos_angle = min(positive_angles)
         neg_angle = max(negative_angles)
-        biref_dir = ctx.output_path / f"{pos_angle}.biref"
+        biref_dir = _tile_dir(ctx, f"{pos_angle}.biref")
         tile_config_source = ctx.output_path / str(pos_angle) / "TileConfiguration.txt"
+        if ctx.n_timepoints > 1:
+            # The TileConfiguration belongs at the top of the group, not in t{tt}/.
+            _copy_tile_configuration_once(
+                tile_config_source, ctx.output_path / f"{pos_angle}.biref"
+            )
+            tile_config_source = None
 
         from ppm_library.imaging.writer import TifWriterUtils as PpmWriterUtils
 
@@ -7278,7 +7443,7 @@ def _acquire_tile_channels_z_outer(
                 # 2D mode: save directly. (Z-outer collapses to the same
                 # write path as the default mode here -- no projection.)
                 channel_images[ch_id] = image
-                image_path = ctx.output_path / str(ch_id) / filename
+                image_path = _tile_dir(ctx, str(ch_id)) / filename
                 if image_path.parent.exists():
                     bf_pixel_size = hardware.get_pixel_size_um()
                     ctx.write_pool.submit(
@@ -7332,7 +7497,7 @@ def _acquire_tile_channels_z_outer(
                 continue
             projected = ctx.projection_fn(planes)
             channel_images[ch_id] = projected
-            image_path = ctx.output_path / str(ch_id) / filename
+            image_path = _tile_dir(ctx, str(ch_id)) / filename
             if image_path.parent.exists():
                 ctx.write_pool.submit(
                     ome_tiff_writer,
@@ -7576,7 +7741,8 @@ def _maybe_reconstruct_lcpolscope_tile(ctx, channel_plan, channel_images, filena
             channel_order=[entry["id"] for entry in channel_plan],
             reconstruction_cfg=recon_cfg,
             output_path=ctx.output_path,
-            filename=filename,
+            # A time-lapse keeps each timepoint's derived tiles in t{tt}/ of each folder.
+            filename=_timepoint_filename(ctx, filename),
             pixel_size_um=ctx.hardware.get_pixel_size_um(),
             write_pool=ctx.write_pool,
             ome_writer=_write_derived_polscope_tile,
@@ -7728,7 +7894,7 @@ def _acquire_tile_channels(
             if not ctx.z_stack_enabled:
                 # 2D mode: save directly
                 channel_images[ch_id] = image
-                image_path = ctx.output_path / str(ch_id) / filename
+                image_path = _tile_dir(ctx, str(ch_id)) / filename
                 if image_path.parent.exists():
                     bf_pixel_size = hardware.get_pixel_size_um()
                     ctx.write_pool.submit(
@@ -7769,7 +7935,7 @@ def _acquire_tile_channels(
         if ctx.z_stack_enabled and ctx.projection_fn is not None and z_stack_planes:
             projected = ctx.projection_fn(z_stack_planes)
             channel_images[ch_id] = projected
-            image_path = ctx.output_path / str(ch_id) / filename
+            image_path = _tile_dir(ctx, str(ch_id)) / filename
             if image_path.parent.exists():
                 ctx.write_pool.submit(
                     ome_tiff_writer,
@@ -7918,7 +8084,7 @@ def _acquire_tile_single(
 
         if not ctx.z_stack_enabled:
             # 2D mode: save directly
-            image_path = ctx.output_path / filename
+            image_path = _tile_dir(ctx, None) / filename
             if image_path.parent.exists():
                 bf_pixel_size = hardware.get_pixel_size_um()
                 ctx.write_pool.submit(
@@ -7946,7 +8112,7 @@ def _acquire_tile_single(
     # Z-stack projection: reduce planes to single 2D image
     if ctx.z_stack_enabled and ctx.projection_fn is not None and z_stack_planes:
         projected = ctx.projection_fn(z_stack_planes)
-        image_path = ctx.output_path / filename
+        image_path = _tile_dir(ctx, None) / filename
         if image_path.parent.exists():
             ctx.write_pool.submit(
                 ome_tiff_writer,
@@ -7963,7 +8129,7 @@ def _acquire_tile_single(
         hardware.move_to_position(Position(z=center_z))
 
     try:
-        image_path = ctx.output_path / filename
+        image_path = _tile_dir(ctx, None) / filename
         write_position_metadata(ctx.metadata_txt_for_positions, image_path, hardware, ctx.modality)
     except Exception as e:
         logger.warning(f"  Failed to write position text {ctx.metadata_txt_for_positions}: {e}")

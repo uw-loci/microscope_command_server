@@ -468,6 +468,8 @@ def _reconstruct_and_write(
         out_dir = output_path / subdir
         out_dir.mkdir(parents=True, exist_ok=True)
         _copy_tile_configuration(tile_config_source, out_dir)
+        # A time-lapse passes "t{tt}/{tile}".
+        (out_dir / filename).parent.mkdir(parents=True, exist_ok=True)
         ome_writer(
             filename=str(out_dir / filename),
             pixel_size_um=pixel_size_um,
@@ -486,6 +488,7 @@ def _reconstruct_and_write(
     color_dir = output_path / ORIENTATION_COLOR_DIR
     color_dir.mkdir(parents=True, exist_ok=True)
     _copy_tile_configuration(tile_config_source, color_dir)
+    (color_dir / filename).parent.mkdir(parents=True, exist_ok=True)
     ome_writer(
         filename=str(color_dir / filename),
         pixel_size_um=pixel_size_um,

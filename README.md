@@ -438,6 +438,21 @@ added to track each timepoint, enabling reassembly into a true 5D mosaic:
     ...
 ```
 
+Every time-lapse writes each timepoint to its own `t{tt}/` folder, with or without
+a Z-stack: `{group}/t{tt}/{filename}` for single planes (and projected Z), so no
+timepoint overwrites another (before 2026-11-11 a 30-timepoint run kept only the
+last). Derived images follow the same layout (`7.0.biref/t{tt}/...`,
+`retardance/t{tt}/...`).
+
+**`--t-projection mean|max|min|sum|std`** reduces the timepoints once the last
+one is acquired, the way `--z-projection` reduces planes: each tile becomes
+`{group}/{filename}` (or `{group}/z{zz}/{filename}` with preserved planes), and
+the `t{tt}/` folders are moved under `Raw/` with `--save-raw true` or removed
+otherwise. A group whose projection fails keeps its timepoints. LC-PolScope
+`orientation/` and `orientation_color/` are not averaged (orientation is axial)
+and keep their timepoints. Absent or `none`: every timepoint is kept. The choice
+is recorded as `time_lapse.projection` in `acquisition_metadata.json`.
+
 PPM also gets a birefringence plane for every Z (and timepoint), from the smallest
 positive angle and the largest negative angle, in the same layout under
 `{positive angle}.biref/` (for example `7.0.biref/z000/tile_000.tif`), with the
