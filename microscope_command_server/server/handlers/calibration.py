@@ -1014,10 +1014,23 @@ def handle_wbppm(conn, client, hardware, settings, **kwargs):
                     jai_props = hardware.camera.properties
                     calibrator = JAIWhiteBalanceCalibrator(hardware, jai_props)
 
-                    # Set up rotation callback
-                    rotation_callback = None
-                    if hasattr(hardware, "set_psg_ticks"):
-                        rotation_callback = hardware.set_psg_ticks
+                    # Set up rotation callback. It is called once per angle, just before
+                    # that angle is calibrated, so it also tells the client which angle is
+                    # in progress: PROGRESS:<n>:<of>:<angle deg>.
+                    rotate = getattr(hardware, "set_psg_ticks", None)
+                    n_angles = len(angle_exposures)
+                    progress = {"n": 0}
+
+                    def rotation_callback(angle_deg):
+                        progress["n"] += 1
+                        try:
+                            conn.sendall(
+                                f"PROGRESS:{progress['n']}:{n_angles}:{float(angle_deg)}".encode()
+                            )
+                        except Exception as send_err:  # noqa: BLE001 - progress is optional
+                            logger.debug("Could not send WBPPM progress: %s", send_err)
+                        if rotate is not None:
+                            rotate(angle_deg)
 
                     # Run per-angle calibration
                     output_path = Path(params["output_folder_path"])

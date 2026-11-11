@@ -8791,6 +8791,26 @@ def acquire_background_with_target_intensity(
                             f"{max_ch_name} saturation "
                             f"(capped ratio={adjustment_ratio:.2f})"
                         )
+                    if adjustment_ratio <= 1.0 + PLATEAU_FRACTION:
+                        # The brightest channel already sits at its safe limit, so no
+                        # longer exposure is possible: this is the best image. Normal on
+                        # a color camera without white balance, where one channel (red,
+                        # under the PPM lamp) fills first and the overall median stays
+                        # below target. Waiting it out failed every Off collection
+                        # (2026-10-21, 2026-11-11: median 173 against 200, R at 221).
+                        if logger:
+                            logger.info(
+                                f"Exposure limited by the {max_ch_name} channel "
+                                f"(median {max_ch_median:.0f}, safe limit "
+                                f"{channel_sat_limit}): accepting median "
+                                f"{mean_intensity:.1f} at {current_exposure:.2f}ms "
+                                f"(target {target_intensity:.0f} is not reachable without "
+                                f"saturating it)."
+                            )
+                        _check_saturation(
+                            image, "background", logger or logging.getLogger(__name__)
+                        )
+                        return image, current_exposure
             new_exposure = current_exposure * adjustment_ratio
 
             # Clamp to bounds
@@ -9992,6 +10012,10 @@ def simple_background_collection(
         # Track final exposures and achieved intensities for each angle
         final_exposures = {}
         achieved_intensities = {}
+        # Angles whose background could not be acquired, with the reason. Reported together
+        # at the end; a failed angle is never saved (it used to reach the TIFF writer as None
+        # and fail as "tuple index out of range", hiding the reason).
+        failed_angles: Dict[float, str] = {}
 
         # Load saved exposures from prior background collection (if available).
         # These are much better starting points than the client's 10ms defaults,
@@ -10345,6 +10369,7 @@ def simple_background_collection(
                                 )
                         except RuntimeError as e:
                             logger.error(f"Failed to acquire background at angle {angle}: {e}")
+                            failed_angles[angle] = str(e)
                             continue
                     else:
                         logger.warning(
@@ -10392,6 +10417,7 @@ def simple_background_collection(
                             achieved_intensities[angle] = actual_intensity
                         except RuntimeError as e:
                             logger.error(f"Failed to acquire background at angle {angle}: {e}")
+                            failed_angles[angle] = str(e)
                             continue
                     else:
                         # Positive angle hasn't been acquired yet - fall back to intensity matching
@@ -10425,6 +10451,7 @@ def simple_background_collection(
                             achieved_intensities[angle] = actual_intensity
                         except RuntimeError as e:
                             logger.error(f"Failed to acquire background at angle {angle}: {e}")
+                            failed_angles[angle] = str(e)
                             continue
                 else:
                     # Non-biref angles (0, 90, positive angles): use standard intensity matching
@@ -10464,6 +10491,8 @@ def simple_background_collection(
                             )
                     except RuntimeError as e:
                         logger.error(f"Failed to acquire background at angle {angle}: {e}")
+                        failed_angles[angle] = str(e)
+                        continue
 
             # Save background image.
             # Rotation modalities (PPM): save as {angle}.tif (e.g. 7.0.tif).
@@ -10519,6 +10548,15 @@ def simple_background_collection(
                 )
             except Exception as e:
                 logger.warning(f"Could not reset per-channel mode: {e}")
+
+        if failed_angles:
+            # Raised after the camera reset above, so the camera is not left in
+            # per-channel mode.
+            detail = "; ".join(f"{a} deg: {why}" for a, why in failed_angles.items())
+            raise RuntimeError(
+                f"Background not collected for {len(failed_angles)} of {len(angles)} "
+                f"angle(s): {detail}"
+            )
 
         logger.info("=== SIMPLE BACKGROUND COLLECTION COMPLETE ===")
         logger.info(f"Successfully collected {len(angles)} background images (wb_mode={wb_mode})")
