@@ -1706,6 +1706,24 @@ def _prompts_operator(ctx) -> bool:
     return strategy is None or getattr(strategy, "on_failure", None) is StrategyFailureMode.MANUAL
 
 
+def _autofocus_or_cancel(hardware, autofocus_kwargs: dict):
+    """``hardware.autofocus``, with a client cancel ending the acquisition.
+
+    Acquisition callers pass ``should_abort=ctx.is_cancelled``: the search then polls the
+    client's cancel between Z steps, restores Z and raises ``AutofocusAborted``, which
+    becomes the acquisition's own cancel. Without it a cancel waited for the search to
+    finish, which with edge retries can take minutes (2026-11-11: a cancel during the
+    focus survey went unanswered and the server was killed).
+    """
+    # Imported here: tests import this module with microscope_control mocked out.
+    from microscope_control.hardware.base import AutofocusAborted
+
+    try:
+        return hardware.autofocus(**autofocus_kwargs)
+    except AutofocusAborted as e:
+        raise _AcquisitionCancelled("Cancelled during autofocus") from e
+
+
 def autofocus_with_manual_fallback(
     hardware: PycromanagerHardware,
     logger,
@@ -1772,7 +1790,7 @@ def autofocus_with_manual_fallback(
     # failed without ever focusing.
     attempts = max(1, max_retries)
     for attempt in range(attempts):
-        result = hardware.autofocus(**autofocus_kwargs)
+        result = _autofocus_or_cancel(hardware, autofocus_kwargs)
 
         # Check if autofocus succeeded (returns float) or failed (returns dict)
         if isinstance(result, float):
@@ -1857,7 +1875,7 @@ def autofocus_with_manual_fallback(
                         logger.info(
                             "Running autofocus at current position (where user found tissue)..."
                         )
-                        retry_result = hardware.autofocus(**autofocus_kwargs)
+                        retry_result = _autofocus_or_cancel(hardware, autofocus_kwargs)
 
                         if isinstance(retry_result, float):
                             # Autofocus succeeded at current position - restore XY with new Z
@@ -5126,6 +5144,7 @@ def _run_pre_acquisition_autofocus(ctx: AcquisitionContext) -> None:
             initial_z = autofocus_with_manual_fallback(
                 outcome=initial_outcome,
                 hardware=hardware,
+                should_abort=ctx.is_cancelled,
                 request_manual_focus=ctx.request_manual_focus,
                 prompt_operator=_prompts_operator(ctx),
                 max_retries=3,
@@ -5144,6 +5163,7 @@ def _run_pre_acquisition_autofocus(ctx: AcquisitionContext) -> None:
             initial_z = autofocus_with_manual_fallback(
                 outcome=initial_outcome,
                 hardware=hardware,
+                should_abort=ctx.is_cancelled,
                 request_manual_focus=ctx.request_manual_focus,
                 prompt_operator=_prompts_operator(ctx),
                 max_retries=0,
@@ -5387,6 +5407,7 @@ def _run_focus_survey(ctx: "AcquisitionContext") -> None:
                 request_manual_focus=None,
                 max_retries=0,
                 fallback_z=seed_z,
+                should_abort=ctx.is_cancelled,
                 move_stage_to_estimate=True,
                 n_steps=ctx.af_n_steps,
                 search_range=ctx.af_search_range,
@@ -5397,6 +5418,9 @@ def _run_focus_survey(ctx: "AcquisitionContext") -> None:
                 diagnostic_output_path=ctx.output_path,
                 position_index=tile_idx,
             )
+        except _AcquisitionCancelled:
+            logger.info("Focus survey cancelled by the operator during autofocus")
+            raise
         except Exception as af_err:
             logger.warning(
                 "Focus survey: autofocus failed at tile %d (%s) -- skipping this point",
@@ -5623,6 +5647,7 @@ def _handle_tile_autofocus(
     deferred_af_positions, first_tissue_autofocus_done, exposure_90.
     """
     from microscope_control.autofocus.strategies import StrategyFailureMode
+    from microscope_control.hardware.base import AutofocusAborted
 
     logger = ctx.logger
     hardware = ctx.hardware
@@ -5938,6 +5963,7 @@ def _handle_tile_autofocus(
                 max_retries=3,
                 fallback_z=_skip_fallback_z(ctx),
                 outcome=tile_outcome,
+                should_abort=ctx.is_cancelled,
                 move_stage_to_estimate=True,
                 # The same widening budget as the initial AF: a far-off window can then
                 # follow the trend toward focus instead of failing in place.
@@ -5975,12 +6001,16 @@ def _handle_tile_autofocus(
                 z_before_adaptive = hardware.get_current_position().z
                 logger.info("  Subsequent tissue position - using SWEEP drift check for speed")
                 t_af = time.perf_counter()
-                new_z = hardware.autofocus_sweep_drift_check(
-                    range_um=ctx.af_sweep_range_um,
-                    n_steps=ctx.af_sweep_n_steps,
-                    score_metric=ctx.af_score_metric_name,
-                    max_retries=ctx.af_edge_retries,
-                )
+                try:
+                    new_z = hardware.autofocus_sweep_drift_check(
+                        range_um=ctx.af_sweep_range_um,
+                        n_steps=ctx.af_sweep_n_steps,
+                        score_metric=ctx.af_score_metric_name,
+                        max_retries=ctx.af_edge_retries,
+                        should_abort=ctx.is_cancelled,
+                    )
+                except AutofocusAborted as e:
+                    raise _AcquisitionCancelled("Cancelled during the drift check") from e
                 t_af = log_timing(logger, "SWEEP drift check", t_af)
                 drift = new_z - z_before_adaptive
                 af_type_for_this_tile = "sweep"
