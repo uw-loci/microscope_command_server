@@ -446,7 +446,8 @@ projection, birefringence is computed from the projected angle images instead,
 as `7.0.biref/tile_000.tif`.
 
 The single-point stack command (Z-stack or time-lapse) writes one file per angle,
-`zstack_angle<NN>.ome.tiff`, and for PPM also `zstack_biref.ome.tiff`
+`zstack_angle<N>.ome.tiff` (for example `zstack_angle7.ome.tiff`; a single angle
+writes `zstack.ome.tiff`), and for PPM also `zstack_biref.ome.tiff`
 (`zstack_t_biref.ome.tiff` with timepoints): the same birefringence, plane by
 plane.
 
