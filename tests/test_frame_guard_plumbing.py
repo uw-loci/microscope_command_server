@@ -136,11 +136,14 @@ def test_the_guard_runs_once_per_tile_in_the_acquisition_loop():
     thirty seconds before slot 4's first autofocus came up blank.
     """
     source = WORKFLOW_SRC.read_text()
-    loop = "for pos_idx, (pos, filename) in enumerate(ctx.positions):"
-    assert source.count(loop) == 1
-    body = source.split(loop, 1)[1]
-    head = "\n".join(body.splitlines()[:12])
+    # Every tile visit, in every time order, goes through _acquire_position.
+    tile = "def _acquire_position("
+    assert source.count(tile) == 1
+    body = source.split(tile, 1)[1]
+    head = "\n".join(body.splitlines()[:16])
     assert "raise_if_frame_suspect(hardware)" in head
+    loops = source.split("def _run_acquisition_loops(", 1)[1].split("\ndef ", 1)[0]
+    assert loops.count("_acquire_position(") == 3
 
 
 def test_the_check_is_armed_before_autofocus_and_disarmed_on_cleanup():

@@ -626,6 +626,10 @@ def handle_zstack(conn, client, hardware, settings, **kwargs):
         elif parts[i] == "--interval" and i + 1 < len(parts):
             params["interval"] = float(parts[i + 1])
             i += 2
+        elif parts[i] == "--t-order" and i + 1 < len(parts):
+            # "plane": each Z plane takes all its timepoints; else the stack per timepoint.
+            params["t_order"] = parts[i + 1].lower()
+            i += 2
         else:
             i += 1
 
@@ -660,6 +664,7 @@ def handle_zstack(conn, client, hardware, settings, **kwargs):
             flatfield_folder=params.get("flatfield_folder"),
             n_timepoints=params.get("timepoints", 1),
             interval_seconds=params.get("interval", 0.0),
+            t_order=params.get("t_order", "region"),
         )
         response = (
             f"SUCCESS:{params['output']}|"

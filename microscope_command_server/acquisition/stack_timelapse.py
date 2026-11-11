@@ -48,6 +48,7 @@ def acquire_z_stack(
     n_timepoints: int = 1,
     interval_seconds: float = 0.0,
     cancel_check: Optional[Callable[[], bool]] = None,
+    t_order: str = "region",
 ) -> Dict:
     """
     Acquire a Z-stack (optionally combined with time-lapse) at the current XY.
@@ -94,6 +95,9 @@ def acquire_z_stack(
             iterations don't accumulate drift.
         cancel_check: Optional callable returning True to abort. Polled
             between timepoints during the interval wait.
+        t_order: "plane" acquires all timepoints of each Z plane before moving to the
+            next plane (each plane paced from its own start); anything else takes the
+            whole Z stack at every timepoint. Output files are the same either way.
 
     Returns:
         Dict with results: n_planes, n_timepoints, z_positions,
@@ -222,77 +226,100 @@ def acquire_z_stack(
         )
 
     total_steps = n_timepoints * n_planes
+    # Visit order. "region" (the default): each timepoint takes the whole Z stack.
+    # "plane": each plane takes all its timepoints before Z moves on, paced by its own
+    # scheduler, so no Z move falls between the frames of one plane's series.
+    plane_major = has_t and t_order == "plane"
+    if plane_major:
+        visits = [(t, p) for p in range(n_planes) for t in range(n_timepoints)]
+    else:
+        visits = [(t, p) for t in range(n_timepoints) for p in range(n_planes)]
+    series_t0 = start_time
     try:
-        for t_idx in range(n_timepoints):
-            # Cancellation + scheduled wait before timepoints after the first.
-            if cancel_check and cancel_check():
-                logger.info(f"Acquisition cancelled at timepoint {t_idx + 1}/{n_timepoints}")
-                break
-            if has_t and t_idx > 0:
-                scheduler.wait_until(t_idx, cancel_event=cancel_check)
+        for t_idx, plane_idx in visits:
+            z_pos = z_positions[plane_idx]
+            starts_timepoint = plane_major or plane_idx == 0
+            if starts_timepoint:
+                # Cancellation + scheduled wait before timepoints after the first.
                 if cancel_check and cancel_check():
-                    logger.info(
-                        f"Acquisition cancelled during wait before timepoint "
-                        f"{t_idx + 1}/{n_timepoints}"
-                    )
+                    logger.info(f"Acquisition cancelled at timepoint {t_idx + 1}/{n_timepoints}")
                     break
-            tp_start_wall = time.time()
-            tp_elapsed = tp_start_wall - start_time
-            if has_t:
-                logger.info(f"=== Timepoint {t_idx + 1}/{n_timepoints} at T={tp_elapsed:.1f}s ===")
-
-            for plane_idx, z_pos in enumerate(z_positions):
-                step_idx = t_idx * n_planes + plane_idx
-                if progress_callback:
-                    msg = f"Z={z_pos:.1f} um"
-                    if has_t:
-                        msg = f"T{t_idx + 1}/{n_timepoints}, " + msg
-                    progress_callback(step_idx, total_steps, msg)
-
-                # Move Z
-                hardware.move_to_position(Position(z=z_pos))
-                actual_z = hardware.get_z_position()
-                logger.info(
-                    f"Plane {plane_idx + 1}/{n_planes}: Z={actual_z:.2f} um "
-                    f"(target={z_pos:.2f})"
-                )
-
-                # Acquire at each angle
-                for angle in angles:
-                    # Rotate if PPM
-                    if len(angles) > 1 and hasattr(hardware, "set_psg_ticks"):
-                        hardware.set_psg_ticks(angle)
-
-                    # Apply WB if calibration available
-                    if jai_calibration:
-                        _apply_wb_for_snap(hardware, jai_calibration, angle, modality, logger)
-
-                    # Snap
-                    image, metadata = hardware.snap_image()
-                    if image is None:
-                        logger.error(f"Failed to snap at T={t_idx} Z={z_pos}, angle={angle}")
-                        continue
-
-                    # Apply per-angle flat-field correction when enabled. Mirrors
-                    # the main workflow's _acquire_tile_angles BG path so PPM
-                    # output from the single-point dialog matches what BoundedAcq
-                    # would have produced for the same modality/folder.
-                    image = flatfield.apply(image)
-                    if bg_active and angle in background_images:
-                        image = _apply_bg_correction(
-                            image=image,
-                            bg_image=background_images[angle],
-                            scaling=background_scaling_factors.get(angle),
-                            method=background_correction_method,
-                            angle=angle,
-                        )
-
-                    angle_frames[angle][(t_idx, plane_idx)] = (
-                        actual_z,
-                        image,
-                        tp_elapsed,
+                if has_t and plane_major and t_idx == 0:
+                    # A new plane's series: its own clock.
+                    scheduler = TimepointScheduler(
+                        t0_monotonic=time.monotonic(),
+                        interval_seconds=interval_seconds,
+                        logger=logger,
                     )
-            actual_n_timepoints = t_idx + 1
+                    series_t0 = time.time()
+                if has_t and t_idx > 0:
+                    scheduler.wait_until(t_idx, cancel_event=cancel_check)
+                    if cancel_check and cancel_check():
+                        logger.info(
+                            f"Acquisition cancelled during wait before timepoint "
+                            f"{t_idx + 1}/{n_timepoints}"
+                        )
+                        break
+                tp_start_wall = time.time()
+                tp_elapsed = tp_start_wall - series_t0
+                if has_t:
+                    where = f" (plane {plane_idx + 1}/{n_planes})" if plane_major else ""
+                    logger.info(
+                        f"=== Timepoint {t_idx + 1}/{n_timepoints}{where} at T={tp_elapsed:.1f}s ==="
+                    )
+
+            step_idx = (
+                plane_idx * n_timepoints + t_idx if plane_major else t_idx * n_planes + plane_idx
+            )
+            if progress_callback:
+                msg = f"Z={z_pos:.1f} um"
+                if has_t:
+                    msg = f"T{t_idx + 1}/{n_timepoints}, " + msg
+                progress_callback(step_idx, total_steps, msg)
+
+            # Move Z
+            hardware.move_to_position(Position(z=z_pos))
+            actual_z = hardware.get_z_position()
+            logger.info(
+                f"Plane {plane_idx + 1}/{n_planes}: Z={actual_z:.2f} um " f"(target={z_pos:.2f})"
+            )
+
+            # Acquire at each angle
+            for angle in angles:
+                # Rotate if PPM
+                if len(angles) > 1 and hasattr(hardware, "set_psg_ticks"):
+                    hardware.set_psg_ticks(angle)
+
+                # Apply WB if calibration available
+                if jai_calibration:
+                    _apply_wb_for_snap(hardware, jai_calibration, angle, modality, logger)
+
+                # Snap
+                image, metadata = hardware.snap_image()
+                if image is None:
+                    logger.error(f"Failed to snap at T={t_idx} Z={z_pos}, angle={angle}")
+                    continue
+
+                # Apply per-angle flat-field correction when enabled. Mirrors
+                # the main workflow's _acquire_tile_angles BG path so PPM
+                # output from the single-point dialog matches what BoundedAcq
+                # would have produced for the same modality/folder.
+                image = flatfield.apply(image)
+                if bg_active and angle in background_images:
+                    image = _apply_bg_correction(
+                        image=image,
+                        bg_image=background_images[angle],
+                        scaling=background_scaling_factors.get(angle),
+                        method=background_correction_method,
+                        angle=angle,
+                    )
+
+                angle_frames[angle][(t_idx, plane_idx)] = (
+                    actual_z,
+                    image,
+                    tp_elapsed,
+                )
+            actual_n_timepoints = max(actual_n_timepoints, t_idx + 1)
     finally:
         # Always restore the stage to the starting position, even if the
         # acquisition raised. Users expect XYZ to return where it started.

@@ -178,13 +178,13 @@ def test_the_loop_records_positions_only_through_the_settled_read():
     the bare wait_for_xy() it used to make.
     """
     source = WORKFLOW_SRC.read_text()
-    loop = "for pos_idx, (pos, filename) in enumerate(ctx.positions):"
-    body = source.split(loop, 1)[1].split("_record_tile_measurement(", 1)[0]
+    body = source.split("def _acquire_position(", 1)[1].split("_record_tile_measurement(", 1)[0]
 
     assert "stage_positions_collected.append" not in body
     assert body.count("_record_settled_tile_position(") == 2
 
-    angle_branch, other_branch = body.split("\n                else:\n", 1)
+    dispatch = body.split('if ctx.params["angles"]:', 1)[1]
+    angle_branch, other_branch = dispatch.split("\n    else:\n", 1)
     assert angle_branch.index("_acquire_tile_angles(") < angle_branch.index(
         "_record_settled_tile_position("
     )

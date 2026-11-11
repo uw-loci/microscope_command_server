@@ -462,6 +462,20 @@ otherwise. A group whose projection fails keeps its timepoints. LC-PolScope
 and keep their timepoints. Absent or `none`: every timepoint is kept. The choice
 is recorded as `time_lapse.projection` in `acquisition_metadata.json`.
 
+**`--t-order region|position|plane`** says where the timepoint loop sits:
+
+- `region` (default): `for t: for position: tile` -- each timepoint visits every
+  position and takes its Z planes there, as for repeated rounds over a well plate.
+- `position`: `for position: for t: tile` -- each position's timepoints back to back.
+- `plane`: `for position: for z: for t: tile` -- each Z plane's timepoints back to
+  back, with no Z move between frames. Needs `--z-projection none` (refused
+  otherwise); without a Z-stack it runs as `position`.
+
+`position` and `plane` pace each series from its own first timepoint, and only a
+position's first visit moves the stage and autofocuses. The tile layout is the same
+for all three. Recorded as `time_lapse.order`. ZSTACK also accepts `--t-order plane`
+(each plane's timepoints, then the next plane); the stack files are the same.
+
 PPM also gets a birefringence plane for every Z (and timepoint), from the smallest
 positive angle and the largest negative angle, in the same layout under
 `{positive angle}.biref/` (for example `7.0.biref/z000/tile_000.tif`), with the

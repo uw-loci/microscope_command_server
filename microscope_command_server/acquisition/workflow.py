@@ -1563,6 +1563,7 @@ def write_acquisition_metadata(
                 "timepoints": int(params.get("n_timepoints", 1)),
                 "interval_s": params.get("interval_seconds"),
                 "projection": params.get("t_projection") or "none",
+                "order": params.get("t_order") or "region",
             }
 
         # Processing pipeline
@@ -2548,6 +2549,12 @@ def parse_acquisition_message(message: str) -> dict:
                 # mean, max, min, sum or std. Absent or "none": keep every timepoint.
                 params["t_projection"] = parts[i + 1].lower()
                 i += 2
+            elif parts[i] == "--t-order" and i + 1 < len(parts):
+                # Where the timepoint loop sits: "region" (every timepoint visits every
+                # position), "position" (each position runs all its timepoints before the
+                # next) or "plane" (each Z plane of a position runs all its timepoints).
+                params["t_order"] = parts[i + 1].lower()
+                i += 2
             # EDF tuning. Only meaningful with --z-projection edf; ignored
             # otherwise, since the other projections have nothing to tune.
             elif parts[i] == "--edf-metric" and i + 1 < len(parts):
@@ -2731,6 +2738,7 @@ def parse_acquisition_message(message: str) -> dict:
         # the per-tile helpers ('z' for widefield, 'angle' for PPM). This keeps
         # callers that omit --inner-axis byte-identical to pre-toggle behavior.
         params.setdefault("inner_axis", None)
+        params.setdefault("t_order", "region")
 
         # Validate required parameters
         required = [
@@ -2837,6 +2845,13 @@ class AcquisitionContext:
     # Reduce the timepoints to one image per tile after the last timepoint ("mean", "max",
     # "min", "sum", "std"), or None to keep every timepoint for a time-series mosaic.
     t_projection: Optional[str] = None
+    # Where the timepoint loop sits (TIME_ORDERS): "region" repeats every position at each
+    # timepoint, "position" runs each position's timepoints back to back, "plane" runs each
+    # Z plane's timepoints back to back. The output layout is the same for all three.
+    t_order: str = "region"
+    # Set while the "plane" order acquires one Z plane: (z index, z offset). The per-tile
+    # Z loops then visit only that plane (see _z_planes).
+    z_plane_only: Optional[Tuple[int, float]] = None
     output_format: str = "ome-per-t"
     t0: float = 0.0  # set at loop start (time.monotonic()); 0.0 means "not yet started"
 
@@ -2994,6 +3009,215 @@ def _resolve_saturation_abort(ctx: "AcquisitionContext", logger) -> bool:
     return False
 
 
+def _wait_for_timepoint(ctx, scheduler, t_idx: int, report_time_lapse_warning, where: str) -> None:
+    """Paced wait before timepoint ``t_idx`` (> 0), polling the cancel throughout."""
+    if ctx.is_cancelled():
+        raise _AcquisitionCancelled()
+    # wait_until() returns at once if overdue (the timepoint took longer than the interval),
+    # with a warning, or as soon as the cancel poll fires.
+    scheduler.wait_until(t_idx, cancel_event=ctx.is_cancelled)
+    if ctx.is_cancelled():
+        raise _AcquisitionCancelled()
+    # One "falling behind" warning per run, for the first timepoint that overran.
+    _maybe_report_time_lapse_warning(ctx, scheduler, ctx.logger, report_time_lapse_warning)
+    ctx.logger.info(
+        "=== TIMEPOINT %d/%d%s starting at t0+%.1fs ===",
+        t_idx + 1,
+        ctx.n_timepoints,
+        where,
+        time.monotonic() - ctx.t0,
+    )
+
+
+def _run_acquisition_loops(ctx: "AcquisitionContext", report_time_lapse_warning) -> None:
+    """Every position, Z plane and timepoint, nested as ``ctx.t_order`` says.
+
+    - ``region``: for each timepoint, every position (a well plate's rounds). A single pass
+      when there is one timepoint.
+    - ``position``: for each position, all its timepoints, each a full Z-stack.
+    - ``plane``: for each position and Z plane, all that plane's timepoints.
+
+    Timepoint starts are paced ``interval_seconds`` apart by one TimepointScheduler for the
+    region, or a new one per position or plane. Only the first visit to a position moves the
+    stage and autofocuses; the timepoints after it image where that visit focused. Every
+    order writes the same ``{group}/t{tt}/[z{zz}/]{tile}`` layout.
+    """
+
+    def scheduler():
+        return TimepointScheduler(
+            t0_monotonic=time.monotonic(),
+            interval_seconds=ctx.interval_seconds,
+            logger=ctx.logger,
+        )
+
+    n_t = ctx.n_timepoints
+    if ctx.t_order == "region" or n_t <= 1:
+        region_scheduler = TimepointScheduler(
+            t0_monotonic=ctx.t0, interval_seconds=ctx.interval_seconds, logger=ctx.logger
+        )
+        for t_idx in range(n_t):
+            ctx.current_timepoint = t_idx
+            if t_idx > 0:
+                _wait_for_timepoint(ctx, region_scheduler, t_idx, report_time_lapse_warning, "")
+            for pos_idx, (pos, filename) in enumerate(ctx.positions):
+                _acquire_position(ctx, pos_idx, pos, filename, revisit=False)
+        return
+
+    for pos_idx, (pos, filename) in enumerate(ctx.positions):
+        where = f" at position {pos_idx + 1}/{len(ctx.positions)}"
+        if ctx.t_order == "position":
+            pos_scheduler = scheduler()
+            for t_idx in range(n_t):
+                ctx.current_timepoint = t_idx
+                if t_idx > 0:
+                    _wait_for_timepoint(ctx, pos_scheduler, t_idx, report_time_lapse_warning, where)
+                if not _acquire_position(ctx, pos_idx, pos, filename, revisit=t_idx > 0):
+                    break
+            continue
+        # plane
+        acquired = True
+        for z_idx, z_offset in enumerate(ctx.z_offsets):
+            ctx.z_plane_only = (z_idx, z_offset)
+            plane_scheduler = scheduler()
+            try:
+                for t_idx in range(n_t):
+                    ctx.current_timepoint = t_idx
+                    if t_idx > 0:
+                        _wait_for_timepoint(
+                            ctx,
+                            plane_scheduler,
+                            t_idx,
+                            report_time_lapse_warning,
+                            f"{where}, plane {z_idx + 1}/{len(ctx.z_offsets)}",
+                        )
+                    revisit = z_idx > 0 or t_idx > 0
+                    if not _acquire_position(ctx, pos_idx, pos, filename, revisit=revisit):
+                        acquired = False
+                        break
+            finally:
+                ctx.z_plane_only = None
+            if not acquired:
+                break
+
+
+def _acquire_position(
+    ctx: "AcquisitionContext", pos_idx: int, pos, filename: str, revisit: bool
+) -> bool:
+    """Acquire one tile visit: the stage move and autofocus (unless ``revisit``), then the
+    angles, channels or single image at the planes ``_z_planes`` names, and the tile's
+    measurements. Returns False when the operator chose to skip this tile."""
+    logger = ctx.logger
+    hardware = ctx.hardware
+    if ctx.is_cancelled():
+        raise _AcquisitionCancelled()
+
+    raise_if_frame_suspect(hardware)
+
+    logger.info(f"Position {pos_idx + 1}/{len(ctx.positions)}: {filename}")
+    tile_start = time.perf_counter()
+
+    # AF decision + stage move + autofocus execution
+    if revisit:
+        # Same position as the previous timepoint or plane: the stage is still here and
+        # Z is back at the stack center, so neither the move nor a new focus is wanted.
+        needs_af, af_type, drift, af_failed, xy_move_pending = False, "none", 0.0, False, False
+    else:
+        with AF_EVENTS.context(
+            f"Tile {pos_idx + 1} of {len(ctx.positions)}", tile=pos_idx, x=pos.x, y=pos.y
+        ):
+            needs_af, af_type, drift, af_failed, xy_move_pending = _handle_tile_autofocus(
+                ctx, pos_idx, pos, filename
+            )
+
+    # User chose to skip this tile during hardware error recovery
+    if af_type == "skipped":
+        return False
+
+    # The tile's recorded stage position is read only once XY has
+    # settled (_record_settled_tile_position). A non-AF tile's XY move
+    # is issued no-wait, so a read here would be a point along the way:
+    # an LC-PolScope tile 3 was recorded at X=9973.4 for a commanded
+    # 9697.0, 276 um short, partway through a 378 um move.
+
+    # Dispatch by modality
+    tile_worst_sat = {"R": 0.0, "G": 0.0, "B": 0.0}
+    tile_role_sat = {
+        SATURATION_ROLE_LOW: 0.0,
+        SATURATION_ROLE_HIGH: 0.0,
+        SATURATION_ROLE_NORMAL: 0.0,
+    }
+    tile_stats: dict = {}
+    if ctx.params["angles"]:
+        # The angle path overlaps the first rotation with the XY move and
+        # waits for XY inside, before its first snap. Z has already
+        # settled (a non-AF tile's Z correction is a blocking move), so
+        # the Z read here is real; XY is the commanded position until
+        # the settled read after the snaps.
+        current_stage_pos = Position(pos.x, pos.y, hardware.get_current_position().z)
+        # PPM high-bit-depth capture is scoped to the angle snaps: enter
+        # the camera's high-bit PixelFormat here (autofocus above already
+        # ran in 8-bit) and always restore, even on cancel/error, so live
+        # view and other modalities are never left in 16-bit.
+        high_bit_active = False
+        if ctx.ppm_high_bit_depth:
+            high_bit_active = hardware.camera.set_high_bit_mode(True)
+        try:
+            tile_worst_sat, tile_role_sat, tile_stats, xy_move_pending = _acquire_tile_angles(
+                ctx,
+                pos_idx,
+                pos,
+                filename,
+                current_stage_pos,
+                xy_move_pending,
+            )
+        finally:
+            if high_bit_active:
+                hardware.camera.set_high_bit_mode(False)
+        # XY waited for inside; Z is back at the stack center if a
+        # Z-stack ran, so this read is where the tile was imaged.
+        current_stage_pos = _record_settled_tile_position(ctx, pos, filename, xy_move_pending)
+        xy_move_pending = False
+    else:
+        # Wait for the non-blocking XY move before the single-image /
+        # channel snaps, and record the settled position.
+        current_stage_pos = _record_settled_tile_position(ctx, pos, filename, xy_move_pending)
+        xy_move_pending = False
+
+        # Try channel-based acquisition first
+        channel_plan = resolve_channel_plan(
+            ctx.ppm_settings,
+            ctx.params.get("scan_type", ""),
+            ctx.params.get("channels", []) or [],
+            ctx.params.get("channel_exposures", []) or [],
+            channel_intensity_overrides=ctx.params.get("channel_intensities") or None,
+        )
+        if channel_plan:
+            tile_worst_sat, tile_role_sat, tile_stats = _acquire_tile_channels(
+                ctx, pos, filename, current_stage_pos
+            )
+        else:
+            tile_worst_sat, tile_role_sat, tile_stats = _acquire_tile_single(
+                ctx, pos, filename, current_stage_pos
+            )
+
+    # Record per-tile measurements
+    _record_tile_measurement(
+        ctx,
+        pos_idx,
+        filename,
+        tile_start,
+        needs_af,
+        af_type,
+        drift,
+        af_failed,
+        tile_worst_sat,
+        current_stage_pos,
+        tile_role_sat=tile_role_sat,
+        tile_stats=tile_stats,
+    )
+    return True
+
+
 def _acquisition_workflow(
     message: str,
     client_addr,
@@ -3087,149 +3311,7 @@ def _acquisition_workflow(
         # When n_timepoints == 1 (default) the scheduler is a no-op and
         # the loop collapses to the pre-refactor single-pass behavior.
         ctx.t0 = time.monotonic()
-        scheduler = TimepointScheduler(
-            t0_monotonic=ctx.t0,
-            interval_seconds=ctx.interval_seconds,
-            logger=logger,
-        )
-        for t_idx in range(ctx.n_timepoints):
-            ctx.current_timepoint = t_idx
-            if t_idx > 0:
-                # Time-lapse pacing. wait_until() returns 0 if overdue
-                # (acq_time > interval) with a warning, or after the
-                # cancel poll fires.
-                if ctx.is_cancelled():
-                    logger.warning(f"Acquisition cancelled by client {client_addr}")
-                    ctx.set_state("CANCELLED")
-                    return
-                scheduler.wait_until(t_idx, cancel_event=ctx.is_cancelled)
-                if ctx.is_cancelled():
-                    logger.warning(f"Acquisition cancelled by client {client_addr}")
-                    ctx.set_state("CANCELLED")
-                    return
-                # One-shot "falling behind" warning. The first paced wait is
-                # wait_until(1); it overruns when 1-based timepoint 1's work
-                # took longer than the interval. overdue_count > 0 here means
-                # that first timepoint overran -- report it exactly once.
-                _maybe_report_time_lapse_warning(ctx, scheduler, logger, report_time_lapse_warning)
-                logger.info(
-                    "=== TIMEPOINT %d/%d starting at t0+%.1fs ===",
-                    t_idx + 1,
-                    ctx.n_timepoints,
-                    time.monotonic() - ctx.t0,
-                )
-
-            for pos_idx, (pos, filename) in enumerate(ctx.positions):
-                if ctx.is_cancelled():
-                    logger.warning(f"Acquisition cancelled by client {client_addr}")
-                    ctx.set_state("CANCELLED")
-                    return
-
-                raise_if_frame_suspect(hardware)
-
-                logger.info(f"Position {pos_idx + 1}/{len(ctx.positions)}: {filename}")
-                tile_start = time.perf_counter()
-
-                # AF decision + stage move + autofocus execution
-                with AF_EVENTS.context(
-                    f"Tile {pos_idx + 1} of {len(ctx.positions)}", tile=pos_idx, x=pos.x, y=pos.y
-                ):
-                    needs_af, af_type, drift, af_failed, xy_move_pending = _handle_tile_autofocus(
-                        ctx, pos_idx, pos, filename
-                    )
-
-                # User chose to skip this tile during hardware error recovery
-                if af_type == "skipped":
-                    continue
-
-                # The tile's recorded stage position is read only once XY has
-                # settled (_record_settled_tile_position). A non-AF tile's XY move
-                # is issued no-wait, so a read here would be a point along the way:
-                # an LC-PolScope tile 3 was recorded at X=9973.4 for a commanded
-                # 9697.0, 276 um short, partway through a 378 um move.
-
-                # Dispatch by modality
-                tile_worst_sat = {"R": 0.0, "G": 0.0, "B": 0.0}
-                tile_role_sat = {
-                    SATURATION_ROLE_LOW: 0.0,
-                    SATURATION_ROLE_HIGH: 0.0,
-                    SATURATION_ROLE_NORMAL: 0.0,
-                }
-                tile_stats: dict = {}
-                if ctx.params["angles"]:
-                    # The angle path overlaps the first rotation with the XY move and
-                    # waits for XY inside, before its first snap. Z has already
-                    # settled (a non-AF tile's Z correction is a blocking move), so
-                    # the Z read here is real; XY is the commanded position until
-                    # the settled read after the snaps.
-                    current_stage_pos = Position(pos.x, pos.y, hardware.get_current_position().z)
-                    # PPM high-bit-depth capture is scoped to the angle snaps: enter
-                    # the camera's high-bit PixelFormat here (autofocus above already
-                    # ran in 8-bit) and always restore, even on cancel/error, so live
-                    # view and other modalities are never left in 16-bit.
-                    high_bit_active = False
-                    if ctx.ppm_high_bit_depth:
-                        high_bit_active = hardware.camera.set_high_bit_mode(True)
-                    try:
-                        tile_worst_sat, tile_role_sat, tile_stats, xy_move_pending = (
-                            _acquire_tile_angles(
-                                ctx,
-                                pos_idx,
-                                pos,
-                                filename,
-                                current_stage_pos,
-                                xy_move_pending,
-                            )
-                        )
-                    finally:
-                        if high_bit_active:
-                            hardware.camera.set_high_bit_mode(False)
-                    # XY waited for inside; Z is back at the stack center if a
-                    # Z-stack ran, so this read is where the tile was imaged.
-                    current_stage_pos = _record_settled_tile_position(
-                        ctx, pos, filename, xy_move_pending
-                    )
-                    xy_move_pending = False
-                else:
-                    # Wait for the non-blocking XY move before the single-image /
-                    # channel snaps, and record the settled position.
-                    current_stage_pos = _record_settled_tile_position(
-                        ctx, pos, filename, xy_move_pending
-                    )
-                    xy_move_pending = False
-
-                    # Try channel-based acquisition first
-                    channel_plan = resolve_channel_plan(
-                        ctx.ppm_settings,
-                        ctx.params.get("scan_type", ""),
-                        ctx.params.get("channels", []) or [],
-                        ctx.params.get("channel_exposures", []) or [],
-                        channel_intensity_overrides=ctx.params.get("channel_intensities") or None,
-                    )
-                    if channel_plan:
-                        tile_worst_sat, tile_role_sat, tile_stats = _acquire_tile_channels(
-                            ctx, pos, filename, current_stage_pos
-                        )
-                    else:
-                        tile_worst_sat, tile_role_sat, tile_stats = _acquire_tile_single(
-                            ctx, pos, filename, current_stage_pos
-                        )
-
-                # Record per-tile measurements
-                _record_tile_measurement(
-                    ctx,
-                    pos_idx,
-                    filename,
-                    tile_start,
-                    needs_af,
-                    af_type,
-                    drift,
-                    af_failed,
-                    tile_worst_sat,
-                    current_stage_pos,
-                    tile_role_sat=tile_role_sat,
-                    tile_stats=tile_stats,
-                )
+        _run_acquisition_loops(ctx, report_time_lapse_warning)
 
         # Phase 11: Post-acquisition finalization
         _finalize_acquisition(ctx)
@@ -4223,6 +4305,9 @@ def _prepare_acquisition(
         n_timepoints=n_timepoints,
         interval_seconds=float(params.get("interval_seconds", 0.0)),
         t_projection=_resolve_time_projection(params.get("t_projection"), n_timepoints, logger),
+        t_order=_resolve_time_order(
+            params.get("t_order"), n_timepoints, z_stack_enabled, preserve_z_planes, logger
+        ),
         output_format=str(params.get("output_format", "ome-per-t")),
         hint_z=params.get("hint_z"),
         metadata_txt_for_positions=metadata_txt_for_positions,
@@ -6358,6 +6443,32 @@ _AXIAL_FOLDERS = ("orientation", "orientation_color")
 _TIMEPOINT_DIR = re.compile(r"^t\d{3}$")
 
 
+TIME_ORDERS = ("region", "position", "plane")
+
+
+def _resolve_time_order(raw, n_timepoints: int, z_stack: bool, keep_planes: bool, logger) -> str:
+    """Where the timepoint loop sits; see AcquisitionContext.t_order.
+
+    "plane" acquires one Z plane at a time, so a Z projection (which needs every plane of a
+    timepoint together) cannot run: it is refused rather than silently changed. Without a
+    Z-stack, "plane" is the same as "position".
+    """
+    name = "region" if raw is None else str(raw).strip().lower() or "region"
+    if name not in TIME_ORDERS:
+        raise ValueError(f"Unknown --t-order '{raw}' (expected one of {', '.join(TIME_ORDERS)})")
+    if n_timepoints <= 1:
+        return "region"
+    if name == "plane" and not z_stack:
+        logger.info("--t-order plane without a Z-stack: running each position's timepoints")
+        return "position"
+    if name == "plane" and not keep_planes:
+        raise ValueError(
+            "--t-order plane keeps every Z plane (each plane's timepoints are taken before the"
+            " next plane), so it needs --z-projection none"
+        )
+    return name
+
+
 def _resolve_time_projection(raw, n_timepoints: int, logger) -> Optional[str]:
     """The time projection to apply, or None to keep every timepoint."""
     if raw is None or n_timepoints <= 1:
@@ -6482,6 +6593,19 @@ def _copy_tile_configuration_once(source: Optional[Path], group_dir: Path) -> No
         shutil.copy2(source, target)
 
 
+def _z_planes(ctx: AcquisitionContext) -> List[Tuple[int, float]]:
+    """The (z index, z offset) pairs a tile visits: every plane, or the one plane the
+    "plane" time order is on."""
+    if ctx.z_plane_only is not None:
+        return [ctx.z_plane_only]
+    return list(enumerate(ctx.z_offsets))
+
+
+def _z_plane_count(ctx: AcquisitionContext) -> int:
+    """Planes in the whole stack (for log lines), whichever one is being visited."""
+    return len(ctx.z_offsets)
+
+
 def _plane_path(ctx: AcquisitionContext, group: Optional[str], z_idx: int, filename: str):
     """Output path for one individual Z-plane.
 
@@ -6533,8 +6657,10 @@ def _submit_biref_planes(
     from ppm_library.imaging.writer import TifWriterUtils as PpmWriterUtils
 
     pixel_size = ctx.hardware.get_pixel_size_um()
+    # The "plane" time order passes one plane at a time; its index is the plane's own.
+    z_base = ctx.z_plane_only[0] if ctx.z_plane_only is not None else 0
     for z_idx in range(min(len(pos_planes), len(neg_planes))):
-        plane_dir = _plane_path(ctx, group, z_idx, filename).parent
+        plane_dir = _plane_path(ctx, group, z_base + z_idx, filename).parent
         plane_dir.mkdir(parents=True, exist_ok=True)
         ctx.write_pool.submit(
             PpmWriterUtils.create_normalized_birefringence_tile,
@@ -6695,7 +6821,7 @@ def _acquire_tile_angles_angle_outer(
         t_rot = log_timing(logger, f"Rotation to {angle}deg", t_rot)
 
         # Inner z-loop: each plane snaps + saves under the current angle.
-        for z_idx, z_offset in enumerate(ctx.z_offsets):
+        for z_idx, z_offset in _z_planes(ctx):
             if ctx.is_cancelled():
                 raise _AcquisitionCancelled()
 
@@ -6706,7 +6832,7 @@ def _acquire_tile_angles_angle_outer(
                     "Angle %sdeg Z-stack: plane %d/%d, Z=%.2f (offset=%+.1f)",
                     angle,
                     z_idx + 1,
-                    len(ctx.z_offsets),
+                    _z_plane_count(ctx),
                     target_z,
                     z_offset,
                 )
@@ -7018,14 +7144,14 @@ def _acquire_tile_angles(
     z_stack_images = {}
     angle_images = {}
 
-    for z_idx, z_offset in enumerate(ctx.z_offsets):
+    for z_idx, z_offset in _z_planes(ctx):
         if ctx.z_stack_enabled and z_offset != 0.0:
             target_z = center_z + z_offset
             hardware.move_to_position(Position(z=target_z))
             logger.debug(
                 "Z-stack: plane %d/%d, Z=%.2f (offset=%+.1f)",
                 z_idx + 1,
-                len(ctx.z_offsets),
+                _z_plane_count(ctx),
                 target_z,
                 z_offset,
             )
@@ -7452,14 +7578,14 @@ def _acquire_tile_channels_z_outer(
             "worst_sat_for_channel": {},
         }
 
-    for z_idx, z_offset in enumerate(ctx.z_offsets):
+    for z_idx, z_offset in _z_planes(ctx):
         if ctx.z_stack_enabled and z_offset != 0.0:
             target_z = center_z + z_offset
             hardware.move_to_position(Position(z=target_z))
             logger.debug(
                 "Z-outer: plane %d/%d, Z=%.2f (offset=%+.1f)",
                 z_idx + 1,
-                len(ctx.z_offsets),
+                _z_plane_count(ctx),
                 target_z,
                 z_offset,
             )
@@ -7917,7 +8043,7 @@ def _acquire_tile_channels(
         z_stack_planes = []  # accumulate Z planes when z_stack_enabled
         worst_sat_for_channel = {}
 
-        for z_idx, z_offset in enumerate(ctx.z_offsets):
+        for z_idx, z_offset in _z_planes(ctx):
             # Move Z if doing Z-stack (skip for single-plane 2D)
             if ctx.z_stack_enabled and z_offset != 0.0:
                 target_z = center_z + z_offset
@@ -7926,7 +8052,7 @@ def _acquire_tile_channels(
                     "Channel %s Z-stack: plane %d/%d, Z=%.2f (offset=%+.1f)",
                     ch_id,
                     z_idx + 1,
-                    len(ctx.z_offsets),
+                    _z_plane_count(ctx),
                     target_z,
                     z_offset,
                 )
@@ -8112,7 +8238,7 @@ def _acquire_tile_single(
     center_z = current_stage_pos.z
     z_stack_planes = []  # accumulate Z planes when z_stack_enabled
 
-    for z_idx, z_offset in enumerate(ctx.z_offsets):
+    for z_idx, z_offset in _z_planes(ctx):
         # Move Z if doing Z-stack (skip for single-plane 2D)
         if ctx.z_stack_enabled and z_offset != 0.0:
             target_z = center_z + z_offset
@@ -8120,7 +8246,7 @@ def _acquire_tile_single(
             logger.debug(
                 "Z-stack: plane %d/%d, Z=%.2f (offset=%+.1f)",
                 z_idx + 1,
-                len(ctx.z_offsets),
+                _z_plane_count(ctx),
                 target_z,
                 z_offset,
             )
