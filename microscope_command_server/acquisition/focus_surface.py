@@ -47,6 +47,17 @@ How it stays honest
   agree with each other and not with the surface, the sample moved (a re-seated slide,
   a stage frame shift) and the surface resets onto them rather than continuing to veto
   the sensor.
+* **It cannot overrule clearer evidence than its own.** Each point keeps the peak
+  prominence of the autofocus that measured it, when there is one (a drift sweep or a
+  manual focus has none). A rejected result is *clearer* when its prominence exceeds
+  every prominence among the surface's inliers. Two clearer results that agree with
+  each other on how far the surface is off (their offsets within the gate) reset the
+  surface instead of being replaced. On 2026-11-10 (PPM 20x) a surface licensed on
+  faint peaks (prominence about 0.45) about 120 um below the tissue replaced all eight
+  clear ones (0.96-0.98) for five hours. Comparing prominences needs no threshold of
+  its own, so it carries across metrics, objectives and microscopes; asking for a
+  second, agreeing result stops a peak that is only a little less faint (0.59 against
+  0.45, at a third height, in that run) from resetting it alone.
 
 Modes: ``off`` (inert), ``observe`` (fit and report, change nothing), ``enforce``
 (predict and reject). ``observe`` exists so a run can measure what enforcement would
@@ -174,6 +185,8 @@ class _Fit:
     qyy: float = 0.0
     # (xmin, xmax, ymin, ymax) of the inlier points, um; None for a plane.
     bounds: Optional[Tuple[float, float, float, float]] = None
+    # Which of the points the fit was made from are its inliers, in point order.
+    inliers: Optional[np.ndarray] = None
 
     @property
     def quadratic(self) -> bool:
@@ -235,11 +248,21 @@ class FocusSurface:
     logger: logging.Logger = field(default_factory=lambda: logging.getLogger(__name__))
 
     _points: List[Tuple[float, float, float]] = field(default_factory=list)
+    # Peak prominence of the autofocus behind each point, None when it has none (a
+    # drift sweep, a manual focus), in the same order as _points.
+    _quality: List[Optional[float]] = field(default_factory=list)
     _fit: Optional[_Fit] = None
     _rejected_streak: List[Tuple[float, float, float]] = field(default_factory=list)
+    _rejected_quality: List[Optional[float]] = field(default_factory=list)
+    # Rejected results clearer than the surface, waiting for a second that agrees:
+    # (x, y, z, prominence, z minus the surface's prediction).
+    _clearer_rejections: List[Tuple[float, float, float, float, float]] = field(
+        default_factory=list
+    )
     _n_checks: int = 0
     _n_would_reject: int = 0
     _n_resurfaces: int = 0
+    _n_clearer_peak_resets: int = 0
     _rng: np.random.Generator = field(default_factory=lambda: np.random.default_rng(12345))
 
     # ---------- state ----------
@@ -313,11 +336,16 @@ class FocusSurface:
 
     # ---------- learning ----------
 
-    def add(self, x: float, y: float, z: float) -> None:
-        """Record a focus measurement and refit."""
+    def add(self, x: float, y: float, z: float, quality: Optional[float] = None) -> None:
+        """Record a focus measurement and refit.
+
+        ``quality`` is the peak prominence of the autofocus that measured it, or None
+        when it has none.
+        """
         if not self.active:
             return
         self._points.append((float(x), float(y), float(z)))
+        self._quality.append(_clean_quality(quality))
         self._refit()
 
     def _refit(self) -> None:
@@ -343,14 +371,17 @@ class FocusSurface:
             return None
         return float(self._fit.predict(x, y))
 
-    def check(self, x: float, y: float, z: float) -> Verdict:
+    def check(self, x: float, y: float, z: float, quality: Optional[float] = None) -> Verdict:
         """Compare one measurement against the surface.
 
         Always computes, whatever the mode, so an ``observe`` run can report exactly
         what enforcement would have done. Only ``enforced`` says to act.
+
+        ``quality`` is the measurement's peak prominence, or None when it has none.
         """
         if not self.active:
             return Verdict(reason="focus surface off")
+        quality = _clean_quality(quality)
         self._n_checks += 1
         predicted = self.predict(x, y)
         if predicted is None:
@@ -360,6 +391,7 @@ class FocusSurface:
         gate = max(self.reject_margin_um, self.reject_sigma * self._fit.inlier_rms_um)
         if residual <= gate:
             self._rejected_streak.clear()
+            self._rejected_quality.clear()
             return Verdict(
                 predicted_z=predicted,
                 residual_um=residual,
@@ -367,8 +399,18 @@ class FocusSurface:
                 reason="agrees with the focus surface",
             )
 
+        support = self._support_quality()
+        if quality is not None and support is not None and quality > support:
+            partner = self._agreeing_clearer_rejection(x, y, z - predicted, gate, support)
+            if partner is not None:
+                return self._reset_onto_clearer_peaks(
+                    partner, predicted, residual, gate, quality, support
+                )
+            self._clearer_rejections.append((float(x), float(y), float(z), quality, z - predicted))
+
         self._n_would_reject += 1
         self._rejected_streak.append((float(x), float(y), float(z)))
+        self._rejected_quality.append(quality)
         resurfaced = self._maybe_resurface()
         if resurfaced:
             # The sample moved; this measurement is now the truth, not an outlier.
@@ -387,6 +429,78 @@ class FocusSurface:
             reason=(
                 f"{residual:.1f} um from a surface {self._fit.n_inliers} points define "
                 f"to {self._fit.inlier_rms_um:.2f} um RMS (gate {gate:.1f} um)"
+                f"{_quality_note(quality, support)}"
+            ),
+        )
+
+    def _support_quality(self) -> Optional[float]:
+        """The clearest peak prominence among the fit's inliers, or None when none has one.
+
+        Only results that carry a prominence are compared: a drift sweep or a manual
+        focus is evidence of another kind, neither clearer nor fainter.
+        """
+        f = self._fit
+        if f is None or f.inliers is None or len(f.inliers) != len(self._quality):
+            return None
+        measured = [q for q, inlier in zip(self._quality, f.inliers) if inlier and q is not None]
+        return max(measured) if measured else None
+
+    def _agreeing_clearer_rejection(
+        self, x: float, y: float, offset: float, gate: float, support: float
+    ) -> Optional[Tuple[float, float, float, float, float]]:
+        """An earlier clearer rejection at another place that is off by the same amount.
+
+        Rejections that are no longer clearer than the surface (its inliers gained a
+        clearer peak since) are dropped first.
+        """
+        self._clearer_rejections = [r for r in self._clearer_rejections if r[3] > support]
+        here = (round(float(x), 1), round(float(y), 1))
+        for r in self._clearer_rejections:
+            if (round(r[0], 1), round(r[1], 1)) != here and abs(r[4] - offset) <= gate:
+                return r
+        return None
+
+    def _reset_onto_clearer_peaks(
+        self,
+        partner: Tuple[float, float, float, float, float],
+        predicted: float,
+        residual: float,
+        gate: float,
+        quality: float,
+        support: float,
+    ) -> Verdict:
+        """Drop a surface that two agreeing, clearer measurements contradict.
+
+        The new surface starts from the earlier of the two; the caller then learns the
+        current one.
+        """
+        old = self._fit
+        self._points = [(partner[0], partner[1], partner[2])]
+        self._quality = [partner[3]]
+        self._fit = None
+        self._rejected_streak.clear()
+        self._rejected_quality.clear()
+        self._clearer_rejections.clear()
+        self._n_clearer_peak_resets += 1
+        self.logger.warning(
+            "FOCUS SURFACE RESET: two autofocus results found clearer peaks (prominence "
+            "%.2f and %.2f) than any of the %d points the surface rests on (at most "
+            "%.2f), and agree that it is off by about %.1f um. A surface built from "
+            "fainter peaks may not overrule them, so rebuilding from these two.",
+            partner[3],
+            quality,
+            old.n_inliers if old else 0,
+            support,
+            residual,
+        )
+        return Verdict(
+            predicted_z=predicted,
+            residual_um=residual,
+            gate_um=gate,
+            reason=(
+                f"focus surface reset: peaks of prominence {partner[3]:.2f} and "
+                f"{quality:.2f} are clearer than any of the surface's points (at most "
+                f"{support:.2f}) and agree with each other"
             ),
         )
 
@@ -428,8 +542,11 @@ class FocusSurface:
         spread = float(np.std(offsets))
         old = self._fit
         self._points = [tuple(p) for p in recent]
+        self._quality = list(self._rejected_quality[-RESURFACE_AFTER_REJECTIONS:])
         self._fit = None
         self._rejected_streak.clear()
+        self._rejected_quality.clear()
+        self._clearer_rejections.clear()
         self._n_resurfaces += 1
         self.logger.warning(
             "FOCUS SURFACE RESET: the last %d autofocus results sit on this surface's "
@@ -479,6 +596,7 @@ class FocusSurface:
             "checks": self._n_checks,
             "would_reject": self._n_would_reject,
             "resurfaces": self._n_resurfaces,
+            "clearer_peak_resets": self._n_clearer_peak_resets,
             "licensed": self.licensed,
             # Always present, including when there is no fit at all -- a summary that
             # omits the reason precisely when the surface did nothing is the least
@@ -577,9 +695,10 @@ def _make_fit(
     n_points: int,
     spread: Tuple[float, float],
     inlier_xy: Optional[np.ndarray],
+    inliers: Optional[np.ndarray] = None,
 ) -> _Fit:
     if len(coef) == 3:
-        return _Fit(centre, *map(float, coef), rms, n_inliers, n_points, spread)
+        return _Fit(centre, *map(float, coef), rms, n_inliers, n_points, spread, inliers=inliers)
     bounds = (
         float(inlier_xy[:, 0].min()),
         float(inlier_xy[:, 0].max()),
@@ -599,6 +718,7 @@ def _make_fit(
         float(coef[4]),
         float(coef[5]),
         bounds,
+        inliers,
     )
 
 
@@ -666,7 +786,16 @@ def _ransac_fit(
             logger.debug("Focus surface: plane fit failed outright on %d points", n)
             return None
         resid = z - A @ coef
-        return _make_fit(centre, coef, float(resid.std()), int(n), int(n), (0.0, 0.0), None)
+        return _make_fit(
+            centre,
+            coef,
+            float(resid.std()),
+            int(n),
+            int(n),
+            (0.0, 0.0),
+            None,
+            np.ones(n, dtype=bool),
+        )
 
     coef, *_ = np.linalg.lstsq(A[best_inliers], z[best_inliers], rcond=None)
     resid = z - A @ coef
@@ -682,7 +811,28 @@ def _ransac_fit(
         int(n),
         _spread_mm(pts[inliers, :2]),
         pts[inliers, :2],
+        inliers,
     )
+
+
+def _clean_quality(quality: Optional[float]) -> Optional[float]:
+    """A peak prominence as a float, or None when there is none or it is not a number."""
+    if quality is None:
+        return None
+    try:
+        q = float(quality)
+    except (TypeError, ValueError):
+        return None
+    return q if np.isfinite(q) else None
+
+
+def _quality_note(quality: Optional[float], support: Optional[float]) -> str:
+    """Peak prominences for a rejection message, empty when there are none."""
+    if quality is None:
+        return ""
+    if support is None:
+        return f"; peak prominence {quality:.2f}"
+    return f"; peak prominence {quality:.2f}, the surface's points at most {support:.2f}"
 
 
 def parse_mode(raw: Optional[str], logger: Optional[logging.Logger] = None) -> str:

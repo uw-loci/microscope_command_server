@@ -1530,6 +1530,32 @@ When any check fails, the mode is logged as "NOT licensed: ..." and the
 acquisition falls back to the nearest-neighbour seeding behavior from before
 this feature.
 
+### Clearer peaks reset the surface
+
+Each point keeps the peak prominence of the standard autofocus that measured it
+(the pre-acquisition AF, a survey point, a per-tile standard AF); a drift sweep
+or a manual focus has none. A rejected result counts as *clearer* when its
+prominence exceeds every prominence among the surface's inliers. Two clearer
+results at different places that agree on how far the surface is off (their
+offsets within the gate of each other) reset the surface: the log says
+`FOCUS SURFACE RESET: two autofocus results found clearer peaks`, the second
+result is kept, and the surface rebuilds from the two. One clearer result alone
+is still replaced, and a surface whose inliers carry no prominence (drift
+sweeps only) is never weighed this way.
+
+Why: on 2026-11-10 (PPM 20x) a surface licensed on faint peaks (prominence
+about 0.45) about 120 um below the tissue replaced all eight clear peaks
+(0.96-0.98) for five hours. Replaying that region, the rule resets at the
+second clear peak; replaying the three other regions of that log (1154-1849
+results each) it never fires. The comparison has no threshold of its own;
+asking for a second agreeing result stops a peak only a little less faint (a
+0.59 at a third height, in the same run) from resetting it alone. Rejection
+messages now include the prominence. It needs microscope_control with
+`last_autofocus_validation` (an older one leaves every point without a
+prominence, which is the previous behavior).
+
+The end-of-region summary counts these as `clearer_peak_resets`.
+
 ### Plane or curved surface
 
 The surface is a plane unless the region supports a quadratic (three more terms:

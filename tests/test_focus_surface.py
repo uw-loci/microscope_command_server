@@ -418,3 +418,123 @@ class TestCurvedSurface:
     def test_no_record_when_off_or_unfitted(self):
         assert surface(MODE_OFF).to_record() is None
         assert surface().to_record() is None
+
+
+# The 2026-11-10 slot-4 region (PPM 20x): eight clear standard-autofocus peaks
+# (prominence 0.96-0.98) lie on z = -190.0 - 7.94*X_mm - 0.60*Y_mm to 0.79 um RMS. The
+# survey and most standard results found faint peaks (median 0.48) about 120 um lower,
+# and the surface licensed on those replaced all eight clear ones.
+def slot4_tissue(x, y):
+    return -190.0 - 7.94 * x / 1000.0 - 0.60 * y / 1000.0
+
+
+def slot4_grid():
+    xs = np.linspace(-55000.0, -42000.0, 5)
+    ys = np.linspace(-31000.0, -26000.0, 4)
+    return [(float(x), float(y)) for x in xs for y in ys]
+
+
+def feed_quality(s, points, fn, qualities, noise_um=0.5, seed=0):
+    rng = np.random.default_rng(seed)
+    for (x, y), q in zip(points, qualities):
+        s.add(x, y, fn(x, y) + rng.normal(0, noise_um), q)
+
+
+class TestClearerEvidenceWins:
+    STRONG = [(-49045.7, -30708.7), (-44213.1, -30215.8), (-45503.7, -29495.5)]
+
+    def faint_surface(self, mode=MODE_ENFORCE):
+        s = surface(mode=mode)
+        rng = np.random.default_rng(3)
+        feed_quality(
+            s,
+            slot4_grid(),
+            lambda x, y: slot4_tissue(x, y) - 120.0,
+            rng.uniform(0.37, 0.62, size=20),
+        )
+        assert s.licensed
+        return s
+
+    def test_two_agreeing_clear_peaks_reset_a_surface_built_from_faint_ones(self):
+        s = self.faint_surface()
+        (x1, y1), (x2, y2) = self.STRONG[:2]
+        first = s.check(x1, y1, slot4_tissue(x1, y1), quality=0.97)
+        assert first.would_reject and first.enforced
+        assert "prominence 0.97" in first.reason
+
+        second = s.check(x2, y2, slot4_tissue(x2, y2), quality=0.98)
+        assert not second.would_reject
+        assert "reset" in second.reason
+        assert s.summary()["clearer_peak_resets"] == 1
+        # The new surface starts from the first; the caller then learns the second.
+        assert s.summary()["points"] == 1
+        s.add(x2, y2, slot4_tissue(x2, y2), 0.98)
+        assert s.summary()["points"] == 2
+
+    def test_one_clear_peak_alone_does_not_reset_it(self):
+        s = self.faint_surface()
+        x, y = self.STRONG[0]
+        v = s.check(x, y, slot4_tissue(x, y), quality=0.97)
+        assert v.would_reject
+        assert s.summary()["clearer_peak_resets"] == 0
+
+    def test_clear_peaks_that_disagree_with_each_other_do_not_reset_it(self):
+        # 2026-11-10: a 0.59 peak at a third height (145 um) followed the 0.45 start.
+        s = self.faint_surface()
+        (x1, y1), (x2, y2) = self.STRONG[:2]
+        s.check(x1, y1, slot4_tissue(x1, y1) - 60.0, quality=0.97)
+        v = s.check(x2, y2, slot4_tissue(x2, y2), quality=0.98)
+        assert v.would_reject
+        assert s.summary()["clearer_peak_resets"] == 0
+
+    def test_the_same_tile_twice_is_not_two_results(self):
+        s = self.faint_surface()
+        x, y = self.STRONG[0]
+        s.check(x, y, slot4_tissue(x, y), quality=0.97)
+        v = s.check(x, y, slot4_tissue(x, y), quality=0.97)
+        assert v.would_reject
+
+    def test_faint_peaks_are_still_overruled_by_a_faint_surface(self):
+        s = self.faint_surface()
+        # Two results: a third consistent one would trip the moved-sample reset.
+        for x, y in self.STRONG[:2]:
+            v = s.check(x, y, slot4_tissue(x, y), quality=0.30)
+            assert v.would_reject and v.enforced
+
+    def test_clear_misses_are_still_overruled_by_a_clear_surface(self):
+        # The protection the surface exists for: wide searches that land far off a
+        # surface whose own peaks are at least as clear.
+        s = surface()
+        rng = np.random.default_rng(4)
+        feed_quality(s, slot4_grid(), slot4_tissue, rng.uniform(0.95, 0.99, size=20))
+        # Two results: a third consistent one would trip the moved-sample reset.
+        for x, y in self.STRONG[:2]:
+            v = s.check(x, y, slot4_tissue(x, y) - 120.0, quality=0.97)
+            assert v.would_reject and v.enforced
+
+    def test_a_surface_built_from_sweeps_is_not_weighed_by_prominence(self):
+        # Drift sweeps carry no prominence, so standard results cannot claim to be
+        # clearer than them: wide-search misses against a sweep surface (one region
+        # had 12 of 12 a median 43 um off) must still be caught.
+        s = surface()
+        feed_quality(s, slot4_grid(), slot4_tissue, [None] * 20)
+        # Two results: a third consistent one would trip the moved-sample reset.
+        for x, y in self.STRONG[:2]:
+            v = s.check(x, y, slot4_tissue(x, y) + 43.0, quality=0.99)
+            assert v.would_reject and v.enforced
+
+    def test_results_without_prominence_are_judged_as_before(self):
+        s = self.faint_surface()
+        # Two results: a third consistent one would trip the moved-sample reset.
+        for x, y in self.STRONG[:2]:
+            v = s.check(x, y, slot4_tissue(x, y))
+            assert v.would_reject
+
+    def test_observe_and_enforce_reset_alike(self):
+        for mode in (MODE_OBSERVE, MODE_ENFORCE):
+            s = self.faint_surface(mode)
+            (x1, y1), (x2, y2) = self.STRONG[:2]
+            s.check(x1, y1, slot4_tissue(x1, y1), quality=0.97)
+            v = s.check(x2, y2, slot4_tissue(x2, y2), quality=0.98)
+            assert not v.would_reject
+            assert s.summary()["clearer_peak_resets"] == 1

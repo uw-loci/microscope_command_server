@@ -178,7 +178,7 @@ class TestTheSurveyCannotHurtARun:
         # improve the surface and leave the fallback worse than it needed to be.
         body = self.body()
         assert "ctx.completed_af_positions.append((pos.x, pos.y, achieved))" in body
-        assert "surface.add(pos.x, pos.y, achieved)" in body
+        assert "surface.add(pos.x, pos.y, achieved, _last_peak_prominence(hardware))" in body
 
     def test_it_records_the_achieved_z_not_the_returned_one(self):
         # autofocus_with_manual_fallback can return a skip-Z that the stage was never

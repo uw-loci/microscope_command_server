@@ -5164,7 +5164,12 @@ def _run_pre_acquisition_autofocus(ctx: AcquisitionContext) -> None:
         ctx.last_af_pos_idx = first_af_idx
         ctx.completed_af_positions.append((first_af_pos.x, first_af_pos.y, initial_z))
         if ctx.focus_surface is not None:
-            ctx.focus_surface.add(first_af_pos.x, first_af_pos.y, initial_z)
+            ctx.focus_surface.add(
+                first_af_pos.x,
+                first_af_pos.y,
+                initial_z,
+                None if initial_outcome.get("skipped") else _last_peak_prominence(hardware),
+            )
         ctx.dynamic_af_positions.discard(first_af_idx)
 
     except RuntimeError as e:
@@ -5403,7 +5408,7 @@ def _run_focus_survey(ctx: "AcquisitionContext") -> None:
 
         achieved = hardware.get_current_position().z
         ctx.completed_af_positions.append((pos.x, pos.y, achieved))
-        surface.add(pos.x, pos.y, achieved)
+        surface.add(pos.x, pos.y, achieved, _last_peak_prominence(hardware))
         measured += 1
         logger.info(
             "Focus survey point %d/%d: tile %d at X=%.0f Y=%.0f -> Z=%.2f um " "(AF returned %.2f)",
@@ -5493,8 +5498,23 @@ def _write_focus_surface_record(ctx: "AcquisitionContext", surface) -> None:
         ctx.logger.warning("  could not write focus_surface.json: %s", exc)
 
 
+def _last_peak_prominence(hardware) -> Optional[float]:
+    """Peak prominence of the Z the last ``hardware.autofocus`` call committed, or None.
+
+    The focus surface uses it to tell a clear peak from a faint one. None when the last
+    call committed nothing, or the hardware does not keep its validation.
+    """
+    validation = getattr(hardware, "last_autofocus_validation", None)
+    if not isinstance(validation, dict):
+        return None
+    value = validation.get("peak_prominence")
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    return float(value) if np.isfinite(value) else None
+
+
 def _vet_autofocus_result(
-    ctx: "AcquisitionContext", pos, af_z: float, af_type: str
+    ctx: "AcquisitionContext", pos, af_z: float, af_type: str, quality: Optional[float] = None
 ) -> Tuple[float, bool]:
     """Check one autofocus result against the fitted focus surface.
 
@@ -5503,6 +5523,11 @@ def _vet_autofocus_result(
     ``z_to_adopt`` is the measurement, or -- when the surface is enforcing and the
     measurement disagrees with it beyond the gate -- the surface's prediction, with the
     stage moved there.
+
+    ``quality`` is the result's peak prominence (None for a drift sweep). Two results
+    at different places whose peaks are clearer than every peak the surface rests on,
+    and that agree on how far it is off, reset the surface instead of being
+    overridden; see ``FocusSurface.check``.
 
     ``learnable`` is False only for an overridden result, and that matters more than it
     looks. The substituted Z came from the surface, so feeding it back would have the
@@ -5524,7 +5549,7 @@ def _vet_autofocus_result(
     if surface is None or not surface.active:
         return af_z, True
     logger = ctx.logger
-    verdict = surface.check(pos.x, pos.y, af_z)
+    verdict = surface.check(pos.x, pos.y, af_z, quality)
     if verdict.predicted_z is None:
         logger.debug("  Focus surface has no opinion yet: %s", verdict.reason)
         return af_z, True
@@ -5979,7 +6004,12 @@ def _handle_tile_autofocus(
                 af_z,
             )
         else:
-            af_z, learnable = _vet_autofocus_result(ctx, pos, af_z, af_type_for_this_tile)
+            af_quality = (
+                _last_peak_prominence(hardware) if af_type_for_this_tile == "standard" else None
+            )
+            af_z, learnable = _vet_autofocus_result(
+                ctx, pos, af_z, af_type_for_this_tile, af_quality
+            )
             if af_type_for_this_tile in ("standard", "sweep"):
                 ctx.last_accepted_af_z = af_z
             # The seed list records where the stage actually is, overridden or not, so
@@ -5987,7 +6017,7 @@ def _handle_tile_autofocus(
             # from a Z that a measurement put there.
             ctx.completed_af_positions.append((pos.x, pos.y, af_z))
             if ctx.focus_surface is not None and learnable:
-                ctx.focus_surface.add(pos.x, pos.y, af_z)
+                ctx.focus_surface.add(pos.x, pos.y, af_z, af_quality)
     else:
         # Strategy rejected this tile
         af_failed_for_this_tile = True

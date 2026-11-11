@@ -110,3 +110,18 @@ def test_the_surface_is_rebuilt_per_region_including_when_af_is_disabled():
     # rebuild or it would inherit the previous region's plane.
     builds = len(re.findall(r"ctx\.focus_surface = _build_focus_surface\(ctx\)", SOURCE))
     assert builds == 2
+
+
+def test_autofocus_results_hand_the_surface_their_peak_prominence():
+    # The surface compares peak prominences (a clear peak must not be overruled by a
+    # surface built from faint ones), so every add of a hardware.autofocus result
+    # carries one: the pre-acquisition AF, the survey, and the per-tile standard AF.
+    assert 'None if initial_outcome.get("skipped") else _last_peak_prominence(hardware)' in SOURCE
+    assert "surface.add(pos.x, pos.y, achieved, _last_peak_prominence(hardware))" in SOURCE
+    assert "ctx.focus_surface.add(pos.x, pos.y, af_z, af_quality)" in SOURCE
+    assert "surface.check(pos.x, pos.y, af_z, quality)" in SOURCE
+    # Only a standard AF has one; a drift sweep does not, and must not borrow the last
+    # standard AF's.
+    assert (
+        '_last_peak_prominence(hardware) if af_type_for_this_tile == "standard" else None' in SOURCE
+    )
