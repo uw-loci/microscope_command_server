@@ -438,6 +438,18 @@ added to track each timepoint, enabling reassembly into a true 5D mosaic:
     ...
 ```
 
+PPM also gets a birefringence plane for every Z (and timepoint), from the smallest
+positive angle and the largest negative angle, in the same layout under
+`{positive angle}.biref/` (for example `7.0.biref/z000/tile_000.tif`), with the
+positive angle's `TileConfiguration.txt` at the top of that folder. With a
+projection, birefringence is computed from the projected angle images instead,
+as `7.0.biref/tile_000.tif`.
+
+The single-point stack command (Z-stack or time-lapse) writes one file per angle,
+`zstack_angle<NN>.ome.tiff`, and for PPM also `zstack_biref.ome.tiff`
+(`zstack_t_biref.ome.tiff` with timepoints): the same birefringence, plane by
+plane.
+
 The stitcher (`qupath-extension-tiles-to-pyramid`) can then assemble all planes
 (and timepoints) into a unified 5D (x, y, z, channel/angle, time) mosaic by
 reading these directory structures.

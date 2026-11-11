@@ -383,6 +383,21 @@ def acquire_z_stack(
             f"{file_bytes / 1024 / 1024:.1f} MB)"
         )
 
+    # PPM: a birefringence stack from the positive/negative angle pair, plane by plane.
+    biref_file = _write_biref_stack(
+        angle_frames,
+        output_path,
+        has_t=has_t,
+        size_t=actual_n_timepoints,
+        size_z=n_planes,
+        pixel_size_um=pixel_size_um,
+        z_step_um=z_step,
+        time_increment_s=interval_seconds if has_t and interval_seconds > 0 else None,
+        logger=logger,
+    )
+    if biref_file is not None:
+        saved_files.append(str(biref_file))
+
     # Apply projection if requested -- one extra 2D file per angle alongside
     # the full Z-stack OME-TIFF.
     projected_file = None
@@ -863,3 +878,83 @@ def _save_image(image: np.ndarray, filepath: Path, metadata: dict):
         else:
             np.save(str(filepath).replace(".tif", ".npy"), image)
     logger.debug(f"Saved: {filepath}")
+
+
+def _write_biref_stack(
+    angle_frames,
+    output_path,
+    has_t,
+    size_t,
+    size_z,
+    pixel_size_um,
+    z_step_um,
+    time_increment_s,
+    logger,
+):
+    """Write ``zstack[_t]_biref.ome.tiff`` from a PPM stack's positive/negative angles.
+
+    The same normalized birefringence as a tiled acquisition's ``.biref`` tiles, from the
+    smallest positive angle (not 90) and the largest negative angle, for every (T, Z)
+    point both were captured at. Returns the file, or None when the stack has no such
+    pair (not PPM, or one angle missing). The stack command used to write the per-angle
+    files only, so a PPM Z-stack produced no birefringence.
+    """
+    positive = [a for a, f in angle_frames.items() if a > 0 and a != 90 and f]
+    negative = [a for a, f in angle_frames.items() if a < 0 and f]
+    if not positive or not negative:
+        return None
+    pos_angle = min(positive)
+    neg_angle = max(negative)
+    pos_frames = angle_frames[pos_angle]
+    neg_frames = angle_frames[neg_angle]
+    keys = sorted(set(pos_frames) & set(neg_frames))
+    if not keys:
+        return None
+    try:
+        from ppm_library.imaging.writer import TifWriterUtils
+    except ImportError:
+        logger.warning("ppm_library is not installed; no birefringence stack written")
+        return None
+    from microscope_imageprocessing.io.ome_writer import StackWriter
+
+    planes = {
+        key: (
+            pos_frames[key][0],
+            TifWriterUtils.ppm_normalized_difference_abs(pos_frames[key][1], neg_frames[key][1]),
+            pos_frames[key][2],
+        )
+        for key in keys
+    }
+    first = next(iter(planes.values()))[1]
+    out_file = output_path / ("zstack_t_biref.ome.tiff" if has_t else "zstack_biref.ome.tiff")
+    with StackWriter(
+        output_path=out_file,
+        size_t=size_t,
+        size_z=size_z,
+        size_c=1,
+        size_y=first.shape[0],
+        size_x=first.shape[1],
+        dtype=first.dtype,
+        pixel_size_um=pixel_size_um,
+        z_step_um=z_step_um,
+        time_increment_s=time_increment_s,
+        channel_names=[f"biref_{pos_angle:g}_{neg_angle:g}"],
+        granularity="single",
+        photometric="minisblack",
+    ) as writer:
+        for (t_idx, z_idx), (actual_z, biref, delta_t_s) in planes.items():
+            writer.write_frame(
+                biref,
+                t=t_idx,
+                z=z_idx,
+                c=0,
+                plane_metadata={"position_z_um": float(actual_z), "delta_t_s": float(delta_t_s)},
+            )
+    logger.info(
+        "Wrote birefringence stack %s from %g and %g deg (%d planes)",
+        out_file,
+        pos_angle,
+        neg_angle,
+        len(planes),
+    )
+    return out_file

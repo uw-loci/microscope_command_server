@@ -6264,6 +6264,57 @@ def _plane_path(ctx: AcquisitionContext, group: Optional[str], z_idx: int, filen
     return base / f"z{z_idx:03d}" / filename
 
 
+def _submit_biref_planes(
+    ctx: AcquisitionContext, z_stack_images: dict, filename: str, params
+) -> bool:
+    """Birefringence for every kept Z-plane of a tile, laid out like the angle planes.
+
+    With ``z_projection`` none every plane is kept for a 5D mosaic, and no per-angle
+    image exists for the tile, so the projected-image birefringence never ran and a PPM
+    Z-stack produced no biref at all. Each plane pair (smallest positive angle, largest
+    negative angle) now gives ``{pos}.biref/[t{tt}/]z{zz}/{filename}``, with the
+    positive angle's TileConfiguration.txt at the top of ``{pos}.biref`` so the
+    stitcher assembles it like the angles.
+
+    Returns False when the tile lacks a positive or negative angle.
+    """
+    positive = [a for a in z_stack_images if a > 0 and a != 90 and z_stack_images[a]]
+    negative = [a for a in z_stack_images if a < 0 and z_stack_images[a]]
+    if not positive or not negative:
+        return False
+    pos_angle = min(positive)
+    neg_angle = max(negative)
+    pos_planes = z_stack_images[pos_angle]
+    neg_planes = z_stack_images[neg_angle]
+    group = f"{pos_angle}.biref"
+    biref_root = ctx.output_path / group
+    biref_root.mkdir(parents=True, exist_ok=True)
+    tile_config_source = ctx.output_path / str(pos_angle) / "TileConfiguration.txt"
+    tile_config_target = biref_root / "TileConfiguration.txt"
+    if tile_config_source.exists() and not tile_config_target.exists():
+        shutil.copy2(tile_config_source, tile_config_target)
+
+    from ppm_library.imaging.writer import TifWriterUtils as PpmWriterUtils
+
+    pixel_size = ctx.hardware.get_pixel_size_um()
+    for z_idx in range(min(len(pos_planes), len(neg_planes))):
+        plane_dir = _plane_path(ctx, group, z_idx, filename).parent
+        plane_dir.mkdir(parents=True, exist_ok=True)
+        ctx.write_pool.submit(
+            PpmWriterUtils.create_normalized_birefringence_tile,
+            pos_image=pos_planes[z_idx],
+            neg_image=neg_planes[z_idx],
+            output_dir=plane_dir,
+            filename=filename,
+            pixel_size_um=pixel_size,
+            tile_config_source=None,
+            logger=ctx.logger,
+            min_intensity=params.get("biref_min_intensity", 0),
+            input_max=ctx.ppm_high_bit_input_max,
+        )
+    return True
+
+
 def _acquire_tile_angles_angle_outer(
     ctx: AcquisitionContext,
     pos_idx: int,
@@ -6660,6 +6711,8 @@ def _acquire_tile_angles_angle_outer(
             min_intensity=params.get("biref_min_intensity", 0),
             input_max=ctx.ppm_high_bit_input_max,
         )
+    elif ctx.preserve_z_planes and _submit_biref_planes(ctx, z_stack_images, filename, params):
+        pass
     else:
         logger.warning(
             f"Skipping birefringence for tile {filename}: "
@@ -7085,6 +7138,8 @@ def _acquire_tile_angles(
             min_intensity=params.get("biref_min_intensity", 0),
             input_max=ctx.ppm_high_bit_input_max,
         )
+    elif ctx.preserve_z_planes and _submit_biref_planes(ctx, z_stack_images, filename, params):
+        pass
     else:
         logger.warning(
             f"Skipping birefringence for tile {filename}: "
