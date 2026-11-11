@@ -98,3 +98,16 @@ def test_the_stack_command_skips_biref_without_a_pair(tmp_path):
         angle_frames, tmp_path, False, 1, 1, 0.5, 1.0, None, logger=None
     )
     assert out is None
+
+
+def test_the_plane_order_writes_the_plane_it_is_on(tmp_path):
+    # --t-order plane hands one plane at a time; its biref goes to that plane's folder.
+    (tmp_path / "7.0").mkdir()
+    ctx = _ctx(tmp_path)
+    ctx.z_plane_only = (2, 1.5)
+    made = workflow._submit_biref_planes(
+        ctx, {7.0: [_plane(200)], -7.0: [_plane(100)]}, "tile_0.tif", {}
+    )
+    assert made
+    assert (tmp_path / "7.0.biref" / "z002" / "tile_0.tif").exists()
+    assert not (tmp_path / "7.0.biref" / "z000").exists()

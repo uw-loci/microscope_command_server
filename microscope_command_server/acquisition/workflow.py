@@ -6596,8 +6596,9 @@ def _copy_tile_configuration_once(source: Optional[Path], group_dir: Path) -> No
 def _z_planes(ctx: AcquisitionContext) -> List[Tuple[int, float]]:
     """The (z index, z offset) pairs a tile visits: every plane, or the one plane the
     "plane" time order is on."""
-    if ctx.z_plane_only is not None:
-        return [ctx.z_plane_only]
+    plane_only = getattr(ctx, "z_plane_only", None)
+    if plane_only is not None:
+        return [plane_only]
     return list(enumerate(ctx.z_offsets))
 
 
@@ -6658,7 +6659,8 @@ def _submit_biref_planes(
 
     pixel_size = ctx.hardware.get_pixel_size_um()
     # The "plane" time order passes one plane at a time; its index is the plane's own.
-    z_base = ctx.z_plane_only[0] if ctx.z_plane_only is not None else 0
+    plane_only = getattr(ctx, "z_plane_only", None)
+    z_base = plane_only[0] if plane_only is not None else 0
     for z_idx in range(min(len(pos_planes), len(neg_planes))):
         plane_dir = _plane_path(ctx, group, z_base + z_idx, filename).parent
         plane_dir.mkdir(parents=True, exist_ok=True)
