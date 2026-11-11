@@ -440,9 +440,8 @@ added to track each timepoint, enabling reassembly into a true 5D mosaic:
 
 Every time-lapse writes each timepoint to its own `t{tt}/` folder, with or without
 a Z-stack: `{group}/t{tt}/{filename}` for single planes (and projected Z), so no
-timepoint overwrites another (before 2026-11-11 a 30-timepoint run kept only the
-last). Derived images follow the same layout (`7.0.biref/t{tt}/...`,
-`retardance/t{tt}/...`).
+timepoint overwrites another. Derived images follow the same layout
+(`7.0.biref/t{tt}/...`, `retardance/t{tt}/...`).
 
 **`--t-projection mean|max|min|sum|std`** reduces the timepoints once the last
 one is acquired, the way `--z-projection` reduces planes: each tile becomes
