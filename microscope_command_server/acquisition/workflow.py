@@ -6508,6 +6508,10 @@ def _project_timepoints(ctx: AcquisitionContext) -> None:
     root = ctx.output_path
     raw_root = ctx.output_path.parent / "Raw" / ctx.output_path.name
     pixel_size = ctx.hardware.get_pixel_size_um()
+    if name in ("mean", "sum"):
+        # Before the timepoints are reduced: a second birefringence, from the averaged
+        # angles, beside the average of the per-timepoint birefringence (for comparison).
+        _biref_from_mean_angles(ctx)
     groups = [root] + sorted(
         d for d in root.iterdir() if d.is_dir() and not _TIMEPOINT_DIR.match(d.name)
     )
@@ -6559,6 +6563,94 @@ def _project_timepoints(ctx: AcquisitionContext) -> None:
             group_dir,
             "; timepoints moved to the raw folder" if ctx.save_raw_tiles else "",
         )
+
+
+# Birefringence computed once from the time-averaged +/- angle tiles. Named so that it does
+# not end in ".biref": the per-timepoint average keeps that folder, and QPSC stitches this
+# one as a separate derived output.
+BIREF_FROM_ANGLES_SUFFIX = ".biref_from_angles"
+
+
+def _biref_from_mean_angles(ctx: AcquisitionContext) -> Optional[Path]:
+    """Writes ``{pos angle}.biref_from_angles/[z{zz}/]{tile}``: the birefringence of the
+    time-averaged positive and negative angle tiles, for a Mean or Sum time projection.
+
+    The per-timepoint birefringence is a magnitude, so averaging it keeps each frame's noise
+    as a positive floor; averaging the angles first lets the noise cancel before the
+    magnitude is taken. Sum uses the same mean frames: the normalized difference is
+    scale-free, and the dark-region threshold is defined on single-frame intensities.
+    Returns the folder, or None when there is no angle pair or it failed (logged).
+    """
+    params = getattr(ctx, "params", None) or {}
+    angles = [float(a) for a in (params.get("angles") or [])]
+    positive = [a for a in angles if 0 < a != 90]
+    negative = [a for a in angles if a < 0]
+    if not positive or not negative:
+        return None
+    pos_angle, neg_angle = min(positive), max(negative)
+    root = ctx.output_path
+    pos_dir, neg_dir = root / str(pos_angle), root / str(neg_angle)
+    pos_t = (
+        sorted(d for d in pos_dir.iterdir() if d.is_dir() and _TIMEPOINT_DIR.match(d.name))
+        if pos_dir.is_dir()
+        else []
+    )
+    neg_t = (
+        sorted(d for d in neg_dir.iterdir() if d.is_dir() and _TIMEPOINT_DIR.match(d.name))
+        if neg_dir.is_dir()
+        else []
+    )
+    if not pos_t or not neg_t:
+        return None
+    import numpy as np
+    import tifffile
+    from ppm_library.imaging.writer import TifWriterUtils as PpmWriterUtils
+
+    out_root = root / f"{pos_angle}{BIREF_FROM_ANGLES_SUFFIX}"
+    tiles = sorted(
+        {
+            p.relative_to(t)
+            for t in pos_t
+            for p in t.rglob("*")
+            if p.is_file() and p.suffix.lower() in (".tif", ".tiff")
+        }
+    )
+    pixel_size = ctx.hardware.get_pixel_size_um()
+    try:
+        for rel in tiles:
+            pos_frames = [tifffile.imread(t / rel) for t in pos_t if (t / rel).exists()]
+            neg_frames = [tifffile.imread(t / rel) for t in neg_t if (t / rel).exists()]
+            if not pos_frames or not neg_frames:
+                continue
+            pos_mean = np.mean(np.stack(pos_frames).astype(np.float32), axis=0)
+            neg_mean = np.mean(np.stack(neg_frames).astype(np.float32), axis=0)
+            out_dir = out_root / rel.parent
+            out_dir.mkdir(parents=True, exist_ok=True)
+            PpmWriterUtils.create_normalized_birefringence_tile(
+                pos_image=pos_mean,
+                neg_image=neg_mean,
+                output_dir=out_dir,
+                filename=rel.name,
+                pixel_size_um=pixel_size,
+                tile_config_source=None,
+                logger=ctx.logger,
+                min_intensity=params.get("biref_min_intensity", 0),
+                input_max=getattr(ctx, "ppm_high_bit_input_max", None),
+            )
+    except Exception as e:
+        ctx.logger.error("Birefringence from the averaged angles failed: %s", e)
+        return None
+    config = pos_dir / "TileConfiguration.txt"
+    if config.exists():
+        shutil.copy2(config, out_root / "TileConfiguration.txt")
+    ctx.logger.info(
+        "Birefringence from the time-averaged %s/%s deg tiles: %d tile(s) in %s",
+        pos_angle,
+        neg_angle,
+        len(tiles),
+        out_root,
+    )
+    return out_root
 
 
 def _tile_dir(ctx: AcquisitionContext, group: Optional[str], base: Optional[Path] = None) -> Path:
