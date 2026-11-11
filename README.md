@@ -166,6 +166,16 @@ on top of the existing angle-based flags:
   output folder. Useful for widefield illumination systems where per-channel
   backgrounds (with channel-specific optics and illumination) better represent
   the correction needed during acquisition.
+- `--wb-folder <folder>` -- the background profile's white balance to apply
+  before collecting; see [White balance per background profile](#white-balance-per-background-profile---wb-folder).
+  Sent last, since each BGACQUIRE value runs to the next known flag.
+
+With WB mode `off` on a color camera, one channel (red under the PPM lamp)
+reaches its saturation limit before the overall median reaches the target. The
+adaptive exposure then accepts the brightest exposure that keeps every channel
+below saturation instead of failing. An angle whose background still cannot be
+acquired is not saved; BGACQUIRE fails with `Background not collected for <n> of
+<m> angle(s): <angle> deg: <reason>`.
 
 When `--channels` is present for acquisition, the server takes the channel
 acquisition branch in `acquisition/workflow.py`. `--channels` is mutually
@@ -724,9 +734,15 @@ and also with a background profile when the client names one:
 - **ACQUIRE, BGACQUIRE, ZSTACK, TLAPSE `--wb-folder <folder>`**: the white balance is
   read from `<folder>/white_balance.yml` instead of the scope-wide block (its
   `white_balance` block has the same keys). A folder without the file falls back to the
-  scope-wide block with a warning; QPSC asks the operator before sending a run like that.
+  scope-wide block with a warning. QPSC sends the flag on ACQUIRE and BGACQUIRE only
+  when the profile has the file; when it has none, QPSC asks the operator first and
+  leaves the flag out. QPSC's single-point ZSTACK and TLAPSE commands do not send it.
 - `acquisition_metadata.json` records `wb_source`: the file used, or
   `scope-wide (imageprocessing YAML)`.
+
+WBPPM also reports which angle it is calibrating: just before each angle it sends
+`PROGRESS:<n>:<of>:<angle deg>` between `STARTED:` and the final reply. QPSC highlights
+that angle in its calibration window.
 
 ZSTACK and TLAPSE now apply per-angle white balance to each snap (the call used to
 pass an argument the function does not take, and failed at debug level).
@@ -1445,6 +1461,15 @@ FAILED:busy: an acquisition is running for <addr>; refusing to move the focus st
 
 and nothing moves. Wait for the acquisition to finish, or send a cancel and wait for it to
 complete, then re-issue the autofocus command.
+
+### Cancel during an acquisition's autofocus
+
+The pre-acquisition autofocus, focus survey points, per-tile standard autofocus and
+drift sweeps are passed `should_abort=ctx.is_cancelled`. A CANCEL is then checked
+between Z steps: the search restores Z and raises `AutofocusAborted`, and the
+acquisition ends as CANCELLED instead of waiting for the search (with edge retries,
+minutes) to finish. A survey point that is canceled ends the survey; it is not
+counted as a failed point.
 
 ## Autofocus progress (AFTRACE, af_trace.ndjson)
 
