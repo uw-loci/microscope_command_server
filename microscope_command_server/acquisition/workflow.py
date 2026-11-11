@@ -588,6 +588,122 @@ class SaturationMonitor:
         )
 
 
+PROFILE_WB_FILE = "white_balance.yml"
+
+
+def _now_iso() -> str:
+    from datetime import datetime
+
+    return datetime.now().isoformat()
+
+
+def imageprocessing_path_for(config_path) -> Path:
+    """``imageprocessing_<X>.yml`` beside ``config_<X>.yml``."""
+    config_path = Path(config_path)
+    name = config_path.stem
+    stem = name[7:] if name.startswith("config_") else name
+    return config_path.parent / f"imageprocessing_{stem}.yml"
+
+
+def read_profile_white_balance(wb_folder, logger=None) -> Optional[Dict[str, Any]]:
+    """The white balance stored with a background profile, or None.
+
+    A background profile keeps one ``white_balance.yml`` in each white-balance-mode
+    folder (``<profile>/<detector>/<family>/<mag>/<per_angle|simple>/``), beside the
+    backgrounds collected with it. Its ``white_balance`` block has the same keys as
+    ``imaging_profiles.<modality>.<objective>.<detector>`` in the imageprocessing YAML
+    (``exposures_ms``, ``gains``, ``wb_last_modified``, and for simple ``simple_wb``),
+    so every reader takes it in place of that block.
+    """
+    if not wb_folder:
+        return None
+    path = Path(wb_folder) / PROFILE_WB_FILE
+    if not path.is_file():
+        return None
+    try:
+        with open(path, "r") as f:
+            data = yaml.safe_load(f) or {}
+    except Exception as e:
+        if logger:
+            logger.warning("Could not read %s: %s", path, e)
+        return None
+    block = data.get("white_balance")
+    return block if isinstance(block, dict) and block else None
+
+
+def write_profile_white_balance(
+    wb_folder, white_balance: Dict[str, Any], mode: str, modality, objective, detector, logger=None
+) -> Optional[Path]:
+    """Store a calibration with a background profile's backgrounds (``white_balance.yml``)."""
+    if not wb_folder or not white_balance:
+        return None
+    folder = Path(wb_folder)
+    folder.mkdir(parents=True, exist_ok=True)
+    path = folder / PROFILE_WB_FILE
+    record = {
+        "version": 1,
+        "mode": mode,
+        "modality": modality,
+        "objective": objective,
+        "detector": detector,
+        "calibrated_at": _now_iso(),
+        "white_balance": white_balance,
+    }
+    with open(path, "w") as f:
+        f.write(
+            "# White balance of this background profile, written by QPSC's white balance\n"
+            "# calibration. Acquisitions with this profile and white balance mode use it.\n"
+        )
+        yaml.safe_dump(record, f, default_flow_style=False, sort_keys=False)
+    if logger:
+        logger.info("Saved %s white balance for this background profile: %s", mode, path)
+    return path
+
+
+def _wb_detector_profile(config_path, modality, objective, detector, wb_folder, logger):
+    """White balance settings for one modality/objective/detector, and where they came from.
+
+    The background profile's ``white_balance.yml`` when ``wb_folder`` holds one, else
+    the scope-wide block in the imageprocessing YAML. Returns ``(None, source)`` when
+    neither has it.
+    """
+    profile = read_profile_white_balance(wb_folder, logger)
+    if profile is not None:
+        source = str(Path(wb_folder) / PROFILE_WB_FILE)
+        if logger:
+            logger.info("White balance from the background profile: %s", source)
+        return profile, source
+    if wb_folder and logger:
+        logger.warning(
+            "No white balance stored with the background profile in %s; using the "
+            "scope-wide calibration in the imageprocessing YAML",
+            wb_folder,
+        )
+    imageprocessing_path = imageprocessing_path_for(config_path)
+    source = str(imageprocessing_path)
+    if not imageprocessing_path.exists():
+        if logger:
+            logger.info(f"No imageprocessing config found at {imageprocessing_path}")
+        return None, source
+    if not objective or not detector:
+        if logger:
+            logger.warning("Objective or detector not specified for calibration lookup")
+        return None, source
+    try:
+        with open(imageprocessing_path, "r") as f:
+            ip_data = yaml.safe_load(f) or {}
+    except Exception as e:
+        if logger:
+            logger.warning(f"Failed to read {imageprocessing_path}: {e}")
+        return None, source
+    detector_profile = (
+        ip_data.get("imaging_profiles", {}).get(modality, {}).get(objective, {}).get(detector, {})
+    )
+    if not detector_profile and logger:
+        logger.info(f"No profile found for {modality}/{objective}/{detector}")
+    return detector_profile or None, source
+
+
 def load_jai_calibration_from_imageprocessing(
     config_path: Path,
     per_angle: bool = False,
@@ -595,9 +711,14 @@ def load_jai_calibration_from_imageprocessing(
     objective: str = None,
     detector: str = None,
     logger=None,
+    wb_folder=None,
 ) -> Optional[Dict[str, Any]]:
     """
     Load JAI white balance calibration from imageprocessing YAML.
+
+    With ``wb_folder`` (a background profile's folder for the WB mode), the
+    calibration stored there in ``white_balance.yml`` is used instead; see
+    ``read_profile_white_balance``.
 
     The calibration data is stored in the imaging_profiles section:
     imaging_profiles.{modality}.{objective}.{detector}.exposures_ms.{angle}.{r,g,b}
@@ -616,48 +737,13 @@ def load_jai_calibration_from_imageprocessing(
         Dictionary with calibration data or None if not found.
         For PPM mode: {'angles': {'positive': {'exposures_ms': {'r': x, 'g': y, 'b': z}}, ...}}
     """
-    config_path = Path(config_path)
-
-    # Derive imageprocessing file path from the config file name.
-    # Naming convention: config_PPM.yml -> imageprocessing_PPM.yml
-    # The imageprocessing file stores calibrated per-channel exposure/gain
-    # values that were computed by JAIWhiteBalanceCalibrator. This separation
-    # keeps hardware config (config_*.yml) independent from calibration
-    # results (imageprocessing_*.yml) so recalibration doesn't modify the
-    # main config and calibration data can be updated independently.
-    config_name = config_path.stem  # e.g., "config_PPM"
-    if config_name.startswith("config_"):
-        microscope_name = config_name[7:]  # e.g., "PPM"
-        imageprocessing_name = f"imageprocessing_{microscope_name}.yml"
-    else:
-        imageprocessing_name = f"imageprocessing_{config_name}.yml"
-
-    imageprocessing_path = config_path.parent / imageprocessing_name
-
-    if not imageprocessing_path.exists():
-        if logger:
-            logger.info(f"No imageprocessing config found at {imageprocessing_path}")
-        return None
-
-    if not objective or not detector:
-        if logger:
-            logger.warning("Objective or detector not specified for calibration lookup")
+    detector_profile, wb_source = _wb_detector_profile(
+        config_path, modality, objective, detector, wb_folder, logger
+    )
+    if not detector_profile:
         return None
 
     try:
-        with open(imageprocessing_path, "r") as f:
-            ip_data = yaml.safe_load(f) or {}
-
-        # Navigate to imaging_profiles.{modality}.{objective}.{detector}
-        imaging_profiles = ip_data.get("imaging_profiles", {})
-        modality_profiles = imaging_profiles.get(modality, {})
-        objective_profiles = modality_profiles.get(objective, {})
-        detector_profile = objective_profiles.get(detector, {})
-
-        if not detector_profile:
-            if logger:
-                logger.info(f"No profile found for {modality}/{objective}/{detector}")
-            return None
 
         # Freshness check: if wb_last_modified is more than 14 days old, warn.
         # The 2026-04-27 silent-first-detector incident left a 12-day-stale JAI
@@ -806,7 +892,7 @@ def load_jai_calibration_from_imageprocessing(
 
     except Exception as e:
         if logger:
-            logger.warning(f"Failed to load JAI calibration from {imageprocessing_path}: {e}")
+            logger.warning(f"Failed to load JAI calibration from {wb_source}: {e}")
         return None
 
 
@@ -816,9 +902,13 @@ def load_simple_wb_from_imageprocessing(
     objective: str = None,
     detector: str = None,
     logger=None,
+    wb_folder=None,
 ) -> Optional[Dict[str, Any]]:
     """
     Load simple WB (Mode 2) pre-computed per-angle scaled exposures from YAML.
+
+    With ``wb_folder``, the simple white balance stored with that background
+    profile is used instead of the imageprocessing YAML.
 
     The simple_wb section stores per-angle exposures that preserve the uncrossed
     R:G:B ratio while scaling intensity for each angle. This data is written
@@ -843,37 +933,13 @@ def load_simple_wb_from_imageprocessing(
             }
         }
     """
-    config_path = Path(config_path)
-
-    config_name = config_path.stem
-    if config_name.startswith("config_"):
-        microscope_name = config_name[7:]
-        imageprocessing_name = f"imageprocessing_{microscope_name}.yml"
-    else:
-        imageprocessing_name = f"imageprocessing_{config_name}.yml"
-
-    imageprocessing_path = config_path.parent / imageprocessing_name
-
-    if not imageprocessing_path.exists():
-        if logger:
-            logger.debug(f"No imageprocessing config for simple_wb at {imageprocessing_path}")
-        return None
-
-    if not objective or not detector:
-        if logger:
-            logger.debug("Objective or detector not specified for simple_wb lookup")
+    detector_profile, wb_source = _wb_detector_profile(
+        config_path, modality, objective, detector, wb_folder, logger
+    )
+    if not detector_profile:
         return None
 
     try:
-        with open(imageprocessing_path, "r") as f:
-            ip_data = yaml.safe_load(f) or {}
-
-        detector_profile = (
-            ip_data.get("imaging_profiles", {})
-            .get(modality, {})
-            .get(objective, {})
-            .get(detector, {})
-        )
 
         simple_wb = detector_profile.get("simple_wb")
         if simple_wb and "angles" in simple_wb:
@@ -890,7 +956,7 @@ def load_simple_wb_from_imageprocessing(
 
     except Exception as e:
         if logger:
-            logger.warning(f"Failed to load simple_wb from {imageprocessing_path}: {e}")
+            logger.warning(f"Failed to load simple_wb from {wb_source}: {e}")
         return None
 
 
@@ -1458,6 +1524,14 @@ def write_acquisition_metadata(
 
         # White balance
         acq_params["wb_mode"] = params.get("wb_mode", "off")
+        # Which white balance the run used: the background profile's (white_balance.yml
+        # in this folder) or, when absent, the scope-wide calibration.
+        wb_folder = params.get("wb_folder")
+        acq_params["wb_source"] = (
+            str(Path(wb_folder) / PROFILE_WB_FILE)
+            if wb_folder and (Path(wb_folder) / PROFILE_WB_FILE).is_file()
+            else "scope-wide (imageprocessing YAML)"
+        )
         acq_params["wb_enabled"] = params.get("white_balance_enabled", False)
         acq_params["wb_per_angle"] = params.get("white_balance_per_angle", False)
 
@@ -2364,6 +2438,11 @@ def parse_acquisition_message(message: str) -> dict:
                 i += 2
             elif parts[i] == "--wb-mode" and i + 1 < len(parts):
                 params["wb_mode"] = parts[i + 1].lower()
+                i += 2
+            elif parts[i] == "--wb-folder" and i + 1 < len(parts):
+                # The background profile's folder for this WB mode: its
+                # white_balance.yml is used instead of the scope-wide calibration.
+                params["wb_folder"] = parts[i + 1]
                 i += 2
             elif parts[i] == "--white-balance" and i + 1 < len(parts):
                 params["white_balance_enabled"] = parts[i + 1].lower() == "true"
@@ -3871,6 +3950,7 @@ def _prepare_acquisition(
             objective=params.get("objective"),
             detector=params.get("detector"),
             logger=logger,
+            wb_folder=params.get("wb_folder"),
         )
         if is_jai_camera:
             try:
@@ -3908,6 +3988,7 @@ def _prepare_acquisition(
             objective=params.get("objective"),
             detector=params.get("detector"),
             logger=logger,
+            wb_folder=params.get("wb_folder"),
         )
         if jai_calibration:
             logger.info("Simple WB: loaded per-angle calibration as base for ratio-scaling")
@@ -3926,6 +4007,7 @@ def _prepare_acquisition(
                 objective=params.get("objective"),
                 detector=params.get("detector"),
                 logger=logger,
+                wb_folder=params.get("wb_folder"),
             )
             if simple_wb_data:
                 logger.info(
@@ -3957,6 +4039,7 @@ def _prepare_acquisition(
             objective=params.get("objective"),
             detector=params.get("detector"),
             logger=logger,
+            wb_folder=params.get("wb_folder"),
         )
         if jai_calibration:
             logger.info(
@@ -9858,9 +9941,14 @@ def simple_background_collection(
     target_intensity_override: float = None,
     profile: str = None,
     channels=None,
+    wb_folder=None,
 ):
     """
     Simplified background collection for BackgroundCollectionWorkflow.
+
+    ``wb_folder``: the background profile's folder whose ``white_balance.yml`` to apply
+    before collecting (normally the output folder itself); None uses the scope-wide
+    calibration.
 
     Acquires background images at current position using adaptive exposure
     to reach target intensities. Saves directly to correct folder structure
@@ -10135,6 +10223,7 @@ def simple_background_collection(
                 objective=objective,
                 detector=detector,
                 logger=logger,
+                wb_folder=wb_folder,
             )
             if jai_calibration:
                 logger.info(

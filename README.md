@@ -710,6 +710,27 @@ When Micro-Manager reports pixel size 0, GETPXSZ also logs (once per state) ever
 preset with the properties it needs and their current values, e.g.
 `'20x 0.4 ORYX' needs DObjective.Label=20x (now 4x) <- differs`.
 
+## White balance per background profile (--wb-folder)
+
+PPM white balance (per-angle and simple) is stored scope-wide in
+`imageprocessing_<scope>.yml` under `imaging_profiles.<modality>.<objective>.<detector>`,
+and also with a background profile when the client names one:
+
+- **WBPPM / WBSIMPLE `--wb-folder <folder>`**: after updating the scope-wide YAML,
+  the calibration is copied to `<folder>/white_balance.yml`. QPSC sends the active
+  background profile's folder for the mode, `<base>/profiles/<id>/<detector>/ppm/<mag>/per_angle`
+  (or `.../simple`), beside the backgrounds collected for that setup. Per-angle stores
+  `exposures_ms`, `gains`, `wb_last_modified`; simple also `simple_wb`.
+- **ACQUIRE, BGACQUIRE, ZSTACK, TLAPSE `--wb-folder <folder>`**: the white balance is
+  read from `<folder>/white_balance.yml` instead of the scope-wide block (its
+  `white_balance` block has the same keys). A folder without the file falls back to the
+  scope-wide block with a warning; QPSC asks the operator before sending a run like that.
+- `acquisition_metadata.json` records `wb_source`: the file used, or
+  `scope-wide (imageprocessing YAML)`.
+
+ZSTACK and TLAPSE now apply per-angle white balance to each snap (the call used to
+pass an argument the function does not take, and failed at debug level).
+
 ## LC-PolScope Calibration (LCCALIB)
 
 The `LCCALIB` command calibrates the liquid crystals on an LC-PolScope system,

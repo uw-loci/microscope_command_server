@@ -35,6 +35,7 @@ def acquire_z_stack(
     angles_str: str = "(0)",
     config_manager=None,
     wb_mode: str = "off",
+    wb_folder=None,
     objective: str = None,
     detector: str = None,
     yaml_file_path: str = None,
@@ -154,6 +155,7 @@ def acquire_z_stack(
                 objective=objective,
                 detector=detector,
                 logger=logger,
+                wb_folder=wb_folder,
             )
         except Exception as e:
             logger.warning(f"Could not load WB calibration: {e}")
@@ -491,6 +493,7 @@ def acquire_time_lapse(
     angles_str: str = "(0)",
     config_manager=None,
     wb_mode: str = "off",
+    wb_folder=None,
     objective: str = None,
     detector: str = None,
     yaml_file_path: str = None,
@@ -566,6 +569,7 @@ def acquire_time_lapse(
                 objective=objective,
                 detector=detector,
                 logger=logger,
+                wb_folder=wb_folder,
             )
         except Exception as e:
             logger.warning(f"Could not load WB calibration: {e}")
@@ -848,15 +852,16 @@ def _apply_wb_for_snap(hardware, jai_calibration, angle, modality, logger):
     try:
         from microscope_command_server.acquisition.workflow import (
             apply_jai_calibration_for_angle,
-            angle_to_name,
         )
 
-        angle_name = angle_to_name(angle, modality=modality)
+        # per_angle=True: the calibration holds one entry per angle. This call used to
+        # pass modality=, which the function does not take; the TypeError was logged at
+        # debug and per-angle white balance never reached a Z-stack or time-lapse snap.
         apply_jai_calibration_for_angle(
             hardware=hardware,
             jai_calibration=jai_calibration,
             angle=angle,
-            modality=modality,
+            per_angle=True,
             logger=logger,
         )
     except Exception as e:

@@ -328,6 +328,8 @@ def handle_bgacquire(conn, client, hardware, settings, **kwargs):
                     "--target-intensity",
                     "--profile",
                     "--channels",
+                    # Last: QPSC sends it last, and each value ends at a later flag.
+                    "--wb-folder",
                 ]
 
                 for i, flag in enumerate(flags):
@@ -378,6 +380,8 @@ def handle_bgacquire(conn, client, hardware, settings, **kwargs):
                             params["profile"] = value
                         elif flag == "--channels":
                             params["channels"] = [c.strip() for c in value.split(",") if c.strip()]
+                        elif flag == "--wb-folder":
+                            params["wb_folder"] = value
 
                 # Resolve wb_mode: prefer explicit --wb-mode, fall back to boolean flag
                 if "wb_mode" in params:
@@ -453,6 +457,7 @@ def handle_bgacquire(conn, client, hardware, settings, **kwargs):
                         target_intensity_override=params.get("target_intensity"),
                         profile=params.get("profile"),
                         channels=params.get("channels"),
+                        wb_folder=params.get("wb_folder"),
                     )
                     final_exposures = bg_result.get("final_exposures", {})
                     applied_lamp = bg_result.get("applied_lamp_intensity")
@@ -588,6 +593,9 @@ def handle_zstack(conn, client, hardware, settings, **kwargs):
         elif parts[i] == "--wb-mode" and i + 1 < len(parts):
             params["wb_mode"] = parts[i + 1]
             i += 2
+        elif parts[i] == "--wb-folder" and i + 1 < len(parts):
+            params["wb_folder"] = parts[i + 1]
+            i += 2
         elif parts[i] == "--yaml" and i + 1 < len(parts):
             params["yaml"] = parts[i + 1]
             i += 2
@@ -641,6 +649,7 @@ def handle_zstack(conn, client, hardware, settings, **kwargs):
             angles_str=params.get("angles", "(0)"),
             config_manager=config_manager,
             wb_mode=params.get("wb_mode", "off"),
+            wb_folder=params.get("wb_folder"),
             objective=params.get("objective"),
             detector=params.get("detector"),
             yaml_file_path=params.get("yaml"),
@@ -718,6 +727,9 @@ def handle_tlapse(conn, client, hardware, settings, **kwargs):
         elif parts[i] == "--wb-mode" and i + 1 < len(parts):
             params["wb_mode"] = parts[i + 1]
             i += 2
+        elif parts[i] == "--wb-folder" and i + 1 < len(parts):
+            params["wb_folder"] = parts[i + 1]
+            i += 2
         elif parts[i] == "--yaml" and i + 1 < len(parts):
             params["yaml"] = parts[i + 1]
             i += 2
@@ -760,6 +772,7 @@ def handle_tlapse(conn, client, hardware, settings, **kwargs):
             angles_str=params.get("angles", "(0)"),
             config_manager=config_manager,
             wb_mode=params.get("wb_mode", "off"),
+            wb_folder=params.get("wb_folder"),
             objective=params.get("objective"),
             detector=params.get("detector"),
             yaml_file_path=params.get("yaml"),

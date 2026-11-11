@@ -102,6 +102,8 @@ def handle_wbcalibr(conn, client, hardware, settings, **kwargs):
                             params["yaml_file_path"] = value
                         elif flag == "--output":
                             params["output_folder_path"] = value
+                        elif flag == "--wb-folder":
+                            params["wb_folder"] = value
                         elif flag == "--modality":
                             params["modality"] = value
                         elif flag == "--objective":
@@ -259,6 +261,38 @@ def handle_wbcalibr(conn, client, hardware, settings, **kwargs):
 # ---------------------------------------------------------------------------
 
 
+def _store_profile_white_balance(params, mode, modality, objective, detector):
+    """Copy a calibration just written to the scope-wide YAML into the background profile.
+
+    ``--wb-folder`` names the active background profile's folder for this white balance
+    mode; the calibration is stored there as ``white_balance.yml`` beside the backgrounds
+    collected with it, so each profile keeps its own white balance. The scope-wide YAML
+    keeps the latest calibration of any profile, as the fallback. Per-angle stores the
+    per-angle exposures and gains; simple also stores its ``simple_wb`` block.
+    """
+    folder = params.get("wb_folder")
+    if not folder:
+        return
+    try:
+        from pathlib import Path
+
+        from microscope_command_server.acquisition.workflow import (
+            _wb_detector_profile,
+            write_profile_white_balance,
+        )
+
+        profile, _ = _wb_detector_profile(
+            Path(params["yaml_file_path"]), modality, objective, detector, None, logger
+        )
+        keys = ["exposures_ms", "gains", "wb_last_modified"]
+        if mode == "simple":
+            keys.append("simple_wb")
+        block = {k: profile[k] for k in keys if profile and k in profile}
+        write_profile_white_balance(folder, block, mode, modality, objective, detector, logger)
+    except Exception as e:  # noqa: BLE001 - the scope-wide calibration is already saved
+        logger.error("Could not store the white balance with the background profile: %s", e)
+
+
 def handle_wbsimple(conn, client, hardware, settings, **kwargs):
     """Simple white balance calibration (JAI per-channel).
 
@@ -312,6 +346,7 @@ def handle_wbsimple(conn, client, hardware, settings, **kwargs):
                     "--objective",
                     "--detector",
                     "--output",
+                    "--wb-folder",
                     "--modality",
                     "--camera",
                     "--exposure",
@@ -362,6 +397,8 @@ def handle_wbsimple(conn, client, hardware, settings, **kwargs):
                             params["detector"] = value
                         elif flag == "--output":
                             params["output_folder_path"] = value
+                        elif flag == "--wb-folder":
+                            params["wb_folder"] = value
                         elif flag == "--modality":
                             params["modality"] = value
                         elif flag == "--camera":
@@ -660,6 +697,9 @@ def handle_wbsimple(conn, client, hardware, settings, **kwargs):
                                 logger=logger,
                             )
                             logger.info("Simple WB: saved calibration values to simple_wb section")
+                            _store_profile_white_balance(
+                                params, "simple", wb_modality, wb_objective, wb_detector
+                            )
 
                     # Format response: uncrossed result for backward compatibility
                     result = uncrossed_result
@@ -817,6 +857,7 @@ def handle_wbppm(conn, client, hardware, settings, **kwargs):
                     "--objective",
                     "--detector",
                     "--output",
+                    "--wb-folder",
                     "--camera",
                     "--positive_exp",
                     "--positive_angle",
@@ -874,6 +915,8 @@ def handle_wbppm(conn, client, hardware, settings, **kwargs):
                             params["detector"] = value
                         elif flag == "--output":
                             params["output_folder_path"] = value
+                        elif flag == "--wb-folder":
+                            params["wb_folder"] = value
                         elif flag == "--camera":
                             params["camera"] = value
                         elif flag == "--positive_exp":
@@ -1082,6 +1125,9 @@ def handle_wbppm(conn, client, hardware, settings, **kwargs):
                                 objective=wb_objective,
                                 detector=wb_detector,
                             )
+                        _store_profile_white_balance(
+                            params, "per_angle", wb_modality, wb_objective, wb_detector
+                        )
 
                     # Format response with results for all angles
                     # Format: SUCCESS:path|angle:exp_r,exp_g,exp_b:unified,aR,aB:Y/N|...
