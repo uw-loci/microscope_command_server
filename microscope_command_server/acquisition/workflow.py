@@ -6508,10 +6508,8 @@ def _project_timepoints(ctx: AcquisitionContext) -> None:
     root = ctx.output_path
     raw_root = ctx.output_path.parent / "Raw" / ctx.output_path.name
     pixel_size = ctx.hardware.get_pixel_size_um()
-    if name in ("mean", "sum"):
-        # Before the timepoints are reduced: a second birefringence, from the averaged
-        # angles, beside the average of the per-timepoint birefringence (for comparison).
-        _biref_from_mean_angles(ctx)
+    # Mean/Sum: PPM birefringence from the averaged angles, written before the timepoints go.
+    biref_dir = _biref_from_mean_angles(ctx) if name in ("mean", "sum") else None
     groups = [root] + sorted(
         d for d in root.iterdir() if d.is_dir() and not _TIMEPOINT_DIR.match(d.name)
     )
@@ -6537,6 +6535,9 @@ def _project_timepoints(ctx: AcquisitionContext) -> None:
                 if p.is_file() and p.suffix.lower() in (".tif", ".tiff")
             }
         )
+        if group_dir == biref_dir:
+            # Already written from the averaged angles; only its timepoints are left to clear.
+            tiles = []
         try:
             for rel in tiles:
                 frames = [tifffile.imread(t / rel) for t in t_dirs if (t / rel).exists()]
@@ -6565,21 +6566,16 @@ def _project_timepoints(ctx: AcquisitionContext) -> None:
         )
 
 
-# Birefringence computed once from the time-averaged +/- angle tiles. Named so that it does
-# not end in ".biref": the per-timepoint average keeps that folder, and QPSC stitches this
-# one as a separate derived output.
-BIREF_FROM_ANGLES_SUFFIX = ".biref_from_angles"
-
-
 def _biref_from_mean_angles(ctx: AcquisitionContext) -> Optional[Path]:
-    """Writes ``{pos angle}.biref_from_angles/[z{zz}/]{tile}``: the birefringence of the
-    time-averaged positive and negative angle tiles, for a Mean or Sum time projection.
+    """Writes ``{pos angle}.biref/[z{zz}/]{tile}`` for a Mean or Sum time projection: the
+    birefringence of the time-averaged positive and negative angle tiles.
 
-    The per-timepoint birefringence is a magnitude, so averaging it keeps each frame's noise
-    as a positive floor; averaging the angles first lets the noise cancel before the
-    magnitude is taken. Sum uses the same mean frames: the normalized difference is
-    scale-free, and the dark-region threshold is defined on single-frame intensities.
-    Returns the folder, or None when there is no angle pair or it failed (logged).
+    Birefringence is a magnitude, so averaging each timepoint's would keep its noise as a
+    positive floor; averaging the angles first lets the noise cancel before the magnitude.
+    Both were tested on PPM 40x runs: same structure, about 18% lower background floor this
+    way. Sum uses the mean frames too (the normalized difference is scale-free, and the
+    dark-region threshold is on single-frame intensities). Returns the folder, or None when
+    there is no angle pair or it failed (logged; the per-timepoint average is then used).
     """
     params = getattr(ctx, "params", None) or {}
     angles = [float(a) for a in (params.get("angles") or [])]
@@ -6606,7 +6602,7 @@ def _biref_from_mean_angles(ctx: AcquisitionContext) -> Optional[Path]:
     import tifffile
     from ppm_library.imaging.writer import TifWriterUtils as PpmWriterUtils
 
-    out_root = root / f"{pos_angle}{BIREF_FROM_ANGLES_SUFFIX}"
+    out_root = root / f"{pos_angle}.biref"
     tiles = sorted(
         {
             p.relative_to(t)

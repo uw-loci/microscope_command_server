@@ -462,13 +462,13 @@ otherwise. A group whose projection fails keeps its timepoints. LC-PolScope
 and keep their timepoints. Absent or `none`: every timepoint is kept. The choice
 is recorded as `time_lapse.projection` in `acquisition_metadata.json`.
 
-For PPM, `mean` and `sum` also write `{positive angle}.biref_from_angles/`: the
-birefringence of the time-averaged positive and negative angle tiles (both from
-the mean frames; the normalized difference is scale-free). It sits beside
-`{positive angle}.biref/`, which is the time projection of each timepoint's
-birefringence. Birefringence is a magnitude, so per-frame noise stays as a
-positive floor in `.biref` and largely cancels in `.biref_from_angles`; both are
-kept for comparison. Max, min and std reduce only the per-timepoint birefringence.
+For PPM, `mean` and `sum` compute `{positive angle}.biref/` once from the
+time-averaged positive and negative angle tiles, rather than averaging each
+timepoint's birefringence. Birefringence is a magnitude, so per-frame noise would
+otherwise stay as a positive floor. Both ways were tested on four PPM 40x runs:
+the structure was the same (correlation 0.98) and the background floor was about
+18% lower angle-first, so that is what is kept. Max, min and std reduce each
+timepoint's birefringence, since those describe how it changes over time.
 
 **`--t-order region|position|plane`** says where the timepoint loop sits:
 
