@@ -1047,8 +1047,8 @@ state folders, each with its own `TileConfiguration.txt` so it stitches on the s
 
 ### LC-PolScope background correction
 
-The background is a set of the five states taken on a specimen-free, slightly defocused
-field (10-20 um), as OpenPolScope does it. It is applied **per tile inside the reconstruction**,
+The background is a set of the five states taken on a specimen-free field, defocused
+as needed for the objective, as OpenPolScope does it. It is applied **per tile inside the reconstruction**,
 in Stokes space (QLIPP) or in OpenPolScope's normalised difference space
 (`reconstruction.method: openpolscope`), never by dividing the raw states, which the channel
 acquisition paths skip for this modality.
