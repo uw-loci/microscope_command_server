@@ -467,8 +467,10 @@ time-averaged positive and negative angle tiles, rather than averaging each
 timepoint's birefringence. Birefringence is a magnitude, so per-frame noise would
 otherwise stay as a positive floor. Both ways were tested on four PPM 40x runs:
 the structure was the same (correlation 0.98) and the background floor was about
-18% lower angle-first, so that is what is kept. Max, min and std reduce each
-timepoint's birefringence, since those describe how it changes over time.
+18% lower angle-first, so that is what is kept. If there is no +/- angle pair, or
+it fails, `mean` and `sum` fall back to averaging each timepoint's birefringence.
+Max, min and std reduce each timepoint's birefringence, since those describe how
+it changes over time.
 
 **`--t-order region|position|plane`** says where the timepoint loop sits:
 
