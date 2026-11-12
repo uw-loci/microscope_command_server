@@ -155,6 +155,12 @@ class TestTheSurveyCannotHurtARun:
         assert "request_manual_focus=None" in body
         assert "max_retries=0" in body
 
+    def test_it_gets_the_objectives_edge_retry_budget(self):
+        # The hardware default is 0 edge retries. Without the budget every survey point
+        # whose focus lay outside one window around the seed failed: on the tilted
+        # LC-PolScope slide of 2026-11-12, 5 of 9, each "after 0 retries".
+        assert "edge_retries=ctx.af_edge_retries" in self.body()
+
     @pytest.mark.parametrize(
         "failure",
         ["could not move to tile", "tissue check failed", "autofocus failed at tile"],

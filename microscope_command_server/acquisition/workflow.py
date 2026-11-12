@@ -5593,6 +5593,11 @@ def _run_focus_survey(ctx: "AcquisitionContext") -> None:
                 # callback a failed AF raises, so a survey point is always measured.)
                 request_manual_focus=None,
                 max_retries=0,
+                # The objective's edge-retry budget, as every other autofocus here gets:
+                # without it the hardware default is 0, and on a tilted slide each survey
+                # point far from the seed failed after one window (LC-PolScope 2026-11-12:
+                # 5 of 9 points, "after 0 retries").
+                edge_retries=ctx.af_edge_retries,
                 fallback_z=seed_z,
                 should_abort=ctx.is_cancelled,
                 move_stage_to_estimate=True,
