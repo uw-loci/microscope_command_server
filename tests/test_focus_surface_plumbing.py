@@ -117,7 +117,8 @@ def test_autofocus_results_hand_the_surface_their_peak_prominence():
     # surface built from faint ones), so every add of a hardware.autofocus result
     # carries one: the pre-acquisition AF, the survey, and the per-tile standard AF.
     assert 'None if initial_outcome.get("skipped") else _last_peak_prominence(hardware)' in SOURCE
-    assert "surface.add(pos.x, pos.y, achieved, _last_peak_prominence(hardware))" in SOURCE
+    assert "prominence = _last_peak_prominence(hardware)" in SOURCE
+    assert "surface.add(pos.x, pos.y, achieved, prominence)" in SOURCE
     assert "ctx.focus_surface.add(pos.x, pos.y, af_z, af_quality)" in SOURCE
     assert "surface.check(pos.x, pos.y, af_z, quality)" in SOURCE
     # Only a standard AF has one; a drift sweep does not, and must not borrow the last
