@@ -457,7 +457,9 @@ timepoint overwrites another. Derived images follow the same layout
 one is acquired, the way `--z-projection` reduces planes: each tile becomes
 `{group}/{filename}` (or `{group}/z{zz}/{filename}` with preserved planes), and
 the `t{tt}/` folders are moved under `Raw/` with `--save-raw true` or removed
-otherwise. A group whose projection fails keeps its timepoints. LC-PolScope
+otherwise. A group whose projection fails keeps its timepoints. A cancel stops the
+projection between tiles: the group in progress loses its partial output and keeps
+its timepoints, and the groups not yet reached keep theirs. LC-PolScope
 `orientation/` and `orientation_color/` are not averaged (orientation is axial)
 and keep their timepoints. Absent or `none`: every timepoint is kept. The choice
 is recorded as `time_lapse.projection` in `acquisition_metadata.json`.
