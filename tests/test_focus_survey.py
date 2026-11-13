@@ -34,12 +34,18 @@ def _load(name, after):
         "List": list,
         "Tuple": tuple,
         "AcquisitionContext": object,
+        "Optional": __import__("typing").Optional,
+        "SURVEY_FIT_MIN_PLANE_POINTS": 5,
+        "SURVEY_FIT_MIN_LINE_POINTS": 4,
+        "SURVEY_FIT_MAX_RMS_UM": 2.0,
+        "SURVEY_FIT_MAX_EXTRAPOLATION": 1.5,
     }
     exec(SOURCE[start:end], ns)
     return ns[name]
 
 
 spread_survey_points = _load("_spread_survey_points", "def _run_focus_survey(")
+survey_seed_z = _load("_survey_seed_z", "def _spread_survey_points(")
 
 
 def raster(n_cols=12, n_rows=10, pitch=300.0):
@@ -184,7 +190,8 @@ class TestTheSurveyCannotHurtARun:
         # improve the surface and leave the fallback worse than it needed to be.
         body = self.body()
         assert "ctx.completed_af_positions.append((pos.x, pos.y, achieved))" in body
-        assert "surface.add(pos.x, pos.y, achieved, _last_peak_prominence(hardware))" in body
+        assert "prominence = _last_peak_prominence(hardware)" in body
+        assert "surface.add(pos.x, pos.y, achieved, prominence)" in body
 
     def test_it_records_the_achieved_z_not_the_returned_one(self):
         # autofocus_with_manual_fallback can return a skip-Z that the stage was never
@@ -212,3 +219,67 @@ class TestTheSurveyCannotHurtARun:
         assert '"--focus-survey"' in SOURCE
         assert '"--focus-survey-tiles"' in SOURCE
         assert re.search(r'params\["focus_survey_points"\] = int\(parts\[i \+ 1\]\)', SOURCE)
+
+
+class TestSurveySeed:
+    """A survey point starts from the tilt the points measured so far imply -- once that
+    tilt has points to spare and they agree with it."""
+
+    # LC-PolScope 2026-11-12, run 1: the plane its 54 autofocus results fit to 0.67 um RMS.
+    @staticmethod
+    def plane(x, y):
+        return 73.76 - 5.84 * (x + 14488) / 1000 - 2.17 * (y - 2084) / 1000
+
+    def measured(self, xys, noise=(0.4, -0.3, 0.5, -0.6, 0.2, -0.1)):
+        return [(x, y, self.plane(x, y) + n) for (x, y), n in zip(xys, noise)]
+
+    SPREAD = [(-22666, 3943), (-19188, 2949), (-20679, 2949), (-16000, 1500), (-13000, 3500)]
+
+    def test_five_points_on_one_tilt_seed_a_far_point_near_its_focus(self):
+        # Tile 66 started from 98.5 (the previous point) and accepted a false peak at
+        # 98.6; the slide's plane puts it at about 58.
+        z, used, rms = survey_seed_z(self.measured(self.SPREAD), -11737, 1956)
+        assert used == 5 and rms < 1.0
+        assert abs(z - self.plane(-11737, 1956)) < 1.5
+
+    def test_three_points_are_not_enough_to_trust(self):
+        # An exactly determined plane has no residual to check it against.
+        assert survey_seed_z(self.measured(self.SPREAD[:3]), -11737, 1956) == (None, 0, None)
+
+    def test_four_spread_points_are_not_enough_either(self):
+        z, used, _ = survey_seed_z(self.measured(self.SPREAD[:4]), -11737, 1956)
+        assert z is None and used == 0
+
+    def test_a_false_peak_among_the_points_withdraws_the_fit(self):
+        pts = self.measured(self.SPREAD)
+        x, y, zz = pts[3]
+        pts[3] = (x, y, zz + 40.0)  # 40 um off, like tile 66's false peak
+        z, used, rms = survey_seed_z(pts, -11737, 1956)
+        assert z is None and used == 0 and rms > 2.0
+
+    def test_four_points_along_a_row_give_the_slope_along_it(self):
+        row = [(0, 0, 10.0), (1000, 0, 16.1), (2000, 0, 21.9), (3000, 0, 28.0)]
+        z, used, rms = survey_seed_z(row, 3500, 0)
+        assert used == 4 and rms < 0.2
+        assert z == pytest.approx(31.0, abs=0.3)
+
+    def test_it_does_not_extrapolate_far_beyond_the_points(self):
+        # Five points clustered in one corner say little about the far side of the slide.
+        corner = [
+            (-22000 + dx, 3500 + dy)
+            for dx, dy in [(0, 0), (500, 0), (0, 500), (500, 500), (250, 250)]
+        ]
+        z, used, rms = survey_seed_z(self.measured(corner), -8000, 1500)
+        assert z is None and used == 0
+
+    def test_too_few_points_give_nothing(self):
+        assert survey_seed_z([], 0, 0) == (None, 0, None)
+        assert survey_seed_z([(0, 0, 1.0), (1, 1, 2.0), (2, 0, 3.0)], 0, 0) == (None, 0, None)
+
+    def test_a_far_faint_peak_is_skipped_only_against_a_verified_fit(self):
+        body = TestTheSurveyCannotHurtARun.body()
+        assert "fit_points\n            and prominence is not None" in body
+        assert "abs(achieved - seed_z) > far_um" in body
+        assert body.index("skipping it as a false peak") < body.index(
+            "ctx.completed_af_positions.append((pos.x, pos.y, achieved))"
+        )

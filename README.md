@@ -1704,6 +1704,20 @@ starts, instead of discovering the plane one tile at a time:
   The indices are from the tile grid; the client typically scores them for
   tissue content on the macro image and supplies the well-covered ones.
 
+- **Where each search starts:** At the licensed surface's prediction once there
+  is one. Before that, at the tilt the points measured so far imply, but only
+  when that tilt is verified: at least 5 points for a plane (4 along one row),
+  fitting it to 2 um RMS or better, and the point no further from their centre
+  than 1.5 times the farthest of them. Otherwise at the current Z (the previous
+  point's height). Early points are often at a tissue edge or focused on
+  something other than tissue; a bad one keeps the fit failing its check, so it
+  cannot steer the points after it. Each search uses the objective's edge-retry
+  budget (`edge_retries`).
+
+- **False peaks:** Against a verified tilt, a result more than 5 um (or a
+  quarter of the search range) away from it with a faint peak (prominence below
+  0.6) is skipped as a false peak, not recorded.
+
 - **Cannot fail the run:** A point that cannot be focused, has no tissue, or
   fails to focus is skipped. If too few points survive the surface stays
   unlicensed and the tile loop behaves as it always did. A survey that

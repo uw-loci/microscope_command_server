@@ -5387,6 +5387,69 @@ def _run_pre_acquisition_autofocus(ctx: AcquisitionContext) -> None:
     logger.info("=== Starting main acquisition loop ===")
 
 
+# A survey result this far from the tilt fitted so far (um, or a quarter of the search range
+# if that is larger) and this faint is taken for a false peak and skipped.
+SURVEY_FAR_FROM_FIT_MIN_UM = 5.0
+SURVEY_WEAK_PROMINENCE = 0.6
+# The fitted tilt is trusted only with points to spare and a close fit: a plane needs 5 points
+# (2 more than it has unknowns), points along one row 4, and the fit at most this RMS (um).
+SURVEY_FIT_MIN_PLANE_POINTS = 5
+SURVEY_FIT_MIN_LINE_POINTS = 4
+SURVEY_FIT_MAX_RMS_UM = 2.0
+# ...and is not extrapolated further from the points' centre than this many times the
+# farthest point: a tilt fitted to a corner says little about the opposite side.
+SURVEY_FIT_MAX_EXTRAPOLATION = 1.5
+
+
+def _survey_seed_z(points, x: float, y: float) -> Tuple[Optional[float], int, Optional[float]]:
+    """The Z a verified tilt through the points measured so far predicts at ``(x, y)``.
+
+    ``points`` are ``(x, y, z)`` in um. Five or more points spread in both axes give a
+    least-squares plane; four or more along one row (a line of tiles) give the slope along
+    it. The prediction is used only when the fit has points to spare and they agree with it
+    to within ``SURVEY_FIT_MAX_RMS_UM``, and only near them (``SURVEY_FIT_MAX_EXTRAPOLATION``):
+    an exactly determined plane, or one a false peak has pulled away, would send the next
+    search somewhere worse than the previous point's height. Early points are often at a
+    tissue edge or focused on something other than tissue, so a bad one is expected; it
+    keeps the fit failing its check, and the survey falls back to the previous point's
+    height, rather than steering the points after it. Returns ``(z, points_used, rms_um)``; ``z`` is None when there is no verified
+    fit, and ``rms_um`` is None when there were too few points to fit.
+
+    The focus surface itself declines to predict until it has six points, so before this
+    every survey point started from the previous one's height, and on a slide tilted
+    6 um/mm points 10 mm apart started 60 um from focus (LC-PolScope 2026-11-12).
+    """
+    pts = np.asarray([(float(px), float(py), float(pz)) for px, py, pz in points])
+    if len(pts) < SURVEY_FIT_MIN_LINE_POINTS:
+        return None, 0, None
+    centre = pts[:, :2].mean(axis=0)
+    xy = pts[:, :2] - centre
+    z = pts[:, 2]
+    _, sing, vt = np.linalg.svd(xy, full_matrices=False)
+    if sing[0] <= 0:
+        return None, 0, None
+    target = np.array([x, y]) - centre
+    reach = float(np.max(np.linalg.norm(xy, axis=1)))
+    if np.linalg.norm(target) > SURVEY_FIT_MAX_EXTRAPOLATION * reach:
+        return None, 0, None
+    if sing[1] < 0.02 * sing[0]:
+        # Collinear: fit z against the position along the line only.
+        along = xy @ vt[0]
+        slope, intercept = np.polyfit(along, z, 1)
+        rms = float(np.sqrt(np.mean((z - (intercept + slope * along)) ** 2)))
+        prediction = float(intercept + slope * (target @ vt[0]))
+    else:
+        if len(pts) < SURVEY_FIT_MIN_PLANE_POINTS:
+            return None, 0, None
+        design = np.column_stack([np.ones(len(pts)), xy])
+        coef, *_ = np.linalg.lstsq(design, z, rcond=None)
+        rms = float(np.sqrt(np.mean((z - design @ coef) ** 2)))
+        prediction = float(coef[0] + coef[1] * target[0] + coef[2] * target[1])
+    if rms > SURVEY_FIT_MAX_RMS_UM:
+        return None, 0, rms
+    return prediction, len(pts), rms
+
+
 def _spread_survey_points(
     xy_positions: List[Tuple[float, float]],
     already: List[Tuple[float, float]],
@@ -5547,8 +5610,29 @@ def _run_focus_survey(ctx: "AcquisitionContext") -> None:
             logger.info("Focus survey cancelled by the operator")
             break
         pos, _ = ctx.positions[tile_idx]
-        # Approach at the best Z we currently believe, so the search starts near focus.
+        # Approach at the best Z we currently believe, so the search starts near focus:
+        # the licensed surface, else the tilt the points measured so far imply.
         seed_z = surface.predict(pos.x, pos.y)
+        fit_points = 0
+        if seed_z is None:
+            seed_z, fit_points, fit_rms = _survey_seed_z(ctx.completed_af_positions, pos.x, pos.y)
+            if fit_points:
+                logger.info(
+                    "Focus survey: tile %d starts at Z=%.2f um, the tilt fitted to the %d "
+                    "points measured so far (%.2f um RMS)",
+                    tile_idx,
+                    seed_z,
+                    fit_points,
+                    fit_rms,
+                )
+            elif fit_rms is not None:
+                logger.info(
+                    "Focus survey: the points measured so far do not fit one tilt (%.2f um RMS "
+                    "> %.1f), so tile %d starts from the current Z",
+                    fit_rms,
+                    SURVEY_FIT_MAX_RMS_UM,
+                    tile_idx,
+                )
         if seed_z is None:
             seed_z = hardware.get_current_position().z
         try:
@@ -5623,8 +5707,30 @@ def _run_focus_survey(ctx: "AcquisitionContext") -> None:
             continue
 
         achieved = hardware.get_current_position().z
+        prominence = _last_peak_prominence(hardware)
+        far_um = max(SURVEY_FAR_FROM_FIT_MIN_UM, 0.25 * float(ctx.af_search_range or 0))
+        if (
+            fit_points
+            and prominence is not None
+            and prominence < SURVEY_WEAK_PROMINENCE
+            and abs(achieved - seed_z) > far_um
+        ):
+            # A faint peak far from where the measured tilt puts focus: on 2026-11-12 one
+            # such peak (prominence 0.48) sat 40 um off the slide's real plane.
+            logger.warning(
+                "Focus survey: tile %d peak at Z=%.2f um is %.1f um from the fitted tilt's "
+                "%.2f and faint (prominence %.2f < %.2f) -- skipping it as a false peak",
+                tile_idx,
+                achieved,
+                abs(achieved - seed_z),
+                seed_z,
+                prominence,
+                SURVEY_WEAK_PROMINENCE,
+            )
+            failed += 1
+            continue
         ctx.completed_af_positions.append((pos.x, pos.y, achieved))
-        surface.add(pos.x, pos.y, achieved, _last_peak_prominence(hardware))
+        surface.add(pos.x, pos.y, achieved, prominence)
         measured += 1
         logger.info(
             "Focus survey point %d/%d: tile %d at X=%.0f Y=%.0f -> Z=%.2f um " "(AF returned %.2f)",
