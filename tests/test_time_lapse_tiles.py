@@ -109,3 +109,37 @@ def test_the_flag_is_parsed():
         "--timepoints 30 --interval 2 --t-projection mean END_MARKER"
     )
     assert params["t_projection"] == "mean"
+
+
+def test_a_cancel_stops_the_projection_and_keeps_the_timepoints(tmp_path):
+    # PPM 2026-11-13: a cancel during a whole-slide projection waited for it and was never
+    # acknowledged. Now the projection stops; the timepoints stay and no partial set is left.
+    ctx = _ctx(tmp_path, t_projection="mean")
+    for t, value in enumerate([10, 20, 30]):
+        ctx.current_timepoint = t
+        for name in ("0.tif", "1.tif", "2.tif"):
+            path = workflow._tile_dir(ctx, "90.0") / name
+            workflow.ome_tiff_writer(
+                filename=str(path), pixel_size_um=0.5, data=np.full((8, 8), value, dtype=np.uint8)
+            )
+    calls = {"n": 0}
+
+    def is_cancelled():
+        calls["n"] += 1
+        return calls["n"] > 3  # group check, then two tiles, then cancel
+
+    ctx.is_cancelled = is_cancelled
+    workflow._project_timepoints(ctx)
+
+    group = ctx.output_path / "90.0"
+    assert not list(group.glob("*.tif")), "the partial projection is removed"
+    assert len(list(group.glob("t*/*.tif"))) == 9, "every timepoint is kept"
+
+
+def test_a_cancel_before_the_projection_leaves_everything(tmp_path):
+    ctx = _ctx(tmp_path, t_projection="mean")
+    _write_timepoints(ctx, "90.0", [10, 20, 30])
+    ctx.is_cancelled = lambda: True
+    workflow._project_timepoints(ctx)
+    assert not (ctx.output_path / "90.0" / "0.tif").exists()
+    assert len(list((ctx.output_path / "90.0").glob("t*/0.tif"))) == 3

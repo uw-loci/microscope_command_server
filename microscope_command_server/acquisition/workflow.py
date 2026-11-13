@@ -6500,10 +6500,19 @@ def _project_timepoints(ctx: AcquisitionContext) -> None:
     raw folder when raw tiles are kept, and removed otherwise, as Z planes are; a group
     whose projection fails keeps them. Axial folders (LC-PolScope orientation) are not
     averaged and keep their timepoints.
+
+    Stops on cancel between tiles: the group being projected loses its partial projection
+    and keeps its timepoints, and the groups not reached keep theirs. A whole-slide
+    projection runs for tens of minutes, and a cancel that waited for it was never
+    acknowledged (PPM 2026-11-13).
     """
     name = ctx.t_projection
     if ctx.n_timepoints <= 1 or not name:
         return
+
+    def cancelled() -> bool:
+        return bool(getattr(ctx, "is_cancelled", None) and ctx.is_cancelled())
+
     import tifffile
 
     from microscope_command_server.acquisition.projections import get_projection
@@ -6519,6 +6528,14 @@ def _project_timepoints(ctx: AcquisitionContext) -> None:
         d for d in root.iterdir() if d.is_dir() and not _TIMEPOINT_DIR.match(d.name)
     )
     for group_dir in groups:
+        if cancelled():
+            logger.warning(
+                "Time projection (%s) stopped by cancel before %s; it and the folders after it "
+                "keep their timepoints",
+                name,
+                group_dir,
+            )
+            return
         t_dirs = sorted(
             d for d in group_dir.iterdir() if d.is_dir() and _TIMEPOINT_DIR.match(d.name)
         )
@@ -6543,12 +6560,26 @@ def _project_timepoints(ctx: AcquisitionContext) -> None:
         if group_dir == biref_dir:
             # Already written from the averaged angles; only its timepoints are left to clear.
             tiles = []
+        written = []
         try:
             for rel in tiles:
+                if cancelled():
+                    for out in written:
+                        out.unlink(missing_ok=True)
+                    logger.warning(
+                        "Time projection (%s) stopped by cancel in %s after %d of %d tiles; "
+                        "the partial projection was removed and the timepoints are kept",
+                        name,
+                        group_dir,
+                        len(written),
+                        len(tiles),
+                    )
+                    return
                 frames = [tifffile.imread(t / rel) for t in t_dirs if (t / rel).exists()]
                 out = group_dir / rel
                 out.parent.mkdir(parents=True, exist_ok=True)
                 ome_tiff_writer(filename=str(out), pixel_size_um=pixel_size, data=project(frames))
+                written.append(out)
         except Exception as e:
             logger.error(
                 "Time projection (%s) failed in %s, keeping its timepoints: %s", name, group_dir, e
