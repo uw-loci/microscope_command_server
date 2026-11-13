@@ -1714,9 +1714,9 @@ starts, instead of discovering the plane one tile at a time:
   cannot steer the points after it. Each search uses the objective's edge-retry
   budget (`edge_retries`).
 
-- **False peaks:** Against a verified tilt, a result more than 5 um (or a
-  quarter of the search range) away from it with a faint peak (prominence below
-  0.6) is skipped as a false peak, not recorded.
+- **False peaks:** Against a verified tilt, a result more than 5 um, or a
+  quarter of the search range if that is larger, away from it with a faint peak
+  (prominence below 0.6) is skipped as a false peak, not recorded.
 
 - **Cannot fail the run:** A point that cannot be focused, has no tissue, or
   fails to focus is skipped. If too few points survive the surface stays
