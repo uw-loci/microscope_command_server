@@ -4530,6 +4530,28 @@ def handle_abort_af(conn, client, hardware, settings, **kwargs):
         pass
 
 
+# Every flag a STRMAFZ request may carry. parse_flags ends each value at the next flag in
+# this list, so a flag the client sends but this list omits is swallowed into the value
+# before it.
+STRMAFZ_FLAGS = [
+    "--yaml",
+    "--objective",
+    "--range",
+    "--modality",
+    "--crop-factor",
+    "--dump",
+    "--dump-label",
+    "--dump-frames",
+    "--max-attempts",
+    "--safe-z",
+    "--approach-max",
+    "--tissue-gate",
+    "--z-start",
+    "--z-end",
+    "--z-limit",
+]
+
+
 def _handle_streaming_focus(conn, client, hardware, settings, **kwargs):
     """Entry point for the STRMAFZ (streaming autofocus) command."""
     addr = getattr(client, "addr", client)
@@ -4565,25 +4587,7 @@ def _handle_streaming_focus(conn, client, hardware, settings, **kwargs):
             conn.sendall(busy_reply(busy_addr, "move the focus stage").encode())
         return
 
-    params = parse_flags(
-        message,
-        [
-            "--yaml",
-            "--objective",
-            "--range",
-            "--modality",
-            "--crop-factor",
-            "--dump",
-            "--dump-label",
-            "--dump-frames",
-            "--max-attempts",
-            "--safe-z",
-            "--approach-max",
-            "--tissue-gate",
-            "--z-start",
-            "--z-end",
-        ],
-    )
+    params = parse_flags(message, STRMAFZ_FLAGS)
     yaml_path = params.get("yaml")
     # parse_flags keys are the flag name with internal dashes turned into UNDERSCORES
     # (see its docstring), so "--dump-label" arrives as "dump_label". Reading "dump-label"

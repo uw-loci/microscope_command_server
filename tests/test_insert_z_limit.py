@@ -100,3 +100,31 @@ def test_no_limit_means_no_change():
 def test_the_limit_itself_stays_reachable(z):
     z_low, _z_high, _side = narrow(-720.0, 1000.0, -300.0, +1.0, current_z=z)
     assert z >= z_low
+
+
+def test_the_limit_is_parsed_and_ends_the_value_before_it():
+    # The request from the 2026-11-13 Focus Approach Validation. With --z-limit missing from
+    # the declared flags, --z-end read "-55.79999923706055 --z-limit -200.0", the server
+    # dropped both endpoints and scanned 72 -> 328 around the safe Z, away from the sample,
+    # and the limit itself was never applied.
+    from microscope_command_server.server.handlers.utils import parse_flags
+
+    message = (
+        "--yaml D:\\cfg\\config_PPM.yml --modality ppm --range 255.79999923706055 --dump 1 "
+        "--dump-label tissue --max-attempts 1 --z-start 200.0 --z-end -55.79999923706055 "
+        "--z-limit -200.0"
+    )
+    params = parse_flags(message, sf.STRMAFZ_FLAGS)
+    assert float(params["z_start"]) == 200.0
+    assert float(params["z_end"]) == pytest.approx(-55.8)
+    assert float(params["z_limit"]) == -200.0
+
+
+def test_every_value_the_handler_reads_is_a_declared_flag():
+    import inspect
+    import re
+
+    source = inspect.getsource(sf._handle_streaming_focus)
+    read = set(re.findall(r'params\.get\(\s*"(\w+)"', source))
+    declared = {f.lstrip("-").replace("-", "_") for f in sf.STRMAFZ_FLAGS}
+    assert read <= declared, f"read but not declared: {sorted(read - declared)}"
