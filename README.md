@@ -1463,13 +1463,15 @@ a move leaves no position discontinuity to find. The MicroManager CoreLog for th
 shows a provably clean counter -- 293,227 position reads across the acquire pass with no
 unexplained change -- while three of the four slides came out offset in Y.
 
-### Per-insert safe Z is not resolved here
+### Per-insert safe Z comes from the request
 
-`stage.inserts.configurations.<id>.safe_z_um` overrides are not applied, because the
-acquisition message does not say which insert is fitted. Declare a scope-level
-`safe_z_um` that is on the retracted side for every insert you use and inside
-`stage.limits.z_um`. The direction check is the backstop: a target on the sample side is
-refused rather than driven to.
+The YAML alone cannot say which insert is fitted, so the server does not pick a
+`stage.inserts.configurations.<id>.safe_z_um` for itself. QPSC resolves the mounted insert's
+value and sends it as `--safe-z` with the acquisition; the retraction uses that value. When
+the request carries no `--safe-z`, the scope-level `stage.safe_z_um` is the fallback. Declare
+a scope-level `safe_z_um` that is on the retracted side for every insert you use and inside
+`stage.limits.z_um`, so the fallback is safe even when a request omits the value. The direction
+check applies to either value: a target on the sample side is refused rather than driven to.
 
 ## Autofocus / Streaming Focus (--safe-z, --approach-max, --tissue-gate)
 
