@@ -206,3 +206,43 @@ def test_the_return_move_no_longer_claims_to_preserve_z():
     source = WORKFLOW_SRC.read_text()
     assert "(preserving Z)" not in source
     assert "(at the retracted Z)" in source
+
+
+# --------------------------------------------------------------------------
+# the insert's safe Z, sent by QPSC as --safe-z
+# --------------------------------------------------------------------------
+
+
+def test_the_inserts_safe_z_wins_over_the_scope_level_value():
+    # PPM after the 2026-11-13 Z re-zero: focus near -26, the four-slide holder's safe Z is
+    # 200, and the scope-level value is still 0, only 26 um from focus.
+    stage = Stage(-26.0)
+    assert run(FakeConfig(PPM), stage, safe_z_um=200.0) is True
+    assert stage.moves == [200.0]
+
+
+def test_without_an_insert_value_the_scope_level_value_is_used():
+    stage = Stage(-26.0)
+    assert run(FakeConfig(PPM), stage, safe_z_um=None) is True
+    assert stage.moves == [0.0]
+
+
+def test_the_inserts_safe_z_is_direction_checked_too(caplog):
+    stage = Stage(-26.0)
+    with caplog.at_level(logging.ERROR):
+        assert run(FakeConfig(PPM), stage, safe_z_um=-300.0) is False
+    assert stage.moves == []
+    assert "SAMPLE side" in caplog.text
+
+
+def test_the_acquisition_message_carries_the_safe_z_to_the_retract():
+    from microscope_command_server.acquisition.workflow import parse_acquisition_message
+
+    params = parse_acquisition_message(
+        "--yaml y --projects p --sample s --scan-type t --region r --hint-z -26.00 "
+        "--safe-z 200.00 ENDOFSTR"
+    )
+    assert params["safe_z"] == 200.0
+    source = WORKFLOW_SRC.read_text()
+    at = source.index("retract_to_safe_z(")
+    assert "safe_z_um=ctx.safe_z" in source[at : at + 300]

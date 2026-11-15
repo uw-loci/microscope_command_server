@@ -2510,6 +2510,11 @@ def parse_acquisition_message(message: str) -> dict:
             elif parts[i] == "--hint-z" and i + 1 < len(parts):
                 params["hint_z"] = float(parts[i + 1])
                 i += 2
+            elif parts[i] == "--safe-z" and i + 1 < len(parts):
+                # The safe Z QPSC resolved for the mounted insert and modality; it falls
+                # back to the scope-level stage.safe_z_um, which is all the YAML alone gives.
+                params["safe_z"] = float(parts[i + 1])
+                i += 2
             elif parts[i] == "--preferred-af-tile" and i + 1 < len(parts):
                 params["preferred_af_tile"] = int(parts[i + 1])
                 i += 2
@@ -2893,6 +2898,7 @@ class AcquisitionContext:
     af_saturation_scale: Optional[float] = None
     af_illumination_power: Optional[float] = None  # remembered reduced AF illumination power
     hint_z: Optional[float] = None
+    safe_z: Optional[float] = None
     metadata_txt_for_positions: Optional[Path] = None
 
     # -- Infrastructure (populated by _initialize_loop_infrastructure) --
@@ -3552,6 +3558,7 @@ def _cleanup_acquisition(ctx: AcquisitionContext) -> None:
         read_z=lambda: ctx.hardware.get_current_position().z,
         move_z=lambda z: ctx.hardware.move_to_position(Position(z=z)),
         log=ctx.logger,
+        safe_z_um=ctx.safe_z,
     )
 
     if return_xy is not None:
@@ -4310,6 +4317,7 @@ def _prepare_acquisition(
         ),
         output_format=str(params.get("output_format", "ome-per-t")),
         hint_z=params.get("hint_z"),
+        safe_z=params.get("safe_z"),
         metadata_txt_for_positions=metadata_txt_for_positions,
         update_progress=update_progress,
         set_state=set_state,

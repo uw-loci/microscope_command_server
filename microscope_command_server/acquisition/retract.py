@@ -50,13 +50,12 @@ def _stage_config(settings: Any) -> dict:
 
 
 def resolve_safe_z(settings: Any) -> Optional[float]:
-    """The declared retracted Z, from ``stage.safe_z_um``, or None.
+    """The scope-level retracted Z, from ``stage.safe_z_um``, or None.
 
-    Per-insert and per-modality overrides (``stage.inserts.configurations.<id>.safe_z_um``)
-    are NOT resolved here, because the acquisition message does not carry which insert is
-    fitted. On a rig where an insert overrides the scope-level value, the direction check
-    below is what keeps a scope-level value from being used unsafely: a target on the wrong
-    side of the sample is refused rather than driven to.
+    This is the fallback. The YAML alone cannot say which insert is fitted, so the
+    per-insert and per-modality values (``stage.inserts.configurations.<id>.safe_z_um``)
+    arrive from QPSC as the acquisition's ``--safe-z`` and are passed to
+    :func:`retract_to_safe_z` as ``safe_z_um``.
     """
     raw = _stage_config(settings).get("safe_z_um")
     if raw is None:
@@ -91,12 +90,17 @@ def retract_to_safe_z(
     move_z: Callable[[float], None],
     log: Any = None,
     tolerance_um: float = 1.0,
+    safe_z_um: Optional[float] = None,
 ) -> bool:
     """Move the focus device to the declared safe Z. Returns True if it moved.
 
     ``settings`` is the acquisition's loaded microscope YAML (``ctx.ppm_settings``), a dict
-    with a ``stage`` block. Never raises: a retraction that cannot be made safely, or at
-    all, must not turn a completed acquisition into a failed one. Every refusal is logged
+    with a ``stage`` block. ``safe_z_um`` is the safe Z for the mounted insert and modality
+    when the client sent one; without it the scope-level ``stage.safe_z_um`` is used. The
+    retract direction is checked either way.
+
+    Never raises: a retraction that cannot be made safely, or at all, must not turn a
+    completed acquisition into a failed one. Every refusal is logged
     at WARNING or above, because a run that quietly stopped retracting would give the
     clearance back without anyone noticing -- which is exactly what the first version did.
     """
@@ -110,7 +114,7 @@ def retract_to_safe_z(
         )
         return False
 
-    safe_z = resolve_safe_z(settings)
+    safe_z = safe_z_um if safe_z_um is not None else resolve_safe_z(settings)
     if safe_z is None:
         out.warning(
             "Not retracting: stage.safe_z_um is not declared in the microscope YAML, so Z "

@@ -1416,8 +1416,11 @@ stage:
 Both keys are optional, and the feature is off without them -- an acquisition that cannot
 retract safely proceeds exactly as before.
 
-**`stage.safe_z_um`** -- a Z at which the objective is clear of the sample. On PPM this is
-`0` while focus sits near -420 um, so retracting buys about 420 um of clearance.
+**`stage.safe_z_um`** -- a Z at which the objective is clear of the sample. This scope-level
+value is the fallback. When the mounted insert (or the insert and modality) declares its own
+`stage.inserts.configurations.<id>.safe_z_um`, QPSC sends that value with the acquisition as
+`--safe-z` and the retraction uses it instead, because the YAML alone cannot say which insert
+is fitted.
 
 **`stage.focus.retract_sign`** -- `positive` or `negative` (case-insensitive; `1`/`+1` and
 `-1` also work). On PPM it is `positive` because, measured 2026-08-26, increasing Z moves
@@ -1430,8 +1433,8 @@ establishing the sign. Measure it; do not derive it.
 
 ### What it does
 
-1. Resolve `stage.safe_z_um` and `stage.focus.retract_sign`. If either is missing or
-   malformed, log and do nothing.
+1. Resolve the safe Z (the request's `--safe-z`, else `stage.safe_z_um`) and
+   `stage.focus.retract_sign`. If either is missing or malformed, log and do nothing.
 2. Read the current Z.
 3. If it is already within 1 um of the safe Z, do nothing.
 4. **Direction check:** if the safe Z lies on the sample side of the current Z, given the

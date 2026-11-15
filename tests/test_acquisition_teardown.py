@@ -75,6 +75,7 @@ class Ctx:
         self.hardware = hardware or FakeHardware()
         self.logger = FakeLogger()
         self.ppm_settings = {}
+        self.safe_z = None
 
 
 def cleanup(ctx):
@@ -95,7 +96,7 @@ def cleanup(ctx):
             (),
             {"detach_file": staticmethod(lambda: ctx.af_trace_detached.append(True))},
         ),
-        "retract_to_safe_z": lambda settings, read_z, move_z, log=None: bool(
+        "retract_to_safe_z": lambda settings, read_z, move_z, log=None, safe_z_um=None: bool(
             ctx.hardware.moves.append("RETRACT")
         ),
     }
