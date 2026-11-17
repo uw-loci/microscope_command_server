@@ -1665,7 +1665,7 @@ The surface refuses to speak unless:
   the column and say nothing across it. The server checks this and refuses to
   extrapolate a tilt in an unconstrained axis.
 
-When any check fails, the mode is logged as "NOT licensed: ..." and the
+When any check fails, the mode is logged as "NOT licensed for checking or seeding: ..." and the
 acquisition falls back to the nearest-neighbour seeding behavior from before
 this feature.
 
@@ -1754,11 +1754,13 @@ once; the quadratic kept 1205 at 0.70 um RMS and would have replaced none.
 
 At the end of a region with the surface active, the server writes
 `focus_surface.json` beside the tiles: `model` (`plane` or `quadratic`),
-`licensed`, `unlicensed_reason`, `mode`, `centre_x_um`/`centre_y_um`, `z0_um`,
+`licensed`, `unlicensed_reason`, `checking`, `mode`, `centre_x_um`/`centre_y_um`, `z0_um`,
 `tilt_x_um_per_mm`/`tilt_y_um_per_mm`, the three `q*_um_per_mm2` terms (0 for a
 plane), `bounds_um` (`[xmin, xmax, ymin, ymax]`, null for a plane),
-`inlier_rms_um`, `inliers` and `points`. QPSC reads it and keeps a licensed
-surface as the slide's focus surface.
+`inlier_rms_um`, `inliers` and `points`. `licensed` and `unlicensed_reason` are the
+seeding licence and its reason; `checking` is the checking licence (see "Checking and
+seeding are licensed separately"). QPSC reads it and keeps a surface licensed to seed
+as the slide's focus surface.
 
 ### Pre-acquisition focus survey
 
@@ -1782,8 +1784,8 @@ starts, instead of discovering the plane one tile at a time:
   The indices are from the tile grid; the client typically scores them for
   tissue content on the macro image and supplies the well-covered ones.
 
-- **Where each search starts:** At the licensed surface's prediction once there
-  is one. Before that, at the tilt the points measured so far imply, but only
+- **Where each search starts:** At the surface's prediction once it is licensed to
+  seed (see "Checking and seeding are licensed separately"). Before that, at the tilt the points measured so far imply, but only
   when that tilt is verified: at least 5 points for a plane (4 along one row),
   fitting it to 2 um RMS or better, and the point no further from their centre
   than 1.5 times the farthest of them. Otherwise at the current Z (the previous
@@ -1816,7 +1818,7 @@ starts, instead of discovering the plane one tile at a time:
 - **What the survey does and does not save:** it does not change how often the
   tile loop autofocuses. That is still `n_tiles` in `autofocus_<scope>.yml`, and
   raising it is a separate, deliberate decision. What the survey buys is a
-  licensed surface from the first tile rather than after a region's worth of
+  surface licensed to seed from the first tile rather than after a region's worth of
   measurements have accumulated -- which is what makes raising `n_tiles` safe.
   The prize is large: the 2026-09-24 session spent **8.95 hours** in per-tile
   autofocus (2,084 sweeps at a mean 15.5 s), and 21% of those sweeps returned no
