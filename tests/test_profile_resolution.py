@@ -146,3 +146,35 @@ def test_config_with_an_unknown_camera_uses_the_shared_values(config_path, tmp_p
     assert _black_level(merged) == 51
     assert manager.active_detector is None
     assert any("matches no detector" in r.getMessage() for r in caplog.records)
+
+
+# ---------------------------------------------------------------- mirror of QPSC's tests
+# The three cases of QPSC's ProfileDetectorResolutionTest (qupath-extension-qpsc,
+# MicroscopeConfigManager.matchProfileKey). Keep the two in step.
+
+JAVA_PROFILES = {
+    "lcpolscope_20x": {"modality": "lcpolscope", "objective": OBJ20, "detector": HAM},
+    "lcpolscope_20x_oryx": {"modality": "lcpolscope", "objective": OBJ20, "detector": ORYX},
+    "brightfield_20x": {"modality": "brightfield", "detector": HAM},
+    "brightfield_20x_oryx": {"modality": "brightfield", "detector": ORYX},
+}
+
+
+def test_java_mirror_the_active_cameras_profile_wins_by_its_fields():
+    hw_ham, hw_oryx = _hw(HAM, JAVA_PROFILES), _hw(ORYX, JAVA_PROFILES)
+    assert _resolve_background_profile_key("lcpolscope", OBJ20, hw_ham, LOG) == "lcpolscope_20x"
+    assert _resolve_background_profile_key("LCPolScope", OBJ20, hw_oryx, LOG) == (
+        "lcpolscope_20x_oryx"
+    )
+
+
+def test_java_mirror_without_objective_fields_name_rules_run_on_the_cameras_profiles_only():
+    hw_ham, hw_oryx = _hw(HAM, JAVA_PROFILES), _hw(ORYX, JAVA_PROFILES)
+    assert _resolve_background_profile_key("brightfield", OBJ20, hw_ham, LOG) == "brightfield_20x"
+    # "20x_oryx" is not in the objective id, and the Hamamatsu profile is not a candidate.
+    assert _resolve_background_profile_key("brightfield", OBJ20, hw_oryx, LOG) is None
+
+
+def test_java_mirror_an_unknown_camera_considers_every_profile_in_file_order():
+    hw = _hw(None, JAVA_PROFILES)
+    assert _resolve_background_profile_key("lcpolscope", OBJ20, hw, LOG) == "lcpolscope_20x"
