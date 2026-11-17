@@ -283,8 +283,9 @@ def prepare_extinction_hardware(
     search starts from there anyway) and, when every profile of the modality names
     the same detector and it is not the active one, switches to it.
 
-    On the LC-PolScope rig, whose lamp is manual and which has one camera per
-    config, both are no-ops. Returns warnings; never raises.
+    On the LC-PolScope rig both are no-ops: the lamp is manual, and its one config
+    has a profile set for each camera, so the modality names two detectors and the
+    calibration runs on whichever camera is active. Returns warnings; never raises.
     """
     notes: list = []
     settings_yaml = settings_yaml or {}

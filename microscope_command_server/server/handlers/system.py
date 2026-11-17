@@ -253,8 +253,9 @@ def handle_config(conn, client, hardware, settings, **kwargs):
                     conn.sendall(b"CFG_BLCK" + error_length + error_msg)
                     return None
 
-        # Load the config file
-        new_settings = config_manager.load_config_file(config_path)
+        # Load the config file as written. Its per_detector values are merged in below,
+        # once the active camera is known (one config serves every camera of a scope).
+        new_settings = config_manager.load_config_file(config_path, apply_detector_values=False)
 
         # Validate essential config sections exist
         # Note: id_detector specs come from resources file, not main config
@@ -288,6 +289,15 @@ def handle_config(conn, client, hardware, settings, **kwargs):
             hardware._camera_name = hardware._detect_camera_name()
             hardware._camera_registry = hardware._build_camera_registry()
             hardware._active_detector_id = hardware._find_detector_id(hardware._camera_name)
+        else:
+            # Same file, but the camera may not be: a two-camera scope keeps one config.
+            # One Core call, safe while a sequence acquisition streams.
+            hardware.refresh_active_detector()
+
+        new_settings = apply_active_detector(config_manager, hardware, new_settings)
+
+        if path_changed:
+            # Built from the merged settings: the camera's own values are in place.
             hardware._stage = hardware._create_stage()
             hardware._rotation_stage = hardware._create_rotation_stage()
             hardware._illumination = hardware._create_illumination()
@@ -338,6 +348,39 @@ def handle_config(conn, client, hardware, settings, **kwargs):
         error_length = struct.pack("!I", len(error_bytes))
         conn.sendall(b"CFG_FAIL" + error_length + error_bytes)
         return None
+
+
+def apply_active_detector(config_manager, hardware, raw_settings):
+    """Merge the active camera's per_detector values into a freshly loaded config.
+
+    Records the active detector on ``config_manager`` (so every later
+    ``load_config_file`` applies the same camera's values), sets ``hardware.settings``
+    and returns the merged settings. Logs the camera and whether the config had values
+    for it, once per CONFIG.
+    """
+    from microscope_control.config import apply_detector_overlay
+
+    detector = getattr(hardware, "_active_detector_id", None)
+    config_manager.active_detector = detector
+    merged = apply_detector_overlay(raw_settings, detector)
+    hardware.settings = merged
+    overlaid = merged != raw_settings
+    logger.info(
+        "CONFIG: active camera %s (detector %s); %s",
+        getattr(hardware, "_camera_name", None),
+        detector,
+        (
+            "per_detector values applied"
+            if overlaid
+            else "no per_detector values for it (shared values only)"
+        ),
+    )
+    if detector is None:
+        logger.warning(
+            "CONFIG: Micro-Manager's camera matches no detector's 'device' in the config; "
+            "per_detector values are not applied"
+        )
+    return merged
 
 
 def handle_reconfig(conn, client, hardware, settings, **kwargs):

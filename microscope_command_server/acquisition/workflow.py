@@ -9834,21 +9834,25 @@ def _resolve_background_profile_key(
     logger,
 ) -> "str | None":
     """Resolve a background-collection modality + objective pair to a full
-    acquisition_profiles key.
+    acquisition_profiles key, for the camera Micro-Manager has active.
 
     Java sends --modality as the bare modality name ("Brightfield") and
     --objective as the full objective id ("0.5NA_AIR_10x" on OWS3, or
-    "LOCI_OBJECTIVE_OLYMPUS_10X_POL_001" on PPM), but acquisition_profiles
-    in the YAML are keyed by <modality>_<objective-suffix>
-    ("Brightfield_10x"). We walk the profiles dict and pick the first key
-    that starts with "<modality>_" and whose suffix is a substring of the
-    objective id (case-insensitive). This is intentionally scope-agnostic
-    so every scope's objective-id convention works without a lookup table.
+    "LOCI_OBJECTIVE_OLYMPUS_10X_POL_001" on PPM). The rule is
+    ``microscope_control.config.resolve_profile_key``: only the active camera's
+    profiles (and those naming no camera) are candidates; among them the first whose
+    ``modality`` (ignoring case) and ``objective`` fields match, else the name rules
+    (a key equal to the modality, the longest ``<modality>_<suffix>`` whose suffix is
+    in the objective id, a case-insensitive prefix fallback). QPSC's
+    MicroscopeConfigManager.resolveProfileKey applies the same rule; the two must stay
+    identical so the --profile key Java sends and the one derived here agree.
 
     Returns the matched profile key, or None if no match is found (in
     which case the caller falls back to using the bare modality and lets
     apply_profile_illumination log its own "profile not found" warning).
     """
+    from microscope_control.config import resolve_profile_key
+
     if not modality:
         return None
     try:
@@ -9857,57 +9861,24 @@ def _resolve_background_profile_key(
         return None
     if not profiles:
         return None
-
-    modality_prefix = modality + "_"
-    # Strategy 1: exact match on modality alone (unusual but possible if
-    # someone keyed a profile by modality-only).
-    if modality in profiles:
-        return modality
-
-    obj_lower = (objective or "").lower()
-
-    # Strategy 2: look for "<modality>_<suffix>" where <suffix> appears in
-    # the objective id. Prefer the longest matching suffix so e.g. "10x"
-    # beats a hypothetical "x" on the same scope.
-    candidates = []
-    for key in profiles:
-        if not key.startswith(modality_prefix):
-            continue
-        suffix = key[len(modality_prefix) :]
-        if suffix and suffix.lower() in obj_lower:
-            candidates.append((len(suffix), key))
-    if candidates:
-        candidates.sort(reverse=True)
-        matched = candidates[0][1]
+    detector = getattr(hardware, "_active_detector_id", None)
+    matched = resolve_profile_key(profiles, modality, objective, detector)
+    if matched is not None:
         logger.info(
-            "Resolved background profile: modality='%s' objective='%s' -> '%s'",
+            "Resolved background profile: modality='%s' objective='%s' detector=%s -> '%s'",
             modality,
             objective,
+            detector,
             matched,
         )
         return matched
 
-    # Strategy 3: case-insensitive fallback for strategy 2, in case the
-    # profile key and the modality arg differ in capitalization.
-    modality_prefix_lower = modality_prefix.lower()
-    for key in profiles:
-        if not key.lower().startswith(modality_prefix_lower):
-            continue
-        suffix = key[len(modality_prefix) :]
-        if suffix and suffix.lower() in obj_lower:
-            logger.info(
-                "Resolved background profile (case-insensitive): modality='%s' objective='%s' -> '%s'",
-                modality,
-                objective,
-                key,
-            )
-            return key
-
     logger.warning(
-        "Could not resolve background profile for modality='%s' objective='%s'. "
-        "Available profiles: %s",
+        "Could not resolve background profile for modality='%s' objective='%s' "
+        "detector=%s. Available profiles: %s",
         modality,
         objective,
+        detector,
         sorted(profiles.keys()),
     )
     return None
@@ -10034,6 +10005,20 @@ def _collect_channel_backgrounds(
     output_path.mkdir(parents=True, exist_ok=True)
 
     profiles = (settings or {}).get("acquisition_profiles", {}) or {}
+    # A two-camera config keeps one profile set per camera: use the active camera's
+    # profile for the same modality and objective when the key names the other one.
+    from microscope_control.config import sibling_for_detector
+
+    active = getattr(hardware, "_active_detector_id", None)
+    own_key = sibling_for_detector(profiles, profile_key, active)
+    if own_key != profile_key:
+        logger.info(
+            "Background collection: profile '%s' is for the other camera; using '%s' (%s)",
+            profile_key,
+            own_key,
+            active,
+        )
+        profile_key = own_key
     profile_cfg = profiles.get(profile_key) or {}
     modality_name = profile_cfg.get("modality") or modality
     modalities = (settings or {}).get("modalities", {}) or {}
@@ -10045,7 +10030,6 @@ def _collect_channel_backgrounds(
     # must not move the stage or re-light the field), so on a scope with one
     # camera per modality the active camera can still be the last profile's.
     detector = profile_cfg.get("detector")
-    active = getattr(hardware, "_active_detector_id", None)
     if (
         detector
         and active is not None

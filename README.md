@@ -157,7 +157,11 @@ on top of the existing angle-based flags:
 **For background collection:**
 - `--profile <key>` -- acquisition profile key to apply for background
   collection (e.g., `profile=Brightfield_10x` or `profile=IF_40x`). If
-  omitted, the profile is resolved automatically from modality and objective.
+  omitted, the profile is resolved automatically from modality, objective and the
+  camera Micro-Manager has active (`microscope_control.config.resolve_profile_key`,
+  the rule QPSC's `resolveProfileKey` also applies). A key that names the other
+  camera's profile when the config has one for the active camera (a two-camera config
+  keeps a profile set per camera) is swapped for the active camera's.
   The profile determines which camera, illumination intensity and device properties are
   applied during background collection.
 - `--channels "(id1,id2,...)"` -- when used with BGACQUIRE, enables
@@ -565,6 +569,16 @@ modalities:
 **If this block is missing or incomplete**, the server logs a warning and skips
 reconstruction; raw state images are still saved and can be reconstructed
 offline.
+
+**Two cameras, one config.** The LC-PolScope's camera-specific values (black level,
+the LC calibration stamps, each state's exposure and retardances, the objective's
+Micro-Manager preset group) sit in `per_detector` blocks keyed by detector ID. On every
+CONFIG the server reads Micro-Manager's active camera, records its detector on the
+`ConfigManager` (`active_detector`) and merges that camera's values in
+(`microscope_control.config.apply_detector_overlay`); every later reload of the YAML
+(ACQUIRE, BGACQUIRE, RECONFIG) applies the same camera. The log line
+`CONFIG: active camera ... (detector ...)` says which camera and whether the config had
+values for it.
 
 ### State Image Acquisition
 

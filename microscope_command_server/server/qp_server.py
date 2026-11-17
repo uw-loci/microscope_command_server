@@ -790,6 +790,9 @@ def initialize_server(demo: bool = False):
         logger.info("Initializing Micro-Manager connection...")
         core, studio = init_pycromanager_with_logger()
     hardware = PycromanagerHardware(core, studio, startup_settings)
+    # A camera switch (set_active_camera) tells the ConfigManager, so later config
+    # loads merge the new camera's per_detector values.
+    hardware.config_manager = config_manager
     # Every stop-and-snap autofocus reports its progress to the operator's display.
     from microscope_command_server.server.af_events import AF_EVENTS
 
