@@ -770,7 +770,9 @@ part `{"ok": bool, "since": epoch seconds or null, "message": text, "failures": 
 also has `known`, which is false when the hardware has no stage cache to report on. Nothing is
 probed: the states come from failures the server has already seen (`microscope_control`'s
 `hardware/health.py`), so the reply comes at once even while a part hangs. A failure in the report
-itself returns `{"error": <text>}`. Implementation: `server/handlers/hwstat.py`.
+itself returns `{"error": <text>}`. Implementation: `server/handlers/hwstat.py`; needs
+microscope_control `8a1affe` or later. QPSC's Live Viewer asks every 5 s and shows a red line
+such as *Server connected; Stage not responding since 12:40*.
 
 ## White balance per background profile (--wb-folder)
 
