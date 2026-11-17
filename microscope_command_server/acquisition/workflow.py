@@ -2922,6 +2922,9 @@ class AcquisitionContext:
     # Robust plane through completed_af_positions. See acquisition/focus_surface.py.
     # None until _setup_autofocus runs; inert unless --focus-surface says otherwise.
     focus_surface: Any = None
+    # focus_surface_max_tilt_uncertainty_um from the objective's autofocus YAML entry,
+    # or None for the module default.
+    focus_surface_max_tilt_uncertainty_um: Optional[float] = None
     first_tissue_autofocus_done: bool = False
     # The last Z a measurement accepted in this acquisition. A skipped autofocus falls
     # back to this rather than to hint_z, which is set once from the request and may be
@@ -4569,6 +4572,10 @@ def _configure_autofocus(ctx: AcquisitionContext) -> None:
     af_edge_retries = 2
     af_gap_index_multiplier = 3
     af_gap_spatial_multiplier = 2.0
+    # How far (um) an uncertain tilt may move the focus surface's prediction before the
+    # surface declines to seed tiles (see focus_surface.DEFAULT_MAX_TILT_UNCERTAINTY_UM).
+    # None keeps the module default.
+    af_surface_max_tilt_uncertainty_um = None
 
     current_objective = params.get("objective", "")
     af_settings_found = False
@@ -4617,6 +4624,9 @@ def _configure_autofocus(ctx: AcquisitionContext) -> None:
             )
             af_gap_spatial_multiplier = af_setting.get(
                 "gap_spatial_multiplier", af_gap_spatial_multiplier
+            )
+            af_surface_max_tilt_uncertainty_um = af_setting.get(
+                "focus_surface_max_tilt_uncertainty_um", af_surface_max_tilt_uncertainty_um
             )
             # Legacy support: old adaptive_initial_step_um -> sweep_range_um
             if "adaptive_initial_step_um" in af_setting and "sweep_range_um" not in af_setting:
@@ -4868,6 +4878,7 @@ def _configure_autofocus(ctx: AcquisitionContext) -> None:
     ctx.deferred_af_positions = set()
     ctx.first_tissue_autofocus_done = False
     ctx.completed_af_positions = []
+    ctx.focus_surface_max_tilt_uncertainty_um = af_surface_max_tilt_uncertainty_um
     ctx.focus_surface = _build_focus_surface(ctx)
 
 
@@ -4884,20 +4895,35 @@ def _build_focus_surface(ctx: "AcquisitionContext"):
     logger = ctx.logger
     mode = parse_mode(ctx.params.get("focus_surface_mode"), logger)
     # Hand it the region's own extent so the spread requirement scales to the geometry:
-    # a 0.5 mm-wide strip cannot produce 0.5 mm of spread and does not need to.
+    # a 0.5 mm-wide strip cannot produce 0.5 mm of spread and does not need to. The
+    # bounds tell the tilt-uncertainty check how far a prediction can be carried.
     extent = None
+    bounds = None
     if ctx.xy_positions:
         xy = np.asarray(ctx.xy_positions, dtype=float)
         extent = (
             float(np.ptp(xy[:, 0]) / 1000.0),
             float(np.ptp(xy[:, 1]) / 1000.0),
         )
-    surface = FocusSurface(mode=mode, logger=logger, region_extent_mm=extent)
+        bounds = (
+            float(xy[:, 0].min()),
+            float(xy[:, 0].max()),
+            float(xy[:, 1].min()),
+            float(xy[:, 1].max()),
+        )
+    kwargs = {}
+    tilt_limit = getattr(ctx, "focus_surface_max_tilt_uncertainty_um", None)
+    if tilt_limit is not None:
+        kwargs["max_tilt_uncertainty_um"] = float(tilt_limit)
+    surface = FocusSurface(
+        mode=mode, logger=logger, region_extent_mm=extent, region_bounds_um=bounds, **kwargs
+    )
     if surface.active:
         logger.info(
             "Focus surface ENABLED in '%s' mode: a robust plane is fitted through this "
             "region's autofocus results, and each new result is checked against it. "
-            "%s",
+            "%s It is used only once both tilts are known to %.2f um of focus across "
+            "the region.",
             mode,
             (
                 "Nothing acts on the result -- this run only reports what enforcement "
@@ -4905,6 +4931,7 @@ def _build_focus_surface(ctx: "AcquisitionContext"):
                 if mode == "observe"
                 else "Disagreeing results are replaced by the surface's prediction."
             ),
+            surface.max_tilt_uncertainty_um,
         )
     return surface
 

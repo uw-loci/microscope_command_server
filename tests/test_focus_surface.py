@@ -157,9 +157,12 @@ class TestCatchingTheWideSearchMisses:
     def test_the_gate_widens_with_a_noisier_fit(self):
         # A surface that fits poorly should be less willing to overrule a measurement.
         # The 5 um floor would mask the scaling at realistic noise levels (4 x 1.14 um
-        # is still under it), so drop the floor here to isolate the sigma term.
-        tight = feed(surface(reject_margin_um=0.5), tile_grid(), noise_um=0.2, seed=3)
-        loose = feed(surface(reject_margin_um=0.5), tile_grid(), noise_um=2.0, seed=3)
+        # is still under it), so drop the floor here to isolate the sigma term. At 2 um
+        # of noise the tilt itself is only known to about 1 um across this region, so
+        # the tilt-uncertainty limit is relaxed too: this test is about the gate.
+        kw = {"reject_margin_um": 0.5, "max_tilt_uncertainty_um": 5.0}
+        tight = feed(surface(**kw), tile_grid(), noise_um=0.2, seed=3)
+        loose = feed(surface(**kw), tile_grid(), noise_um=2.0, seed=3)
         x, y = CENTRE
         assert (
             loose.check(x, y, real_plane(x, y) + 9.0).gate_um
@@ -208,9 +211,11 @@ class TestGatesThatRealLogsCorrected:
         # The spread measure divided by the point count, so adding points to a thin
         # cloud SHRANK the measured spread. Measured consequence: a 16-point survey was
         # refused on five regions where the same region's 9-point survey was licensed.
+        # The tilt-uncertainty limit is relaxed: nine points with 0.5 um of noise over
+        # 1.2 mm know the tilt to about 0.5 um, and this test is about the spread measure.
         tiles = tile_grid(n_side=4, pitch_um=600.0)
-        small = feed(surface(), tiles[:9], seed=2)
-        large = feed(surface(), tiles, seed=2)
+        small = feed(surface(max_tilt_uncertainty_um=5.0), tiles[:9], seed=2)
+        large = feed(surface(max_tilt_uncertainty_um=5.0), tiles, seed=2)
         assert small.licensed
         assert large.licensed, large.describe()
         assert large.summary()["spread_minor_mm"] >= small.summary()["spread_minor_mm"]
@@ -538,3 +543,137 @@ class TestClearerEvidenceWins:
             v = s.check(x2, y2, slot4_tissue(x2, y2), quality=0.98)
             assert not v.would_reject
             assert s.summary()["clearer_peak_resets"] == 1
+
+
+# LC-PolScope 20x, 2026-11-15, region 35005_24510 (server_session_20261115_123621.log).
+# A diagonal tissue strip, 6.7 x 0.9 mm along its own axes; the region's 53 tile centres
+# span 7451 x 2980 um on the stage (the log's "Spatial grid AF ... over 7451x2980 um
+# area", which is x_max - x_min by y_max - y_min of the tile positions). The bounds are
+# inferred from that and the 496.74 um tile step: one step beyond the outermost AF tiles
+# on each side, which also matches the 702 um (one diagonal step) the log reports from
+# the first and last tiles to their nearest AF tile. Points are the
+# autofocus results fed to the surface, in order: the pre-acquisition AF (Z logged to two
+# decimals), the eight focus-survey points (all on ONE row, Y = 5310.67), then the 22
+# results of the tile loop (drift sweeps that moved the stage, and one standard AF at
+# tile 32; sweeps that held their Z were not recorded, as in workflow.py).
+INCIDENT_EXTENT_MM = (7.451, 2.980)
+INCIDENT_BOUNDS_UM = (2278.26, 9729.40, 3820.44, 6800.90)
+INCIDENT_SURVEY = [
+    (2775.005, 6304.155, 44.48),
+    (4265.232, 5310.67, 45.20),
+    (4761.975, 5310.67, 45.70),
+    (5258.717, 5310.67, 45.50),
+    (5755.459, 5310.67, 44.20),
+    (6252.202, 5310.67, 44.60),
+    (6748.944, 5310.67, 44.10),
+    (7245.687, 5310.67, 44.30),
+    (7742.429, 5310.67, 44.70),
+]
+INCIDENT_TILE_LOOP = [
+    (2775.005, 6304.155, 44.786),
+    (3271.747, 6304.155, 43.856),
+    (4761.975, 5807.413, 45.832),
+    (4265.232, 5807.413, 45.551),
+    (3768.490, 5807.413, 45.898),
+    (3271.747, 5807.413, 46.498),
+    (2775.005, 5807.413, 46.969),
+    (4265.232, 5310.670, 47.617),
+    (4761.975, 5310.670, 47.261),
+    (5258.717, 5310.670, 46.812),
+    (5755.459, 5310.670, 46.486),
+    (6252.202, 5310.670, 46.076),
+    (6748.944, 5310.670, 45.494),
+    (7245.687, 5310.670, 45.022),
+    (8735.914, 4813.928, 45.745),
+    (8239.171, 4813.928, 45.702),
+    (7742.429, 4813.928, 46.408),
+    (6748.944, 4813.928, 47.616),
+    (6252.202, 4813.928, 48.123),
+    (5755.459, 4813.928, 48.385),
+    (8239.171, 4317.185, 48.532),
+    (9232.656, 4317.185, 47.193),
+]
+
+
+class TestTiltMustBeDeterminedOnBothAxes:
+    """The 2026-11-15 LC-PolScope strip: licensed on spread, not on evidence.
+
+    After the survey the surface had 0.8 mm of spread (above the 0.5 mm floor) and 0.39
+    um RMS, so it licensed and seeded every tile. But eight of its nine points sat on
+    one row: the ninth alone set the tilt across the strip, which then wandered from
+    -1.42 to -4.0 um/mm as the loop fed it results; seeds ran 1-1.5 um low and tile 21
+    came out soft. Turning the surface off fixed it.
+    """
+
+    def incident(self, **kw):
+        return surface(
+            region_extent_mm=INCIDENT_EXTENT_MM, region_bounds_um=INCIDENT_BOUNDS_UM, **kw
+        )
+
+    def test_the_replay_reproduces_the_incident_under_the_spread_rule_alone(self):
+        s = self.incident(max_tilt_uncertainty_um=float("inf"))
+        for x, y, z in INCIDENT_SURVEY:
+            s.add(x, y, z)
+        assert s.licensed, s.describe()
+        summary = s.summary()
+        # The log: "z = 44.75 -0.34*X_mm -1.42*Y_mm ... 9/9 inliers at 0.39 um RMS".
+        assert summary["tilt_x_um_per_mm"] == pytest.approx(-0.34, abs=0.02)
+        assert summary["tilt_y_um_per_mm"] == pytest.approx(-1.42, abs=0.02)
+        assert summary["inlier_rms_um"] == pytest.approx(0.39, abs=0.02)
+
+    def test_it_does_not_license_where_the_incident_did(self):
+        s = self.incident()
+        for x, y, z in INCIDENT_SURVEY:
+            s.add(x, y, z)
+        assert not s.licensed
+        assert not s.enforcing
+        assert s.predict(4265.232, 5807.413) is None
+        reason = s.summary()["unlicensed_reason"]
+        assert "tilt along Y is not determined" in reason, reason
+        # The fit's centre (5645, 5421) is 1.60 mm from the region's far edge in Y.
+        assert "carried 1.60 mm to the region's far edge in Y" in reason, reason
+        assert reason.isascii()
+        # Y, across the strip, is the undetermined axis, by a wide margin.
+        assert s.summary()["tilt_uncertainty_um"]["Y"] > 2 * s.max_tilt_uncertainty_um
+
+    def test_it_never_enforces_on_that_strip(self):
+        s = self.incident()
+        for x, y, z in INCIDENT_SURVEY + INCIDENT_TILE_LOOP:
+            v = s.check(x, y, z)
+            assert not v.enforced
+            assert s.predict(x, y) is None
+            s.add(x, y, z)
+        assert not s.enforcing
+
+    def test_a_region_whose_tilts_are_both_measured_still_licenses(self):
+        # About the incident's noise (0.4 um) on a grid that covers the region in both
+        # axes determines both tilts well inside the limit.
+        grid = np.asarray(tile_grid())
+        bounds = (grid[:, 0].min(), grid[:, 0].max(), grid[:, 1].min(), grid[:, 1].max())
+        s = feed(surface(region_bounds_um=bounds), tile_grid(), noise_um=0.4, seed=7)
+        assert s.licensed, s.describe()
+        assert max(s.summary()["tilt_uncertainty_um"].values()) <= s.max_tilt_uncertainty_um
+
+    def test_without_a_region_extent_the_points_own_span_is_used(self):
+        s = surface()
+        for x, y, z in INCIDENT_SURVEY:
+            s.add(x, y, z)
+        assert not s.licensed
+        reason = s.summary()["unlicensed_reason"]
+        # The points span 0.99 mm in Y (one point off the surveyed row).
+        assert "carried 0.99 mm across the points in Y" in reason, reason
+
+    def test_the_whole_extent_is_used_when_only_the_extent_is_known(self):
+        s = surface(region_extent_mm=INCIDENT_EXTENT_MM)
+        for x, y, z in INCIDENT_SURVEY:
+            s.add(x, y, z)
+        assert "carried 2.98 mm across the region in Y" in s.summary()["unlicensed_reason"]
+
+    def test_a_region_one_column_wide_does_not_need_the_tilt_across_it(self):
+        # Tiles that all share an X are never predicted at another X, so the X tilt
+        # does not matter there; the spread check alone speaks to that geometry.
+        s = surface(region_extent_mm=(0.0, 6.0))
+        for i in range(10):
+            y = CENTRE[1] + i * 600.0
+            s.add(CENTRE[0], y, real_plane(CENTRE[0], y))
+        assert [axis for axis, *_ in s.tilt_uncertainty()] == ["Y"]

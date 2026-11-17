@@ -41,6 +41,14 @@ How it stays honest
 * **It refuses to speak when it does not fit.** Above ``max_rms_um`` the sample is not
   planar -- a folded or detached section, a cytology smear -- and the surface returns
   None, which drops the caller back to today's nearest-neighbour behaviour.
+* **It refuses to speak until both tilts are measured.** Spread alone is not enough:
+  on LC-PolScope 20x on 2026-11-15 a diagonal 6.7 x 0.9 mm strip licensed after its
+  survey with 0.8 mm of spread, but eight of its nine points sat on one row and the
+  ninth alone set the tilt across the strip. That tilt then wandered from 1.4 to 4.0
+  um/mm as results came in, seeds ran 1-1.5 um low and a tile came out soft. So the
+  fit also reports the standard error of each slope, and the surface is licensed only
+  when that error, carried from the fit's centre to the region's far edge on its axis,
+  moves the prediction by no more than ``max_tilt_uncertainty_um``.
 * **The fit is robust.** RANSAC then refit on inliers: one 70 um miss drags a
   least-squares plane several microns, and that is exactly the input we expect.
 * **It can be overruled by reality.** When several consecutive rejected measurements
@@ -119,6 +127,18 @@ DEFAULT_MIN_SPREAD_MM = 0.5
 # floor OR this fraction of the region's own narrow dimension, whichever is smaller.
 DEFAULT_SPREAD_COVERAGE = 0.6
 
+# How far (um) an uncertain tilt may move the predicted focus before the surface
+# declines. Each slope's standard error (um/mm, from the fit's residuals and where its
+# points sit) is multiplied by the distance (mm) the prediction is carried on that axis:
+# from the fit's centre to the region's farther edge when the region's bounds are known
+# (early in a raster the points sit at one end, so that is most of the region), else the
+# whole region extent, else the points' own span. 0.5 um is a quarter of the 20x depth
+# of field; on the 2026-11-15 LC-PolScope strip the seeds that made a visibly soft tile
+# were 1-1.5 um off, and the tilt across that strip stayed uncertain by more than 0.7 um
+# for its whole run. Per objective: ``focus_surface_max_tilt_uncertainty_um`` in the
+# autofocus YAML entry.
+DEFAULT_MAX_TILT_UNCERTAINTY_UM = 0.5
+
 # Consecutive rejections that agree with each other and not with the surface, after
 # which the surface concedes that the sample moved.
 RESURFACE_AFTER_REJECTIONS = 3
@@ -187,6 +207,11 @@ class _Fit:
     bounds: Optional[Tuple[float, float, float, float]] = None
     # Which of the points the fit was made from are its inliers, in point order.
     inliers: Optional[np.ndarray] = None
+    # Standard errors (um/mm) of the X and Y slopes at the centre; inf when the points
+    # cannot determine that slope at all (collinear, or no degrees of freedom left).
+    slope_se: Tuple[float, float] = (float("inf"), float("inf"))
+    # Peak-to-peak extent (mm) of the inlier points along stage X and Y.
+    axis_span_mm: Tuple[float, float] = (0.0, 0.0)
 
     @property
     def quadratic(self) -> bool:
@@ -239,9 +264,13 @@ class FocusSurface:
     min_inlier_fraction: float = DEFAULT_MIN_INLIER_FRACTION
     min_spread_mm: float = DEFAULT_MIN_SPREAD_MM
     spread_coverage: float = DEFAULT_SPREAD_COVERAGE
+    max_tilt_uncertainty_um: float = DEFAULT_MAX_TILT_UNCERTAINTY_UM
     # (dx, dy) extent of the tiles this surface will be asked about, in mm. Lets the
     # spread requirement scale to the region instead of assuming every region is wide.
     region_extent_mm: Optional[Tuple[float, float]] = None
+    # (xmin, xmax, ymin, ymax) of those tiles, um. Tells the tilt-uncertainty check how
+    # far from the fit's centre a prediction can be asked for.
+    region_bounds_um: Optional[Tuple[float, float, float, float]] = None
     inlier_band_um: float = DEFAULT_INLIER_BAND_UM
     reject_margin_um: float = DEFAULT_REJECT_MARGIN_UM
     reject_sigma: float = DEFAULT_REJECT_SIGMA
@@ -280,10 +309,17 @@ class FocusSurface:
     def _unlicensed_reason(self) -> Optional[str]:
         """Why the surface may not be consulted, or None when it may be.
 
-        Four separate ways a fit can look fine and not be:
+        Five separate ways a fit can look fine and not be:
         too few agreeing points, a residual too large to be a plane, a majority that
-        does not agree with it, and points that do not spread far enough to constrain
-        both tilts. The last two were each found by a test that the first two passed.
+        does not agree with it, points that do not spread far enough to constrain
+        both tilts, and a tilt that the points do constrain but too loosely to carry
+        across the region. Each of the last three was found by a case the earlier ones
+        passed.
+
+        The spread check stays alongside the tilt-uncertainty check: it needs no noise
+        estimate, so it still refuses a handful of points that happen to agree almost
+        exactly along a near-line, where a residual close to zero would make the
+        standard error look small.
         """
         if not self.active:
             return "focus surface off"
@@ -318,7 +354,48 @@ class FocusSurface:
                 f"(need {required:.2f} mm{scaled}) -- they do not constrain a tilt "
                 f"in both axes"
             )
+        limit = self.max_tilt_uncertainty_um
+        undetermined = [
+            _describe_undetermined_tilt(axis, se, reach, basis, dz, limit)
+            for axis, se, reach, basis, dz in self.tilt_uncertainty()
+            if dz > limit
+        ]
+        if undetermined:
+            return "; ".join(undetermined) + " -- seeding from the nearest autofocus instead"
         return None
+
+    def tilt_uncertainty(self) -> List[Tuple[str, float, float, str, float]]:
+        """Per stage axis: (axis, slope SE um/mm, reach mm, basis, Z uncertainty um).
+
+        ``reach`` is how far from the fit's centre a prediction is carried on that axis:
+        to the region's farther edge when its bounds are known, else the region's whole
+        extent, else the span of the fit's own points (``basis`` names which, for the
+        log). An axis the region does not extend along (one column of tiles) is never
+        extrapolated over, so its tilt does not matter and it is left out. Empty when
+        there is no fit.
+        """
+        f = self._fit
+        if f is None:
+            return []
+        out = []
+        for i, axis in enumerate(("X", "Y")):
+            if self.region_bounds_um is not None:
+                lo, hi = self.region_bounds_um[2 * i], self.region_bounds_um[2 * i + 1]
+                extent = (hi - lo) / 1000.0
+                reach = max(abs(lo - f.centre[i]), abs(hi - f.centre[i])) / 1000.0
+                basis = "to the region's far edge"
+            elif self.region_extent_mm is not None:
+                extent = reach = float(self.region_extent_mm[i])
+                basis = "across the region"
+            else:
+                extent = reach = float(f.axis_span_mm[i])
+                basis = "across the points"
+            if not extent > 1e-6:
+                continue
+            se = float(f.slope_se[i])
+            dz = se * reach if np.isfinite(se) else float("inf")
+            out.append((axis, se, float(reach), basis, float(dz)))
+        return out
 
     def required_spread_mm(self) -> float:
         """How much spread this region's geometry can reasonably be asked for."""
@@ -616,6 +693,10 @@ class FocusSurface:
                     "spread_major_mm": round(self._fit.spread_mm[0], 3),
                     "spread_minor_mm": round(self._fit.spread_mm[1], 3),
                     "required_spread_mm": round(self.required_spread_mm(), 3),
+                    "tilt_uncertainty_um": {
+                        axis: (round(dz, 3) if np.isfinite(dz) else None)
+                        for axis, _, _, _, dz in self.tilt_uncertainty()
+                    },
                     "model": self._fit.model(),
                 }
             )
@@ -696,9 +777,21 @@ def _make_fit(
     spread: Tuple[float, float],
     inlier_xy: Optional[np.ndarray],
     inliers: Optional[np.ndarray] = None,
+    slope_se: Tuple[float, float] = (float("inf"), float("inf")),
+    axis_span_mm: Tuple[float, float] = (0.0, 0.0),
 ) -> _Fit:
     if len(coef) == 3:
-        return _Fit(centre, *map(float, coef), rms, n_inliers, n_points, spread, inliers=inliers)
+        return _Fit(
+            centre,
+            *map(float, coef),
+            rms,
+            n_inliers,
+            n_points,
+            spread,
+            inliers=inliers,
+            slope_se=slope_se,
+            axis_span_mm=axis_span_mm,
+        )
     bounds = (
         float(inlier_xy[:, 0].min()),
         float(inlier_xy[:, 0].max()),
@@ -719,6 +812,8 @@ def _make_fit(
         float(coef[5]),
         bounds,
         inliers,
+        slope_se,
+        axis_span_mm,
     )
 
 
@@ -744,6 +839,52 @@ def _spread_mm(xy: np.ndarray) -> Tuple[float, float]:
     major = float(np.ptp(projected[:, 0]))
     minor = float(np.ptp(projected[:, 1])) if projected.shape[1] > 1 else 0.0
     return (major, minor)
+
+
+def _slope_standard_errors(A: np.ndarray, resid: np.ndarray) -> Tuple[float, float]:
+    """Standard errors (um/mm) of the X and Y slope terms of a least-squares fit.
+
+    ``A`` is the design matrix of the points the fit was made from (columns 1 and 2
+    are the slopes, in mm) and ``resid`` their residuals. Ordinary least squares:
+    sigma^2 = SSR / (n - p), cov = sigma^2 * inv(A^T A). A slope the points cannot
+    determine -- collinear points, or no residual degrees of freedom -- is inf.
+    """
+    inf = (float("inf"), float("inf"))
+    n, p = A.shape
+    if n <= p or np.linalg.matrix_rank(A) < p:
+        return inf
+    sigma2 = float(np.sum(resid**2)) / (n - p)
+    try:
+        cov = np.linalg.inv(A.T @ A)
+    except np.linalg.LinAlgError:
+        return inf
+    out = []
+    for k in (1, 2):
+        v = sigma2 * float(cov[k, k])
+        out.append(float(np.sqrt(v)) if np.isfinite(v) and v >= 0 else float("inf"))
+    return (out[0], out[1])
+
+
+def _axis_span_mm(xy: np.ndarray) -> Tuple[float, float]:
+    """Peak-to-peak extent (mm) of the points along stage X and Y."""
+    if len(xy) == 0:
+        return (0.0, 0.0)
+    return (float(np.ptp(xy[:, 0]) / 1000.0), float(np.ptp(xy[:, 1]) / 1000.0))
+
+
+def _describe_undetermined_tilt(
+    axis: str, se: float, reach: float, basis: str, dz: float, limit: float
+) -> str:
+    """One clause of the unlicensed reason for an axis whose tilt is not determined."""
+    if not np.isfinite(dz):
+        return (
+            f"the tilt along {axis} is not determined at all: the points carry no "
+            f"information about it, and the region reaches {reach:.2f} mm in {axis}"
+        )
+    return (
+        f"the tilt along {axis} is not determined: +/-{se:.2f} um/mm carried {reach:.2f} "
+        f"mm {basis} in {axis} is +/-{dz:.2f} um of focus (limit {limit:.2f} um)"
+    )
 
 
 def _ransac_fit(
@@ -795,6 +936,8 @@ def _ransac_fit(
             (0.0, 0.0),
             None,
             np.ones(n, dtype=bool),
+            _slope_standard_errors(A, resid),
+            _axis_span_mm(pts[:, :2]),
         )
 
     coef, *_ = np.linalg.lstsq(A[best_inliers], z[best_inliers], rcond=None)
@@ -812,6 +955,8 @@ def _ransac_fit(
         _spread_mm(pts[inliers, :2]),
         pts[inliers, :2],
         inliers,
+        _slope_standard_errors(A[inliers], resid[inliers]),
+        _axis_span_mm(pts[inliers, :2]),
     )
 
 

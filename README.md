@@ -1643,6 +1643,26 @@ The surface refuses to speak unless:
   one raster column are six points on a line; they constrain the tilt along
   the column and say nothing across it. The server checks this and refuses to
   extrapolate a tilt in an unconstrained axis.
+- Both tilts are actually determined. The fit reports the standard error of
+  its X and Y slopes (from its residuals and where its points sit); each is
+  multiplied by how far a prediction is carried on that axis -- from the fit's
+  centre to the region's farther edge -- and both results must be at most
+  0.5 um. The limit is per objective: `focus_surface_max_tilt_uncertainty_um`
+  in the objective's entry of `autofocus_<scope>.yml` (optional; 0.5 when
+  absent). The log names the axis and the numbers, for example `the tilt along
+  Y is not determined: +/-0.71 um/mm carried 1.60 mm to the region's far edge
+  in Y is +/-1.14 um of focus (limit 0.50 um)`. Why: on 2026-11-15
+  (LC-PolScope 20x) a diagonal 6.7 x 0.9 mm strip licensed after its survey
+  with 0.8 mm of spread, but eight of the nine points sat on one row, so one
+  point set the tilt across the strip. That tilt moved from 1.4 to 4.0 um/mm
+  as results came in, seeds ran 1-1.5 um low and a tile came out soft.
+  Replaying that region, the surface now never licenses and every tile is
+  seeded from the nearest autofocus result. The cost: replaying the 30 regions
+  in `OtherDocuments/logs` without their survey points, regions license after
+  a median of 24 measurements instead of 7 (up to 275 on 19 mm regions scanned
+  in raster order), and the surface is licensed for a median 44% of
+  measurements instead of 78%. A focus survey spread over the region shortens
+  that.
 
 When any check fails, the mode is logged as "NOT licensed: ..." and the
 acquisition falls back to the nearest-neighbour seeding behavior from before
