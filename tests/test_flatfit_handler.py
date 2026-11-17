@@ -66,6 +66,37 @@ def test_fits_a_folder_with_spaces_in_its_name(tmp_path):
     assert summary["flatfield_max"] > summary["flatfield_min"]
     assert (profile / "flatfield.tif").exists()
     assert "top PMT" in (profile / "profile.yml").read_text()
+    assert "objective:" not in (profile / "profile.yml").read_text()
+
+
+def test_the_objective_and_detector_are_recorded(tmp_path):
+    import yaml
+
+    rng = np.random.default_rng(2)
+    tiles = tmp_path / "tiles"
+    tiles.mkdir()
+    y, x = np.mgrid[0:64, 0:64] / 63.0
+    for index in range(10):
+        tile = 6500 + rng.uniform(500, 900) * (1 + 0.2 * (x - 0.5)) + rng.normal(0, 20, (64, 64))
+        tf.imwrite(tiles / f"{index}.tif", tile.astype(np.uint16))
+    profile = tmp_path / "profile"
+
+    reply = _call(
+        json.dumps(
+            {
+                "tiles": str(tiles),
+                "profile": str(profile),
+                "offset": 6500.0,
+                "objective": "LOCI_OBJECTIVE_NIKON_20X_001",
+                "detector": "LOCI_DETECTOR_PMT_001",
+            }
+        ).encode()
+    )
+
+    assert reply.startswith("SUCCESS:")
+    record = yaml.safe_load((profile / "profile.yml").read_text())
+    assert record["objective"] == "LOCI_OBJECTIVE_NIKON_20X_001"
+    assert record["detector"] == "LOCI_DETECTOR_PMT_001"
 
 
 def test_a_region_of_channel_folders_fits_each_channel(tmp_path):

@@ -41,6 +41,10 @@ def _fit(request):
     targets = [(d.name, d, profile_folder / d.name) for d in channel_folders]
     targets = targets or [(None, tiles_path, profile_folder)]
 
+    # The hardware the tiles were acquired with, when the client knows it (QPSC reads it from
+    # the acquisition command file beside its tiles). An acquisition warns when they differ.
+    hardware_record = {key: request[key] for key in ("objective", "detector") if request.get(key)}
+
     summaries = []
     try:
         for name, source, destination in targets:
@@ -54,6 +58,7 @@ def _fit(request):
                     "channel": channel,  # a MicroManager index; Tiles to Pyramid reads it
                     "channel_id": name,
                     "label": request.get("label", ""),
+                    **hardware_record,
                 },
             )
             profile.save(destination)
@@ -87,7 +92,8 @@ def handle_flatfit(conn, client, hardware, settings, **kwargs):
 
     The payload is one JSON object, since folder paths can hold spaces:
     ``{"tiles": <folder>, "profile": <folder>, "channel": <int|null>, "offset": <float|null>,
-    "label": <text>}`` then END_MARKER.
+    "label": <text>, "objective": <id|null>, "detector": <id|null>}`` then END_MARKER.
+    ``objective`` and ``detector``, when given, are stored in each ``profile.yml``.
 
     With no channel given and channel folders under ``tiles`` (each holding a
     TileConfiguration.txt, as a QPSC region does), every channel is fitted on its own and saved to

@@ -723,8 +723,10 @@ Viewer Camera tab uses it to choose the one exposure all states share. Implement
 Fits a BaSiC flat-field profile from a folder of tiles and saves it, for detectors with no background
 image such as a PMT. The fit can take minutes and runs on its own thread, so a client's command socket
 stays free for cancel and status polls. `FLATFIT` takes JSON, because a folder path can hold spaces:
-`{"tiles": <folder>, "profile": <folder>, "channel": <int|null>, "offset": <float|null>, "label": <text>}`,
-and replies `STARTED` or `FAILED:<reason>`. Only one fit runs at a time.
+`{"tiles": <folder>, "profile": <folder>, "channel": <int|null>, "offset": <float|null>, "label": <text>,
+"objective": <id|null>, "detector": <id|null>}`, and replies `STARTED` or `FAILED:<reason>`. Only one
+fit runs at a time. `objective` and `detector`, when given, are written to each `profile.yml` so an
+acquisition can warn when it uses a profile fitted on other hardware.
 `FLATPOLL` replies `RUNNING`, `SUCCESS:{"profiles": [...]}` with `channel`, `flatfield_min`,
 `flatfield_max`, `offset`, `images_used` and `images_read` for each, or `FAILED:<reason>`. Every reply
 ends with a newline.
