@@ -762,6 +762,16 @@ When Micro-Manager reports pixel size 0, GETPXSZ also logs (once per state) ever
 preset with the properties it needs and their current values, e.g.
 `'20x 0.4 ORYX' needs DObjective.Label=20x (now 4x) <- differs`.
 
+## Hardware status (HWSTAT)
+
+`HWSTAT` reports which part of the microscope is not answering. The request is the 8-byte command
+alone; the reply is a 4-byte big-endian length plus UTF-8 JSON: `{"stage": {...}, "camera": {...}, "micromanager": {...}}`, each
+part `{"ok": bool, "since": epoch seconds or null, "message": text, "failures": int}`. The stage part
+also has `known`, which is false when the hardware has no stage cache to report on. Nothing is
+probed: the states come from failures the server has already seen (`microscope_control`'s
+`hardware/health.py`), so the reply comes at once even while a part hangs. A failure in the report
+itself returns `{"error": <text>}`. Implementation: `server/handlers/hwstat.py`.
+
 ## White balance per background profile (--wb-folder)
 
 PPM white balance (per-angle and simple) is stored scope-wide in
