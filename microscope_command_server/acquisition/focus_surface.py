@@ -41,14 +41,19 @@ How it stays honest
 * **It refuses to speak when it does not fit.** Above ``max_rms_um`` the sample is not
   planar -- a folded or detached section, a cytology smear -- and the surface returns
   None, which drops the caller back to today's nearest-neighbour behaviour.
-* **It refuses to speak until both tilts are measured.** Spread alone is not enough:
-  on LC-PolScope 20x on 2026-11-15 a diagonal 6.7 x 0.9 mm strip licensed after its
-  survey with 0.8 mm of spread, but eight of its nine points sat on one row and the
-  ninth alone set the tilt across the strip. That tilt then wandered from 1.4 to 4.0
-  um/mm as results came in, seeds ran 1-1.5 um low and a tile came out soft. So the
-  fit also reports the standard error of each slope, and the surface is licensed only
-  when that error, carried from the fit's centre to the region's far edge on its axis,
-  moves the prediction by no more than ``max_tilt_uncertainty_um``.
+* **It checks before it seeds.** Two licences, two jobs. CHECKING -- comparing each
+  autofocus result with the surface and replacing a wide-search miss -- needs only the
+  rules above and below: a miss is tens of um, and a tilt known to a micron or two
+  still tells it from a measurement. SEEDING -- the Z an autofocus tile starts from and
+  the Z every other tile is taken at -- needs the tilt itself, on both axes. On
+  LC-PolScope 20x on 2026-11-15 a diagonal 6.7 x 0.9 mm strip licensed after its survey
+  with 0.8 mm of spread, but eight of its nine points sat on one row and the ninth
+  alone set the tilt across the strip. That tilt then wandered from 1.4 to 4.0 um/mm
+  as results came in, seeds ran 1-1.5 um low and a tile came out soft. So the fit also
+  reports the standard error of each slope, and the surface seeds only when that
+  error, carried from the fit's centre to the region's far edge on its axis, moves the
+  prediction by no more than ``max_tilt_uncertainty_um``. Until then tiles are seeded
+  from the nearest autofocus result, and the surface still checks results.
 * **The fit is robust.** RANSAC then refit on inliers: one 70 um miss drags a
   least-squares plane several microns, and that is exactly the input we expect.
 * **It can be overruled by reality.** When several consecutive rejected measurements
@@ -128,7 +133,7 @@ DEFAULT_MIN_SPREAD_MM = 0.5
 DEFAULT_SPREAD_COVERAGE = 0.6
 
 # How far (um) an uncertain tilt may move the predicted focus before the surface
-# declines. Each slope's standard error (um/mm, from the fit's residuals and where its
+# declines to SEED (checking is not affected). Each slope's standard error (um/mm, from the fit's residuals and where its
 # points sit) is multiplied by the distance (mm) the prediction is carried on that axis:
 # from the fit's centre to the region's farther edge when the region's bounds are known
 # (early in a raster the points sit at one end, so that is most of the region), else the
@@ -303,23 +308,40 @@ class FocusSurface:
 
     @property
     def licensed(self) -> bool:
-        """Whether the fit is good enough to be worth consulting."""
+        """Licensed for CHECKING: whether results may be compared with the surface."""
         return self._unlicensed_reason() is None
 
+    @property
+    def seeding(self) -> bool:
+        """Licensed for SEEDING: whether tiles may start from, or be taken at, its Z.
+
+        Checking plus both tilts determined (see ``tilt_uncertainty``).
+        """
+        return self.seeding_reason() is None
+
+    def seeding_reason(self) -> Optional[str]:
+        """Why the surface may not seed tiles, or None when it may."""
+        why = self._unlicensed_reason()
+        if why is not None:
+            return why
+        limit = self.max_tilt_uncertainty_um
+        undetermined = [
+            _describe_undetermined_tilt(axis, se, reach, basis, dz, limit)
+            for axis, se, reach, basis, dz in self.tilt_uncertainty()
+            if dz > limit
+        ]
+        if undetermined:
+            return "; ".join(undetermined) + " -- seeding from the nearest autofocus instead"
+        return None
+
     def _unlicensed_reason(self) -> Optional[str]:
-        """Why the surface may not be consulted, or None when it may be.
+        """Why the surface may not check results, or None when it may.
 
-        Five separate ways a fit can look fine and not be:
+        Four separate ways a fit can look fine and not be:
         too few agreeing points, a residual too large to be a plane, a majority that
-        does not agree with it, points that do not spread far enough to constrain
-        both tilts, and a tilt that the points do constrain but too loosely to carry
-        across the region. Each of the last three was found by a case the earlier ones
-        passed.
-
-        The spread check stays alongside the tilt-uncertainty check: it needs no noise
-        estimate, so it still refuses a handful of points that happen to agree almost
-        exactly along a near-line, where a residual close to zero would make the
-        standard error look small.
+        does not agree with it, and points that do not spread far enough to constrain
+        both tilts. The last two were each found by a test that the first two passed.
+        Seeding asks more again: ``seeding_reason``.
         """
         if not self.active:
             return "focus surface off"
@@ -354,14 +376,6 @@ class FocusSurface:
                 f"(need {required:.2f} mm{scaled}) -- they do not constrain a tilt "
                 f"in both axes"
             )
-        limit = self.max_tilt_uncertainty_um
-        undetermined = [
-            _describe_undetermined_tilt(axis, se, reach, basis, dz, limit)
-            for axis, se, reach, basis, dz in self.tilt_uncertainty()
-            if dz > limit
-        ]
-        if undetermined:
-            return "; ".join(undetermined) + " -- seeding from the nearest autofocus instead"
         return None
 
     def tilt_uncertainty(self) -> List[Tuple[str, float, float, str, float]]:
@@ -408,7 +422,7 @@ class FocusSurface:
 
     @property
     def enforcing(self) -> bool:
-        """Whether the caller should act on this surface's opinion."""
+        """Whether the caller should act on this surface's checks (enforce mode)."""
         return self.mode == MODE_ENFORCE and self.licensed
 
     # ---------- learning ----------
@@ -443,8 +457,14 @@ class FocusSurface:
     # ---------- using ----------
 
     def predict(self, x: float, y: float) -> Optional[float]:
-        """Predicted focus Z, or None when the surface is not licensed to say."""
+        """Predicted focus Z for CHECKING, or None when not licensed for that."""
         if not self.licensed:
+            return None
+        return float(self._fit.predict(x, y))
+
+    def seed_z(self, x: float, y: float) -> Optional[float]:
+        """Predicted focus Z to SEED a tile with, or None when not licensed for that."""
+        if not self.seeding:
             return None
         return float(self._fit.predict(x, y))
 
@@ -651,7 +671,13 @@ class FocusSurface:
             )
         f = self._fit
         why = self._unlicensed_reason()
-        verdict = "licensed" if why is None else f"NOT licensed: {why}"
+        seed_why = self.seeding_reason()
+        if why is not None:
+            verdict = f"NOT licensed for checking or seeding: {why}"
+        elif seed_why is not None:
+            verdict = f"checking, NOT seeding: {seed_why}"
+        else:
+            verdict = "checking and seeding"
         curve = (
             f" {f.qxx:+.3f}*X_mm^2 {f.qxy:+.3f}*X_mm*Y_mm {f.qyy:+.3f}*Y_mm^2"
             if f.quadratic
@@ -674,13 +700,16 @@ class FocusSurface:
             "would_reject": self._n_would_reject,
             "resurfaces": self._n_resurfaces,
             "clearer_peak_resets": self._n_clearer_peak_resets,
-            "licensed": self.licensed,
+            # The two licences: checking results, and seeding tiles.
+            "checking": self.licensed,
+            "seeding": self.seeding,
             # Always present, including when there is no fit at all -- a summary that
             # omits the reason precisely when the surface did nothing is the least
             # useful version of itself. Replaying real logs turned up regions with one
             # usable measurement in ninety tiles, and the summary said only "licensed:
             # false".
-            "unlicensed_reason": self._unlicensed_reason(),
+            "checking_reason": self._unlicensed_reason(),
+            "seeding_reason": self.seeding_reason(),
         }
         if self._fit is not None:
             out.update(
@@ -717,14 +746,18 @@ class FocusSurface:
         next region on the slide starts from hundreds of points instead of the two or
         three measured at alignment. None when there is no fit at all; a fit that is not
         licensed is still written, with ``licensed: false`` and the reason.
+
+        ``licensed`` is the SEEDING licence: QPSC predicts later regions' focus from this
+        record, which is seeding. ``checking`` says whether it was licensed to check.
         """
         f = self._fit
         if not self.active or f is None:
             return None
         return {
             "model": f.model(),
-            "licensed": self.licensed,
-            "unlicensed_reason": self._unlicensed_reason(),
+            "licensed": self.seeding,
+            "unlicensed_reason": self.seeding_reason(),
+            "checking": self.licensed,
             "mode": self.mode,
             "centre_x_um": f.centre[0],
             "centre_y_um": f.centre[1],

@@ -157,12 +157,9 @@ class TestCatchingTheWideSearchMisses:
     def test_the_gate_widens_with_a_noisier_fit(self):
         # A surface that fits poorly should be less willing to overrule a measurement.
         # The 5 um floor would mask the scaling at realistic noise levels (4 x 1.14 um
-        # is still under it), so drop the floor here to isolate the sigma term. At 2 um
-        # of noise the tilt itself is only known to about 1 um across this region, so
-        # the tilt-uncertainty limit is relaxed too: this test is about the gate.
-        kw = {"reject_margin_um": 0.5, "max_tilt_uncertainty_um": 5.0}
-        tight = feed(surface(**kw), tile_grid(), noise_um=0.2, seed=3)
-        loose = feed(surface(**kw), tile_grid(), noise_um=2.0, seed=3)
+        # is still under it), so drop the floor here to isolate the sigma term.
+        tight = feed(surface(reject_margin_um=0.5), tile_grid(), noise_um=0.2, seed=3)
+        loose = feed(surface(reject_margin_um=0.5), tile_grid(), noise_um=2.0, seed=3)
         x, y = CENTRE
         assert (
             loose.check(x, y, real_plane(x, y) + 9.0).gate_um
@@ -211,11 +208,9 @@ class TestGatesThatRealLogsCorrected:
         # The spread measure divided by the point count, so adding points to a thin
         # cloud SHRANK the measured spread. Measured consequence: a 16-point survey was
         # refused on five regions where the same region's 9-point survey was licensed.
-        # The tilt-uncertainty limit is relaxed: nine points with 0.5 um of noise over
-        # 1.2 mm know the tilt to about 0.5 um, and this test is about the spread measure.
         tiles = tile_grid(n_side=4, pitch_um=600.0)
-        small = feed(surface(max_tilt_uncertainty_um=5.0), tiles[:9], seed=2)
-        large = feed(surface(max_tilt_uncertainty_um=5.0), tiles, seed=2)
+        small = feed(surface(), tiles[:9], seed=2)
+        large = feed(surface(), tiles, seed=2)
         assert small.licensed
         assert large.licensed, large.describe()
         assert large.summary()["spread_minor_mm"] >= small.summary()["spread_minor_mm"]
@@ -262,8 +257,9 @@ class TestGatesThatRealLogsCorrected:
         # "licensed: false", which says nothing about what to do next.
         s = surface()
         s.add(CENTRE[0], CENTRE[1], Z0)
-        assert s.summary()["unlicensed_reason"]
-        assert "not enough focus points" in s.summary()["unlicensed_reason"]
+        assert s.summary()["checking_reason"]
+        assert "not enough focus points" in s.summary()["checking_reason"]
+        assert s.summary()["seeding_reason"] == s.summary()["checking_reason"]
 
 
 class TestConcedingToReality:
@@ -595,14 +591,17 @@ INCIDENT_TILE_LOOP = [
 ]
 
 
-class TestTiltMustBeDeterminedOnBothAxes:
-    """The 2026-11-15 LC-PolScope strip: licensed on spread, not on evidence.
+class TestSeedingNeedsBothTiltsDetermined:
+    """The 2026-11-15 LC-PolScope strip: it seeded on spread, not on evidence.
 
     After the survey the surface had 0.8 mm of spread (above the 0.5 mm floor) and 0.39
     um RMS, so it licensed and seeded every tile. But eight of its nine points sat on
     one row: the ninth alone set the tilt across the strip, which then wandered from
     -1.42 to -4.0 um/mm as the loop fed it results; seeds ran 1-1.5 um low and tile 21
     came out soft. Turning the surface off fixed it.
+
+    Checking results (catching tens-of-um wide-search misses) keeps the previous
+    licence; only seeding waits for both tilts.
     """
 
     def incident(self, **kw):
@@ -610,56 +609,73 @@ class TestTiltMustBeDeterminedOnBothAxes:
             region_extent_mm=INCIDENT_EXTENT_MM, region_bounds_um=INCIDENT_BOUNDS_UM, **kw
         )
 
-    def test_the_replay_reproduces_the_incident_under_the_spread_rule_alone(self):
+    def test_the_replay_reproduces_the_incident_without_the_tilt_rule(self):
         s = self.incident(max_tilt_uncertainty_um=float("inf"))
         for x, y, z in INCIDENT_SURVEY:
             s.add(x, y, z)
-        assert s.licensed, s.describe()
+        assert s.seeding, s.describe()
         summary = s.summary()
         # The log: "z = 44.75 -0.34*X_mm -1.42*Y_mm ... 9/9 inliers at 0.39 um RMS".
         assert summary["tilt_x_um_per_mm"] == pytest.approx(-0.34, abs=0.02)
         assert summary["tilt_y_um_per_mm"] == pytest.approx(-1.42, abs=0.02)
         assert summary["inlier_rms_um"] == pytest.approx(0.39, abs=0.02)
 
-    def test_it_does_not_license_where_the_incident_did(self):
+    def test_it_checks_but_does_not_seed_where_the_incident_seeded(self):
         s = self.incident()
         for x, y, z in INCIDENT_SURVEY:
             s.add(x, y, z)
-        assert not s.licensed
-        assert not s.enforcing
-        assert s.predict(4265.232, 5807.413) is None
-        reason = s.summary()["unlicensed_reason"]
+        assert s.licensed and s.enforcing, "checking keeps the previous licence"
+        assert s.predict(4265.232, 5807.413) is not None
+        assert not s.seeding
+        assert s.seed_z(4265.232, 5807.413) is None
+        summary = s.summary()
+        assert summary["checking"] and not summary["seeding"]
+        assert summary["checking_reason"] is None
+        reason = summary["seeding_reason"]
         assert "tilt along Y is not determined" in reason, reason
         # The fit's centre (5645, 5421) is 1.60 mm from the region's far edge in Y.
         assert "carried 1.60 mm to the region's far edge in Y" in reason, reason
         assert reason.isascii()
+        assert "checking, NOT seeding" in s.describe()
         # Y, across the strip, is the undetermined axis, by a wide margin.
-        assert s.summary()["tilt_uncertainty_um"]["Y"] > 2 * s.max_tilt_uncertainty_um
+        assert summary["tilt_uncertainty_um"]["Y"] > 2 * s.max_tilt_uncertainty_um
 
-    def test_it_never_enforces_on_that_strip(self):
+    def test_it_never_seeds_on_that_strip_and_still_catches_a_miss(self):
         s = self.incident()
         for x, y, z in INCIDENT_SURVEY + INCIDENT_TILE_LOOP:
-            v = s.check(x, y, z)
-            assert not v.enforced
-            assert s.predict(x, y) is None
+            s.check(x, y, z)
+            assert s.seed_z(x, y) is None
             s.add(x, y, z)
-        assert not s.enforcing
+        assert not s.seeding
+        # A wide-search miss on that strip is still rejected and replaced.
+        x, y = 6000.0, 5000.0
+        v = s.check(x, y, s.predict(x, y) + 40.0)
+        assert v.would_reject and v.enforced, v.reason
 
-    def test_a_region_whose_tilts_are_both_measured_still_licenses(self):
+    def test_the_record_qpsc_seeds_from_is_not_licensed(self):
+        s = self.incident()
+        for x, y, z in INCIDENT_SURVEY:
+            s.add(x, y, z)
+        r = s.to_record()
+        assert r["licensed"] is False and r["checking"] is True
+        assert "tilt along Y" in r["unlicensed_reason"]
+
+    def test_a_region_whose_tilts_are_both_measured_seeds(self):
         # About the incident's noise (0.4 um) on a grid that covers the region in both
         # axes determines both tilts well inside the limit.
         grid = np.asarray(tile_grid())
         bounds = (grid[:, 0].min(), grid[:, 0].max(), grid[:, 1].min(), grid[:, 1].max())
         s = feed(surface(region_bounds_um=bounds), tile_grid(), noise_um=0.4, seed=7)
-        assert s.licensed, s.describe()
+        assert s.seeding, s.describe()
+        assert s.seed_z(*CENTRE) == pytest.approx(s.predict(*CENTRE))
+        assert "checking and seeding" in s.describe()
         assert max(s.summary()["tilt_uncertainty_um"].values()) <= s.max_tilt_uncertainty_um
 
     def test_without_a_region_extent_the_points_own_span_is_used(self):
         s = surface()
         for x, y, z in INCIDENT_SURVEY:
             s.add(x, y, z)
-        assert not s.licensed
-        reason = s.summary()["unlicensed_reason"]
+        reason = s.seeding_reason()
         # The points span 0.99 mm in Y (one point off the surveyed row).
         assert "carried 0.99 mm across the points in Y" in reason, reason
 
@@ -667,7 +683,14 @@ class TestTiltMustBeDeterminedOnBothAxes:
         s = surface(region_extent_mm=INCIDENT_EXTENT_MM)
         for x, y, z in INCIDENT_SURVEY:
             s.add(x, y, z)
-        assert "carried 2.98 mm across the region in Y" in s.summary()["unlicensed_reason"]
+        assert "carried 2.98 mm across the region in Y" in s.seeding_reason()
+
+    def test_an_unlicensed_surface_neither_checks_nor_seeds(self):
+        s = surface()
+        for x, y, z in INCIDENT_SURVEY[:3]:
+            s.add(x, y, z)
+        assert not s.licensed and not s.seeding
+        assert s.seeding_reason() == s.summary()["checking_reason"]
 
     def test_a_region_one_column_wide_does_not_need_the_tilt_across_it(self):
         # Tiles that all share an X are never predicted at another X, so the X tilt

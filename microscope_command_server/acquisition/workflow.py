@@ -4573,8 +4573,9 @@ def _configure_autofocus(ctx: AcquisitionContext) -> None:
     af_gap_index_multiplier = 3
     af_gap_spatial_multiplier = 2.0
     # How far (um) an uncertain tilt may move the focus surface's prediction before the
-    # surface declines to seed tiles (see focus_surface.DEFAULT_MAX_TILT_UNCERTAINTY_UM).
-    # None keeps the module default.
+    # surface declines to SEED tiles; checking results is not affected. Optional YAML
+    # key focus_surface_max_tilt_uncertainty_um; None keeps the default of 0.5 um
+    # (focus_surface.DEFAULT_MAX_TILT_UNCERTAINTY_UM).
     af_surface_max_tilt_uncertainty_um = None
 
     current_objective = params.get("objective", "")
@@ -4922,8 +4923,8 @@ def _build_focus_surface(ctx: "AcquisitionContext"):
         logger.info(
             "Focus surface ENABLED in '%s' mode: a robust plane is fitted through this "
             "region's autofocus results, and each new result is checked against it. "
-            "%s It is used only once both tilts are known to %.2f um of focus across "
-            "the region.",
+            "%s It seeds tiles only once both tilts are known to %.2f um of focus "
+            "across the region; until then tiles start from the nearest autofocus.",
             mode,
             (
                 "Nothing acts on the result -- this run only reports what enforcement "
@@ -5646,8 +5647,9 @@ def _run_focus_survey(ctx: "AcquisitionContext") -> None:
             break
         pos, _ = ctx.positions[tile_idx]
         # Approach at the best Z we currently believe, so the search starts near focus:
-        # the licensed surface, else the tilt the points measured so far imply.
-        seed_z = surface.predict(pos.x, pos.y)
+        # the surface when it is licensed to seed, else the tilt the points measured so
+        # far imply.
+        seed_z = surface.seed_z(pos.x, pos.y)
         fit_points = 0
         if seed_z is None:
             seed_z, fit_points, fit_rms = _survey_seed_z(ctx.completed_af_positions, pos.x, pos.y)
@@ -5794,6 +5796,11 @@ def _run_focus_survey(ctx: "AcquisitionContext") -> None:
             "choose each tile's Z exactly as it does today. This is a safe outcome, "
             "not an error -- but if it repeats, either the survey needs more points "
             "or this sample is not planar."
+        )
+    elif not surface.seeding:
+        logger.info(
+            "The surface checks autofocus results but does not seed tiles yet: tiles "
+            "start from the nearest autofocus result until both tilts are determined."
         )
 
 
@@ -6081,7 +6088,8 @@ def _handle_tile_autofocus(
         # one of the two that a single bad measurement cannot poison.
         seed_z = nearest_z
         seed_source = "nearest AF"
-        surface_z = ctx.focus_surface.predict(pos.x, pos.y) if ctx.focus_surface else None
+        # Seeding has its own licence (both tilts determined), stricter than checking.
+        surface_z = ctx.focus_surface.seed_z(pos.x, pos.y) if ctx.focus_surface else None
         if surface_z is not None and ctx.focus_surface.enforcing:
             seed_z = surface_z
             seed_source = "focus surface"
