@@ -94,6 +94,7 @@ class ExtendedCommand:
     # preset in step with the objective chosen in QPSC). Request and reply are a
     # 4-byte big-endian length + UTF-8 JSON; see server/handlers/presets.py.
     MMPRESET = b"mmpreset"
+    HWSTAT = b"hwstat__"  # Which part of the microscope is not answering (JSON)
 
     # ---- JAI-Specific: White Balance Calibration Commands ----
     # These commands require a JAI trilinear color camera with per-channel

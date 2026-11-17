@@ -84,6 +84,7 @@ from microscope_command_server.server.handlers.calibration import (
     handle_noischar,
 )
 from microscope_command_server.server.handlers.presets import handle_mmpreset
+from microscope_command_server.server.handlers.hwstat import handle_hwstat
 from microscope_command_server.server.handlers.acquisition import (
     handle_acquire,
     handle_bgacquire,
@@ -184,6 +185,7 @@ COMMAND_HANDLERS = {
     ExtendedCommand.LCREADY: handle_lcready,
     ExtendedCommand.LCSIGNAL: handle_lcsignal,
     ExtendedCommand.MMPRESET: handle_mmpreset,
+    ExtendedCommand.HWSTAT: handle_hwstat,
     ExtendedCommand.GETNOISE: handle_getnoise,
     ExtendedCommand.NOISCHAR: handle_noischar,
     # Acquisition
