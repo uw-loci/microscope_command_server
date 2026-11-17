@@ -1588,6 +1588,122 @@ def _restore_roi(
             logger.warning("STREAM_AF:could not restart sequence after " "ROI restore: %s", e)
 
 
+# How long to wait for a stopped Live stream to report itself stopped.
+LIVE_STOP_WAIT_S = 1.0
+
+
+class _LiveStreamPause:
+    """Stops a running Live stream for one scan and restarts it afterwards.
+
+    The scan reads whether Live is running ONCE, here, and from then on owns the
+    camera: it changes the ROI, snaps, and starts and stops its own sequences. Until
+    2026-11-17 it read ``is_sequence_running()`` separately before the crop, before the
+    pre-flight frame and before the scan, and on PPM on 2026-11-13 those reads
+    disagreed with each other: the crop ran with no stop, the pre-flight frame was a
+    snap, and then the scan's own start failed with "This operation can not be executed
+    while sequence acquisition is running" -- Live had come back in between. The ROI
+    was restored with Live still delivering frames and the server stopped answering
+    seconds later.
+
+    Two things count as Live: a core continuous sequence (the QPSC Live Viewer starts
+    one with STRTSEQ), and Micro-Manager's own live mode (SETLIVE ON; it was on in that
+    run), which can restart its sequence by itself when camera settings change.
+    Stopping the sequence without turning live mode off would leave that restart
+    possible, so live mode is turned off too, and both are put back by ``resume()``.
+
+    When nothing is running, ``pause()`` changes nothing and ``resume()`` does nothing.
+    """
+
+    def __init__(self, core, studio=None):
+        self._core = core
+        self._studio = studio
+        self.sequence_was_running = False
+        self.live_mode_was_on = False
+        self._paused = False
+
+    def pause(self) -> bool:
+        """Stop Live if it is running. Returns True when something was stopped."""
+        try:
+            self.sequence_was_running = bool(self._core.is_sequence_running())
+        except Exception as e:
+            logger.warning("STREAM_AF:could not read the sequence state: %s", e)
+            self.sequence_was_running = False
+        live = self._studio_live()
+        if live is not None:
+            try:
+                self.live_mode_was_on = bool(live.is_live_mode_on())
+            except Exception:
+                self.live_mode_was_on = False
+        if not (self.sequence_was_running or self.live_mode_was_on):
+            return False
+
+        self._paused = True
+        if self.live_mode_was_on:
+            try:
+                live.set_live_mode(False)
+            except Exception as e:
+                logger.warning("STREAM_AF:could not turn Micro-Manager live mode off: %s", e)
+        try:
+            self._core.stop_sequence_acquisition()
+        except Exception as e:
+            logger.warning("STREAM_AF:could not stop the Live sequence: %s", e)
+        # Confirm it stopped before anything touches the camera. This read verifies
+        # the stop; it decides nothing about what the scan does next.
+        deadline = time.perf_counter() + LIVE_STOP_WAIT_S
+        still_running = True
+        while True:
+            try:
+                still_running = bool(self._core.is_sequence_running())
+            except Exception:
+                still_running = False
+            if not still_running or time.perf_counter() >= deadline:
+                break
+            time.sleep(0.02)
+        if still_running:
+            logger.warning(
+                "STREAM_AF:Live sequence still running %.1f s after the stop; the camera "
+                "ROI change may be refused",
+                LIVE_STOP_WAIT_S,
+            )
+        logger.info(
+            "STREAM_AF:Live was running (sequence %s, Micro-Manager live mode %s); stopped it "
+            "for the scan. It is restarted after the camera ROI is restored.",
+            "on" if self.sequence_was_running else "off",
+            "on" if self.live_mode_was_on else "off",
+        )
+        return True
+
+    def resume(self) -> None:
+        """Put back what ``pause()`` stopped. Safe to call more than once."""
+        if not self._paused:
+            return
+        self._paused = False
+        if self.live_mode_was_on:
+            live = self._studio_live()
+            try:
+                if live is not None:
+                    live.set_live_mode(True)
+            except Exception as e:
+                logger.warning("STREAM_AF:could not turn Micro-Manager live mode back on: %s", e)
+        if self.sequence_was_running:
+            try:
+                # Live mode, when it was on, has started a sequence of its own.
+                if not self._core.is_sequence_running():
+                    self._core.clear_circular_buffer()
+                    self._core.start_continuous_sequence_acquisition(0)
+            except Exception as e:
+                logger.warning("STREAM_AF:could not restart the Live sequence: %s", e)
+        logger.info("STREAM_AF:restarted Live after the scan")
+
+    def _studio_live(self):
+        if self._studio is None:
+            return None
+        try:
+            return self._studio.live()
+        except Exception:
+            return None
+
+
 def _try_get(core, device: str, prop: str) -> Optional[str]:
     try:
         return core.get_property(device, prop)
@@ -5039,6 +5155,12 @@ def _handle_streaming_focus(conn, client, hardware, settings, **kwargs):
         conn.sendall(f"FAILED:get-position: {e}".encode())
         return
 
+    # Read whether Live is running ONCE, and stop it if it is: from here the scan owns
+    # the camera. Every exit below restores the ROI and then calls live_pause.resume().
+    # See _LiveStreamPause for the 2026-11-13 run that separate reads broke.
+    live_pause = _LiveStreamPause(core, getattr(hardware, "studio", None))
+    live_pause.pause()
+
     # Apply the central ROI crop before preflight. This reduces the
     # per-frame pixel transfer for both the saturation-check frame
     # AND every frame popped during the scan, which is the single
@@ -5046,11 +5168,10 @@ def _handle_streaming_focus(conn, client, hardware, settings, **kwargs):
     # dominates per-pop cost.
     #
     # On JAI / GenAPI cameras the Width property is not writable
-    # while a sequence acquisition is running, so _apply_crop_roi
-    # may need to stop+restart an in-progress stream. The second
-    # return value tells _restore_roi whether to put the sequence
-    # back at the end. Both saved values are passed to the helper
-    # in the handler's finally block.
+    # while a sequence acquisition is running. Live was stopped
+    # above, so _apply_crop_roi's own stop+restart is only a guard
+    # against a sequence started since. Its second return value
+    # tells _restore_roi whether to put such a sequence back.
     saved_roi, roi_seq_was_running = _apply_crop_roi(core, crop_factor)
 
     # --- JAI FrameRateHz sanity check + force-to-max ---
@@ -5143,21 +5264,15 @@ def _handle_streaming_focus(conn, client, hardware, settings, **kwargs):
         # restore here or the Live Viewer keeps showing the cropped
         # area on subsequent frame polls.
         _restore_roi(core, saved_roi, roi_seq_was_running)
+        live_pause.resume()
         return
 
     # --- Pre-flight: saturation check ---
-    # If the Live Viewer (or any caller) has a sequence running, pop
-    # one frame from its buffer instead of calling snap_image(). A
-    # blocking snap on the JAI costs ~400 ms (exposure + readout +
-    # driver overhead) and is the single biggest fixed cost in the
-    # Streaming AF handler -- nearly 20% of the total scan time. Stream
-    # frames are already arriving at ~30 fps so a pop-with-timeout
-    # gets us a fresh frame in <50 ms.
-    preflight_sequence_running = False
-    try:
-        preflight_sequence_running = bool(core.is_sequence_running())
-    except Exception:
-        pass
+    # If a sequence is running, pop one frame from its buffer instead
+    # of calling snap_image() (which fails while one runs). Not read
+    # again from the core: Live was stopped at entry, so the only
+    # sequence the scan knows of is one _apply_crop_roi restarted.
+    preflight_sequence_running = roi_seq_was_running
 
     preflight_img = None
     if preflight_sequence_running:
@@ -5199,6 +5314,7 @@ def _handle_streaming_focus(conn, client, hardware, settings, **kwargs):
         # ROI explicitly or the Live Viewer keeps showing the cropped
         # area indefinitely.
         _restore_roi(core, saved_roi, roi_seq_was_running)
+        live_pause.resume()
         return
 
     # --- Execute scan with edge-retry loop ---
@@ -5239,13 +5355,11 @@ def _handle_streaming_focus(conn, client, hardware, settings, **kwargs):
                 f"{z_high:.3f}" if z_high is not None else "None",
             )
 
-    # Check whether the Live Viewer already has a sequence running.
-    # Computed once -- attempts share this state since we don't stop
-    # the caller's stream between attempts.
-    try:
-        sequence_was_running = bool(core.is_sequence_running())
-    except Exception:
-        sequence_was_running = False
+    # Whether a sequence the scan did not start is running, which the
+    # attempts then reuse instead of starting their own. Not read again
+    # from the core (see _LiveStreamPause): Live was stopped at entry,
+    # so this is only a sequence _apply_crop_roi restarted.
+    sequence_was_running = roi_seq_was_running
 
     attempts_log: List[str] = []
     final_result: Optional[_ScanAttemptResult] = None
@@ -6382,6 +6496,9 @@ def _handle_streaming_focus(conn, client, hardware, settings, **kwargs):
         # roi_seq_was_running flag tells _restore_roi to bring
         # the original streaming state back up.
         _restore_roi(core, saved_roi, roi_seq_was_running)
+        # Then Live, if it was running when the scan began -- only now
+        # that the camera is back at full sensor.
+        live_pause.resume()
         # JAI FrameRateHz: deliberately do NOT restore if the saved
         # value was below the streaming threshold. A low FrameRateHz
         # is almost always a stale misconfiguration (the JAI device

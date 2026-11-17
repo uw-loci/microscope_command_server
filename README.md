@@ -1507,6 +1507,25 @@ FAILED:busy: an acquisition is running for <addr>; refusing to move the focus st
 and nothing moves. Wait for the acquisition to finish, or send a cancel and wait for it to
 complete, then re-issue the autofocus command.
 
+### Live is stopped for the scan and restarted after it
+
+`STRMAFZ` reads once, at its start, whether Live is running: a core continuous sequence
+(the QPSC Live Viewer's `STRTSEQ`) or Micro-Manager's own live mode (`SETLIVE ON`). If
+either is, it stops both before it touches the camera ROI, logs
+`STREAM_AF:Live was running (...); stopped it for the scan`, and after the ROI is back at
+full sensor puts them back and logs `STREAM_AF:restarted Live after the scan`. The scan
+then owns the camera: it snaps its pre-flight frame and starts and stops its own sequence.
+Nothing changes when Live is not running.
+
+Why: on PPM on 2026-11-13 a streaming autofocus started while Live was streaming. The
+handler read the sequence state separately before the crop, before the pre-flight frame
+and before the scan, and the reads disagreed: the ROI changed under the stream, the
+scan's own start failed with `This operation can not be executed while sequence
+acquisition is running`, the ROI was restored with Live still delivering frames, and the
+server stopped answering seconds later. Live mode had been turned on four seconds before
+that request, and Micro-Manager's live mode can restart its own sequence when camera
+settings change, so stopping the sequence alone may not be enough; both are stopped.
+
 ### Cancel during an acquisition's autofocus
 
 The pre-acquisition autofocus, focus survey points, per-tile standard autofocus and
