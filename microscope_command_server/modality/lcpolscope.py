@@ -30,6 +30,7 @@ Two invariants this modality does NOT enforce alone
 import json
 import logging
 import shutil
+import time
 from pathlib import Path
 
 import numpy as np
@@ -285,6 +286,189 @@ def _copy_tile_configuration(source_dir, out_dir):
         shutil.copy2(source, dest)
 
 
+def _derived_channel_annotations():
+    """Per-folder OME annotations and channel names of the retardance and orientation tiles.
+
+    Shared by the tiles as reconstructed and their drift-corrected copies.
+    """
+    # Resampling policy uses the shared vocabulary rather than a polscope-specific
+    # key: a mask, a label map or an object-id channel needs the same protection,
+    # and a reader should only have to understand one convention.
+    per_channel = {
+        RETARDANCE_DIR: {
+            "polscope.quantity": "retardance",
+            "polscope.units": "nanometres",
+            "polscope.counts_per_unit": RETARDANCE_COUNTS_PER_NM,
+            "polscope.to_physical": "nanometres = counts / 100",
+            # Ordinary non-negative scalar. Nothing special.
+            **channel_handling(RESAMPLE_LINEAR),
+        },
+        ORIENTATION_DIR: {
+            "polscope.quantity": "slow_axis_orientation",
+            "polscope.units": "degrees",
+            "polscope.range": "[0,180)",
+            "polscope.counts_per_unit": ORIENTATION_COUNTS_PER_DEGREE,
+            "polscope.to_physical": "degrees = counts / 100 (OpenPolScope convention)",
+            # The frame note stays polscope-local: it is about how the values
+            # relate to image geometry, not about how they may be combined.
+            "polscope.frame": "image (y-down); a single mirror negates the angle",
+            **channel_handling(
+                RESAMPLE_ANGULAR_180,
+                # 0..18000 counts span the full 0..180 degree cycle. A reader
+                # holding counts cannot convert them to angles without this, so
+                # microscope_imageprocessing requires it for angular policies --
+                # without it the declared circular averaging would silently
+                # degrade to nearest-neighbour, which is the exact failure the
+                # policy exists to prevent.
+                period=ORIENTATION_MAX_COUNTS,
+                reason=(
+                    "axial slow-axis angle: 0 and 180 degrees are the same physical "
+                    "axis, so the mean of 179 and 1 is 90 -- perpendicular to the truth"
+                ),
+            ),
+        },
+    }
+    channel_label = {
+        RETARDANCE_DIR: "Retardance_nm_x_100",
+        ORIENTATION_DIR: "Orientation_deg_x_100",
+    }
+
+    return per_channel, channel_label
+
+
+#: Channel name of the display-only color image (unchanged spelling: saved images carry it).
+COLOR_CHANNEL_NAME = "Orientation colour (hue = orientation, brightness = retardance)"
+
+
+def _color_annotations(ceiling, display_colormap):
+    """OME annotations of the display-only color image, beyond the tile's shared ones."""
+    return {
+        "polscope.quantity": "orientation_colour_display",
+        "polscope.display_only": "true -- for viewing; measure on the retardance and orientation images",
+        "polscope.hue": "slow-axis orientation, one colour cycle over 0..180 deg",
+        "polscope.colormap": (display_colormap or ColormapSettings()).describe(),
+        "polscope.brightness": f"retardance, full brightness at {ceiling:g} nm",
+        # RGB but not brightfield: no signal is black. Tells the stitcher to fill
+        # the area no tile reaches with black, not the white it assumes for RGB.
+        "qpsc.background": "black",
+    }
+
+
+def _record_drift_tile(
+    drift_log,
+    *,
+    filename,
+    tile_time,
+    shared,
+    state_images,
+    background_images,
+    black_level,
+    result,
+    display,
+    log,
+):
+    """Step A of the drift correction: the tile's time and, when asked, its glass leftover.
+
+    Never raises: a failed measurement loses one point of the drift model, not the tile.
+    """
+    from .lcpolscope_drift import glass_mask, leftover_vector
+
+    glass = None
+    try:
+        if not drift_log.display:
+            drift_log.display = display
+        s = drift_log.settings
+        if s.tile_glass and background_images:
+            mask = glass_mask(
+                state_images, background_images, black_level, s, drift_log.exposure_ratio
+            )
+            fraction = float(mask.mean())
+            if fraction >= s.min_glass_fraction:
+                vx, vy, n = leftover_vector(result.retardance_nm, result.orientation_rad, mask)
+                glass = (vx, vy, n, fraction)
+                if log is not None:
+                    log.debug(
+                        "Drift: %s glass %.0f%%, leftover %.3f nm",
+                        filename,
+                        100 * fraction,
+                        float(np.hypot(vx, vy)),
+                    )
+    except Exception as exc:
+        if log is not None:
+            log.warning("Drift: glass measurement failed on %s: %s", filename, exc)
+    drift_log.add_tile(
+        str(filename), float(tile_time if tile_time is not None else 0.0), dict(shared), glass
+    )
+
+
+def measure_drift_reference(channel_images, channel_order, reconstruction_cfg, background_images):
+    """Step B: the leftover over the whole field at the background spot, as (vx, vy, pixels).
+
+    The same reconstruction as a tile (method, black level, state order), against the same
+    background; the field is all glass, so the median of the whole field is the leftover.
+    """
+    from polscope_library import reconstruct
+
+    from .lcpolscope_drift import leftover_vector
+
+    order = resolve_state_order(channel_order, reconstruction_cfg.get("state_order"))
+    result = reconstruct(
+        intensities=[channel_images[c] for c in order],
+        swing_waves=float(reconstruction_cfg["swing_waves"]),
+        wavelength_nm=float(reconstruction_cfg["wavelength_nm"]),
+        scheme=str(reconstruction_cfg.get("scheme", "5-State")),
+        background_intensities=[background_images[c] for c in order],
+        method=str(reconstruction_cfg.get("method", DEFAULT_RECONSTRUCTION_METHOD)),
+        black_level=float(reconstruction_cfg.get("black_level", 0.0)),
+    )
+    return leftover_vector(result.retardance_nm, result.orientation_rad)
+
+
+def apply_drift_correction(output_path, drift_log, ome_writer, log=None):
+    """Step C: fit the drift model and write the corrected copies beside the originals.
+
+    Returns the summary written to drift_correction/drift_model.json.
+    """
+    import tifffile
+
+    from .lcpolscope_drift import write_corrected_tiles
+
+    display = drift_log.display or {}
+    pixel_size_um = display.get("pixel_size_um")
+
+    def write_tile(*, filename, data, channel_name, map_annotations):
+        ome_writer(
+            filename=filename,
+            pixel_size_um=pixel_size_um,
+            data=data,
+            channel_name=channel_name,
+            map_annotations=map_annotations,
+        )
+
+    def color_image(r, o):
+        return orientation_rgb(
+            r, o, display.get("ceiling", DEFAULT_DISPLAY_CEILING_NM), display.get("colormap")
+        )
+
+    return write_corrected_tiles(
+        Path(output_path),
+        drift_log,
+        read_tile=lambda p: tifffile.imread(str(p)),
+        write_tile=write_tile,
+        retardance_dir=RETARDANCE_DIR,
+        orientation_dir=ORIENTATION_DIR,
+        color_dir=ORIENTATION_COLOR_DIR,
+        retardance_counts_per_nm=RETARDANCE_COUNTS_PER_NM,
+        orientation_counts_per_degree=ORIENTATION_COUNTS_PER_DEGREE,
+        orientation_max_counts=ORIENTATION_MAX_COUNTS,
+        to_uint16=_to_uint16,
+        channel_annotations=_derived_channel_annotations,
+        color_image=color_image,
+        copy_tile_configuration=_copy_tile_configuration,
+        logger_=log,
+    )
+
+
 def _reconstruct_and_write(
     state_images,
     reconstruction_cfg,
@@ -303,8 +487,14 @@ def _reconstruct_and_write(
     background_provenance=None,
     estimated_background=None,
     display_colormap=None,
+    drift_log=None,
+    tile_time=None,
 ):
-    """Reconstruct one tile and write retardance + orientation. Runs in the write pool."""
+    """Reconstruct one tile and write retardance + orientation. Runs in the write pool.
+
+    With a ``drift_log`` (reconstruction.drift_correction), also records the tile's time and,
+    when tile glass is measured, the leftover on its glass; see lcpolscope_drift.
+    """
     from polscope_library import reconstruct
 
     method = str(reconstruction_cfg.get("method", DEFAULT_RECONSTRUCTION_METHOD))
@@ -402,47 +592,7 @@ def _reconstruct_and_write(
             )
         else:
             log.info("Estimated background on %s: %s", filename, fit.reason)
-    # Resampling policy uses the shared vocabulary rather than a polscope-specific
-    # key: a mask, a label map or an object-id channel needs the same protection,
-    # and a reader should only have to understand one convention.
-    per_channel = {
-        RETARDANCE_DIR: {
-            "polscope.quantity": "retardance",
-            "polscope.units": "nanometres",
-            "polscope.counts_per_unit": RETARDANCE_COUNTS_PER_NM,
-            "polscope.to_physical": "nanometres = counts / 100",
-            # Ordinary non-negative scalar. Nothing special.
-            **channel_handling(RESAMPLE_LINEAR),
-        },
-        ORIENTATION_DIR: {
-            "polscope.quantity": "slow_axis_orientation",
-            "polscope.units": "degrees",
-            "polscope.range": "[0,180)",
-            "polscope.counts_per_unit": ORIENTATION_COUNTS_PER_DEGREE,
-            "polscope.to_physical": "degrees = counts / 100 (OpenPolScope convention)",
-            # The frame note stays polscope-local: it is about how the values
-            # relate to image geometry, not about how they may be combined.
-            "polscope.frame": "image (y-down); a single mirror negates the angle",
-            **channel_handling(
-                RESAMPLE_ANGULAR_180,
-                # 0..18000 counts span the full 0..180 degree cycle. A reader
-                # holding counts cannot convert them to angles without this, so
-                # microscope_imageprocessing requires it for angular policies --
-                # without it the declared circular averaging would silently
-                # degrade to nearest-neighbour, which is the exact failure the
-                # policy exists to prevent.
-                period=ORIENTATION_MAX_COUNTS,
-                reason=(
-                    "axial slow-axis angle: 0 and 180 degrees are the same physical "
-                    "axis, so the mean of 179 and 1 is 90 -- perpendicular to the truth"
-                ),
-            ),
-        },
-    }
-    channel_label = {
-        RETARDANCE_DIR: "Retardance_nm_x_100",
-        ORIENTATION_DIR: "Orientation_deg_x_100",
-    }
+    per_channel, channel_label = _derived_channel_annotations()
 
     retardance_counts, ret_clipped = _to_uint16(result.retardance_nm, RETARDANCE_COUNTS_PER_NM)
     orientation_counts, _ = _to_uint16(
@@ -485,6 +635,7 @@ def _reconstruct_and_write(
         )
     except (TypeError, ValueError):
         ceiling = DEFAULT_DISPLAY_CEILING_NM
+    color_annotations = _color_annotations(ceiling, display_colormap)
     color_dir = output_path / ORIENTATION_COLOR_DIR
     color_dir.mkdir(parents=True, exist_ok=True)
     _copy_tile_configuration(tile_config_source, color_dir)
@@ -495,19 +646,27 @@ def _reconstruct_and_write(
         data=orientation_rgb(
             result.retardance_nm, result.orientation_rad, ceiling, display_colormap
         ),
-        channel_name="Orientation colour (hue = orientation, brightness = retardance)",
-        map_annotations={
-            **shared,
-            "polscope.quantity": "orientation_colour_display",
-            "polscope.display_only": "true -- for viewing; measure on the retardance and orientation images",
-            "polscope.hue": "slow-axis orientation, one colour cycle over 0..180 deg",
-            "polscope.colormap": (display_colormap or ColormapSettings()).describe(),
-            "polscope.brightness": f"retardance, full brightness at {ceiling:g} nm",
-            # RGB but not brightfield: no signal is black. Tells the stitcher to fill
-            # the area no tile reaches with black, not the white it assumes for RGB.
-            "qpsc.background": "black",
-        },
+        channel_name=COLOR_CHANNEL_NAME,
+        map_annotations={**shared, **color_annotations},
     )
+    if drift_log is not None:
+        _record_drift_tile(
+            drift_log,
+            filename=filename,
+            tile_time=tile_time,
+            shared=shared,
+            state_images=state_images,
+            background_images=background_images,
+            black_level=black_level,
+            result=result,
+            display={
+                "ceiling": ceiling,
+                "colormap": display_colormap,
+                "annotations": color_annotations,
+                "pixel_size_um": pixel_size_um,
+            },
+            log=log,
+        )
     if log is not None:
         log.debug("Reconstructed LC-PolScope tile %s", filename)
 
@@ -896,6 +1055,7 @@ def submit_tile_reconstruction(
     camera_problems=None,
     lc_adapter_wavelength_nm=None,
     background_provenance=None,
+    drift_log=None,
     logger_=None,
 ):
     """Queue birefringence reconstruction for one acquired tile.
@@ -990,6 +1150,9 @@ def submit_tile_reconstruction(
         background_provenance=background_provenance,
         estimated_background=estimated_background,
         display_colormap=display_colormap,
+        drift_log=drift_log,
+        # When the states were taken: the drift correction models the leftover against it.
+        tile_time=time.time(),
         output_path=output_path,
         filename=filename,
         pixel_size_um=pixel_size_um,

@@ -1148,6 +1148,64 @@ the first tile. Every derived tile records `polscope.estimated_background` (the 
 and, when applied, `..._peak_removed_nm` / `..._mean_removed_nm`, which compared across tiles is
 the size of the residual the measured background missed. The server logs one INFO line per tile.
 
+#### Drift correction (opt-in): the leftover that grows after the background
+
+The measured background removes the instrument's own retardance as it was when the background
+was taken. The light path keeps changing afterwards (most likely the liquid crystals settling or
+warming), so later tiles carry a leftover that is uniform within a tile and grows with time. On
+2026-11-17 the glass of one scan read 0.36 nm 8 min after the background and 1.0 nm at 63 min,
+all along one axis; 6 to 8 h later it had leveled off near 1.5-1.9 nm, wobbling by about 0.3 nm
+over 20-30 min. It adds to fibers near its axis and subtracts from fibers across it.
+`reconstruction.drift_correction` measures it during the run and writes corrected copies:
+
+```yaml
+drift_correction:
+  tile_glass: true               # A: measure the leftover on the glass in every tile
+  reference_interval_min: 10     # B: revisit the background spot every N min (0 or absent = off)
+  reference_frames: 1            # frames averaged per state at each visit
+  glass_min_ratio: 0.94          # glass: state mean / background state mean in this range ...
+  glass_max_ratio: 1.06
+  glass_max_local_sd: 0.02       # ... and locally uniform (SD of that ratio over 5 x 5 px)
+  min_glass_fraction: 0.02       # tiles with less glass than this add no point to the model
+  time_bandwidth_min: 5          # tile glass alone: width of the local fit in time
+```
+
+Either measurement switches it on; both together are best.
+
+- **A, tile glass.** Glass is found by brightness against the background images (about 1.0 on
+  glass at any exposure or vignetting, below about 0.93 under stained tissue), and the median
+  leftover of each tile's glass is recorded with the time its states were taken.
+- **B, reference visits.** Before the first tile, then whenever `reference_interval_min` has
+  passed, and once after the last tile, the stage goes to the background's position (from
+  `background_settings.yml`, `context.stage_xy_um` and `stage_z_um`), takes the five states and
+  records the whole field's leftover, then comes back exactly where it was (XY at the tiles' Z,
+  then Z; the return in reverse). A visit costs the stage moves plus five exposures. It tracks
+  drift while the tiles hold no glass.
+- **C, after the last tile** (before the run reports COMPLETED, so QPSC stitches the result):
+  the leftover is modeled against time and removed from copies of every tile, written to
+  `driftcorr_retardance/`, `driftcorr_orientation/` and `driftcorr_orientation_color/`. QPSC
+  stitches every folder whose name ends in an LC-PolScope output name, so the corrected images
+  are stitched beside the originals, which are never changed. With visits, the model
+  interpolates between them, starting from zero at the moment the background was taken; with
+  tile glass as well, the curve is shifted by the median difference between the tile glass and
+  the curve, because the background spot and the scanned area need not read the same (0.2-0.3 nm
+  apart on 2026-11-17). With tile glass alone it is a local linear fit in time, held constant
+  before the first and after the last glass tile, and one tile far off the trend is left out.
+  The removal is a first-order vector subtraction in the R cos 2theta, R sin 2theta plane.
+
+It needs a measured background; without one it is skipped with a WARNING. It is refused (ERROR)
+while `estimated_background` is enabled, whose per-tile fit already removes a uniform leftover.
+A bad block is reported at ERROR when the run starts, and the run goes on without it. Too few measurements (no
+visit and fewer than 3 glass tiles) write no corrected copies. Every corrected tile records
+`polscope.drift_correction` (one line), `polscope.drift_removed_nm`, `..._removed_axis_deg`,
+`..._removed_vector_nm`, `..._minutes_after_background` and `polscope.drift_model`. The
+measurements are in `drift_correction/drift_measurements.ndjson` (one line per tile and visit,
+written as the run goes) and the model and per-tile removal in
+`drift_correction/drift_model.json`; its summary is also in `acquisition_metadata.json` under
+`polscope.drift_correction`. Replayed on the glass measured in the stitched 2026-11-15 and
+2026-11-17 scans, tile glass alone brings the leftover from 0.5-1.9 nm to a median of 0.03-0.045
+nm per tile (largest 0.14 nm).
+
 ### Black-level options
 
 The `--black-level` parameter controls the dark-frame correction, which improves

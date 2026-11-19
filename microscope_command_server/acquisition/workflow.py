@@ -2802,6 +2802,8 @@ class AcquisitionContext:
     channel_background_images: dict = field(default_factory=dict)
     #: LC-PolScope only: background_provenance.json of the background in use.
     lcps_background_provenance: dict = field(default_factory=dict)
+    #: LC-PolScope only: the drift correction's record (lcpolscope_drift.DriftLog), or None.
+    lcps_drift: Any = None
     #: Flat-field profiles, the alternative to background images.
     flatfield: FlatfieldCorrector = field(default_factory=FlatfieldCorrector)
 
@@ -3122,6 +3124,11 @@ def _acquire_position(
 
     raise_if_frame_suspect(hardware)
 
+    # LC-PolScope drift correction: back to the background spot when a visit is due. Before the
+    # tile's clock starts, so the visit does not count as this tile's time.
+    if not revisit:
+        _maybe_visit_drift_reference(ctx)
+
     logger.info(f"Position {pos_idx + 1}/{len(ctx.positions)}: {filename}")
     tile_start = time.perf_counter()
 
@@ -3347,6 +3354,8 @@ def _acquisition_workflow(
 def _finalize_acquisition(ctx: AcquisitionContext) -> None:
     """Post-acquisition: close streams, write metadata files, set COMPLETED state."""
     logger = ctx.logger
+    # The drift correction's last background-spot visit brackets the last tile.
+    _maybe_visit_drift_reference(ctx, final=True)
     if ctx.flatfield.clipped_pixels:
         logger.warning(
             "Flat-field correction clipped %d pixels at the limits of the range",
@@ -3384,6 +3393,10 @@ def _finalize_acquisition(ctx: AcquisitionContext) -> None:
 
     # Every timepoint's tiles are on disk now; reduce them if a time projection was asked for.
     _project_timepoints(ctx)
+
+    # LC-PolScope drift correction (step C): every derived tile is on disk, and QPSC stitches
+    # only after COMPLETED, so the corrected copies are stitched with the rest.
+    _apply_lcpolscope_drift(ctx)
 
     # Save device properties
     current_props = ctx.hardware.get_device_properties()
@@ -3603,6 +3616,9 @@ def _initialize_loop_infrastructure(ctx: AcquisitionContext) -> None:
 
     # Initialize background write pool for overlapped I/O.
     ctx.write_pool = _TileWritePool(max_workers=2)
+
+    # LC-PolScope drift correction, when the YAML asks for it.
+    ctx.lcps_drift = _setup_lcpolscope_drift(ctx)
 
     # Reset AF position tracking (may have been set during pre-acquisition AF)
     if ctx.last_af_pos_idx < 0:
@@ -8160,6 +8176,173 @@ def _preserve_lcpolscope_record(modality, output_path, settings, provenance, log
         return {}
 
 
+def _setup_lcpolscope_drift(ctx):
+    """LC-PolScope only: the drift correction's record for this run, or None when it is off.
+
+    Off unless ``reconstruction.drift_correction`` asks for it, and off (with a warning) without a
+    measured background, which the leftover is measured against. A bad block is reported at
+    ERROR and the run goes on without it: the retardance and orientation tiles do not depend on
+    it, only the extra corrected copies do.
+    """
+    from microscope_command_server.modality.lcpolscope import LCPOLSCOPE_CONFIG
+    from microscope_command_server.modality.lcpolscope_drift import (
+        DRIFT_FOLDER,
+        DriftLog,
+        background_spot,
+        drift_settings,
+        parse_time,
+    )
+
+    if get_modality_config(ctx.modality) is not LCPOLSCOPE_CONFIG:
+        return None
+    modalities = (ctx.ppm_settings or {}).get("modalities", {}) or {}
+    recon = (modalities.get("lcpolscope") or {}).get("reconstruction") or {}
+    try:
+        settings = drift_settings(recon)
+    except (TypeError, ValueError) as exc:
+        ctx.logger.error(
+            "reconstruction.drift_correction NOT used: %s. The run goes on without drift correction.",
+            exc,
+        )
+        return None
+    if settings is None:
+        return None
+    if (recon.get("estimated_background") or {}).get("enabled") is True:
+        ctx.logger.error(
+            "reconstruction.drift_correction NOT used: reconstruction.estimated_background is also "
+            "enabled, and its per-tile fit already removes a uniform leftover, so the drift "
+            "correction would subtract it twice. Enable one of them."
+        )
+        return None
+    provenance = ctx.lcps_background_provenance or {}
+    if not ctx.channel_background_images or not provenance:
+        ctx.logger.warning(
+            "LC-PolScope drift correction is on in the YAML but this run has no measured "
+            "background to measure the drift against; it is skipped."
+        )
+        return None
+    exposure_ratio = 1.0
+    taken = provenance.get("exposure_ms") or {}
+    for cid, ms in zip(ctx.params.get("channels") or [], ctx.params.get("channel_exposures") or []):
+        try:
+            if taken.get(str(cid)):
+                exposure_ratio = float(ms) / float(taken[str(cid)])
+                break
+        except (TypeError, ValueError):
+            continue
+    log = DriftLog(
+        settings=settings,
+        background_time=parse_time(provenance.get("collected_at")),
+        reference_xyz=background_spot(provenance.get("folder")),
+        exposure_ratio=exposure_ratio,
+        folder=ctx.output_path / DRIFT_FOLDER,
+    )
+    if settings.reference_interval_min > 0 and log.reference_xyz is None:
+        ctx.logger.warning(
+            "Drift correction: the background folder has no stage position "
+            "(background_settings.yml context.stage_xy_um / stage_z_um), so the background "
+            "spot cannot be revisited; tile glass only."
+        )
+    ctx.logger.info(
+        "LC-PolScope drift correction on: %s; background taken %s at %s",
+        settings.describe(),
+        provenance.get("collected_at", "?"),
+        log.reference_xyz,
+    )
+    return log
+
+
+def _maybe_visit_drift_reference(ctx, final: bool = False) -> None:
+    """Step B of the drift correction: when a visit is due, take the five states at the spot
+    where the background was taken, record the leftover there, and come back.
+
+    XY moves at the current Z (where the tiles are), then Z to the background's Z; the return
+    reverses that, ending exactly where the stage was. A failure is logged and the run goes on.
+    """
+    drift = getattr(ctx, "lcps_drift", None)
+    if drift is None or drift.reference_xyz is None or drift.settings.reference_interval_min <= 0:
+        return
+    if not final and not drift.reference_due(time.time()):
+        return
+    from microscope_command_server.modality.lcpolscope import measure_drift_reference
+
+    if ctx.is_cancelled():
+        raise _AcquisitionCancelled()
+    logger = ctx.logger
+    hardware = ctx.hardware
+    here = hardware.get_current_position()
+    x, y, z = drift.reference_xyz
+    t_visit = time.perf_counter()
+    try:
+        hardware.move_to_position(Position(x, y))
+        hardware.move_to_position(Position(z=z))
+        channel_plan = resolve_channel_plan(
+            ctx.ppm_settings,
+            ctx.params.get("scan_type", ""),
+            ctx.params.get("channels", []) or [],
+            ctx.params.get("channel_exposures", []) or [],
+            channel_intensity_overrides=ctx.params.get("channel_intensities") or None,
+        )
+        images = {}
+        times = []
+        for ch_entry in channel_plan:
+            apply_channel_hardware_state(
+                hardware, ch_entry, logger, preset_cache=ctx.channel_preset_cache
+            )
+            exposure_ms = float(ch_entry.get("exposure_ms") or 0)
+            if exposure_ms > 0:
+                hardware.set_exposure(exposure_ms)
+            frames = []
+            for _ in range(drift.settings.reference_frames):
+                times.append(time.time())
+                frames.append(np.asarray(hardware.snap_image()[0], dtype=np.float32))
+            images[ch_entry["id"]] = np.mean(frames, axis=0)
+        modalities = (ctx.ppm_settings or {}).get("modalities", {}) or {}
+        recon = (modalities.get("lcpolscope") or {}).get("reconstruction") or {}
+        vx, vy, n = measure_drift_reference(
+            images, [e["id"] for e in channel_plan], recon, ctx.channel_background_images
+        )
+        drift.add_reference(float(np.mean(times)), vx, vy, n)
+        logger.info(
+            "Drift reference at the background spot: %.3f nm (%s visit, %.1f s)",
+            float(np.hypot(vx, vy)),
+            "last" if final else "scheduled",
+            time.perf_counter() - t_visit,
+        )
+    except _AcquisitionCancelled:
+        raise
+    except Exception as exc:
+        logger.warning("Drift reference visit failed (the run goes on): %s", exc)
+    finally:
+        try:
+            hardware.move_to_position(Position(z=here.z))
+            hardware.move_to_position(Position(here.x, here.y))
+        except Exception as exc:
+            logger.error("Could not return the stage after the drift reference visit: %s", exc)
+            raise
+
+
+def _apply_lcpolscope_drift(ctx) -> None:
+    """Step C of the drift correction: model the leftover and write the corrected copies.
+    Never fails the acquisition: the original tiles are complete without it."""
+    drift = getattr(ctx, "lcps_drift", None)
+    if drift is None:
+        return
+    from microscope_command_server.modality.lcpolscope import apply_drift_correction
+
+    try:
+        summary = apply_drift_correction(
+            ctx.output_path, drift, _write_derived_polscope_tile, ctx.logger
+        )
+        record = ctx.params.get("polscope_record")
+        if isinstance(record, dict):
+            record["drift_correction"] = {k: v for k, v in summary.items() if k != "per_tile"}
+    except Exception as exc:
+        ctx.logger.error(
+            "LC-PolScope drift correction failed (originals unaffected): %s", exc, exc_info=True
+        )
+
+
 def _uses_stokes_background(ctx) -> bool:
     """True when this acquisition corrects background in Stokes space.
 
@@ -8238,6 +8421,7 @@ def _maybe_reconstruct_lcpolscope_tile(ctx, channel_plan, channel_images, filena
             camera_problems=getattr(ctx, "_lc_camera_problems", None),
             lc_adapter_wavelength_nm=getattr(ctx, "_lc_adapter_wavelength_nm", None),
             background_provenance=ctx.lcps_background_provenance or None,
+            drift_log=getattr(ctx, "lcps_drift", None),
             logger_=ctx.logger,
         )
     except ReconstructionRefused as e:
