@@ -26,7 +26,6 @@ from microscope_command_server.modality.lcpolscope_drift import (
     drift_settings,
     fit_drift_model,
     glass_mask,
-    leftover_vector,
     remove_vector,
     vector_nm_axis,
 )
@@ -346,7 +345,7 @@ class _Hardware:
         return self.fields[self.channel], {}
 
 
-def test_reference_visit_records_the_spot_and_returns_the_stage(monkeypatch):
+def test_reference_visit_records_the_spot_and_returns_the_stage(monkeypatch, tmp_path):
     pytest.importorskip("polscope_library")
     from microscope_command_server.acquisition import workflow
 
@@ -363,7 +362,9 @@ def test_reference_visit_records_the_spot_and_returns_the_stage(monkeypatch):
 
     monkeypatch.setattr(workflow, "apply_channel_hardware_state", apply)
     log = DriftLog(
-        settings=DriftSettings(reference_interval_min=10), reference_xyz=(5000.0, 600.0, 50.0)
+        settings=DriftSettings(reference_interval_min=10),
+        reference_xyz=(5000.0, 600.0, 50.0),
+        folder=tmp_path / DRIFT_FOLDER,
     )
     ctx = SimpleNamespace(
         lcps_drift=log,
@@ -401,6 +402,16 @@ def test_reference_visit_records_the_spot_and_returns_the_stage(monkeypatch):
     assert len(log.references) == 1
     workflow._maybe_visit_drift_reference(ctx, final=True)
     assert len(log.references) == 2
+    # Only the first and the last visit keep their five state images.
+    import tifffile
+
+    for sub in ("reference_first", "reference_last"):
+        files = sorted(p.name for p in (tmp_path / DRIFT_FOLDER / sub).iterdir())
+        assert files == [f"State{i}.tif" for i in range(5)]
+    img = tifffile.imread(tmp_path / DRIFT_FOLDER / "reference_first" / "State1.tif")
+    assert img.dtype == np.uint16
+    np.testing.assert_allclose(img, np.rint(spot["State1"]), atol=0)
+    assert [r.get("images") for r in log.references] == ["reference_first", "reference_last"]
 
 
 def _setup_ctx(recon, provenance=None, backgrounds=True):
@@ -433,6 +444,8 @@ def test_setup_needs_a_background_and_refuses_the_estimated_background_too(tmp_p
     ctx.output_path = tmp_path
     log = workflow._setup_lcpolscope_drift(ctx)
     assert log is not None and log.exposure_ratio == pytest.approx(2.0)
+    # Kept with the background and calibration, where tile cleanup leaves files alone.
+    assert log.folder == tmp_path / "_protected" / DRIFT_FOLDER
     assert log.reference_xyz is None  # no background_settings.yml in the folder
     (tmp_path / "background_settings.yml").write_text(
         "context:\n  stage_xy_um: [30294.0, 772.3]\n  stage_z_um: 50.9\n"

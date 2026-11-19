@@ -8184,7 +8184,7 @@ def _setup_lcpolscope_drift(ctx):
     ERROR and the run goes on without it: the retardance and orientation tiles do not depend on
     it, only the extra corrected copies do.
     """
-    from microscope_command_server.modality.lcpolscope import LCPOLSCOPE_CONFIG
+    from microscope_command_server.modality.lcpolscope import LCPOLSCOPE_CONFIG, PROTECTED_FOLDER
     from microscope_command_server.modality.lcpolscope_drift import (
         DRIFT_FOLDER,
         DriftLog,
@@ -8235,7 +8235,8 @@ def _setup_lcpolscope_drift(ctx):
         background_time=parse_time(provenance.get("collected_at")),
         reference_xyz=background_spot(provenance.get("folder")),
         exposure_ratio=exposure_ratio,
-        folder=ctx.output_path / DRIFT_FOLDER,
+        # With the background and calibration the run used: tile cleanup keeps _protected.
+        folder=ctx.output_path / PROTECTED_FOLDER / DRIFT_FOLDER,
     )
     if settings.reference_interval_min > 0 and log.reference_xyz is None:
         ctx.logger.warning(
@@ -8265,6 +8266,10 @@ def _maybe_visit_drift_reference(ctx, final: bool = False) -> None:
     if not final and not drift.reference_due(time.time()):
         return
     from microscope_command_server.modality.lcpolscope import measure_drift_reference
+    from microscope_command_server.modality.lcpolscope_drift import (
+        FIRST_VISIT_FOLDER,
+        LAST_VISIT_FOLDER,
+    )
 
     if ctx.is_cancelled():
         raise _AcquisitionCancelled()
@@ -8302,7 +8307,13 @@ def _maybe_visit_drift_reference(ctx, final: bool = False) -> None:
         vx, vy, n = measure_drift_reference(
             images, [e["id"] for e in channel_plan], recon, ctx.channel_background_images
         )
-        drift.add_reference(float(np.mean(times)), vx, vy, n)
+        # The first and the last visit keep their state images; the rest only their numbers.
+        kept = None
+        if final:
+            kept = drift.save_reference_images(LAST_VISIT_FOLDER, images)
+        elif not drift.references:
+            kept = drift.save_reference_images(FIRST_VISIT_FOLDER, images)
+        drift.add_reference(float(np.mean(times)), vx, vy, n, images_folder=kept)
         logger.info(
             "Drift reference at the background spot: %.3f nm (%s visit, %.1f s)",
             float(np.hypot(vx, vy)),

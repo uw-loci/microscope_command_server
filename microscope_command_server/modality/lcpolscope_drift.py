@@ -55,8 +55,13 @@ logger = logging.getLogger(__name__)
 #: Prefix of the corrected output folders. QPSC's LC-PolScope handler stitches every folder whose
 #: name ENDS in retardance / orientation / orientation_color, so the prefix keeps them stitched.
 DRIFT_PREFIX = "driftcorr_"
-#: Measurements and the fitted model, beside the tiles.
+#: Measurements, the fitted model and the first and last reference visits' state images, inside
+#: the acquisition's _protected folder (kept by tile cleanup and Make Project Portable) with the
+#: background and LC calibration the run used.
 DRIFT_FOLDER = "drift_correction"
+#: Subfolders of DRIFT_FOLDER holding the five state images of the first and the last visit.
+FIRST_VISIT_FOLDER = "reference_first"
+LAST_VISIT_FOLDER = "reference_last"
 MEASUREMENTS_FILE = "drift_measurements.ndjson"
 MODEL_FILE = "drift_model.json"
 
@@ -234,11 +239,37 @@ class DriftLog:
             self.tiles[filename] = {**record, "annotations": annotations}
             self._append(record)
 
-    def add_reference(self, t: float, vx: float, vy: float, pixels: int) -> None:
+    def add_reference(
+        self, t: float, vx: float, vy: float, pixels: int, images_folder: Optional[str] = None
+    ) -> None:
         record = {"kind": "reference", "time": t, "vx": vx, "vy": vy, "pixels": pixels}
+        if images_folder:
+            record["images"] = images_folder
         with self._lock:
             self.references.append(record)
             self._append(record)
+
+    def save_reference_images(self, subfolder: str, images: Dict[str, np.ndarray]) -> Optional[str]:
+        """Keep one visit's five state images (uint16, one TIFF per state, named like the
+        background's) in DRIFT_FOLDER/<subfolder>. Only the first and the last visit are kept:
+        about 42 MB each for 2048 x 2048 states, where keeping every visit would grow a
+        multi-hour run's _protected folder by gigabytes. Returns the subfolder, or None."""
+        import tifffile
+
+        if self.folder is None:
+            return None
+        target = self.folder / subfolder
+        try:
+            target.mkdir(parents=True, exist_ok=True)
+            for cid, img in images.items():
+                data = np.clip(np.rint(np.asarray(img, dtype=np.float64)), 0, 65535).astype(
+                    np.uint16
+                )
+                tifffile.imwrite(str(target / f"{cid}.tif"), data)
+            return subfolder
+        except OSError as exc:
+            logger.warning("Could not keep the reference visit images in %s: %s", target, exc)
+            return None
 
     def reference_due(self, now: float) -> bool:
         if self.settings.reference_interval_min <= 0 or self.reference_xyz is None:

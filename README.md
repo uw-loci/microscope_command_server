@@ -1199,12 +1199,19 @@ A bad block is reported at ERROR when the run starts, and the run goes on withou
 visit and fewer than 3 glass tiles) write no corrected copies. Every corrected tile records
 `polscope.drift_correction` (one line), `polscope.drift_removed_nm`, `..._removed_axis_deg`,
 `..._removed_vector_nm`, `..._minutes_after_background` and `polscope.drift_model`. The
-measurements are in `drift_correction/drift_measurements.ndjson` (one line per tile and visit,
-written as the run goes) and the model and per-tile removal in
-`drift_correction/drift_model.json`; its summary is also in `acquisition_metadata.json` under
-`polscope.drift_correction`. Replayed on the glass measured in the stitched 2026-11-15 and
-2026-11-17 scans, tile glass alone brings the leftover from 0.5-1.9 nm to a median of 0.03-0.045
-nm per tile (largest 0.14 nm).
+measurements, the model and the first and last visits' images are kept in the run's
+`_protected/drift_correction/` folder, beside the background and LC calibration the run used
+(tile cleanup and Make Project Portable never delete from `_protected`):
+`drift_measurements.ndjson` (one line per tile and visit, written as the run goes),
+`drift_model.json` (the model and the removal per tile; its summary is also in
+`acquisition_metadata.json` under `polscope.drift_correction`), and `reference_first/` and
+`reference_last/` with the five state images (uint16, `State0.tif`..`State4.tif`) of the first
+and the last background-spot visit. The visits in between keep only their numbers: each visit's
+images are about 42 MB, so keeping all of them would add about 2 GB to an 8 h run at 10 min.
+
+Replayed on the glass measured in the stitched 2026-11-15 and 2026-11-17 scans, tile glass
+alone brings the leftover from 0.5-1.9 nm to a median of 0.03-0.045 nm per tile (largest
+0.14 nm).
 
 ### Black-level options
 
