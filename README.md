@@ -1093,7 +1093,9 @@ acquisition paths skip for this modality.
   (default 10; a single frame's noise would be copied into every tile), refuses a camera on
   auto gain or auto exposure, warns on clipped pixels, and writes `<State>.tif` (float32) plus
   `background_provenance.json`: the LC calibration time and file, exposures, frames, adapter
-  wavelength, black level, camera summary, per-state means, `swing_state_spread` (how far
+  wavelength, black level, camera summary, stage position (`stage_position_um`: X, Y, Z in um
+  where the background was collected, or `null` if the stage could not be read), per-state means,
+  `swing_state_spread` (how far
   apart the swing states' background means lie, as a fraction of their mean) and
   `swing_field_variation` (how much their balance changes across the field, from 64 px blocks;
   a uniform imbalance from an uncalibrated palette stays low, specimen or debris pushes it up;
