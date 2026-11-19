@@ -8830,7 +8830,10 @@ def _record_tile_measurement(
         "saturation_role_high_pct": role_high_pct,
         "saturation_role_normal_pct": role_normal_pct,
         "acq_order_index": pos_idx,
-        "acq_timestamp_iso": time.strftime("%Y-%m-%dT%H:%M:%S", time.localtime(tile_start)),
+        # tile_start is a perf_counter() reading, not a wall-clock time: convert via the elapsed time
+        "acq_timestamp_iso": time.strftime(
+            "%Y-%m-%dT%H:%M:%S", time.localtime(time.time() - tile_elapsed_ms / 1000.0)
+        ),
     }
     # Per-channel percentile / mean / std stats (P1 metrics). Surfaces dim-tile
     # under-exposure in the same QuPath measurement table as saturation.
