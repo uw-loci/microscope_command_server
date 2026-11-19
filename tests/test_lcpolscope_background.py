@@ -153,6 +153,7 @@ class TestCollector:
             get_exposure=lambda: 50.0,
             get_camera_name=lambda: "Cam",
             get_pixel_size_um=lambda: 0.17,
+            get_current_position=lambda: SimpleNamespace(x=1234.567, y=-89.0, z=28.891),
         )
         hw.snaps = snaps
         return hw
@@ -210,8 +211,22 @@ class TestCollector:
         assert prov["states"] == [f"State{i}" for i in range(5)]
         assert prov["state_stats"]["State0"]["mean"] == pytest.approx(1000.0)
         assert prov["camera"]["significant_bits"] == 12
+        assert prov["stage_position_um"] == {"x_um": 1234.57, "y_um": -89.0, "z_um": 28.89}
         for i in range(5):
             assert (tmp_path / f"State{i}.tif").exists()
+
+    def test_a_failed_stage_read_still_writes_the_background(self, tmp_path):
+        pytest.importorskip("tifffile")
+        hw = self._hardware()
+
+        def broken():
+            raise RuntimeError("Serial command failed")
+
+        hw.get_current_position = broken
+        self._collect(tmp_path, hw, frames=1)
+        prov = json.loads((tmp_path / BACKGROUND_PROVENANCE_FILE).read_text())
+        assert prov["stage_position_um"] is None
+        assert (tmp_path / "State0.tif").exists()
 
     def test_a_camera_on_auto_gain_is_refused(self, tmp_path):
         with pytest.raises(RuntimeError, match="Gain Auto"):

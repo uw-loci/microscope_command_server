@@ -10012,6 +10012,20 @@ def _swing_spread_message(spread, means, calibrated, field_variation):
     )
 
 
+def _stage_position_record(hardware, logger):
+    """Stage X/Y/Z (um) where a background is collected, or None if it cannot be read."""
+    try:
+        pos = hardware.get_current_position()
+        return {
+            "x_um": round(float(pos.x), 2),
+            "y_um": round(float(pos.y), 2),
+            "z_um": round(float(pos.z), 2),
+        }
+    except Exception as e:  # a background must not fail because the stage read did
+        logger.warning("Background collection: could not read the stage position (%s)", e)
+        return None
+
+
 def _collect_channel_backgrounds(
     channels,
     output_folder_path,
@@ -10280,6 +10294,7 @@ def _collect_channel_backgrounds(
             "lc_adapter_wavelength_nm": adapter_wavelength_nm,
             "black_level": recon.get("black_level"),
             "camera": camera_summary,
+            "stage_position_um": _stage_position_record(hardware, logger),
         }
         (output_path / BACKGROUND_PROVENANCE_FILE).write_text(json.dumps(provenance, indent=1))
         logger.info(
@@ -10393,6 +10408,14 @@ def simple_background_collection(
     use_per_angle_wb = wb_mode == "per_angle"
     logger.info(f"Background collection wb_mode: {wb_mode}")
     logger.info("=== SIMPLE BACKGROUND COLLECTION STARTED ===")
+    bg_stage = _stage_position_record(hardware, logger)
+    if bg_stage is not None:
+        logger.info(
+            "Background collection stage position: X=%.2f Y=%.2f Z=%.2f um",
+            bg_stage["x_um"],
+            bg_stage["y_um"],
+            bg_stage["z_um"],
+        )
 
     # Lamp metadata captured so the caller can record it in background_settings.yml
     # and the Java side can later validate acquisition-vs-collection consistency.
