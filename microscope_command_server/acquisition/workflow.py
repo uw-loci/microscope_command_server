@@ -10294,7 +10294,6 @@ def _collect_channel_backgrounds(
             "lc_adapter_wavelength_nm": adapter_wavelength_nm,
             "black_level": recon.get("black_level"),
             "camera": camera_summary,
-            "stage_position_um": _stage_position_record(hardware, logger),
         }
         (output_path / BACKGROUND_PROVENANCE_FILE).write_text(json.dumps(provenance, indent=1))
         logger.info(
