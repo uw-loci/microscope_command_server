@@ -159,9 +159,13 @@ on top of the existing angle-based flags:
   collection (e.g., `profile=Brightfield_10x` or `profile=IF_40x`). If
   omitted, the profile is resolved automatically from modality, objective and the
   camera Micro-Manager has active (`microscope_control.config.resolve_profile_key`,
-  the rule QPSC's `resolveProfileKey` also applies). A key that names the other
-  camera's profile when the config has one for the active camera (a two-camera config
-  keeps a profile set per camera) is swapped for the active camera's.
+  the rule QPSC's `resolveProfileKey` also applies). With `--channels`
+  (per-channel collection), a key that names the other camera's profile when the config
+  has one for the active camera (a two-camera config keeps a profile set per camera) is
+  swapped for the active camera's for the channel settings; the lamp level is applied
+  first, from the key as sent. Angle-based collection (PPM, brightfield) uses the key as
+  sent. QPSC normally sends the active camera's key already (`resolveProfileKey` filters
+  by camera).
   The profile determines which camera, illumination intensity and device properties are
   applied during background collection.
 - `--channels "(id1,id2,...)"` -- when used with BGACQUIRE, enables
