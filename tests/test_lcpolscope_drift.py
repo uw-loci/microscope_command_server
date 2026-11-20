@@ -22,8 +22,10 @@ from microscope_command_server.modality.lcpolscope_drift import (
     DRIFT_FOLDER,
     DRIFT_PREFIX,
     DriftLog,
+    DEFAULT_REFERENCE_INTERVAL_MIN,
     DriftSettings,
     drift_settings,
+    drift_settings_for_run,
     fit_drift_model,
     glass_mask,
     remove_vector,
@@ -111,6 +113,45 @@ def test_settings_are_read():
 def test_a_bad_block_is_refused(block, match):
     with pytest.raises(ValueError, match=match):
         drift_settings({"drift_correction": block})
+
+
+RECON_WITH_BLOCK = {
+    "drift_correction": {"tile_glass": False, "reference_interval_min": 3, "glass_max_ratio": 1.1}
+}
+
+
+def test_without_a_dialog_choice_the_yaml_decides():
+    assert drift_settings_for_run({}, None) is None
+    assert drift_settings_for_run(RECON_WITH_BLOCK, None).reference_interval_min == 3
+
+
+def test_the_dialog_can_switch_the_yaml_block_off():
+    assert drift_settings_for_run(RECON_WITH_BLOCK, False) is None
+
+
+def test_the_dialog_switches_it_on_without_a_yaml_block():
+    s = drift_settings_for_run({}, True)
+    assert s.tile_glass and s.reference_interval_min == DEFAULT_REFERENCE_INTERVAL_MIN
+
+
+def test_the_dialog_interval_wins_and_the_yaml_keeps_its_thresholds():
+    s = drift_settings_for_run(RECON_WITH_BLOCK, True, 7)
+    assert s.tile_glass and s.reference_interval_min == 7 and s.glass_max_ratio == 1.1
+    # 0 = tile glass only, no visits to the background spot.
+    assert drift_settings_for_run(RECON_WITH_BLOCK, True, 0).reference_interval_min == 0
+    # No interval from the dialog: the YAML's.
+    assert drift_settings_for_run(RECON_WITH_BLOCK, True).reference_interval_min == 3
+
+
+def test_the_run_flags_are_parsed():
+    from microscope_command_server.acquisition.workflow import parse_acquisition_message
+
+    base = "--yaml c.yml --projects p --sample s --scan-type t --region r"
+    on = parse_acquisition_message(base + " --bg-drift on --bg-drift-interval-min 5 ENDOFSTR")
+    assert on["bg_drift"] is True and on["bg_drift_interval_min"] == 5.0
+    assert parse_acquisition_message(base + " --bg-drift OFF ENDOFSTR")["bg_drift"] is False
+    assert "bg_drift" not in parse_acquisition_message(base + " --bg-drift maybe ENDOFSTR")
+    assert "bg_drift" not in parse_acquisition_message(base + " ENDOFSTR")
 
 
 # ---------------------------------------------------------------------------

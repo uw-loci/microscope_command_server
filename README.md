@@ -1156,7 +1156,16 @@ warming), so later tiles carry a leftover that is uniform within a tile and grow
 2026-11-17 the glass of one scan read 0.36 nm 8 min after the background and 1.0 nm at 63 min,
 all along one axis; 6 to 8 h later it had leveled off near 1.5-1.9 nm, wobbling by about 0.3 nm
 over 20-30 min. It adds to fibers near its axis and subtracts from fibers across it.
-`reconstruction.drift_correction` measures it during the run and writes corrected copies:
+`reconstruction.drift_correction` measures it during the run and writes corrected copies. QPSC's
+acquisition dialog (AUTOFOCUS section, **Background drift correction**) switches it on or off
+per run with `--bg-drift on|off` and `--bg-drift-interval-min N`. The dialog's choice wins over
+the YAML: `off` turns it off whatever the block says, `on` turns tile glass on and visits the
+background spot every N minutes (0 = no visits; without an interval, the YAML's, else 10), and
+the block's glass thresholds still apply. Without `--bg-drift` (an older client) the block
+decides. The background spot is the X, Y and Z recorded in the background folder's
+`background_settings.yml` (`context.stage_xy_um`, `context.stage_z_um`) when the background was
+collected, so a visit returns to the same defocus. The stage moves in XY at the tile's Z, then in
+Z; the return reverses that.
 
 ```yaml
 drift_correction:

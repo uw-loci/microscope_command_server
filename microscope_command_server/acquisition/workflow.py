@@ -2483,6 +2483,21 @@ def parse_acquisition_message(message: str) -> dict:
             elif parts[i] == "--af-benchmark":
                 params["af_benchmark"] = True
                 i += 1
+            elif parts[i] == "--bg-drift" and i + 1 < len(parts):
+                # LC-PolScope background drift correction for this run: on | off. Absent means
+                # the YAML block decides, so an older client keeps the previous behavior.
+                value = parts[i + 1].lower()
+                if value in ("on", "off"):
+                    params["bg_drift"] = value == "on"
+                else:
+                    logger.warning("Ignoring --bg-drift %r; expected on or off", parts[i + 1])
+                i += 2
+            elif parts[i] == "--bg-drift-interval-min" and i + 1 < len(parts):
+                try:
+                    params["bg_drift_interval_min"] = float(parts[i + 1])
+                except ValueError:
+                    logger.warning("Ignoring non-numeric --bg-drift-interval-min %r", parts[i + 1])
+                i += 2
             elif parts[i] == "--focus-surface" and i + 1 < len(parts):
                 # off | observe | enforce. Absent means off, so a client that knows
                 # nothing about this gets exactly the previous behaviour.
@@ -8179,7 +8194,8 @@ def _preserve_lcpolscope_record(modality, output_path, settings, provenance, log
 def _setup_lcpolscope_drift(ctx):
     """LC-PolScope only: the drift correction's record for this run, or None when it is off.
 
-    Off unless ``reconstruction.drift_correction`` asks for it, and off (with a warning) without a
+    Off unless the acquisition dialog's checkbox (``--bg-drift``) or ``reconstruction.drift_correction``
+    asks for it, and off (with a warning) without a
     measured background, which the leftover is measured against. A bad block is reported at
     ERROR and the run goes on without it: the retardance and orientation tiles do not depend on
     it, only the extra corrected copies do.
@@ -8189,7 +8205,7 @@ def _setup_lcpolscope_drift(ctx):
         DRIFT_FOLDER,
         DriftLog,
         background_spot,
-        drift_settings,
+        drift_settings_for_run,
         parse_time,
     )
 
@@ -8197,8 +8213,11 @@ def _setup_lcpolscope_drift(ctx):
         return None
     modalities = (ctx.ppm_settings or {}).get("modalities", {}) or {}
     recon = (modalities.get("lcpolscope") or {}).get("reconstruction") or {}
+    run_choice = (ctx.params or {}).get("bg_drift")
     try:
-        settings = drift_settings(recon)
+        settings = drift_settings_for_run(
+            recon, run_choice, (ctx.params or {}).get("bg_drift_interval_min")
+        )
     except (TypeError, ValueError) as exc:
         ctx.logger.error(
             "reconstruction.drift_correction NOT used: %s. The run goes on without drift correction.",
@@ -8206,6 +8225,8 @@ def _setup_lcpolscope_drift(ctx):
         )
         return None
     if settings is None:
+        if run_choice is False:
+            ctx.logger.info("LC-PolScope drift correction off for this run (acquisition dialog).")
         return None
     if (recon.get("estimated_background") or {}).get("enabled") is True:
         ctx.logger.error(

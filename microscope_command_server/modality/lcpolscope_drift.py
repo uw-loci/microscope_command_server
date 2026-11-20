@@ -8,7 +8,9 @@ the background and 1.0 nm at 63 min, along one axis, and the leftover adds to fi
 axis and subtracts from fibers across it. See
 claude-reports/2026-11-16_jove-liver-l002-roi4-reacquisition.md (2026-11-19 entries).
 
-Two optional measurements, both in ``modalities.lcpolscope.reconstruction.drift_correction``:
+Two optional measurements, both in ``modalities.lcpolscope.reconstruction.drift_correction``,
+or switched on for one run by the acquisition dialog's "Background drift correction" checkbox
+(``--bg-drift on|off`` and ``--bg-drift-interval-min``; see drift_settings_for_run):
 
 A. ``tile_glass: true`` -- in every tile, find the glass (no specimen) and record its leftover
    with the time. Glass is found by brightness against the background images: the mean of the
@@ -144,6 +146,36 @@ def drift_settings(reconstruction_cfg) -> Optional[DriftSettings]:
     if s.time_bandwidth_min <= 0:
         raise ValueError("time_bandwidth_min must be positive")
     return s if s.enabled else None
+
+
+#: Minutes between visits to the background spot when the acquisition dialog switches the drift
+#: correction on and neither the dialog nor the YAML gives an interval.
+DEFAULT_REFERENCE_INTERVAL_MIN = 10.0
+
+
+def drift_settings_for_run(
+    reconstruction_cfg, run_choice: Optional[bool] = None, interval_min: Optional[float] = None
+) -> Optional[DriftSettings]:
+    """The drift correction for one acquisition: the dialog's choice, else the YAML.
+
+    ``run_choice`` is the acquisition dialog's checkbox (``--bg-drift on|off``). None (a client
+    that does not send it) leaves the YAML block in charge. False switches the correction off
+    whatever the YAML says. True switches tile glass on and visits the background spot every
+    ``interval_min`` minutes (0 = no visits; None = the YAML's interval, else
+    DEFAULT_REFERENCE_INTERVAL_MIN); the YAML block still supplies the glass thresholds.
+    """
+    if run_choice is None:
+        return drift_settings(reconstruction_cfg)
+    if not run_choice:
+        return None
+    yaml_block = (reconstruction_cfg or {}).get("drift_correction")
+    block = dict(yaml_block) if isinstance(yaml_block, dict) else {}
+    block["tile_glass"] = True
+    if interval_min is not None:
+        block["reference_interval_min"] = float(interval_min)
+    elif block.get("reference_interval_min") is None:
+        block["reference_interval_min"] = DEFAULT_REFERENCE_INTERVAL_MIN
+    return drift_settings({"drift_correction": block})
 
 
 # ---------------------------------------------------------------------------
