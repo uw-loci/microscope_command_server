@@ -2968,6 +2968,11 @@ class AcquisitionContext:
     # One-shot latch for the time-lapse "falling behind" warning. Set True
     # after the first overrunning timepoint so the warning fires exactly once.
     time_lapse_warning_fired: bool = False
+    # Tells the client the run no longer needs the microscope (REQFINSH); None when the
+    # caller does not poll for it.
+    report_finishing: Optional[Callable[[str], None]] = None
+    # True once _park_microscope has run, so cleanup does not move the stage again.
+    microscope_parked: bool = False
 
 
 def _format_time_lapse_warning(scheduler) -> str:
@@ -3263,6 +3268,7 @@ def _acquisition_workflow(
     request_saturation_decision: Optional[Callable[[str], str]] = None,
     connection_config_path: Optional[str] = None,
     report_time_lapse_warning: Optional[Callable[[str], None]] = None,
+    report_finishing: Optional[Callable[[str], None]] = None,
 ):
     """Execute the main image acquisition workflow with progress and cancellation.
 
@@ -3288,6 +3294,10 @@ def _acquisition_workflow(
                                human-readable message when the first time-lapse
                                timepoint overruns the requested interval. If
                                None, the overrun is only logged.
+        report_finishing: Optional callback invoked once, with a message for the
+                               operator, when the run has finished with the
+                               microscope (device properties saved, illumination
+                               off, stage parked) and only disk work remains.
     """
     ctx = None
     try:
@@ -3306,6 +3316,7 @@ def _acquisition_workflow(
             request_saturation_decision=request_saturation_decision,
             connection_config_path=connection_config_path,
         )
+        ctx.report_finishing = report_finishing
 
         # From here until cleanup we are the only thing that moves the stage,
         # so the stage may hold us to it: a reported position that disagrees
@@ -3366,171 +3377,55 @@ def _acquisition_workflow(
 ##############################################################################
 
 
-def _finalize_acquisition(ctx: AcquisitionContext) -> None:
-    """Post-acquisition: close streams, write metadata files, set COMPLETED state."""
+def _finish_with_microscope(ctx: AcquisitionContext):
+    """Do the last things that need the hardware, park it, and tell the operator.
+
+    Reads what the disk-only steps after this need from the hardware (the device properties
+    for MMproperties.txt, the final Z for the client's focus model, the pixel size for a
+    timepoint projection), then parks: illumination off, Z retracted, XY returned. Returns
+    ``(final_z, pixel_size_um)``; the pixel size is None when no projection was asked for.
+    """
     logger = ctx.logger
-    # The drift correction's last background-spot visit brackets the last tile.
-    _maybe_visit_drift_reference(ctx, final=True)
-    if ctx.flatfield.clipped_pixels:
-        logger.warning(
-            "Flat-field correction clipped %d pixels at the limits of the range",
-            ctx.flatfield.clipped_pixels,
-        )
-    if ctx.af_tissue_tiles is not None:
-        glass_skipped = sum(1 for m in ctx.tile_measurements if m.get("af_type") == "skipped-glass")
-        logger.info(
-            "Autofocus skipped on %d glass tile(s) by the client's macro image (WSI); %d of "
-            "%d tiles were on the allow-list",
-            glass_skipped,
-            len(ctx.af_tissue_tiles),
-            len(ctx.positions),
-        )
-
-    # Close NDJSON stream now that the loop has finished normally
-    if ctx.tile_measurements_stream is not None:
-        try:
-            ctx.tile_measurements_stream.close()
-        except Exception as e:
-            logger.debug("Error closing tile measurements NDJSON stream: %s", e)
-        ctx.tile_measurements_stream = None
-
-    # Drain any remaining background writes before finalizing
-    if ctx.write_pool.pending_count > 0:
-        t_drain = time.perf_counter()
-        n_remaining = ctx.write_pool.pending_count
-        logger.info(f"Draining {n_remaining} remaining background writes...")
-        failed = ctx.write_pool.drain()
-        log_timing(logger, f"Final drain of {n_remaining} writes ({failed} failed)", t_drain)
-    if ctx.write_pool.total_failed > 0:
-        logger.warning(
-            f"Total background write failures during acquisition: {ctx.write_pool.total_failed}"
-        )
-
-    # Every timepoint's tiles are on disk now; reduce them if a time projection was asked for.
-    _project_timepoints(ctx)
-
-    # LC-PolScope drift correction (step C): every derived tile is on disk, and QPSC stitches
-    # only after COMPLETED, so the corrected copies are stitched with the rest.
-    _apply_lcpolscope_drift(ctx)
-
-    # Save device properties
     current_props = ctx.hardware.get_device_properties()
-    props_path = ctx.output_path / "MMproperties.txt"
-    with open(props_path, "w") as fid:
+    with open(ctx.output_path / "MMproperties.txt", "w") as fid:
         from pprint import pprint as dict_printer
 
         dict_printer(current_props, stream=fid)
-
-    # Write TileConfiguration with stage coordinates including Z
-    if ctx.stage_positions_collected:
-        TileConfigUtils.write_tileconfig_stage(ctx.output_path, ctx.stage_positions_collected)
-
-    # Write consolidated tile manifest (intended vs actual positions)
-    try:
-        manifest_path = ctx.output_path / "tile_manifest.csv"
-        with open(manifest_path, "w") as mf:
-            mf.write(
-                "filename,intended_x_um,intended_y_um,actual_x_um,actual_y_um,actual_z_um,dx_um,dy_um\n"
-            )
-            intended = {fn: (pos.x, pos.y) for pos, fn in ctx.positions}
-            for entry in ctx.stage_positions_collected:
-                fn, ax, ay, az = entry
-                ix, iy = intended.get(fn, (0.0, 0.0))
-                mf.write(
-                    f"{fn},{ix:.2f},{iy:.2f},{ax:.2f},{ay:.2f},{az:.2f},{ax - ix:.2f},{ay - iy:.2f}\n"
-                )
-        logger.info(f"Wrote tile manifest: {manifest_path}")
-    except Exception as e:
-        logger.warning(f"Failed to write tile manifest: {e}")
-
-    # Write saturation report
-    ctx.sat_monitor.write_saturation_report(ctx.output_path)
-
-    # Write per-tile measurements JSON (authoritative copy)
-    try:
-        measurements_path = ctx.output_path / "tile_measurements.json"
-        with open(measurements_path, "w") as f:
-            json.dump(ctx.tile_measurements, f, indent=2)
-        logger.info(f"Wrote tile measurements: {measurements_path}")
-    except Exception as e:
-        logger.warning(f"Failed to write tile measurements: {e}")
-
-    # Write FAIR/4DN-BINA-OME acquisition metadata
-    try:
-        write_acquisition_metadata(
-            output_path=ctx.output_path,
-            params=ctx.params,
-            tile_measurements=ctx.tile_measurements,
-            sat_monitor=ctx.sat_monitor,
-        )
-    except Exception as e:
-        logger.warning(f"Failed to write acquisition metadata: {e}")
-
-    # Post-acquisition timing report
-    all_times = [m["tile_time_ms"] for m in ctx.tile_measurements]
-    if all_times:
-        af_tiles = [m for m in ctx.tile_measurements if m["af_performed"]]
-        non_af_tiles = [m for m in ctx.tile_measurements if not m["af_performed"]]
-        total_wall_s = sum(all_times) / 1000
-        avg_all = sum(all_times) / len(all_times)
-        avg_af = sum(m["tile_time_ms"] for m in af_tiles) / len(af_tiles) if af_tiles else 0
-        avg_non_af = (
-            sum(m["tile_time_ms"] for m in non_af_tiles) / len(non_af_tiles) if non_af_tiles else 0
-        )
-        throughput = len(all_times) / (total_wall_s / 3600) if total_wall_s > 0 else 0
-        logger.info("=== ACQUISITION TIMING REPORT ===")
-        logger.info("  Total tiles: %d, wall time: %.1fh", len(all_times), total_wall_s / 3600)
-        logger.info("  Average: %.1fms/tile (%.1fs)", avg_all, avg_all / 1000)
-        logger.info(
-            "  AF tiles: %d (avg %.1fms), non-AF: %d (avg %.1fms)",
-            len(af_tiles),
-            avg_af,
-            len(non_af_tiles),
-            avg_non_af,
-        )
-        logger.info("  Throughput: %.0f tiles/hr", throughput)
-
-    # Get final Z position for tilt correction model
+    # Before the retract: this is the focus height the client's Z model learns from.
     final_z = ctx.hardware.get_current_position().z
-    sat_summary = ctx.sat_monitor.get_summary_string()
-    ctx.set_state("COMPLETED", final_z=final_z, saturation_summary=sat_summary)
-    logger.info("=== ACQUISITION COMPLETED SUCCESSFULLY ===")
-    ctx.sat_monitor.log_summary()
-    logger.info(f"Final Z position: {final_z:.2f} um")
-    _log_focus_surface_summary(ctx)
-    logger.info(f"Total images saved: {ctx.image_count}/{ctx.total_images}")
-    logger.info(f"Output directory: {ctx.output_path}")
+    pixel_size = (
+        ctx.hardware.get_pixel_size_um() if ctx.n_timepoints > 1 and ctx.t_projection else None
+    )
+    _park_microscope(ctx)
+    remaining = ["the records"]
+    if ctx.n_timepoints > 1 and ctx.t_projection:
+        remaining.insert(0, "the timepoint projection")
+    if getattr(ctx, "lcps_drift", None) is not None:
+        remaining.insert(0, "the drift-corrected copies")
+    message = (
+        "All images are acquired and the microscope is parked (illumination off, stage "
+        "retracted). It is no longer needed for this acquisition and can be switched off. "
+        "The server is still writing " + ", ".join(remaining) + "; stitching starts after that."
+    )
+    logger.info("=== MICROSCOPE NO LONGER NEEDED === %s", message)
+    if ctx.report_finishing is not None:
+        try:
+            ctx.report_finishing(message)
+        except Exception as e:
+            logger.debug("Could not report the finishing notice: %s", e)
+    return final_z, pixel_size
 
-    # Report autofocus activity
-    if ctx.deferred_af_positions:
-        logger.info(
-            f"Autofocus deferred at {len(ctx.deferred_af_positions)} positions "
-            f"due to insufficient tissue: {sorted(ctx.deferred_af_positions)}"
-        )
 
-
-def _cleanup_acquisition(ctx: AcquisitionContext) -> None:
-    """Guaranteed cleanup: shutdown write pool, return stage to start."""
+def _park_microscope(ctx: AcquisitionContext) -> None:
+    """Illumination off, Z retracted, XY returned. Runs once: after the last image on success
+    (``_finish_with_microscope``), or from cleanup when the run ended early."""
+    if ctx.microscope_parked:
+        return
+    ctx.microscope_parked = True
     # Hand the stage back: once the acquisition is over the operator may move it
     # from the joystick or the Live Viewer, and a disagreement with our last
     # commanded position stops being evidence of anything.
     set_frame_check_armed(ctx.hardware, False)
-
-    # Shut down background write pool (drains any remaining writes)
-    if ctx.write_pool is not None:
-        try:
-            ctx.write_pool.shutdown()
-        except Exception as e:
-            ctx.logger.warning(f"Error shutting down write pool: {e}")
-
-    # Close NDJSON stream if still open (error path)
-    if ctx.tile_measurements_stream is not None:
-        try:
-            ctx.tile_measurements_stream.close()
-        except Exception:
-            pass
-        ctx.tile_measurements_stream = None
-    AF_EVENTS.detach_file()
 
     # Leave the light path dark for channel modalities. The tile loop ends with the
     # LAST acquired channel still applied and still exciting the sample, and the Live
@@ -3606,6 +3501,170 @@ def _cleanup_acquisition(ctx: AcquisitionContext) -> None:
             ctx.hardware.move_to_position(Position(x=return_xy[0], y=return_xy[1]))
         except Exception as e:
             ctx.logger.warning(f"Failed to return to {return_label}: {e}")
+
+
+def _finalize_acquisition(ctx: AcquisitionContext) -> None:
+    """Post-acquisition: close streams, write metadata files, set COMPLETED state."""
+    logger = ctx.logger
+    # The drift correction's last background-spot visit brackets the last tile.
+    _maybe_visit_drift_reference(ctx, final=True)
+    if ctx.flatfield.clipped_pixels:
+        logger.warning(
+            "Flat-field correction clipped %d pixels at the limits of the range",
+            ctx.flatfield.clipped_pixels,
+        )
+    if ctx.af_tissue_tiles is not None:
+        glass_skipped = sum(1 for m in ctx.tile_measurements if m.get("af_type") == "skipped-glass")
+        logger.info(
+            "Autofocus skipped on %d glass tile(s) by the client's macro image (WSI); %d of "
+            "%d tiles were on the allow-list",
+            glass_skipped,
+            len(ctx.af_tissue_tiles),
+            len(ctx.positions),
+        )
+
+    # Close NDJSON stream now that the loop has finished normally
+    if ctx.tile_measurements_stream is not None:
+        try:
+            ctx.tile_measurements_stream.close()
+        except Exception as e:
+            logger.debug("Error closing tile measurements NDJSON stream: %s", e)
+        ctx.tile_measurements_stream = None
+
+    # Drain any remaining background writes before finalizing
+    if ctx.write_pool.pending_count > 0:
+        t_drain = time.perf_counter()
+        n_remaining = ctx.write_pool.pending_count
+        logger.info(f"Draining {n_remaining} remaining background writes...")
+        failed = ctx.write_pool.drain()
+        log_timing(logger, f"Final drain of {n_remaining} writes ({failed} failed)", t_drain)
+    if ctx.write_pool.total_failed > 0:
+        logger.warning(
+            f"Total background write failures during acquisition: {ctx.write_pool.total_failed}"
+        )
+
+    # Everything that needs the microscope happens here, then it is parked and the operator
+    # is told it may be switched off. What follows is disk work only, and the drift-corrected
+    # copies alone took over 15 minutes for 1756 LC-PolScope tiles (2026-11-21).
+    final_z, pixel_size = _finish_with_microscope(ctx)
+
+    # Every timepoint's tiles are on disk now; reduce them if a time projection was asked for.
+    _project_timepoints(ctx, pixel_size)
+
+    # LC-PolScope drift correction (step C): every derived tile is on disk, and QPSC stitches
+    # only after COMPLETED, so the corrected copies are stitched with the rest.
+    _apply_lcpolscope_drift(ctx)
+
+    # Write TileConfiguration with stage coordinates including Z
+    if ctx.stage_positions_collected:
+        TileConfigUtils.write_tileconfig_stage(ctx.output_path, ctx.stage_positions_collected)
+
+    # Write consolidated tile manifest (intended vs actual positions)
+    try:
+        manifest_path = ctx.output_path / "tile_manifest.csv"
+        with open(manifest_path, "w") as mf:
+            mf.write(
+                "filename,intended_x_um,intended_y_um,actual_x_um,actual_y_um,actual_z_um,dx_um,dy_um\n"
+            )
+            intended = {fn: (pos.x, pos.y) for pos, fn in ctx.positions}
+            for entry in ctx.stage_positions_collected:
+                fn, ax, ay, az = entry
+                ix, iy = intended.get(fn, (0.0, 0.0))
+                mf.write(
+                    f"{fn},{ix:.2f},{iy:.2f},{ax:.2f},{ay:.2f},{az:.2f},{ax - ix:.2f},{ay - iy:.2f}\n"
+                )
+        logger.info(f"Wrote tile manifest: {manifest_path}")
+    except Exception as e:
+        logger.warning(f"Failed to write tile manifest: {e}")
+
+    # Write saturation report
+    ctx.sat_monitor.write_saturation_report(ctx.output_path)
+
+    # Write per-tile measurements JSON (authoritative copy)
+    try:
+        measurements_path = ctx.output_path / "tile_measurements.json"
+        with open(measurements_path, "w") as f:
+            json.dump(ctx.tile_measurements, f, indent=2)
+        logger.info(f"Wrote tile measurements: {measurements_path}")
+    except Exception as e:
+        logger.warning(f"Failed to write tile measurements: {e}")
+
+    # Write FAIR/4DN-BINA-OME acquisition metadata
+    try:
+        write_acquisition_metadata(
+            output_path=ctx.output_path,
+            params=ctx.params,
+            tile_measurements=ctx.tile_measurements,
+            sat_monitor=ctx.sat_monitor,
+        )
+    except Exception as e:
+        logger.warning(f"Failed to write acquisition metadata: {e}")
+
+    # Post-acquisition timing report
+    all_times = [m["tile_time_ms"] for m in ctx.tile_measurements]
+    if all_times:
+        af_tiles = [m for m in ctx.tile_measurements if m["af_performed"]]
+        non_af_tiles = [m for m in ctx.tile_measurements if not m["af_performed"]]
+        total_wall_s = sum(all_times) / 1000
+        avg_all = sum(all_times) / len(all_times)
+        avg_af = sum(m["tile_time_ms"] for m in af_tiles) / len(af_tiles) if af_tiles else 0
+        avg_non_af = (
+            sum(m["tile_time_ms"] for m in non_af_tiles) / len(non_af_tiles) if non_af_tiles else 0
+        )
+        throughput = len(all_times) / (total_wall_s / 3600) if total_wall_s > 0 else 0
+        logger.info("=== ACQUISITION TIMING REPORT ===")
+        logger.info("  Total tiles: %d, wall time: %.1fh", len(all_times), total_wall_s / 3600)
+        logger.info("  Average: %.1fms/tile (%.1fs)", avg_all, avg_all / 1000)
+        logger.info(
+            "  AF tiles: %d (avg %.1fms), non-AF: %d (avg %.1fms)",
+            len(af_tiles),
+            avg_af,
+            len(non_af_tiles),
+            avg_non_af,
+        )
+        logger.info("  Throughput: %.0f tiles/hr", throughput)
+
+    sat_summary = ctx.sat_monitor.get_summary_string()
+    ctx.set_state("COMPLETED", final_z=final_z, saturation_summary=sat_summary)
+    logger.info("=== ACQUISITION COMPLETED SUCCESSFULLY ===")
+    ctx.sat_monitor.log_summary()
+    logger.info(f"Final Z position: {final_z:.2f} um")
+    _log_focus_surface_summary(ctx)
+    logger.info(f"Total images saved: {ctx.image_count}/{ctx.total_images}")
+    logger.info(f"Output directory: {ctx.output_path}")
+
+    # Report autofocus activity
+    if ctx.deferred_af_positions:
+        logger.info(
+            f"Autofocus deferred at {len(ctx.deferred_af_positions)} positions "
+            f"due to insufficient tissue: {sorted(ctx.deferred_af_positions)}"
+        )
+
+
+def _cleanup_acquisition(ctx: AcquisitionContext) -> None:
+    """Guaranteed cleanup: shut down the write pool, park the microscope if the run did not."""
+    # Shut down background write pool (drains any remaining writes)
+    if ctx.write_pool is not None:
+        try:
+            ctx.write_pool.shutdown()
+        except Exception as e:
+            ctx.logger.warning(f"Error shutting down write pool: {e}")
+
+    # Close NDJSON stream if still open (error path)
+    if ctx.tile_measurements_stream is not None:
+        try:
+            ctx.tile_measurements_stream.close()
+        except Exception:
+            pass
+        ctx.tile_measurements_stream = None
+    AF_EVENTS.detach_file()
+
+    # A completed run parked the microscope before its disk-only finishing work; a canceled
+    # or failed one gets here first. Either way the frame check is handed back.
+    if ctx.microscope_parked:
+        set_frame_check_armed(ctx.hardware, False)
+    else:
+        _park_microscope(ctx)
 
 
 def _initialize_loop_infrastructure(ctx: AcquisitionContext) -> None:
@@ -6671,7 +6730,7 @@ def _resolve_time_projection(raw, n_timepoints: int, logger) -> Optional[str]:
     return name
 
 
-def _project_timepoints(ctx: AcquisitionContext) -> None:
+def _project_timepoints(ctx: AcquisitionContext, pixel_size_um=None) -> None:
     """Reduce each tile's timepoints to one image, like a Z projection reduces planes.
 
     Reads ``{group}/t{tt}/{tile}`` for every timepoint and writes the projection to
@@ -6701,7 +6760,9 @@ def _project_timepoints(ctx: AcquisitionContext) -> None:
     project = get_projection(name)
     root = ctx.output_path
     raw_root = ctx.output_path.parent / "Raw" / ctx.output_path.name
-    pixel_size = ctx.hardware.get_pixel_size_um()
+    # Read before the microscope was parked (it may be off by now); asked again only when the
+    # caller did not pass it.
+    pixel_size = pixel_size_um if pixel_size_um is not None else ctx.hardware.get_pixel_size_um()
     # Mean/Sum: PPM birefringence from the averaged angles, written before the timepoints go.
     biref_dir = _biref_from_mean_angles(ctx) if name in ("mean", "sum") else None
     groups = [root] + sorted(

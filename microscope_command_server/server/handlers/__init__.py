@@ -59,6 +59,7 @@ from microscope_command_server.server.handlers.status import (
     handle_reqhwer,
     handle_ackhwer,
     handle_reqtwarn,
+    handle_reqfinsh,
     handle_reqsat,
     handle_acksat,
 )
@@ -165,6 +166,7 @@ COMMAND_HANDLERS = {
     ExtendedCommand.REQHWER: handle_reqhwer,
     ExtendedCommand.ACKHWER: handle_ackhwer,
     ExtendedCommand.REQTWARN: handle_reqtwarn,
+    ExtendedCommand.REQFINSH: handle_reqfinsh,
     ExtendedCommand.REQSAT: handle_reqsat,
     ExtendedCommand.ACKSAT: handle_acksat,
     # Autofocus testing

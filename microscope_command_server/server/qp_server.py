@@ -244,6 +244,7 @@ saturation_complete_events = {}  # addr -> Event (set when user answers the satu
 saturation_user_choice = {}  # addr -> str ("continue", "cancel")
 saturation_message = {}  # addr -> str (saturation-abort reason shown to the user)
 time_lapse_warnings = {}  # addr -> Optional[str] (time-lapse "falling behind" warning)
+finishing_notices = {}  # addr -> Optional[str] (set once a run no longer needs the microscope)
 
 # Server configuration state - CRITICAL FOR SAFETY
 # NEVER allow hardware operations with generic config - could damage microscope!
@@ -355,6 +356,14 @@ def acquisitionWorkflow(message, client_addr):
 
     def _is_cancelled() -> bool:
         return acquisition_cancel_events[client_addr].is_set()
+
+    def _report_finishing(msg: str):
+        """Store the 'microscope no longer needed' notice for REQFINSH polling."""
+        with acquisition_locks[client_addr]:
+            finishing_notices[client_addr] = msg
+
+    with acquisition_locks[client_addr]:
+        finishing_notices[client_addr] = None
 
     def _report_time_lapse_warning(msg: str):
         """Store a time-lapse 'falling behind' warning for REQTWARN polling.
@@ -484,6 +493,7 @@ def acquisitionWorkflow(message, client_addr):
         request_saturation_decision=_request_saturation_decision,
         connection_config_path=active_connection_config_path,
         report_time_lapse_warning=_report_time_lapse_warning,
+        report_finishing=_report_finishing,
     )
 
 
@@ -524,6 +534,7 @@ def handle_client(conn, addr):
     saturation_user_choice[addr] = None
     saturation_message[addr] = ""
     time_lapse_warnings[addr] = None
+    finishing_notices[addr] = None
 
     # ClientState object for handlers that use the new pattern
     client = ClientState(addr)
@@ -573,6 +584,7 @@ def handle_client(conn, addr):
         "saturation_user_choice": saturation_user_choice,
         "saturation_message": saturation_message,
         "time_lapse_warnings": time_lapse_warnings,
+        "finishing_notices": finishing_notices,
         # Acquisition thread tracking
         "acquisition_thread": acquisition_thread,
     }
@@ -651,6 +663,8 @@ def handle_client(conn, addr):
             del acquisition_saturation_summary[addr]
         if addr in time_lapse_warnings:
             del time_lapse_warnings[addr]
+        if addr in finishing_notices:
+            del finishing_notices[addr]
 
         # Remove this connection from tracking and check if all connections from
         # the active IP are gone before unconfiguring.  Java uses main + aux sockets,

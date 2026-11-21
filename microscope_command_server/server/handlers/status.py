@@ -232,6 +232,34 @@ def handle_reqtwarn(conn, client, hardware, settings, **kwargs):
         conn.sendall(b"IDLE____")  # 8 bytes: no warning
 
 
+def handle_reqfinsh(conn, client, hardware, settings, **kwargs):
+    """Check whether the running acquisition is done with the microscope.
+
+    After the last tile the workflow saves the device properties, turns the illumination off,
+    retracts Z and returns XY, and only then does the disk-only work (timepoint projection,
+    LC-PolScope drift-corrected copies, records), which can take many minutes. From that point
+    the operator may switch the microscope off; this tells the client so.
+
+    Response: 'FINSH___' (8 bytes) + 4-byte length (big-endian) + message bytes once the
+    microscope is no longer needed, or 'IDLE____' (8 bytes) before that. Repeated on every poll
+    until the next acquisition starts (the Java client de-dupes).
+    """
+    finishing_notices = kwargs["finishing_notices"]
+    acquisition_locks = kwargs["acquisition_locks"]
+    addr = client.addr
+
+    with acquisition_locks[addr]:
+        notice = finishing_notices.get(addr)
+
+    if notice:
+        msg_bytes = notice.encode("utf-8")
+        conn.sendall(b"FINSH___")
+        conn.sendall(len(msg_bytes).to_bytes(4, "big"))
+        conn.sendall(msg_bytes)
+    else:
+        conn.sendall(b"IDLE____")
+
+
 def handle_ackhwer(conn, client, hardware, settings, **kwargs):
     """Acknowledge hardware error - user chose retry/skip/cancel.
 

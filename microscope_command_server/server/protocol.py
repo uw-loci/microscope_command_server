@@ -59,6 +59,7 @@ class ExtendedCommand:
     REQHWER = b"reqhwer_"  # Check if hardware error recovery is requested
     ACKHWER = b"ackhwer_"  # Acknowledge hardware error - retry/skip/cancel
     REQTWARN = b"reqtwarn"  # Check if a time-lapse "falling behind" warning is pending
+    REQFINSH = b"reqfinsh"  # Check if the run is done with the microscope (disk-only finishing)
     REQSAT = b"reqsat__"  # Check if a saturation continue/cancel decision is pending
     ACKSAT = b"acksat__"  # Acknowledge saturation prompt - continue/cancel
     AFBENCH = b"afbench_"  # Run autofocus parameter benchmark

@@ -191,13 +191,17 @@ def test_the_retraction_precedes_the_end_of_region_return_move():
     """
     source = WORKFLOW_SRC.read_text()
     retract_at = source.index("retract_to_safe_z(")
-    # The return move inside _cleanup_acquisition.
+    # The return move inside _park_microscope.
     return_at = source.index("Returning to %s: X=%.1f, Y=%.1f")
     assert retract_at < return_at
-    # And it sits in the guaranteed-cleanup path, so a cancelled or failed acquisition
-    # also leaves the objective clear.
-    cleanup_at = source.index("def _cleanup_acquisition(")
-    assert retract_at > cleanup_at
+    # Both sit in _park_microscope, which a completed run calls before its disk-only
+    # finishing work and the guaranteed-cleanup path calls otherwise, so a cancelled or
+    # failed acquisition also leaves the objective clear.
+    park_at = source.index("def _park_microscope(")
+    assert retract_at > park_at
+    cleanup_body = source[source.index("def _cleanup_acquisition(") :]
+    cleanup_body = cleanup_body[: cleanup_body.index("\ndef ")]
+    assert "_park_microscope(ctx)" in cleanup_body
 
 
 def test_the_return_move_no_longer_claims_to_preserve_z():

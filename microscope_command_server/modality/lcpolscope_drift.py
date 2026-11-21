@@ -66,6 +66,9 @@ FIRST_VISIT_FOLDER = "reference_first"
 LAST_VISIT_FOLDER = "reference_last"
 MEASUREMENTS_FILE = "drift_measurements.ndjson"
 MODEL_FILE = "drift_model.json"
+#: Worker threads for the corrected copies (also capped by the CPU count). Each holds about
+#: 0.3 GB of float64 intermediates for a 2048 x 2048 tile.
+DRIFT_WRITE_WORKERS = 4
 
 
 @dataclass(frozen=True)
@@ -506,15 +509,18 @@ def write_corrected_tiles(
     out_ret = output_path / (DRIFT_PREFIX + retardance_dir)
     out_ori = output_path / (DRIFT_PREFIX + orientation_dir)
     out_col = output_path / (DRIFT_PREFIX + color_dir)
-    rows = []
-    t_start = time.perf_counter()
-    for name, t, vx, vy in zip(names, times, px, py):
+    for out_dir in (out_ret, out_ori) + ((out_col,) if log.display else ()):
+        out_dir.mkdir(parents=True, exist_ok=True)
+        copy_tile_configuration(output_path / retardance_dir, out_dir)
+
+    def correct_one(name, t, vx, vy):
+        """Read, correct and write one tile; its summary row, or None when it was skipped."""
         rec = log.tiles[name]
         src_r = output_path / retardance_dir / name
         src_o = output_path / orientation_dir / name
         if not (src_r.is_file() and src_o.is_file()):
             log_.warning("Drift correction: %s has no retardance/orientation tile; skipped", name)
-            continue
+            return None
         ret = read_tile(src_r).astype(np.float64) / retardance_counts_per_nm
         ori = np.deg2rad(read_tile(src_o).astype(np.float64) / orientation_counts_per_degree)
         new_r, new_o = remove_vector(ret, ori, float(vx), float(vy))
@@ -539,8 +545,6 @@ def write_corrected_tiles(
             (out_ret, retardance_dir, r_counts),
             (out_ori, orientation_dir, o_counts),
         ):
-            out_dir.mkdir(parents=True, exist_ok=True)
-            copy_tile_configuration(output_path / retardance_dir, out_dir)
             (out_dir / name).parent.mkdir(parents=True, exist_ok=True)
             write_tile(
                 filename=str(out_dir / name),
@@ -549,8 +553,6 @@ def write_corrected_tiles(
                 map_annotations={**shared, **per_channel[src_dir]},
             )
         if log.display:
-            out_col.mkdir(parents=True, exist_ok=True)
-            copy_tile_configuration(output_path / retardance_dir, out_col)
             (out_col / name).parent.mkdir(parents=True, exist_ok=True)
             write_tile(
                 filename=str(out_col / name),
@@ -558,19 +560,47 @@ def write_corrected_tiles(
                 channel_name="Orientation colour (hue = orientation, brightness = retardance)",
                 map_annotations={**shared, **log.display.get("annotations", {})},
             )
-        rows.append(
-            {
-                "file": name,
-                "minutes_after_background": None if minutes is None else round(minutes, 2),
-                "removed_nm": round(nm, 4),
-                "removed_axis_deg": round(axis, 2),
-                "vx": round(float(vx), 4),
-                "vy": round(float(vy), 4),
-                "glass_vx": rec.get("vx"),
-                "glass_vy": rec.get("vy"),
-                "glass_fraction": rec.get("glass_fraction"),
-            }
-        )
+        return {
+            "file": name,
+            "minutes_after_background": None if minutes is None else round(minutes, 2),
+            "removed_nm": round(nm, 4),
+            "removed_axis_deg": round(axis, 2),
+            "vx": round(float(vx), 4),
+            "vy": round(float(vy), 4),
+            "glass_vx": rec.get("vx"),
+            "glass_vy": rec.get("vy"),
+            "glass_fraction": rec.get("glass_fraction"),
+        }
+
+    # The time is arithmetic, not disk: on 2048 x 2048 tiles the correction, the 16-bit
+    # conversion and the colour image take about 2.4 s a tile and the three writes 0.07 s, so a
+    # 1756-tile run spent 55 minutes here one tile at a time (2026-11-21). numpy releases the
+    # GIL in those operations, so tiles run on worker threads; each tile is independent and the
+    # rows come back in tile order.
+    from concurrent.futures import ThreadPoolExecutor
+    import os
+
+    total = len(names)
+    workers = max(1, min(DRIFT_WRITE_WORKERS, os.cpu_count() or 1, total))
+    log_.info(
+        "LC-PolScope drift correction: writing corrected copies of %d tiles on %d threads",
+        total,
+        workers,
+    )
+    rows = []
+    t_start = time.perf_counter()
+    with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="driftcorr") as pool:
+        for i, row in enumerate(pool.map(correct_one, names, times, px, py), start=1):
+            if row is not None:
+                rows.append(row)
+            if i % 100 == 0 and i < total:
+                elapsed = time.perf_counter() - t_start
+                log_.info(
+                    "  Drift-corrected copies: %d of %d tiles, about %.0f s left",
+                    i,
+                    total,
+                    elapsed / i * (total - i),
+                )
     removed = [r["removed_nm"] for r in rows]
     summary.update(
         applied=bool(rows),

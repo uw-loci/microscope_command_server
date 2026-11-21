@@ -76,6 +76,7 @@ class Ctx:
         self.logger = FakeLogger()
         self.ppm_settings = {}
         self.safe_z = None
+        self.microscope_parked = False
 
 
 def cleanup(ctx):
@@ -100,8 +101,22 @@ def cleanup(ctx):
             ctx.hardware.moves.append("RETRACT")
         ),
     }
+    load_function("_park_microscope", ns)
     load_function("_cleanup_acquisition", ns)(ctx)
     return ctx
+
+
+def test_a_run_that_already_parked_is_not_moved_again():
+    """A completed run parks before its disk-only finishing work (the operator may have
+    switched the microscope off by now), so cleanup must not touch the hardware again --
+    only hand the frame check back."""
+    ctx = Ctx(channels=["State0"])
+    ctx.starting_position = type("P", (), {"x": 1.0, "y": 2.0})()
+    ctx.microscope_parked = True
+    cleanup(ctx)
+    assert ctx.hardware.moves == []
+    assert ctx.hardware.disabled == 0
+    assert ctx.frame_check_calls == [False]
 
 
 def test_teardown_closes_the_autofocus_record():

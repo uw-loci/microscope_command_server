@@ -154,11 +154,15 @@ def test_the_check_is_armed_before_autofocus_and_disarmed_on_cleanup():
     assert source.index("set_frame_check_armed(hardware, True)") < source.index(
         "_configure_autofocus(ctx)"
     )
-    # Disarmed in the guaranteed-cleanup path, so a joystick nudge after the
-    # run is not reported as an origin change.
-    assert source.index("set_frame_check_armed(ctx.hardware, False)") > source.index(
-        "def _cleanup_acquisition("
-    )
+    # Disarmed when the microscope is parked, and parked (or disarmed, if already
+    # parked) in the guaranteed-cleanup path, so a joystick nudge after the run is
+    # not reported as an origin change.
+    park = source[source.index("def _park_microscope(") :]
+    assert "set_frame_check_armed(ctx.hardware, False)" in park[: park.index("\ndef ")]
+    cleanup = source[source.index("def _cleanup_acquisition(") :]
+    cleanup = cleanup[: cleanup.index("\ndef ")]
+    assert "set_frame_check_armed(ctx.hardware, False)" in cleanup
+    assert "_park_microscope(ctx)" in cleanup
 
 
 # --------------------------------------------------------------------------
