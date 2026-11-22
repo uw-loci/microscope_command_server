@@ -1,6 +1,6 @@
 [project]
 name = "microscope-command-server"
-version = "1.5.0"
+version = "1.6.0"
 description = "Socket-based command server for remote microscope control"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -11,15 +11,15 @@ authors = [
     {name = "Jenu Chacko", email = "jenu.chacko@wisc.edu"}
 ]
 dependencies = [
-    "microscope-control>=1.2.0",  # stage frame check pause (0d0ed10)
-    "microscope-imageprocessing>=0.4.0",  # focus.planes, StackWriter metadata
+    "microscope-control>=1.3.0",  # hardware health (HWSTAT), per_detector overlay
+    "microscope-imageprocessing>=0.5.0",  # BaSiC flat-field profiles (FLATFIT)
 ]
 
 [project.optional-dependencies]
 ppm = ["ppm-library>=1.0.0"]
 # LC-PolScope birefringence reconstruction. Optional for the same reason
 # ppm is: only scopes running that modality need it.
-polscope = ["polscope-library>=0.1.0"]
+polscope = ["polscope-library>=0.2.0"]
 dev = [
     "pytest>=7.4.0",
     "pytest-cov>=4.1.0",
