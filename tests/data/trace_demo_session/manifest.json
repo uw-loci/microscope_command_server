@@ -1,0 +1,111 @@
+{
+  "format_version": 1,
+  "start_time": "2026-11-26T15:39:06",
+  "streams": [
+    "hardware.jsonl",
+    "socket.jsonl"
+  ],
+  "recorder": "microscope_command_server.trace",
+  "demo": true,
+  "frame_mode": "hash",
+  "python": "3.12.3",
+  "platform": "Linux",
+  "argv": [
+    "/home/msnelson/QPSC_Project/microscope_command_server/tests/trace_support.py",
+    "/tmp/qpsc_demo_session/traces",
+    "--work-dir",
+    "/tmp/qpsc_demo_session/work",
+    "--no-autofocus",
+    "--label",
+    "demo"
+  ],
+  "config_files": [
+    {
+      "path": "/tmp/qpsc_demo_session/work/config/config_Demo.yml",
+      "stage": 1,
+      "copied": [
+        "autofocus_Demo.yml",
+        "config_Demo.yml",
+        "imageprocessing_Demo.yml",
+        "resources/"
+      ],
+      "dir": "/tmp/qpsc_demo_session/work/config"
+    }
+  ],
+  "inputs": [
+    {
+      "stage": 13,
+      "command": "ACQUIRE",
+      "flags": {
+        "yaml": "/tmp/qpsc_demo_session/work/config/config_Demo.yml",
+        "projects": "/tmp/qpsc_demo_session/work/projects",
+        "sample": "Sample1",
+        "scan-type": "Brightfield_10x_1",
+        "region": "bounds"
+      },
+      "copied": [
+        "inputs/stage_13/TileConfiguration.txt"
+      ],
+      "region_dir": "/tmp/qpsc_demo_session/work/projects/Sample1/Brightfield_10x_1/bounds"
+    }
+  ],
+  "paths": [
+    {
+      "stage": 7,
+      "command": "SNAP",
+      "flag": "output",
+      "value": "/tmp/qpsc_demo_session/work/snaps/snap_0"
+    },
+    {
+      "stage": 9,
+      "command": "SNAP",
+      "flag": "output",
+      "value": "/tmp/qpsc_demo_session/work/snaps/snap_1"
+    },
+    {
+      "stage": 11,
+      "command": "SNAP",
+      "flag": "output",
+      "value": "/tmp/qpsc_demo_session/work/snaps/snap_2"
+    },
+    {
+      "stage": 13,
+      "command": "ACQUIRE",
+      "flag": "yaml",
+      "value": "/tmp/qpsc_demo_session/work/config/config_Demo.yml"
+    },
+    {
+      "stage": 13,
+      "command": "ACQUIRE",
+      "flag": "projects",
+      "value": "/tmp/qpsc_demo_session/work/projects"
+    }
+  ],
+  "connections": [
+    {
+      "conn": 1,
+      "addr": [
+        "127.0.0.1",
+        50001
+      ]
+    }
+  ],
+  "versions": {
+    "Microscope Command Server": "1.3.1",
+    "Microscope Control": "1.1.0",
+    "Microscope Image Processing": "0.3.0",
+    "PPM Library": "not installed",
+    "PolScope Library": "0.1.0",
+    "Python": "3.12.3",
+    "OS": "Linux 6.6.87.2-microsoft-standard-WSL2 (x86_64)"
+  },
+  "git": {
+    "Microscope Command Server": "2425d46 (2026-11-22 00:38:48 -0600)",
+    "Microscope Control": "0bf6357 (2026-11-22 00:38:34 -0600)",
+    "Microscope Image Processing": "90eb71d (2026-11-22 00:38:16 -0600)",
+    "PPM Library": "unknown (module not found)",
+    "PolScope Library": "ba04d16 (2026-11-22 00:38:32 -0600)"
+  },
+  "end_time": "2026-11-26T15:39:09",
+  "duration_s": 2.544
+}

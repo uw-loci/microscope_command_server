@@ -1,0 +1,57 @@
+# Hardware resources for the demo microscope (config_Demo.yml).
+#
+# This file is installed as resources/resources_LOCI.yml next to the demo
+# config and is the single definition of the demo's stage, detector and
+# objective. Both QPSC and the command server merge the id_* sections of
+# this file into the config, so the entries live here rather than inline.
+# Device names are the server's --demo simulation's; DCam and DStage also
+# match Micro-Manager's Demo adapter, XYStage and DMonoCam are the
+# simulation's own labels.
+# NA and working distance below are metadata only; the simulation's depth
+# response comes from its blur-per-micrometer constant, not from NA.
+
+id_stage:
+  DEMO_STAGE:
+    name: Demo XYZ stage
+    manufacturer: Demo
+    device: XYStage
+    description: Simulated XY stage with a DStage focus drive.
+
+id_detector:
+  DEMO_CAMERA:
+    name: Demo Camera
+    manufacturer: Demo
+    camera_type: generic
+    device: DCam
+    width_px: 512
+    height_px: 512
+    sensor_pixel_width_um: 6.5
+    sensor_pixel_height_um: 6.5
+    flip_x: false
+    flip_y: false
+    description: Simulated colour camera looking at a virtual H&E slide.
+  DEMO_MONO_CAMERA:
+    name: Demo Mono Camera
+    manufacturer: Demo
+    camera_type: generic
+    device: DMonoCam
+    width_px: 640
+    height_px: 512
+    sensor_pixel_width_um: 5.86
+    sensor_pixel_height_um: 5.86
+    flip_x: false
+    flip_y: false
+    description: >-
+      Simulated 12-bit monochrome camera (5.86 um pixels, 0.586 um/px at
+      10x, offset 100 counts) on the epi
+      fluorescence port and behind the simulated LC-PolScope compensator.
+
+id_objective_lens:
+  DEMO_OBJECTIVE_10X:
+    name: 10x Demo
+    magnification: 10.0
+    na: 0.3
+    wd_um: 10000
+    description: Simulated 10x objective for the demo microscope.
+    manufacturer_id: DEMO
+    on_scope: Demo

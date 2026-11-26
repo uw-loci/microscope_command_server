@@ -80,6 +80,7 @@ from microscope_control.hardware.pycromanager import (
 from microscope_command_server.server.protocol import TCP_PORT
 from microscope_command_server.acquisition.workflow import _acquisition_workflow
 from microscope_command_server.version_info import format_log_header, shadowed_modules
+from microscope_command_server.trace.recorder import SessionRecorder, command_scope
 
 # Boot/pre-connection logging is configured by initialize_server() at startup.
 # The logger itself is defined at import time because module-level functions
@@ -276,6 +277,9 @@ package_dir = None
 core = None
 studio = None
 hardware = None
+# Record-and-replay: set by initialize_server() when --trace-dir or
+# MICROSCOPE_TRACE_DIR is given; None in normal operation.
+trace_recorder = None
 
 
 def init_pycromanager_with_logger():
@@ -510,6 +514,9 @@ def handle_client(conn, addr):
 
     logger.info(f">>> New client connected from {addr}")
 
+    if trace_recorder is not None:
+        conn = trace_recorder.wrap_connection(conn, addr)
+
     # Track this connection for disconnect cleanup
     with connection_state_lock:
         active_ip_connections.add(addr)
@@ -610,7 +617,8 @@ def handle_client(conn, addr):
             handler_kwargs["active_connection_config_path"] = active_connection_config_path
             handler_kwargs["acquisition_thread"] = acquisition_thread
 
-            result = handler(conn, client, hardware, startup_settings, **handler_kwargs)
+            with command_scope(conn, data):
+                result = handler(conn, client, hardware, startup_settings, **handler_kwargs)
 
             # Handle special return values from handlers
             if result == "DISCONNECT":
@@ -717,22 +725,8 @@ def handle_client(conn, addr):
         logger.info(f"<<< Client {addr} disconnected and cleaned up")
 
 
-def initialize_server(demo: bool = False):
-    """Configure boot logging and initialize hardware for the server process.
-
-    ``demo=True`` skips Micro-Manager entirely and drives the simulated
-    microscope in :mod:`microscope_command_server.demo` instead.
-
-    Must be called exactly once, by main(), before any handler thread runs.
-    Splitting these side effects out of module top level is what makes
-    `from microscope_command_server.server.qp_server import AcquisitionState`
-    (the lazy import in handlers/status.py) safe -- otherwise Python would
-    re-run hardware init the second time the module is loaded under its
-    package-qualified name, on top of the script-name `__main__` load.
-    """
-    global config_manager, startup_settings, package_dir, core, studio, hardware
-
-    # Configure logging - boot/pre-connection logging goes to console + fallback file
+def _configure_boot_logging() -> None:
+    """Boot/pre-connection logging goes to the console and a fallback file."""
     current_file_path = pathlib.Path(__file__).resolve()
     base_dir = current_file_path.parent
     log_dir = base_dir / "server_logfiles"
@@ -744,12 +738,17 @@ def initialize_server(demo: bool = False):
         handlers=[logging.FileHandler(boot_log_filename), logging.StreamHandler()],
     )
 
-    # Initialize hardware connections
+
+def load_startup_settings() -> dict:
+    """Load the generic startup configuration into the module globals and return it.
+
+    The microscope-specific config is loaded later by the CONFIG command. The
+    generic one only allows exploratory XYZ movements.
+    """
+    global config_manager, startup_settings, package_dir
+
     logger.info("Loading generic startup configuration...")
     config_manager = ConfigManager()
-
-    ## GENERIC CONFIG loaded for exploratory XYZ movements
-    # Actual microscope-specific config loaded during ACQUIRE command via --yaml parameter
     package_dir = pathlib.Path(__file__).parent.parent
 
     # config_generic.yml ships inside the package (configurations/), so the
@@ -787,6 +786,62 @@ def initialize_server(demo: bool = False):
         logger.info("Loaded LOCI resources for hardware device lookup")
     else:
         logger.warning("LOCI resources file not found - device lookups may fail during ACQUIRE")
+    return startup_settings
+
+
+def build_hardware(new_core, new_studio):
+    """Build the PycromanagerHardware over ``new_core``/``new_studio`` into the module globals.
+
+    Used by initialize_server() for the live or demo core and by the trace
+    replayer for a ReplayCore; the same code path either way.
+    """
+    global core, studio, hardware
+
+    core = new_core
+    studio = new_studio
+    hardware = PycromanagerHardware(core, studio, startup_settings)
+    # A camera switch (set_active_camera) tells the ConfigManager, so later config
+    # loads merge the new camera's per_detector values.
+    hardware.config_manager = config_manager
+    # Every stop-and-snap autofocus reports its progress to the operator's display.
+    from microscope_command_server.server.af_events import AF_EVENTS
+
+    hardware.autofocus_listener = AF_EVENTS
+    logger.info("Hardware initialized with generic config")
+    return hardware
+
+
+def reset_connection_state() -> None:
+    """Forget every client: the server is unconfigured again (used between replays)."""
+    global server_configured, active_connection_addr, active_connection_config_path
+
+    with connection_state_lock:
+        server_configured = False
+        active_connection_addr = None
+        active_connection_config_path = None
+        active_ip_connections.clear()
+    shutdown_event.clear()
+
+
+def initialize_server(demo: bool = False, trace_dir: str = None):
+    """Configure boot logging and initialize hardware for the server process.
+
+    ``demo=True`` skips Micro-Manager entirely and drives the simulated
+    microscope in :mod:`microscope_command_server.demo` instead.
+    ``trace_dir`` (or the MICROSCOPE_TRACE_DIR environment variable) records
+    the session for replay; see :mod:`microscope_command_server.trace`.
+
+    Must be called exactly once, by main(), before any handler thread runs.
+    Splitting these side effects out of module top level is what makes
+    `from microscope_command_server.server.qp_server import AcquisitionState`
+    (the lazy import in handlers/status.py) safe -- otherwise Python would
+    re-run hardware init the second time the module is loaded under its
+    package-qualified name, on top of the script-name `__main__` load.
+    """
+    global trace_recorder
+
+    _configure_boot_logging()
+    load_startup_settings()
 
     # Initialize hardware with generic config (will be replaced during ACQUIRE)
     if demo:
@@ -797,21 +852,19 @@ def initialize_server(demo: bool = False):
         logger.info("=" * 60)
         logger.info("DEMO MODE: no Micro-Manager, driving a simulated microscope")
         logger.info("=" * 60)
-        core = DemoCore()
-        studio = DemoStudio(core)
+        new_core = DemoCore()
+        new_studio = DemoStudio(new_core)
     else:
         # OPTION 1 (ACTIVE): Fail-fast - require Micro-Manager at startup
         logger.info("Initializing Micro-Manager connection...")
-        core, studio = init_pycromanager_with_logger()
-    hardware = PycromanagerHardware(core, studio, startup_settings)
-    # A camera switch (set_active_camera) tells the ConfigManager, so later config
-    # loads merge the new camera's per_detector values.
-    hardware.config_manager = config_manager
-    # Every stop-and-snap autofocus reports its progress to the operator's display.
-    from microscope_command_server.server.af_events import AF_EVENTS
+        new_core, new_studio = init_pycromanager_with_logger()
 
-    hardware.autofocus_listener = AF_EVENTS
-    logger.info("Hardware initialized with generic config")
+    trace_recorder = SessionRecorder.from_flag_or_env(trace_dir, demo=demo)
+    if trace_recorder is not None:
+        new_core = trace_recorder.wrap_core(new_core)
+        new_studio = trace_recorder.wrap_studio(new_studio)
+
+    build_hardware(new_core, new_studio)
     logger.info(
         "Server ready - microscope-specific config will be loaded from ACQUIRE --yaml parameter"
     )
@@ -833,13 +886,23 @@ def parse_args(argv=None):
             "(a virtual H&E slide on an XYZ stage). For trying QPSC on any computer."
         ),
     )
+    parser.add_argument(
+        "--trace-dir",
+        metavar="DIR",
+        default=None,
+        help=(
+            "Record this session (client commands, replies, every Micro-Manager call) "
+            "into a new folder under DIR for later replay. Off by default; the "
+            "MICROSCOPE_TRACE_DIR environment variable does the same."
+        ),
+    )
     return parser.parse_args(argv)
 
 
 def main(argv=None):
     """Main server loop that accepts client connections and spawns handler threads."""
     args = parse_args(argv)
-    initialize_server(demo=args.demo)
+    initialize_server(demo=args.demo, trace_dir=args.trace_dir)
     logger.info("=" * 60)
     logger.info(
         "Microscope Command Server" + (" (DEMO -- simulated microscope)" if args.demo else "")
@@ -876,6 +939,8 @@ def main(argv=None):
     else:
         logger.info(f"  Micro-Manager core: {'Connected' if core else 'Not connected'}")
     logger.info(f"  Hardware: {'Initialized' if hardware else 'Not initialized'}")
+    if trace_recorder is not None:
+        logger.info(f"  Trace recording: {trace_recorder.directory}")
 
     # Log loaded configuration
     microscope_info = startup_settings.get("microscope", {})
@@ -917,6 +982,8 @@ def main(argv=None):
         for t in threads:
             t.join(timeout=5.0)
 
+        if trace_recorder is not None:
+            trace_recorder.close()
         logger.info("Server has shut down.")
 
 

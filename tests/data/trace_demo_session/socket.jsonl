@@ -1,0 +1,72 @@
+{"kind":"connect","conn":1,"addr":["127.0.0.1",50001],"command":"","seq":65,"t":0.015246,"stage":0}
+{"kind":"command","conn":1,"stage":1,"command":"CONFIG","class":"action","code":"636f6e6669675f5f","thread":"Thread-1 (handle_client)","seq":66,"t":0.015396}
+{"kind":"c2s","conn":1,"stage":1,"command":"CONFIG","n":4,"thread":"Thread-1 (handle_client)","bytes":"00000032","text":"...2","seq":67,"t":0.01543}
+{"kind":"c2s","conn":1,"stage":1,"command":"CONFIG","n":50,"thread":"Thread-1 (handle_client)","bytes":"2f746d702f717073635f64656d6f5f73657373696f6e2f776f726b2f636f6e6669672f636f6e6669675f44656d6f2e796d6c","text":"/tmp/qpsc_demo_session/work/config/config_Demo.yml","seq":68,"t":0.015459}
+{"kind":"s2c","conn":1,"stage":1,"command":"CONFIG","n":259,"thread":"Thread-1 (handle_client)","bytes":"4346475f5f5f4f4b000000f77b224d6963726f73636f706520436f6d6d616e6420536572766572223a2022312e332e31222c20224d6963726f73636f706520436f6e74726f6c223a2022312e312e30222c20224d6963726f73636f706520496d6167652050726f63657373696e67223a2022302e332e30222c202250504d204c696272617279223a20226e6f7420696e7374616c6c6564222c2022506f6c53636f7065204c696272617279223a2022302e312e30222c2022507974686f6e223a2022332e31322e33222c20224f53223a20224c696e757820362e362e38372e322d6d6963726f736f66742d7374616e646172642d57534c3220287838365f363429227d","text":"CFG___OK...\\xf7{\"Microscope Command Server\": \"1.3.1\", \"Microscope Control\": \"1.1.0\", \"Microscope Image Processing\": \"0.3.0\"...","seq":133,"t":0.039178}
+{"kind":"end","conn":1,"stage":1,"command":"CONFIG","seq":134,"t":0.039243}
+{"kind":"command","conn":1,"stage":2,"command":"GETXYZ","class":"read","code":"67657478797a5f5f","thread":"Thread-1 (handle_client)","seq":135,"t":0.040582}
+{"kind":"s2c","conn":1,"stage":2,"command":"GETXYZ","n":12,"thread":"Thread-1 (handle_client)","bytes":"000000000000000000000000","text":"............","seq":136,"t":0.040681}
+{"kind":"end","conn":1,"stage":2,"command":"GETXYZ","seq":137,"t":0.040705}
+{"kind":"command","conn":1,"stage":3,"command":"MOVE","class":"action","code":"6d6f76655f5f5f5f","thread":"Thread-1 (handle_client)","seq":138,"t":0.040813}
+{"kind":"c2s","conn":1,"stage":3,"command":"MOVE","n":8,"thread":"Thread-1 (handle_client)","bytes":"447a000044fa0000","text":"Dz..D\\xfa..","seq":139,"t":0.04086}
+{"kind":"end","conn":1,"stage":3,"command":"MOVE","seq":143,"t":0.062892}
+{"kind":"command","conn":1,"stage":4,"command":"GETXY","class":"read","code":"67657478795f5f5f","thread":"Thread-1 (handle_client)","seq":144,"t":0.062942}
+{"kind":"s2c","conn":1,"stage":4,"command":"GETXY","n":8,"thread":"Thread-1 (handle_client)","bytes":"0000000000000000","text":"........","seq":145,"t":0.063008}
+{"kind":"end","conn":1,"stage":4,"command":"GETXY","seq":146,"t":0.063033}
+{"kind":"command","conn":1,"stage":5,"command":"SETEXP","class":"action","code":"7365746578705f5f","thread":"Thread-1 (handle_client)","seq":147,"t":0.063149}
+{"kind":"c2s","conn":1,"stage":5,"command":"SETEXP","n":1,"thread":"Thread-1 (handle_client)","bytes":"01","text":".","seq":148,"t":0.06318}
+{"kind":"c2s","conn":1,"stage":5,"command":"SETEXP","n":4,"thread":"Thread-1 (handle_client)","bytes":"41480000","text":"AH..","seq":149,"t":0.063196}
+{"kind":"s2c","conn":1,"stage":5,"command":"SETEXP","n":8,"thread":"Thread-1 (handle_client)","bytes":"41434b5f5f5f5f5f","text":"ACK_____","seq":152,"t":0.063303}
+{"kind":"end","conn":1,"stage":5,"command":"SETEXP","seq":153,"t":0.063337}
+{"kind":"command","conn":1,"stage":6,"command":"MOVE","class":"action","code":"6d6f76655f5f5f5f","thread":"Thread-1 (handle_client)","seq":154,"t":0.063795}
+{"kind":"c2s","conn":1,"stage":6,"command":"MOVE","n":8,"thread":"Thread-1 (handle_client)","bytes":"0000000000000000","text":"........","seq":155,"t":0.063846}
+{"kind":"end","conn":1,"stage":6,"command":"MOVE","seq":159,"t":0.086036}
+{"kind":"command","conn":1,"stage":7,"command":"SNAP","class":"action","code":"736e61705f5f5f5f","thread":"Thread-1 (handle_client)","seq":160,"t":0.086087}
+{"kind":"c2s","conn":1,"stage":7,"command":"SNAP","n":86,"thread":"Thread-1 (handle_client)","bytes":"2d2d616e676c6520302e30202d2d6578706f737572652031322e35202d2d6f7574707574202f746d702f717073635f64656d6f5f73657373696f6e2f776f726b2f736e6170732f736e61705f3020454e444f46535452","text":"--angle 0.0 --exposure 12.5 --output /tmp/qpsc_demo_session/work/snaps/snap_0 ENDOFSTR","seq":161,"t":0.086139}
+{"kind":"s2c","conn":1,"stage":7,"command":"SNAP","n":48,"thread":"Thread-1 (handle_client)","bytes":"535543434553533a2f746d702f717073635f64656d6f5f73657373696f6e2f776f726b2f736e6170732f736e61705f30","text":"SUCCESS:/tmp/qpsc_demo_session/work/snaps/snap_0","seq":167,"t":0.382158}
+{"kind":"end","conn":1,"stage":7,"command":"SNAP","seq":168,"t":0.382258}
+{"kind":"command","conn":1,"stage":8,"command":"MOVE","class":"action","code":"6d6f76655f5f5f5f","thread":"Thread-1 (handle_client)","seq":169,"t":0.382781}
+{"kind":"c2s","conn":1,"stage":8,"command":"MOVE","n":8,"thread":"Thread-1 (handle_client)","bytes":"437a000000000000","text":"Cz......","seq":170,"t":0.382822}
+{"kind":"end","conn":1,"stage":8,"command":"MOVE","seq":174,"t":0.404873}
+{"kind":"command","conn":1,"stage":9,"command":"SNAP","class":"action","code":"736e61705f5f5f5f","thread":"Thread-1 (handle_client)","seq":175,"t":0.404926}
+{"kind":"c2s","conn":1,"stage":9,"command":"SNAP","n":86,"thread":"Thread-1 (handle_client)","bytes":"2d2d616e676c6520302e30202d2d6578706f737572652031322e35202d2d6f7574707574202f746d702f717073635f64656d6f5f73657373696f6e2f776f726b2f736e6170732f736e61705f3120454e444f46535452","text":"--angle 0.0 --exposure 12.5 --output /tmp/qpsc_demo_session/work/snaps/snap_1 ENDOFSTR","seq":176,"t":0.404979}
+{"kind":"s2c","conn":1,"stage":9,"command":"SNAP","n":48,"thread":"Thread-1 (handle_client)","bytes":"535543434553533a2f746d702f717073635f64656d6f5f73657373696f6e2f776f726b2f736e6170732f736e61705f31","text":"SUCCESS:/tmp/qpsc_demo_session/work/snaps/snap_1","seq":185,"t":0.659439}
+{"kind":"end","conn":1,"stage":9,"command":"SNAP","seq":186,"t":0.659657}
+{"kind":"command","conn":1,"stage":10,"command":"MOVE","class":"action","code":"6d6f76655f5f5f5f","thread":"Thread-1 (handle_client)","seq":187,"t":0.660101}
+{"kind":"c2s","conn":1,"stage":10,"command":"MOVE","n":8,"thread":"Thread-1 (handle_client)","bytes":"00000000437a0000","text":"....Cz..","seq":188,"t":0.660142}
+{"kind":"end","conn":1,"stage":10,"command":"MOVE","seq":192,"t":0.682208}
+{"kind":"command","conn":1,"stage":11,"command":"SNAP","class":"action","code":"736e61705f5f5f5f","thread":"Thread-1 (handle_client)","seq":193,"t":0.682268}
+{"kind":"c2s","conn":1,"stage":11,"command":"SNAP","n":86,"thread":"Thread-1 (handle_client)","bytes":"2d2d616e676c6520302e30202d2d6578706f737572652031322e35202d2d6f7574707574202f746d702f717073635f64656d6f5f73657373696f6e2f776f726b2f736e6170732f736e61705f3220454e444f46535452","text":"--angle 0.0 --exposure 12.5 --output /tmp/qpsc_demo_session/work/snaps/snap_2 ENDOFSTR","seq":194,"t":0.68232}
+{"kind":"s2c","conn":1,"stage":11,"command":"SNAP","n":48,"thread":"Thread-1 (handle_client)","bytes":"535543434553533a2f746d702f717073635f64656d6f5f73657373696f6e2f776f726b2f736e6170732f736e61705f32","text":"SUCCESS:/tmp/qpsc_demo_session/work/snaps/snap_2","seq":200,"t":0.984074}
+{"kind":"end","conn":1,"stage":11,"command":"SNAP","seq":201,"t":0.984353}
+{"kind":"command","conn":1,"stage":12,"command":"MOVEZ","class":"action","code":"6d6f76655f7a5f5f","thread":"Thread-1 (handle_client)","seq":202,"t":0.98497}
+{"kind":"c2s","conn":1,"stage":12,"command":"MOVEZ","n":4,"thread":"Thread-1 (handle_client)","bytes":"00000000","text":"....","seq":203,"t":0.985024}
+{"kind":"end","conn":1,"stage":12,"command":"MOVEZ","seq":214,"t":0.99838}
+{"kind":"command","conn":1,"stage":13,"command":"ACQUIRE","class":"action","code":"616371756972655f","thread":"Thread-1 (handle_client)","seq":215,"t":0.998427}
+{"kind":"c2s","conn":1,"stage":13,"command":"ACQUIRE","n":304,"thread":"Thread-1 (handle_client)","bytes":"2d2d79616d6c202f746d702f717073635f64656d6f5f73657373696f6e2f776f726b2f636f6e6669672f636f6e6669675f44656d6f2e796d6c202d2d70726f6a65637473202f746d702f717073635f64656d6f5f73657373696f6e2f776f726b2f70726f6a65637473202d2d73616d706c652053616d706c6531202d2d7363616e2d74797065204272696768746669656c645f3130785f31202d2d726567696f6e20626f756e6473202d2d6f626a6563746976652044454d4f5f4f424a4543544956455f313058202d2d6465746563746f722044454d4f5f43414d455241202d2d706978656c2d73697a6520302e3635202d2d62672d636f7272656374696f6e2066616c7365202d2d77622d6d6f6465206f6666202d2d61662d64697361626c6564207472756520454e444f46535452","text":"--yaml /tmp/qpsc_demo_session/work/config/config_Demo.yml --projects /tmp/qpsc_demo_session/work/projects --sample Sampl...","seq":216,"t":0.998486}
+{"kind":"s2c","conn":1,"stage":13,"command":"ACQUIRE","n":16,"thread":"Thread-1 (handle_client)","bytes":"535441525445443a4143515549524520","text":"STARTED:ACQUIRE ","seq":218,"t":1.015671}
+{"kind":"end","conn":1,"stage":13,"command":"ACQUIRE","seq":219,"t":1.015819}
+{"kind":"command","conn":1,"stage":14,"command":"STATUS","class":"poll","code":"7374617475735f5f","thread":"Thread-1 (handle_client)","seq":230,"t":1.02594}
+{"kind":"s2c","conn":1,"stage":14,"command":"STATUS","n":16,"thread":"Thread-1 (handle_client)","bytes":"52554e4e494e47202020202020202020","text":"RUNNING         ","seq":231,"t":1.026093}
+{"kind":"end","conn":1,"stage":14,"command":"STATUS","seq":232,"t":1.026144}
+{"kind":"command","conn":1,"stage":15,"command":"PROGRESS","class":"poll","code":"70726f6772657373","thread":"Thread-1 (handle_client)","seq":235,"t":1.028681}
+{"kind":"s2c","conn":1,"stage":15,"command":"PROGRESS","n":8,"thread":"Thread-1 (handle_client)","bytes":"0000000000000004","text":"........","seq":240,"t":1.02903}
+{"kind":"end","conn":1,"stage":15,"command":"PROGRESS","seq":241,"t":1.029078}
+{"kind":"command","conn":1,"stage":16,"command":"STATUS","class":"poll","code":"7374617475735f5f","thread":"Thread-1 (handle_client)","seq":267,"t":1.529639}
+{"kind":"s2c","conn":1,"stage":16,"command":"STATUS","n":16,"thread":"Thread-1 (handle_client)","bytes":"52554e4e494e47202020202020202020","text":"RUNNING         ","seq":268,"t":1.529872}
+{"kind":"end","conn":1,"stage":16,"command":"STATUS","seq":269,"t":1.529911}
+{"kind":"command","conn":1,"stage":17,"command":"PROGRESS","class":"poll","code":"70726f6772657373","thread":"Thread-1 (handle_client)","seq":270,"t":1.530077}
+{"kind":"s2c","conn":1,"stage":17,"command":"PROGRESS","n":8,"thread":"Thread-1 (handle_client)","bytes":"0000000100000004","text":"........","seq":271,"t":1.530278}
+{"kind":"end","conn":1,"stage":17,"command":"PROGRESS","seq":272,"t":1.530316}
+{"kind":"command","conn":1,"stage":18,"command":"STATUS","class":"poll","code":"7374617475735f5f","thread":"Thread-1 (handle_client)","seq":310,"t":2.031863}
+{"kind":"s2c","conn":1,"stage":18,"command":"STATUS","n":16,"thread":"Thread-1 (handle_client)","bytes":"52554e4e494e47202020202020202020","text":"RUNNING         ","seq":311,"t":2.032185}
+{"kind":"end","conn":1,"stage":18,"command":"STATUS","seq":312,"t":2.032288}
+{"kind":"command","conn":1,"stage":19,"command":"PROGRESS","class":"poll","code":"70726f6772657373","thread":"Thread-1 (handle_client)","seq":313,"t":2.03252}
+{"kind":"s2c","conn":1,"stage":19,"command":"PROGRESS","n":8,"thread":"Thread-1 (handle_client)","bytes":"0000000300000004","text":"........","seq":314,"t":2.032683}
+{"kind":"end","conn":1,"stage":19,"command":"PROGRESS","seq":315,"t":2.032733}
+{"kind":"command","conn":1,"stage":20,"command":"STATUS","class":"poll","code":"7374617475735f5f","thread":"Thread-1 (handle_client)","seq":408,"t":2.543313}
+{"kind":"s2c","conn":1,"stage":20,"command":"STATUS","n":22,"thread":"Thread-1 (handle_client)","bytes":"434f4d504c455445447c66696e616c5f7a3a302e3030","text":"COMPLETED|final_z:0.00","seq":409,"t":2.543449}
+{"kind":"end","conn":1,"stage":20,"command":"STATUS","seq":410,"t":2.543494}
+{"kind":"command","conn":1,"stage":21,"command":"DISCONNECT","class":"action","code":"71756974636c6e74","thread":"Thread-1 (handle_client)","seq":411,"t":2.543625}
+{"kind":"end","conn":1,"stage":21,"command":"DISCONNECT","seq":412,"t":2.543673}
+{"kind":"close","conn":1,"stage":21,"command":"DISCONNECT","seq":414,"t":2.543871}

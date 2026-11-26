@@ -123,6 +123,57 @@ works too and its banner then says so instead of asking for Micro-Manager. A SNA
 scope with no rotation stage (the demo, or any brightfield-only scope) ignores `--angle`
 instead of failing.
 
+## Record and replay a session (--trace-dir)
+
+```bash
+microscope-command-server --trace-dir D:\qpsc_traces          # or: set MICROSCOPE_TRACE_DIR=D:\qpsc_traces
+```
+
+records the whole session into a new folder `D:\qpsc_traces\session_<date>_<time>\`:
+every command QuPath sends and every reply (`socket.jsonl`), every call the server makes
+into Micro-Manager through `microscope_control` (`hardware.jsonl`: method, arguments, return
+value, duration, thread), a copy of the YAML bundle CONFIG pointed at (`config/`), the
+`TileConfiguration.txt` of each acquisition (`inputs/`), and `manifest.json` with the server
+version, the git ref of every lab package and the paths the client named. Off by default;
+the server runs unchanged otherwise. Everything written is ASCII. Frames are stored as a
+digest plus shape, dtype and statistics; set `MICROSCOPE_TRACE_FRAMES=full` to keep the
+pixels as `.npy` files (needed for a replay of anything that autofocuses; about 15 MB per
+camera frame on the PPM scope) or `preview` for a 128-px strided copy. Recording adds about
+10 us per Micro-Manager call and 25 to 45 ms per frame, so a session runs as it did.
+
+Replay the recording against the code now checked out, on any machine:
+
+```bash
+python -m microscope_command_server.trace replay D:\qpsc_traces\session_20261126_101500 --output-dir replay_out
+python -m microscope_control.trace group replay_out/differences.jsonl
+```
+
+The server's own handlers run on a fake Micro-Manager core that answers from the trace, and
+the recorded commands are fed to them in order. A stage is one client command. Each reply is
+compared with the recorded one (numeric replies within `--abs-tol`, time stamps masked;
+STATUS and PROGRESS polls are re-asked until the recorded answer comes) and every hardware
+call with the recorded sequence: a different method, an argument outside tolerance, a call
+the trace does not have or a recorded call that never comes. Differences land in
+`differences.jsonl`, one record per departure with a `fingerprint` of
+`command|kind|subject|field`, so one defect across a 40-tile run reads as one group. Exit
+status 0 means no differences. Paths in the recorded messages are rewritten to the output
+folder (`--rewrite OLD=NEW` for anything else, such as a background folder the run read);
+`--tolerance set_xy_position=0.5` loosens one method; `--strict` stops the code under test at
+the first hardware difference instead of noting it and going on.
+
+A replay that reads `0 difference(s)` says the new code asked the hardware for the same
+things, in the same order, and answered the client the same way. Position reads (GETXY,
+GETZ, GETXYZ) are waited for but not compared: they come from the background position cache,
+whose timing a replay cannot reproduce. After the first difference a run may go wrong in
+ways that cascade; read `first difference:` in the report before the groups.
+
+A synthetic trace of the demo microscope (CONFIG, moves, SETEXP, three SNAPs, a four-tile
+acquisition) is checked in under `tests/data/trace_demo_session` and replayed by
+`tests/test_trace_session.py`, which also shows a flipped stage sign and a shifted tile order
+being caught. Record one yourself with `python -m tests.trace_support DIR` (add `--frames
+full` to keep the autofocus test and the autofocus tiles replayable). Format details and the
+fake core: `microscope_control/docs/RECORD_AND_REPLAY.md`.
+
 ## Multi-Channel Acquisition (Widefield IF, BF+IF)
 
 The BGACQUIRE command now supports a vendor-agnostic channel-based acquisition
