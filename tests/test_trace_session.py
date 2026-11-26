@@ -209,6 +209,24 @@ def test_rewrite_payload_relocates_paths_and_keeps_binary_payloads():
     assert rewrite_payload("MOVE", floats, rewrites) == floats
 
 
+def test_config_reply_versions_are_environment_not_behavior():
+    from microscope_command_server.trace.replayer import _compare_reply
+
+    def reply(versions):
+        body = json.dumps(versions).encode()
+        return b"CFG___OK" + struct.pack("!I", len(body)) + body
+
+    recorded = reply({"Microscope Command Server": "1.6.0", "ppm-library": "1.2.0"})
+    records = [{"n": len(recorded), "bytes": recorded.hex()}]
+    other_versions = reply({"Microscope Command Server": "1.7.0", "ppm-library": "not installed"})
+    assert _compare_reply(1, "CONFIG", records, other_versions, 1e-6) == []
+    fewer_keys = reply({"Microscope Command Server": "1.6.0"})
+    diffs = _compare_reply(1, "CONFIG", records, fewer_keys, 1e-6)
+    assert [d.field for d in diffs] == ["keys"] and diffs[0].expected == ["ppm-library"]
+    failed = b"CFG_FAIL" + struct.pack("!I", 2) + b"{}"
+    assert [d.field for d in _compare_reply(1, "CONFIG", records, failed, 1e-6)] == ["status"]
+
+
 # -- the replay connection -------------------------------------------------------------
 
 

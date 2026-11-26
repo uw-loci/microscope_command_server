@@ -64,6 +64,21 @@ logger = logging.getLogger(__name__)
 # still shows in the set_xy_position / set_position arguments.
 CACHED_READ_COMMANDS = frozenset({"GETXY", "GETZ", "GETXYZ"})
 
+# Replies that carry their own length: an optional fixed status word, then a
+# big-endian unsigned length, then that many bytes. They are read by length
+# rather than by the recorded size, since the body can legitimately differ in
+# size (CONFIG answers with the installed package versions).
+LENGTH_PREFIXED_REPLIES: Dict[str, Tuple[int, str]] = {
+    "CONFIG": (8, "!I"),
+    "MMPRESET": (0, "!I"),
+    "HWSTAT": (0, "!I"),
+    "AFTRACE": (0, "!I"),
+}
+
+# CONFIG's JSON body lists package versions and git refs: environment, not
+# behavior. Its keys are compared, its values are not.
+ENVIRONMENT_JSON_REPLIES = frozenset({"CONFIG"})
+
 # Fixed-format replies that are compared field by field, within a tolerance.
 REPLY_FORMATS: Dict[str, Tuple[str, Tuple[str, ...]]] = {
     "GETXY": ("!ff", ("x", "y")),
@@ -309,6 +324,70 @@ def _expected_bytes(records: List[Dict[str, Any]]) -> Tuple[int, bytes]:
     return total, raw
 
 
+def _take_reply(conn: "ReplayConnection", command: str, total: int, timeout: float) -> bytes:
+    """The reply bytes: by recorded size, or by the length a prefixed reply announces."""
+    prefixed = LENGTH_PREFIXED_REPLIES.get(command)
+    if prefixed is None:
+        return conn.take(total, timeout)
+    word, fmt = prefixed
+    head = conn.take(word + struct.calcsize(fmt), timeout)
+    if len(head) < word + struct.calcsize(fmt):
+        return head
+    (n,) = struct.unpack(fmt, head[word:])
+    return head + conn.take(n, timeout)
+
+
+def _compare_environment_json(
+    stage: int, command: str, expected: bytes, got: bytes, word: int, fmt: str
+) -> List[Difference]:
+    """Status word exact; the JSON body's keys exact; its values are environment."""
+    size = struct.calcsize(fmt)
+    if expected[:word] != got[:word]:
+        return [
+            Difference(
+                stage,
+                command,
+                KIND_REPLY_BYTES,
+                "reply",
+                "status",
+                _text_preview(expected[:word]),
+                _text_preview(got[:word]),
+            )
+        ]
+    try:
+        exp_json = json.loads(expected[word + size :].decode("utf-8"))
+        got_json = json.loads(got[word + size :].decode("utf-8"))
+    except (ValueError, UnicodeDecodeError):
+        if expected == got:
+            return []
+        return [
+            Difference(
+                stage,
+                command,
+                KIND_REPLY_BYTES,
+                "reply",
+                "body",
+                _text_preview(expected),
+                _text_preview(got),
+                "not JSON on both sides",
+            )
+        ]
+    if isinstance(exp_json, dict) and isinstance(got_json, dict) and set(exp_json) != set(got_json):
+        return [
+            Difference(
+                stage,
+                command,
+                KIND_REPLY_VALUE,
+                "reply",
+                "keys",
+                sorted(set(exp_json) - set(got_json)),
+                sorted(set(got_json) - set(exp_json)),
+                "recorded-only keys vs replay-only keys; values are environment and not compared",
+            )
+        ]
+    return []
+
+
 def _compare_reply(
     stage: int,
     command: str,
@@ -317,7 +396,10 @@ def _compare_reply(
     abs_tol: float,
 ) -> List[Difference]:
     """Differences between the recorded reply records and the bytes the replay produced."""
-    total, _ = _expected_bytes(records)
+    total, expected_all = _expected_bytes(records)
+    if command in ENVIRONMENT_JSON_REPLIES and command in LENGTH_PREFIXED_REPLIES:
+        word, fmt = LENGTH_PREFIXED_REPLIES[command]
+        return _compare_environment_json(stage, command, expected_all, got, word, fmt)
     if len(got) != total:
         return [
             Difference(
@@ -693,8 +775,8 @@ def replay_trace(
             if klass == "action":
                 gave_up.difference_update({k for k in gave_up if k[0] == conn.conn_id})
             conn.push(stage, name, code + payload)
-            got = conn.take(total, stage_timeout_s)
-            if len(got) < total:
+            got = _take_reply(conn, name, total, stage_timeout_s)
+            if len(got) < total and name not in LENGTH_PREFIXED_REPLIES:
                 report.differences.append(
                     Difference(
                         stage,
